@@ -5151,8 +5151,14 @@ mod tests {
         // In retry-only mode, the producer checks known_ids before sending
         // tasks. Simulate that filtering logic here.
         let mut ctx = super::super::DownloadContext::default();
-        ctx.known_ids.insert("PREV_SYNCED_001".into());
-        ctx.known_ids.insert("PREV_SYNCED_002".into());
+        ctx.known_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("PREV_SYNCED_001".into());
+        ctx.known_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("PREV_SYNCED_002".into());
 
         let known_asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1"
         let config = test_config();
@@ -5161,7 +5167,7 @@ mod tests {
         // Simulate the retry_only check from the producer loop
         let retry_filtered: Vec<_> = tasks
             .into_iter()
-            .filter(|task| ctx.known_ids.contains(task.asset_id.as_ref()))
+            .filter(|task| ctx.is_known(&task.library, &task.asset_id))
             .collect();
 
         // "TEST_1" is NOT in known_ids, so retry_only would skip it
@@ -5171,11 +5177,14 @@ mod tests {
         );
 
         // Now add "TEST_1" to known_ids and verify it passes
-        ctx.known_ids.insert("TEST_1".into());
+        ctx.known_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("TEST_1".into());
         let tasks2 = filter_asset_fresh(&known_asset, &config);
         let retry_filtered2: Vec<_> = tasks2
             .into_iter()
-            .filter(|task| ctx.known_ids.contains(task.asset_id.as_ref()))
+            .filter(|task| ctx.is_known(&task.library, &task.asset_id))
             .collect();
         assert_eq!(
             retry_filtered2.len(),

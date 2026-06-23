@@ -1390,8 +1390,8 @@ where
 
                         for task in plan.tasks {
                             // Mark assets that have exceeded the retry limit as failed.
-                            if let Some(&attempts) =
-                                download_ctx.attempt_counts.get(task.asset_id.as_ref())
+                            if let Some(attempts) =
+                                download_ctx.attempt_count(&task.library, &task.asset_id)
                             {
                                 if config.max_download_attempts > 0
                                     && attempts >= config.max_download_attempts
@@ -1428,7 +1428,7 @@ where
                             }
 
                             if config.retry_only
-                                && !download_ctx.known_ids.contains(task.asset_id.as_ref())
+                                && !download_ctx.is_known(&task.library, &task.asset_id)
                             {
                                 tracing::debug!(
                                     asset_id = %task.asset_id,
@@ -4067,7 +4067,7 @@ mod tests {
             Ok(HashSet::new())
         }
 
-        async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+        async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             Ok(HashSet::new())
         }
 
@@ -4077,7 +4077,7 @@ mod tests {
             Ok(HashMap::new())
         }
 
-        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+        async fn get_attempt_counts(&self) -> Result<HashMap<(String, String), u32>, StateError> {
             Ok(HashMap::new())
         }
 

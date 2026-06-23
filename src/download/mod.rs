@@ -1347,6 +1347,14 @@ fn intern_id(interner: &mut FxHashSet<Arc<str>>, s: String) -> Arc<str> {
 /// `DownloadContext::downloaded_ids` and `metadata_retry_markers`.
 type LibraryAssetVersionSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<Box<str>>>>;
 
+/// `library -> asset_id`. Used by retry-only mode to decide whether an asset is
+/// already known in the same CloudKit zone.
+type LibraryAssetSet = FxHashMap<Arc<str>, FxHashSet<Arc<str>>>;
+
+/// `library -> asset_id -> attempt count`. Used by max-attempt gating without
+/// leaking failures across libraries that happen to share an id.
+type LibraryAssetAttemptCounts = FxHashMap<Arc<str>, FxHashMap<Arc<str>, u32>>;
+
 /// `library -> asset_id -> (version_size -> value)`. Used by
 /// `DownloadContext::downloaded_checksums` and
 /// `downloaded_metadata_hashes`.
@@ -1393,15 +1401,13 @@ struct DownloadContext {
     /// for pending rows. Pending on-disk adoption uses this to avoid adopting
     /// a same-name/same-size collision that belongs to a different asset.
     pending_filenames: LibraryAssetVersionValueMap,
-    /// All asset IDs known to the state DB (any status). Used in retry-only mode
-    /// to skip new assets that were never synced. Library-blind: a known ID
-    /// is "known" regardless of which zone it belongs to.
-    known_ids: FxHashSet<Arc<str>>,
-    /// Per-asset maximum download attempt count (from failed assets).
+    /// Nested map: `library` -> set of asset IDs known to the state DB (any
+    /// status). Used in retry-only mode to skip new assets that were never
+    /// synced in the same CloudKit zone.
+    known_ids: LibraryAssetSet,
+    /// Per-library/asset maximum download attempt count (from failed assets).
     /// Used to skip assets that have exceeded `max_download_attempts`.
-    /// Library-blind: an asset shared across libraries shares its attempt
-    /// budget (mirrors how `get_attempt_counts` aggregates by id alone).
-    attempt_counts: FxHashMap<Arc<str>, u32>,
+    attempt_counts: LibraryAssetAttemptCounts,
     /// True when at least one downloaded asset-version lacks a metadata hash.
     /// Cached because the producer checks this on hot on-disk skip paths.
     downloaded_without_metadata_hash: bool,
@@ -1425,7 +1431,7 @@ impl DownloadContext {
                 Default::default()
             }
         };
-        let (ids, checksums, paths, hashes, markers, pending, attempts, known_ids) = tokio::join!(
+        let (ids, checksums, paths, hashes, markers, pending, attempts, known_id_rows) = tokio::join!(
             async {
                 db.get_downloaded_ids().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
@@ -1571,15 +1577,19 @@ impl DownloadContext {
                 .insert(version_size, record.filename.to_string().into_boxed_str());
         }
 
-        let known_ids: FxHashSet<Arc<str>> = known_ids
-            .into_iter()
-            .map(|id| intern_id(&mut interner, id))
-            .collect();
+        let mut known_ids: LibraryAssetSet = FxHashMap::default();
+        for (library, asset_id) in known_id_rows {
+            let lib = intern_id(&mut interner, library);
+            let id = intern_id(&mut interner, asset_id);
+            known_ids.entry(lib).or_default().insert(id);
+        }
 
-        let attempt_counts: FxHashMap<Arc<str>, u32> = attempts
-            .into_iter()
-            .map(|(id, count)| (intern_id(&mut interner, id), count))
-            .collect();
+        let mut attempt_counts: LibraryAssetAttemptCounts = FxHashMap::default();
+        for ((library, asset_id), count) in attempts {
+            let lib = intern_id(&mut interner, library);
+            let id = intern_id(&mut interner, asset_id);
+            attempt_counts.entry(lib).or_default().insert(id, count);
+        }
         let downloaded_without_metadata_hash = count_version_set_entries(&downloaded_ids)
             > count_value_map_entries(&downloaded_metadata_hashes);
 
@@ -1595,6 +1605,19 @@ impl DownloadContext {
             attempt_counts,
             downloaded_without_metadata_hash,
         }
+    }
+
+    fn is_known(&self, library: &str, asset_id: &str) -> bool {
+        self.known_ids
+            .get(library)
+            .is_some_and(|ids| ids.contains(asset_id))
+    }
+
+    fn attempt_count(&self, library: &str, asset_id: &str) -> Option<u32> {
+        self.attempt_counts
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+            .copied()
     }
 
     /// Whether a downloaded asset-version needs a metadata-only rewrite:
@@ -3055,6 +3078,21 @@ impl IncrementalStateTransition {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SourceStateUpdate {
+    SoftDeleted { deleted_at: Option<DateTime<Utc>> },
+    Hidden,
+}
+
+impl SourceStateUpdate {
+    const fn transition(self) -> IncrementalStateTransition {
+        match self {
+            Self::SoftDeleted { .. } => IncrementalStateTransition::SoftDelete,
+            Self::Hidden => IncrementalStateTransition::Hidden,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SourceStateTransitionKey<'a> {
     record_name: Cow<'a, str>,
@@ -3130,6 +3168,102 @@ fn source_state_transition_key(event: &ChangeEvent) -> SourceStateTransitionKey<
         record_name: Cow::Borrowed(&event.record_name),
         record_type: event.record_type.as_deref(),
         unresolved_identity: event.record_type.is_none(),
+    }
+}
+
+fn unpaired_cplasset_state_key(event: &ChangeEvent) -> Option<SourceStateTransitionKey<'_>> {
+    if event.asset.is_none() && matches!(event.record_type.as_deref(), Some("CPLAsset")) {
+        return Some(SourceStateTransitionKey {
+            record_name: Cow::Borrowed(&event.record_name),
+            record_type: Some("CPLAsset"),
+            unresolved_identity: false,
+        });
+    }
+    None
+}
+
+async fn cplasset_master_fallback_state_key<'a>(
+    event: &'a ChangeEvent,
+    config: &DownloadConfig,
+    db: &dyn DownloadStore,
+) -> std::result::Result<Option<SourceStateTransitionKey<'a>>, crate::state::error::StateError> {
+    if !matches!(event.record_type.as_deref(), Some("CPLAsset")) {
+        return Ok(None);
+    }
+
+    if let Some(master_record_name) = event.master_record_name.as_deref() {
+        return Ok(Some(SourceStateTransitionKey {
+            record_name: Cow::Borrowed(master_record_name),
+            record_type: Some("CPLMaster"),
+            unresolved_identity: false,
+        }));
+    }
+
+    let Some(master_record_name) = db
+        .get_master_record_name_for_asset(&config.library, &event.record_name)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    tracing::debug!(
+        asset_record_name = %event.record_name,
+        master_record_name = %master_record_name,
+        library = %config.library,
+        "Resolved source-state CPLAsset event through asset/master mapping"
+    );
+    Ok(Some(SourceStateTransitionKey {
+        record_name: Cow::Owned(master_record_name),
+        record_type: Some("CPLMaster"),
+        unresolved_identity: false,
+    }))
+}
+
+async fn run_source_state_update(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    key: &SourceStateTransitionKey<'_>,
+    update: SourceStateUpdate,
+) -> Result<usize, crate::state::error::StateError> {
+    match update {
+        SourceStateUpdate::SoftDeleted { deleted_at } => {
+            db.mark_soft_deleted_affected(&config.library, key.record_name(), deleted_at)
+                .await
+        }
+        SourceStateUpdate::Hidden => {
+            db.mark_hidden_at_source_affected(&config.library, key.record_name())
+                .await
+        }
+    }
+}
+
+async fn apply_source_state_update<'a>(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    event: &'a ChangeEvent,
+    update: SourceStateUpdate,
+) -> (
+    Result<usize, crate::state::error::StateError>,
+    SourceStateTransitionKey<'a>,
+) {
+    let Some(asset_key) = unpaired_cplasset_state_key(event) else {
+        let state_key = source_state_transition_key(event);
+        let result = run_source_state_update(db, config, &state_key, update).await;
+        return (result, state_key);
+    };
+
+    let result = run_source_state_update(db, config, &asset_key, update).await;
+    match result {
+        Ok(0) => match cplasset_master_fallback_state_key(event, config, db).await {
+            Ok(Some(fallback_key)) => {
+                let fallback_result =
+                    run_source_state_update(db, config, &fallback_key, update).await;
+                (fallback_result, fallback_key)
+            }
+            Ok(None) => (Ok(0), asset_key),
+            Err(e) => (Err(e), asset_key),
+        },
+        other => (other, asset_key),
     }
 }
 
@@ -4747,17 +4881,12 @@ impl IncrementalDeltaSummary {
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
                 if let Some(db) = &config.state_db {
                     let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
-                    let state_key = source_state_transition_key(event);
-                    let result = db
-                        .mark_soft_deleted_affected(
-                            &config.library,
-                            state_key.record_name(),
-                            deleted_at,
-                        )
-                        .await;
+                    let update = SourceStateUpdate::SoftDeleted { deleted_at };
+                    let (result, state_key) =
+                        apply_source_state_update(db.as_ref(), config, event, update).await;
                     record_incremental_state_transition_result(
                         result,
-                        IncrementalStateTransition::SoftDelete,
+                        update.transition(),
                         state_key,
                         &mut self.state_transition_failures,
                         &mut self.token_unsafe_reason,
@@ -4851,13 +4980,12 @@ impl IncrementalDeltaSummary {
                 self.hidden_count += 1;
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
                 if let Some(db) = &config.state_db {
-                    let state_key = source_state_transition_key(event);
-                    let result = db
-                        .mark_hidden_at_source_affected(&config.library, state_key.record_name())
-                        .await;
+                    let update = SourceStateUpdate::Hidden;
+                    let (result, state_key) =
+                        apply_source_state_update(db.as_ref(), config, event, update).await;
                     record_incremental_state_transition_result(
                         result,
-                        IncrementalStateTransition::Hidden,
+                        update.transition(),
                         state_key,
                         &mut self.state_transition_failures,
                         &mut self.token_unsafe_reason,
@@ -8361,6 +8489,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_cplasset_soft_delete_marks_sibling_state_row_before_master_ref() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("asset-TRACKED_SIBLING").build())
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-TRACKED_SIBLING", "TRACKED_MASTER")
+            .await
+            .unwrap();
+
+        let result = run_incremental_change_records(
+            db.clone(),
+            vec![soft_deleted_cpl_asset_record(
+                "asset-TRACKED_SIBLING",
+                "TRACKED_MASTER",
+            )],
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+        let pending = db.get_pending().await.unwrap();
+        assert_source_flags(&pending, "TRACKED_MASTER", false, false);
+        assert_source_flags(&pending, "asset-TRACKED_SIBLING", true, false);
+    }
+
+    #[tokio::test]
+    async fn incremental_cplasset_hidden_marks_sibling_state_row_before_master_ref() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(&TestAssetRecord::new("TRACKED_HIDDEN_MASTER").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("asset-TRACKED_HIDDEN_SIBLING").build())
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-TRACKED_HIDDEN_SIBLING",
+            "TRACKED_HIDDEN_MASTER",
+        )
+        .await
+        .unwrap();
+
+        let result = run_incremental_change_records(
+            db.clone(),
+            vec![hidden_cpl_asset_record(
+                "asset-TRACKED_HIDDEN_SIBLING",
+                "TRACKED_HIDDEN_MASTER",
+            )],
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+        let pending = db.get_pending().await.unwrap();
+        assert_source_flags(&pending, "TRACKED_HIDDEN_MASTER", false, false);
+        assert_source_flags(&pending, "asset-TRACKED_HIDDEN_SIBLING", false, true);
+    }
+
+    #[tokio::test]
     async fn incremental_change_persists_asset_master_mapping() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         let result = run_incremental_change_records(
@@ -10364,7 +10558,10 @@ mod tests {
     fn test_download_context_known_ids_populated_for_retry_only() {
         // Simulate retry-only mode: known_ids is populated
         let mut ctx = DownloadContext::default();
-        ctx.known_ids.insert("known_asset".into());
+        ctx.known_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("known_asset".into());
 
         // A known asset that's not in downloaded_ids needs download
         assert_eq!(
@@ -10379,8 +10576,12 @@ mod tests {
         );
         // The known_ids set is used externally to decide whether to skip new assets;
         // verify the set membership works
-        assert!(ctx.known_ids.contains("known_asset"));
-        assert!(!ctx.known_ids.contains("new_asset"));
+        assert!(ctx.is_known("PrimarySync", "known_asset"));
+        assert!(!ctx.is_known("PrimarySync", "new_asset"));
+        assert!(
+            !ctx.is_known("SharedSync-AAAA", "known_asset"),
+            "retry-only known IDs are library-scoped"
+        );
     }
 
     #[test]
@@ -11162,25 +11363,39 @@ mod tests {
     #[test]
     fn download_context_attempt_counts_track_per_asset() {
         let mut ctx = DownloadContext::default();
-        ctx.attempt_counts.insert("asset_high".into(), 15);
-        ctx.attempt_counts.insert("asset_low".into(), 2);
+        ctx.attempt_counts
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("asset_high".into(), 15);
+        ctx.attempt_counts
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("asset_low".into(), 2);
+        ctx.attempt_counts
+            .entry("SharedSync-AAAA".into())
+            .or_default()
+            .insert("asset_high".into(), 1);
 
         // Simulate the producer's retry-exhaustion check
         let max_attempts = 10u32;
         assert!(
-            ctx.attempt_counts
-                .get("asset_high")
-                .is_some_and(|&c| c >= max_attempts),
+            ctx.attempt_count("PrimarySync", "asset_high")
+                .is_some_and(|c| c >= max_attempts),
             "asset_high should exceed max_download_attempts"
         );
         assert!(
-            ctx.attempt_counts
-                .get("asset_low")
-                .is_none_or(|&c| c < max_attempts),
+            ctx.attempt_count("PrimarySync", "asset_low")
+                .is_none_or(|c| c < max_attempts),
             "asset_low should not exceed max_download_attempts"
         );
         assert!(
-            !ctx.attempt_counts.contains_key("asset_never_failed"),
+            ctx.attempt_count("SharedSync-AAAA", "asset_high")
+                .is_none_or(|c| c < max_attempts),
+            "same asset id in another library should not inherit primary attempts"
+        );
+        assert!(
+            ctx.attempt_count("PrimarySync", "asset_never_failed")
+                .is_none(),
             "unknown asset should not be in attempt_counts"
         );
     }
@@ -11352,7 +11567,10 @@ mod tests {
     #[test]
     fn download_context_retry_only_known_ids_filtering() {
         let mut ctx = DownloadContext::default();
-        ctx.known_ids.insert("previously_synced".into());
+        ctx.known_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("previously_synced".into());
 
         // Known asset: should_download_fast returns Some(true) (it needs
         // download because it's not in downloaded_ids)
@@ -11367,10 +11585,14 @@ mod tests {
             Some(true)
         );
         // The producer checks known_ids separately before forwarding:
-        assert!(ctx.known_ids.contains("previously_synced"));
+        assert!(ctx.is_known("PrimarySync", "previously_synced"));
         assert!(
-            !ctx.known_ids.contains("brand_new_asset"),
+            !ctx.is_known("PrimarySync", "brand_new_asset"),
             "new asset should not be in known_ids in retry_only mode"
+        );
+        assert!(
+            !ctx.is_known("SharedSync-AAAA", "previously_synced"),
+            "same asset id in another library should stay retry-only-new"
         );
     }
 

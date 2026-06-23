@@ -4115,7 +4115,7 @@ mod tests {
 
         async fn get_all_known_ids(
             &self,
-        ) -> Result<std::collections::HashSet<String>, state::error::StateError> {
+        ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError> {
             self.inner.get_all_known_ids().await
         }
 
@@ -4139,7 +4139,8 @@ mod tests {
 
         async fn get_attempt_counts(
             &self,
-        ) -> Result<std::collections::HashMap<String, u32>, state::error::StateError> {
+        ) -> Result<std::collections::HashMap<(String, String), u32>, state::error::StateError>
+        {
             self.inner.get_attempt_counts().await
         }
 

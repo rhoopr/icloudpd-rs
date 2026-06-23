@@ -156,7 +156,7 @@ pub trait DownloadStateStore: Send + Sync {
         Ok(0)
     }
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
-    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError>;
+    async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError>;
     async fn get_downloaded_checksums(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError>;
@@ -165,7 +165,7 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
         Ok(HashMap::new())
     }
-    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError>;
+    async fn get_attempt_counts(&self) -> Result<HashMap<(String, String), u32>, StateError>;
     async fn touch_last_seen_many(
         &self,
         library: &str,
@@ -1927,14 +1927,16 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+    pub(crate) async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         self.with_conn("get_all_known_ids", move |conn| {
             let mut stmt = conn
-                .prepare_cached("SELECT DISTINCT id FROM assets")
+                .prepare_cached("SELECT DISTINCT library, id FROM assets")
                 .map_err(|e| StateError::query("get_all_known_ids", e))?;
 
             let ids = stmt
-                .query_map([], |row| row.get::<_, String>(0))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|e| StateError::query("get_all_known_ids", e))?
                 .collect::<Result<HashSet<_>, _>>()
                 .map_err(|e| StateError::query("get_all_known_ids", e))?;
@@ -2034,20 +2036,23 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+    pub(crate) async fn get_attempt_counts(
+        &self,
+    ) -> Result<HashMap<(String, String), u32>, StateError> {
         self.with_conn("get_attempt_counts", move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, MAX(download_attempts) FROM assets \
-                     WHERE download_attempts > 0 GROUP BY id",
+                    "SELECT library, id, MAX(download_attempts) FROM assets \
+                     WHERE download_attempts > 0 GROUP BY library, id",
                 )
                 .map_err(|e| StateError::query("get_attempt_counts", e))?;
 
             let counts = stmt
                 .query_map([], |row| {
-                    let id: String = row.get(0)?;
-                    let count: i64 = row.get(1)?;
-                    Ok((id, u32::try_from(count).unwrap_or(u32::MAX)))
+                    let library: String = row.get(0)?;
+                    let id: String = row.get(1)?;
+                    let count: i64 = row.get(2)?;
+                    Ok(((library, id), u32::try_from(count).unwrap_or(u32::MAX)))
                 })
                 .map_err(|e| StateError::query("get_attempt_counts", e))?
                 .collect::<Result<HashMap<_, _>, _>>()
@@ -3098,7 +3103,7 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::get_downloaded_ids(self).await
     }
 
-    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+    async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         SqliteStateDb::get_all_known_ids(self).await
     }
 
@@ -3114,7 +3119,7 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::get_downloaded_local_paths(self).await
     }
 
-    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+    async fn get_attempt_counts(&self) -> Result<HashMap<(String, String), u32>, StateError> {
         SqliteStateDb::get_attempt_counts(self).await
     }
 
@@ -5376,14 +5381,22 @@ mod tests {
         db.mark_failed("PrimarySync", "FAILED_1", "original", "test error")
             .await
             .unwrap();
+        let shared_same_id = TestAssetRecord::new("FAILED_1")
+            .library("SharedSync-AAAA")
+            .checksum("shared_failed_ck")
+            .filename("shared_failed.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&shared_same_id).await.unwrap();
 
         let known_ids = db.get_all_known_ids().await.unwrap();
-        // Should include all 4 assets regardless of status
-        assert_eq!(known_ids.len(), 4);
-        assert!(known_ids.contains("DL_0"));
-        assert!(known_ids.contains("DL_1"));
-        assert!(known_ids.contains("PENDING_1"));
-        assert!(known_ids.contains("FAILED_1"));
+        // Should include all assets regardless of status, scoped by library.
+        assert_eq!(known_ids.len(), 5);
+        assert!(known_ids.contains(&("PrimarySync".to_string(), "DL_0".to_string())));
+        assert!(known_ids.contains(&("PrimarySync".to_string(), "DL_1".to_string())));
+        assert!(known_ids.contains(&("PrimarySync".to_string(), "PENDING_1".to_string())));
+        assert!(known_ids.contains(&("PrimarySync".to_string(), "FAILED_1".to_string())));
+        assert!(known_ids.contains(&("SharedSync-AAAA".to_string(), "FAILED_1".to_string())));
 
         // get_downloaded_ids should only return 2
         let downloaded_ids = db.get_downloaded_ids().await.unwrap();
@@ -5451,8 +5464,8 @@ mod tests {
         // After reset, the failed asset should be in known_ids but not downloaded_ids
         let known = db.get_all_known_ids().await.unwrap();
         assert_eq!(known.len(), 2);
-        assert!(known.contains("DL_1"));
-        assert!(known.contains("FAIL_1"));
+        assert!(known.contains(&("PrimarySync".to_string(), "DL_1".to_string())));
+        assert!(known.contains(&("PrimarySync".to_string(), "FAIL_1".to_string())));
 
         let downloaded = db.get_downloaded_ids().await.unwrap();
         assert_eq!(downloaded.len(), 1);
@@ -6463,8 +6476,13 @@ mod tests {
     async fn test_get_attempt_counts() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        for id in ["A", "B"] {
+        for (library, id) in [
+            ("PrimarySync", "A"),
+            ("PrimarySync", "B"),
+            ("SharedSync-AAAA", "A"),
+        ] {
             let record = TestAssetRecord::new(id)
+                .library(library)
                 .checksum(&format!("ck_{id}"))
                 .filename(&format!("{id}.jpg"))
                 .size(1000)
@@ -6484,10 +6502,23 @@ mod tests {
         db.mark_failed("PrimarySync", "B", "original", "error 1")
             .await
             .unwrap();
+        db.mark_failed("SharedSync-AAAA", "A", "original", "shared error 1")
+            .await
+            .unwrap();
 
         let counts = db.get_attempt_counts().await.unwrap();
-        assert_eq!(counts.get("A"), Some(&3));
-        assert_eq!(counts.get("B"), Some(&1));
+        assert_eq!(
+            counts.get(&("PrimarySync".to_string(), "A".to_string())),
+            Some(&3)
+        );
+        assert_eq!(
+            counts.get(&("PrimarySync".to_string(), "B".to_string())),
+            Some(&1)
+        );
+        assert_eq!(
+            counts.get(&("SharedSync-AAAA".to_string(), "A".to_string())),
+            Some(&1)
+        );
     }
 
     #[tokio::test]

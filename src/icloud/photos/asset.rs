@@ -917,11 +917,10 @@ impl DeltaRecordBuffer {
 
     fn emit_paired_group(
         master_record: Record,
-        mut asset_records: Vec<Record>,
+        asset_records: Vec<Record>,
         master_reason: ChangeReason,
         events: &mut Vec<ChangeEvent>,
     ) {
-        asset_records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
         let sibling_count = asset_records.len();
         for (index, asset_record) in asset_records.into_iter().enumerate() {
             let reason =
@@ -1590,12 +1589,12 @@ mod tests {
             .iter()
             .map(|event| event.asset.as_ref().expect("paired asset"))
             .collect();
-        assert_eq!(assets[0].asset_record_name(), "A1");
+        assert_eq!(assets[0].asset_record_name(), "A2");
         assert_eq!(assets[0].id(), "M1");
         assert_eq!(assets[0].state_id(), "M1");
-        assert_eq!(assets[1].asset_record_name(), "A2");
+        assert_eq!(assets[1].asset_record_name(), "A1");
         assert_eq!(assets[1].id(), "M1");
-        assert_eq!(assets[1].state_id(), "A2");
+        assert_eq!(assets[1].state_id(), "A1");
     }
 
     #[test]
@@ -1609,10 +1608,10 @@ mod tests {
         ]);
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].asset.as_ref().unwrap().asset_record_name(), "A1");
-        assert_eq!(events[0].reason, ChangeReason::Created);
-        assert_eq!(events[1].asset.as_ref().unwrap().asset_record_name(), "A2");
-        assert_eq!(events[1].reason, ChangeReason::SoftDeleted);
+        assert_eq!(events[0].asset.as_ref().unwrap().asset_record_name(), "A2");
+        assert_eq!(events[0].reason, ChangeReason::SoftDeleted);
+        assert_eq!(events[1].asset.as_ref().unwrap().asset_record_name(), "A1");
+        assert_eq!(events[1].reason, ChangeReason::Created);
     }
 
     #[test]

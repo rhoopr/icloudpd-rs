@@ -1485,9 +1485,7 @@ impl PhotoAlbum {
                             .get_or_insert_with(Vec::new)
                             .extend(page_records);
                     }
-                    if let Some(mut asset_records) = asset_records {
-                        asset_records
-                            .sort_by(|left, right| left.record_name.cmp(&right.record_name));
+                    if let Some(asset_records) = asset_records {
                         let sibling_count = asset_records.len();
                         for (index, asset_rec) in asset_records.into_iter().enumerate() {
                             if let Some(n) = limit {
@@ -1530,8 +1528,6 @@ impl PhotoAlbum {
 
                 for (master_id, records) in page_assets {
                     if let Some(master) = pending_masters.remove(&master_id) {
-                        let mut records = records;
-                        records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
                         let sibling_count = records.len();
                         for (index, asset_rec) in records.into_iter().enumerate() {
                             if let Some(n) = limit {
@@ -1554,8 +1550,6 @@ impl PhotoAlbum {
                         paired_masters.insert(master.record_name.clone(), master);
                         prune_paired_master_cache(&mut paired_masters, max_pending_records);
                     } else if let Some(master) = paired_masters.get(&master_id) {
-                        let mut records = records;
-                        records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
                         for asset_rec in records {
                             if let Some(n) = limit {
                                 if total_sent >= u64::from(n) {
@@ -2440,13 +2434,65 @@ mod tests {
             vec![
                 (
                     "master-sibling".to_string(),
-                    "asset-sibling-a".to_string(),
+                    "asset-sibling-b".to_string(),
                     "master-sibling".to_string(),
                 ),
                 (
                     "master-sibling".to_string(),
-                    "asset-sibling-b".to_string(),
-                    "asset-sibling-b".to_string(),
+                    "asset-sibling-a".to_string(),
+                    "asset-sibling-a".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_query_late_earlier_sibling_keeps_first_seen_master_state_id() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .query_page(
+                vec![
+                    test_asset_record_for("asset-late-b", "master-late-earlier"),
+                    test_master_record("master-late-earlier"),
+                ],
+                Some("token-full"),
+            )
+            .query_page(
+                vec![test_asset_record_for("asset-late-a", "master-late-earlier")],
+                Some("token-full"),
+            )
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 1);
+        tokio::pin!(stream);
+        let mut seen = Vec::new();
+        while let Some(result) = stream.next().await {
+            let asset = result.expect("late sibling asset should parse");
+            seen.push((
+                asset.id().to_string(),
+                asset.asset_record_name().to_string(),
+                asset.state_id().to_string(),
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "master-late-earlier".to_string(),
+                    "asset-late-b".to_string(),
+                    "master-late-earlier".to_string(),
+                ),
+                (
+                    "master-late-earlier".to_string(),
+                    "asset-late-a".to_string(),
+                    "asset-late-a".to_string(),
                 ),
             ]
         );
