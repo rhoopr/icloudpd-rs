@@ -827,7 +827,7 @@ impl PhotoAlbum {
                 .filter(|id| !seen_asset_records.contains(id))
                 .collect();
             if missing.is_empty() {
-                let _ = token_tx.send(None);
+                let _ = token_tx.send(base_token);
                 return;
             }
 
@@ -844,12 +844,15 @@ impl PhotoAlbum {
                     break;
                 }
                 let missing_before = missing.len();
-                match source
-                    .send_matching_assets_from_changes(&mut missing, &tx)
-                    .await
-                {
-                    Ok(()) => {
+                match source.matching_assets_from_changes(&mut missing).await {
+                    Ok(assets) => {
                         hydrated += missing_before.saturating_sub(missing.len());
+                        for asset in assets {
+                            if tx.send(Ok(asset)).await.is_err() {
+                                let _ = token_tx.send(None);
+                                return;
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
@@ -879,10 +882,7 @@ impl PhotoAlbum {
                 );
             }
 
-            // Cross-zone hydration currently replays full relation/source-zone
-            // scans. Suppress the owner zone token until incremental relation
-            // semantics are implemented.
-            let _ = token_tx.send(None);
+            let _ = token_tx.send(if missing.is_empty() { base_token } else { None });
         });
 
         (
@@ -986,11 +986,31 @@ impl PhotoAlbum {
         Ok(ids)
     }
 
-    async fn send_matching_assets_from_changes(
+    pub(crate) async fn hydrate_matching_assets_from_changes(
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,
-        tx: &mpsc::Sender<anyhow::Result<PhotoAsset>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<PhotoAsset>> {
+        let mut matched = self
+            .clone_for_task_without_sources()
+            .matching_assets_from_changes(missing_asset_record_names)
+            .await?;
+        for source in self.cross_zone_sources_for_task() {
+            if missing_asset_record_names.is_empty() {
+                break;
+            }
+            matched.extend(
+                source
+                    .matching_assets_from_changes(missing_asset_record_names)
+                    .await?,
+            );
+        }
+        Ok(matched)
+    }
+
+    async fn matching_assets_from_changes(
+        &self,
+        missing_asset_record_names: &mut FxHashSet<String>,
+    ) -> anyhow::Result<Vec<PhotoAsset>> {
         let source_zone: Arc<str> = Arc::from(self.zone_name());
         let mut buffer = DeltaRecordBuffer::new();
         let mut matched = Vec::new();
@@ -1017,10 +1037,7 @@ impl PhotoAlbum {
                 matched.push(asset);
             }
         }
-        for asset in matched {
-            tx.send(Ok(asset)).await?;
-        }
-        Ok(())
+        Ok(matched)
     }
 
     async fn scan_changes_zone<F>(&self, mut on_record: F) -> anyhow::Result<()>
@@ -3086,9 +3103,9 @@ mod tests {
             && asset.asset_record_name() == "asset-master-shared"
             && asset.source_zone() == Some("SharedSync-abc")));
         assert_eq!(
-            token_rx.await.expect("sync token sender"),
-            None,
-            "cross-zone hydration suppresses owner-zone token advancement"
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("owner-token"),
+            "fully resolved cross-zone hydration can keep the owner-zone token"
         );
         assert_eq!(
             owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),

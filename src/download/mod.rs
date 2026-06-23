@@ -4851,6 +4851,14 @@ impl IncrementalDeltaSummary {
         let Some(asset) = &event.asset else {
             return;
         };
+        self.persist_asset_mapping_for_asset(asset, config).await;
+    }
+
+    async fn persist_asset_mapping_for_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) {
         let Some(db) = &config.state_db else {
             return;
         };
@@ -5087,6 +5095,38 @@ async fn apply_incremental_relation_delta(
         return;
     };
 
+    let mut master_record_name = asset_to_master
+        .get(relation.asset_record_name.as_ref())
+        .cloned();
+    if !relation.is_deleted && master_record_name.is_none() {
+        match db
+            .get_master_record_name_for_asset(&config.library, &relation.asset_record_name)
+            .await
+        {
+            Ok(Some(master)) => {
+                tracing::debug!(
+                    container_id = %relation.container_id,
+                    asset_record_name = %relation.asset_record_name,
+                    master_record_name = %master,
+                    library = %config.library,
+                    "Resolved album relation asset through persisted asset/master mapping"
+                );
+                master_record_name = Some(master);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    container_id = %relation.container_id,
+                    asset_record_name = %relation.asset_record_name,
+                    library = %config.library,
+                    error = %e,
+                    "Failed to look up persisted asset/master mapping for album relation delta"
+                );
+                token_unsafe_reason.get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+            }
+        }
+    }
+
     if let Some(album_name) = planned_album_containers.get(relation.container_id.as_ref()) {
         let container_id = relation.container_id.as_ref();
         if !ensured_planned_containers.contains(container_id) {
@@ -5126,9 +5166,7 @@ async fn apply_incremental_relation_delta(
             &config.library,
             &relation.container_id,
             &relation.asset_record_name,
-            asset_to_master
-                .get(relation.asset_record_name.as_ref())
-                .map(String::as_str),
+            master_record_name.as_deref(),
             "icloud",
         )
         .await
@@ -5142,7 +5180,12 @@ async fn apply_incremental_relation_delta(
                 asset_record_name = %relation.asset_record_name,
                 "Album relation delta referenced an unknown album container"
             );
-            token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_CONTAINER_REASON);
+            if routing
+                .album_passes_for_container(&relation.container_id)
+                .is_some()
+            {
+                token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_CONTAINER_REASON);
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -5159,7 +5202,7 @@ async fn apply_incremental_relation_delta(
         && routing
             .album_passes_for_container(&relation.container_id)
             .is_some()
-        && !asset_to_master.contains_key(relation.asset_record_name.as_ref())
+        && master_record_name.is_none()
     {
         tracing::warn!(
             container_id = %relation.container_id,
@@ -5167,6 +5210,94 @@ async fn apply_incremental_relation_delta(
             "Selected album relation add referenced an asset not present in the delta page set"
         );
         token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_ASSET_REASON);
+    }
+}
+
+async fn hydrate_missing_selected_relation_assets(
+    change_events: &[ChangeEvent],
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    routing: &IncrementalPassRouting,
+    asset_to_master: &mut FxHashMap<String, String>,
+    downloadable_assets: &mut Vec<(PhotoAsset, usize)>,
+    delta_summary: &mut IncrementalDeltaSummary,
+) {
+    let mut missing_by_hydrator: FxHashMap<usize, FxHashSet<String>> = FxHashMap::default();
+    let mut pass_indices_by_asset: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
+
+    for event in change_events {
+        let Some(relation) = &event.relation else {
+            continue;
+        };
+        if relation.is_deleted {
+            continue;
+        }
+        let Some(pass_indices) = routing.album_passes_for_container(&relation.container_id) else {
+            continue;
+        };
+        let Some(pass_index) = pass_indices.first().copied() else {
+            continue;
+        };
+
+        if asset_to_master.contains_key(relation.asset_record_name.as_ref()) {
+            continue;
+        }
+
+        pass_indices_by_asset
+            .entry(relation.asset_record_name.to_string())
+            .or_default()
+            .extend(pass_indices.iter().copied());
+        missing_by_hydrator
+            .entry(pass_index)
+            .or_default()
+            .insert(relation.asset_record_name.to_string());
+    }
+
+    let mut hydrated_asset_record_names = FxHashSet::default();
+    for (pass_index, mut missing) in missing_by_hydrator {
+        missing.retain(|asset_record_name| {
+            !asset_to_master.contains_key(asset_record_name.as_str())
+                && !hydrated_asset_record_names.contains(asset_record_name.as_str())
+        });
+        if missing.is_empty() {
+            continue;
+        }
+        let Some(pass) = passes.get(pass_index) else {
+            continue;
+        };
+
+        let assets = match pass
+            .album
+            .hydrate_matching_assets_from_changes(&mut missing)
+            .await
+        {
+            Ok(assets) => assets,
+            Err(e) => {
+                tracing::warn!(
+                    pass_index,
+                    error = %e,
+                    "Failed to hydrate missing selected album relation assets"
+                );
+                delta_summary
+                    .token_unsafe_reason
+                    .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+                continue;
+            }
+        };
+
+        for asset in assets {
+            let asset_record_name = asset.asset_record_name().to_string();
+            hydrated_asset_record_names.insert(asset_record_name.clone());
+            asset_to_master.insert(asset_record_name.clone(), asset.id().to_string());
+            delta_summary
+                .persist_asset_mapping_for_asset(&asset, config)
+                .await;
+            if let Some(pass_indices) = pass_indices_by_asset.get(asset_record_name.as_str()) {
+                for pass_index in pass_indices {
+                    downloadable_assets.push((asset.clone(), *pass_index));
+                }
+            }
+        }
     }
 }
 
@@ -5430,6 +5561,17 @@ async fn download_photos_incremental_collecting(
     for event in &change_events {
         apply_incremental_album_delta(event, config, &mut delta_summary.token_unsafe_reason).await;
     }
+
+    hydrate_missing_selected_relation_assets(
+        &change_events,
+        passes,
+        config,
+        &routing,
+        &mut asset_to_master,
+        &mut downloadable_assets,
+        &mut delta_summary,
+    )
+    .await;
 
     for event in &change_events {
         apply_incremental_relation_delta(
@@ -6152,6 +6294,56 @@ mod tests {
     #[derive(Clone)]
     struct BackfillAndChangesSession {
         changes_zone_calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct RelationHydrationSession {
+        incremental_calls: Arc<AtomicUsize>,
+        hydrate_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for RelationHydrationSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if !url.contains("/changes/zone?") {
+                return Ok(json!({"records": []}));
+            }
+
+            let request: Value = serde_json::from_str(&body)?;
+            let sync_token = request["zones"]
+                .as_array()
+                .and_then(|zones| zones.first())
+                .and_then(|zone| zone.get("syncToken"))
+                .and_then(Value::as_str);
+            let records = if sync_token == Some("zone-token-prev") {
+                self.incremental_calls.fetch_add(1, Ordering::SeqCst);
+                vec![relation_delta_record(
+                    "container-vacation",
+                    "asset-MASTER_HYDRATED",
+                )]
+            } else {
+                self.hydrate_calls.fetch_add(1, Ordering::SeqCst);
+                incremental_photo_records("MASTER_HYDRATED")
+            };
+
+            Ok(json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "zone-token-next",
+                    "moreComing": false,
+                    "records": records,
+                }]
+            }))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
     }
 
     #[async_trait::async_trait]
@@ -10154,7 +10346,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_relation_add_unknown_container_blocks_sync_token() {
+    async fn selected_relation_add_without_photo_uses_persisted_asset_master_mapping() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        db.upsert_asset_master_mapping("PrimarySync", "asset-MASTER_KNOWN", "MASTER_KNOWN")
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            vec![relation_delta_record(
+                "container-vacation",
+                "asset-MASTER_KNOWN",
+            )],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("known selected relation add should not fall back to full here");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(!result.stats.sync_token_blocked);
+        let memberships = db
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-MASTER_KNOWN",
+                &["container-vacation"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(
+            memberships[0].master_record_name.as_deref(),
+            Some("MASTER_KNOWN")
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_relation_add_without_photo_hydrates_missing_asset() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let session = RelationHydrationSession {
+            incremental_calls: Arc::new(AtomicUsize::new(0)),
+            hydrate_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container(
+                "Vacation",
+                Some("container-vacation"),
+                session.clone(),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("missing selected relation asset should hydrate");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(
+            session.incremental_calls.load(Ordering::SeqCst),
+            1,
+            "incremental changes should be read once"
+        );
+        assert_eq!(
+            session.hydrate_calls.load(Ordering::SeqCst),
+            1,
+            "missing relation asset should trigger one bounded hydrate scan"
+        );
+        let memberships = db
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-MASTER_HYDRATED",
+                &["container-vacation"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(
+            memberships[0].master_record_name.as_deref(),
+            Some("MASTER_HYDRATED")
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_relation_add_unknown_unselected_container_advances_sync_token() {
         let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
         let calls = Arc::new(AtomicUsize::new(0));
         let session = changes_zone_session(
@@ -10184,12 +10486,8 @@ mod tests {
         .expect("unknown relation container should not fall back to full here");
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert_eq!(result.sync_token, None);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(UNKNOWN_ALBUM_RELATION_CONTAINER_REASON)
-        );
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(!result.stats.sync_token_blocked);
     }
 
     #[tokio::test]
