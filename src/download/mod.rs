@@ -3077,19 +3077,6 @@ fn record_incremental_state_transition_result(
 ) {
     match result {
         Ok(updated) if updated > 0 => {}
-        Ok(_)
-            if transition == IncrementalStateTransition::HardDelete
-                && state_key.unresolved_identity =>
-        {
-            *state_transition_failures += 1;
-            token_unsafe_reason.get_or_insert(INCREMENTAL_DELETE_ZERO_ROWS_REASON);
-            tracing::warn!(
-                record_name = state_key.record_name(),
-                record_type = state_key.record_type,
-                transition = transition.label(),
-                "Unresolved hard-delete event did not match local state; blocking sync token advancement"
-            );
-        }
         Ok(_) => {
             tracing::debug!(
                 record_name = state_key.record_name(),
@@ -8270,7 +8257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_unresolved_hard_delete_zero_rows_blocks_sync_token() {
+    async fn incremental_unresolved_hard_delete_zero_rows_advances_sync_token() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
             .await
@@ -8281,17 +8268,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
-        ));
-        assert_eq!(result.sync_token, None);
-        assert_eq!(result.stats.state_write_failures, 1);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(INCREMENTAL_DELETE_ZERO_ROWS_REASON)
-        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
         let pending = db.get_pending().await.unwrap();
         assert_source_flags(&pending, "TRACKED_MASTER", false, false);
     }
