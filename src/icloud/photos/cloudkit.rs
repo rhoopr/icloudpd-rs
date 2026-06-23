@@ -58,7 +58,7 @@ pub(crate) struct BatchQueryResponse {
 
 /// A `CloudKit` record. Fields are kept as dynamic JSON because Apple's schema
 /// varies by record type and changes without notice.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Record {
     #[serde(default)]

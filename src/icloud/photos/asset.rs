@@ -37,10 +37,10 @@ pub struct ChangeEvent {
     pub record_type: Option<Box<str>>,
     /// Master record referenced by an unpaired `CPLAsset`.
     ///
-    /// Download state is keyed by the master record name, while `CPLAsset`
-    /// soft-delete deltas can arrive without their matching `CPLMaster`. Keep
-    /// the reference so state transitions can update or no-op against the
-    /// same key that normal downloads use.
+    /// Download state normally uses the master record name, while sibling
+    /// `CPLAsset` rows can use their own asset record names. Keep the
+    /// reference so state transitions can resolve unpaired asset deltas
+    /// against the same key family that normal downloads use.
     pub master_record_name: Option<Box<str>>,
     /// Why this record changed
     pub reason: ChangeReason,
@@ -95,15 +95,15 @@ pub struct AlbumRelationDelta {
 /// - f64 primitives
 /// - Small enums last
 ///
-/// `record_name` is `Arc<str>` so downstream consumers (producer
-/// dedup set, `DownloadTask`, deferred state writes) can share the
-/// same allocation via refcount bumps instead of re-cloning the
-/// record ID at every stage boundary.
+/// Record IDs are `Arc<str>` so downstream consumers (producer dedup,
+/// `DownloadTask`, deferred state writes) can share the same allocation via
+/// refcount bumps instead of re-cloning IDs at every stage boundary.
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
     // Heap types first
     record_name: Arc<str>,
     asset_record_name: Arc<str>,
+    state_record_name: Option<Arc<str>>,
     source_zone: Option<Arc<str>>,
     filename: Option<Box<str>>,
     // Metadata behind Arc so downstream consumers (AssetRecord, the
@@ -397,6 +397,7 @@ impl PhotoAsset {
         Self {
             record_name,
             asset_record_name,
+            state_record_name: None,
             source_zone: None,
             filename,
             asset_metadata,
@@ -441,6 +442,7 @@ impl PhotoAsset {
         Self {
             record_name: Arc::from(master.record_name),
             asset_record_name: Arc::from(asset.record_name.as_str()),
+            state_record_name: None,
             source_zone,
             filename,
             asset_metadata,
@@ -485,6 +487,11 @@ impl PhotoAsset {
         self
     }
 
+    pub(crate) fn with_state_record_name(mut self, state_record_name: Arc<str>) -> Self {
+        self.state_record_name = Some(state_record_name);
+        self
+    }
+
     /// True when the CloudKit record carried a usable recordName.
     ///
     /// An empty ID cannot safely key state rows, path fingerprints, retry
@@ -494,12 +501,28 @@ impl PhotoAsset {
         !self.record_name.is_empty()
     }
 
-    /// Shared handle on the record ID. Consumers that want to store the ID
-    /// (producer dedup set, `DownloadTask`, deferred state writes) clone the
-    /// `Arc<str>` instead of allocating a fresh owned copy.
-    #[must_use]
-    pub fn id_arc(&self) -> Arc<str> {
-        Arc::clone(&self.record_name)
+    /// Local state/download identity for this asset.
+    ///
+    /// Most CloudKit assets use their `CPLMaster.recordName` as kei's durable
+    /// state ID for compatibility with existing databases. When Apple exposes
+    /// multiple sibling `CPLAsset` records that share one master, additional
+    /// siblings need their own state rows, retry accounting, and path collision
+    /// suffixes, so the enumerator can override this to the sibling
+    /// `CPLAsset.recordName`.
+    pub(crate) fn state_id(&self) -> &str {
+        self.state_record_name
+            .as_deref()
+            .unwrap_or(self.record_name.as_ref())
+    }
+
+    pub(crate) fn state_id_arc(&self) -> Arc<str> {
+        self.state_record_name
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.record_name), Arc::clone)
+    }
+
+    pub(crate) fn asset_record_name_arc(&self) -> Arc<str> {
+        Arc::clone(&self.asset_record_name)
     }
 
     pub fn filename(&self) -> Option<&str> {
@@ -705,7 +728,11 @@ pub(crate) struct DeltaRecordBuffer {
     /// Unpaired `CPLMaster` records, keyed by recordName
     pending_masters: FxHashMap<String, Record>,
     /// Unpaired `CPLAsset` records, keyed by masterRef recordName
-    pending_assets: FxHashMap<String, Record>,
+    pending_assets: FxHashMap<String, Vec<Record>>,
+    /// Masters that have already paired with at least one asset in this delta
+    /// stream. Keep them available so sibling `CPLAsset` records that share the
+    /// same `CPLMaster` do not flush as orphaned metadata-only events.
+    paired_masters: FxHashMap<String, Record>,
 }
 
 impl DeltaRecordBuffer {
@@ -747,10 +774,14 @@ impl DeltaRecordBuffer {
                 _ => match record.record_type.as_str() {
                     "CPLMaster" => {
                         let master_name = record.record_name.clone();
-                        if let Some(asset_record) = self.pending_assets.remove(&master_name) {
-                            let asset_reason = classify_change_reason(&asset_record);
-                            let final_reason = Self::reconcile_reasons(reason, asset_reason);
-                            Self::emit_paired(record, asset_record, final_reason, &mut events);
+                        if let Some(asset_records) = self.pending_assets.remove(&master_name) {
+                            Self::emit_paired_group(
+                                record.clone(),
+                                asset_records,
+                                reason,
+                                &mut events,
+                            );
+                            self.paired_masters.insert(master_name, record);
                         } else {
                             self.pending_masters.insert(master_name, record);
                         }
@@ -761,9 +792,31 @@ impl DeltaRecordBuffer {
                             if let Some(master_record) = self.pending_masters.remove(master_name) {
                                 let master_reason = classify_change_reason(&master_record);
                                 let final_reason = Self::reconcile_reasons(master_reason, reason);
-                                Self::emit_paired(master_record, record, final_reason, &mut events);
+                                Self::emit_paired(
+                                    master_record.clone(),
+                                    record,
+                                    final_reason,
+                                    false,
+                                    &mut events,
+                                );
+                                self.paired_masters
+                                    .insert(master_name.clone(), master_record);
+                            } else if let Some(master_record) = self.paired_masters.get(master_name)
+                            {
+                                let master_reason = classify_change_reason(master_record);
+                                let final_reason = Self::reconcile_reasons(master_reason, reason);
+                                Self::emit_paired(
+                                    master_record.clone(),
+                                    record,
+                                    final_reason,
+                                    true,
+                                    &mut events,
+                                );
                             } else {
-                                self.pending_assets.insert(master_name.clone(), record);
+                                self.pending_assets
+                                    .entry(master_name.clone())
+                                    .or_default()
+                                    .push(record);
                             }
                         } else {
                             // CPLAsset with no masterRef -- metadata-only change
@@ -805,15 +858,17 @@ impl DeltaRecordBuffer {
             ));
         }
 
-        for (master_ref, record) in self.pending_assets.drain() {
-            let reason = classify_change_reason(&record);
-            let mut event = ChangeEvent::new(
-                record.record_name.into_boxed_str(),
-                Some("CPLAsset".into()),
-                reason,
-            );
-            event.master_record_name = Some(master_ref.into_boxed_str());
-            events.push(event);
+        for (master_ref, records) in self.pending_assets.drain() {
+            for record in records {
+                let reason = classify_change_reason(&record);
+                let mut event = ChangeEvent::new(
+                    record.record_name.into_boxed_str(),
+                    Some("CPLAsset".into()),
+                    reason,
+                );
+                event.master_record_name = Some(master_ref.clone().into_boxed_str());
+                events.push(event);
+            }
         }
 
         events
@@ -845,15 +900,40 @@ impl DeltaRecordBuffer {
         master_record: Record,
         asset_record: Record,
         reason: ChangeReason,
+        use_asset_state_id: bool,
         events: &mut Vec<ChangeEvent>,
     ) {
         // Box::from(&str) copies only the bytes, without the String's Vec
         // capacity slack that .clone().into_boxed_str() would drag along.
         let master_name: Box<str> = Box::from(master_record.record_name.as_str());
-        let asset = PhotoAsset::from_records(master_record, &asset_record);
+        let mut asset = PhotoAsset::from_records(master_record, &asset_record);
+        if use_asset_state_id {
+            asset = asset.with_state_record_name(Arc::from(asset_record.record_name.as_str()));
+        }
         let mut event = ChangeEvent::new(master_name, Some("CPLMaster".into()), reason);
         event.asset = Some(asset);
         events.push(event);
+    }
+
+    fn emit_paired_group(
+        master_record: Record,
+        mut asset_records: Vec<Record>,
+        master_reason: ChangeReason,
+        events: &mut Vec<ChangeEvent>,
+    ) {
+        asset_records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
+        let sibling_count = asset_records.len();
+        for (index, asset_record) in asset_records.into_iter().enumerate() {
+            let reason =
+                Self::reconcile_reasons(master_reason, classify_change_reason(&asset_record));
+            Self::emit_paired(
+                master_record.clone(),
+                asset_record,
+                reason,
+                sibling_count > 1 && index > 0,
+                events,
+            );
+        }
     }
 }
 
@@ -862,7 +942,7 @@ impl Drop for DeltaRecordBuffer {
         if !self.pending_masters.is_empty() || !self.pending_assets.is_empty() {
             tracing::warn!(
                 orphaned_masters = self.pending_masters.len(),
-                orphaned_assets = self.pending_assets.len(),
+                orphaned_assets = self.pending_assets.values().map(Vec::len).sum::<usize>(),
                 "DeltaRecordBuffer dropped with orphaned records"
             );
         }
@@ -1428,6 +1508,12 @@ mod tests {
         }
     }
 
+    fn make_soft_deleted_asset_record(name: &str, master_ref: &str) -> Record {
+        let mut record = make_asset_record(name, master_ref);
+        record.fields["isDeleted"] = json!({"value": 1});
+        record
+    }
+
     #[test]
     fn test_buffer_master_then_asset_pairs() {
         let mut buffer = DeltaRecordBuffer::new();
@@ -1487,6 +1573,65 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
+    }
+
+    #[test]
+    fn test_buffer_sibling_assets_share_master_without_clobbering() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let events = buffer.process_records(vec![
+            make_asset_record("A2", "M1"),
+            make_asset_record("A1", "M1"),
+            make_master_record("M1"),
+        ]);
+
+        assert_eq!(events.len(), 2);
+        let assets: Vec<_> = events
+            .iter()
+            .map(|event| event.asset.as_ref().expect("paired asset"))
+            .collect();
+        assert_eq!(assets[0].asset_record_name(), "A1");
+        assert_eq!(assets[0].id(), "M1");
+        assert_eq!(assets[0].state_id(), "M1");
+        assert_eq!(assets[1].asset_record_name(), "A2");
+        assert_eq!(assets[1].id(), "M1");
+        assert_eq!(assets[1].state_id(), "A2");
+    }
+
+    #[test]
+    fn test_buffer_sibling_asset_reasons_stay_per_asset() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let events = buffer.process_records(vec![
+            make_soft_deleted_asset_record("A2", "M1"),
+            make_asset_record("A1", "M1"),
+            make_master_record("M1"),
+        ]);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].asset.as_ref().unwrap().asset_record_name(), "A1");
+        assert_eq!(events[0].reason, ChangeReason::Created);
+        assert_eq!(events[1].asset.as_ref().unwrap().asset_record_name(), "A2");
+        assert_eq!(events[1].reason, ChangeReason::SoftDeleted);
+    }
+
+    #[test]
+    fn test_buffer_late_sibling_asset_pairs_with_seen_master() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let first = buffer.process_records(vec![
+            make_master_record("M1"),
+            make_asset_record("A1", "M1"),
+        ]);
+        assert_eq!(first.len(), 1);
+
+        let second = buffer.process_records(vec![make_asset_record("A2", "M1")]);
+        assert_eq!(second.len(), 1);
+        let asset = second[0].asset.as_ref().expect("late sibling asset");
+        assert_eq!(asset.id(), "M1");
+        assert_eq!(asset.asset_record_name(), "A2");
+        assert_eq!(asset.state_id(), "A2");
+        assert!(buffer.flush().is_empty());
     }
 
     #[test]

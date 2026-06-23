@@ -606,7 +606,7 @@ where
         stats.total += 1;
         heartbeat_state.total.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut last) = heartbeat_state.last_seen_id.lock() {
-            *last = Some(asset.id().to_string());
+            *last = Some(asset.state_id().to_string());
         }
 
         if asset.versions().is_empty() {
@@ -667,17 +667,22 @@ where
                 expected_size,
                 version_size,
             };
-            let (expected_path, metadata) =
-                match resolve_match_path(&candidate, &expected, asset.id(), path_config, dir_cache)
-                    .await
-                {
-                    Some(found) => found,
-                    None => {
-                        stats.unmatched += 1;
-                        heartbeat_state.unmatched.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
+            let (expected_path, metadata) = match resolve_match_path(
+                &candidate,
+                &expected,
+                asset.state_id(),
+                path_config,
+                dir_cache,
+            )
+            .await
+            {
+                Some(found) => found,
+                None => {
+                    stats.unmatched += 1;
+                    heartbeat_state.unmatched.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
 
             if let Some(verifier) = options.strict_verifier {
                 match verifier
@@ -718,7 +723,10 @@ where
                 // (e.g. /photos on HDD).
                 let mtime_epoch = file_mtime_epoch(&metadata);
                 let already_imported = imported_index
-                    .get(&(asset.id().to_string(), version_size.as_str().to_string()))
+                    .get(&(
+                        asset.state_id().to_string(),
+                        version_size.as_str().to_string(),
+                    ))
                     .filter(|rec| {
                         rec.local_path == expected_path
                             && rec.imported_size == Some(metadata.len())
@@ -774,7 +782,7 @@ where
                     .to_string();
                 let record = state::AssetRecord::new_pending(
                     Arc::from(library_label),
-                    asset.id().to_string(),
+                    asset.state_id().to_string(),
                     version_size,
                     checksum.to_string(),
                     filename,

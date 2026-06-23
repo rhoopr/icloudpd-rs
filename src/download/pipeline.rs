@@ -261,7 +261,7 @@ fn asset_record_for_derived_path(
 ) -> AssetRecord {
     AssetRecord::new_pending(
         library,
-        asset.id().to_string(),
+        asset.state_id().to_string(),
         derived.version_size,
         derived.checksum.to_string(),
         derived.filename.clone(),
@@ -280,7 +280,7 @@ fn pending_versions_for_asset<'a>(
 ) -> Option<&'a FxHashSet<Box<str>>> {
     ctx.pending_ids
         .get(library)
-        .and_then(|assets| assets.get(asset.id()))
+        .and_then(|assets| assets.get(asset.state_id()))
 }
 
 fn pending_filename_for_asset_version<'a>(
@@ -291,7 +291,7 @@ fn pending_filename_for_asset_version<'a>(
 ) -> Option<&'a str> {
     ctx.pending_filenames
         .get(library)
-        .and_then(|assets| assets.get(asset.id()))
+        .and_then(|assets| assets.get(asset.state_id()))
         .and_then(|versions| versions.get(version_size.as_str()))
         .map(Box::as_ref)
 }
@@ -471,7 +471,7 @@ async fn mark_pending_downloaded_from_existing_path(
     if let Err(e) = db
         .mark_downloaded(
             library,
-            asset.id(),
+            asset.state_id(),
             version_size,
             &existing_path,
             &local_checksum,
@@ -645,7 +645,7 @@ fn state_confirmed_current_path_exists(
             continue;
         }
         if !stored_path_matches_current_collision_family(
-            asset.id(),
+            asset.state_id(),
             derived,
             &derived_paths,
             config,
@@ -700,14 +700,14 @@ async fn backfill_downloaded_metadata_for_on_disk_skip(
     let downloaded_versions = ctx
         .downloaded_ids
         .get(library)
-        .and_then(|assets| assets.get(asset.id()));
+        .and_then(|assets| assets.get(asset.state_id()));
     let Some(downloaded_versions) = downloaded_versions else {
         return;
     };
     let version_hashes = ctx
         .downloaded_metadata_hashes
         .get(library)
-        .and_then(|assets| assets.get(asset.id()));
+        .and_then(|assets| assets.get(asset.state_id()));
 
     for derived in derive_expected_paths(asset, config) {
         let version_size = derived.version_size.as_str();
@@ -976,7 +976,7 @@ where
                                 matches!(
                                     download_ctx.should_download_fast(
                                         library,
-                                        asset.id(),
+                                        asset.state_id(),
                                         vs,
                                         cs,
                                         true
@@ -1197,7 +1197,7 @@ where
     let handle = tokio::spawn(async move {
         let config = &producer_config;
         let mut task_planner = TaskPlanner::new();
-        let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
+        let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
         // Skipped-asset IDs accumulated across the producer run and
         // flushed to the DB in a single transaction at the end. This
         // collapses N UPDATE statements (one per fast-skip / on-disk
@@ -1205,8 +1205,8 @@ where
         // serialize behind an fsync-per-asset under WAL mode.
         //
         // Vec is sufficient: every push is inside a branch predicated on
-        // `seen_ids.insert(asset.id_arc())` returning true, so IDs are
-        // already unique at this point.
+        // `seen_asset_record_names.insert(asset.asset_record_name_arc())`
+        // returning true, so IDs are already unique at this point.
         let mut touched_assets: Vec<(Arc<str>, Arc<str>)> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
@@ -1297,10 +1297,11 @@ where
             }
             match result {
                 Ok(asset) => {
-                    if !seen_ids.insert(asset.id_arc()) {
+                    if !seen_asset_record_names.insert(asset.asset_record_name_arc()) {
                         tracing::debug!(
                             asset_id = %asset.id(),
-                            "Duplicate asset ID from API, skipping"
+                            asset_record_name = %asset.asset_record_name(),
+                            "Duplicate CPLAsset record from API, skipping"
                         );
                         skips.duplicates += 1;
                         continue;
@@ -1380,7 +1381,7 @@ where
                         .await;
                         if producer_state_db.is_some() {
                             let library = effective_asset_library_arc(&asset, config);
-                            touched_assets.push((library, asset.id_arc()));
+                            touched_assets.push((library, asset.state_id_arc()));
                         }
                         skips.on_disk += 1;
                         producer_pb.inc(1);

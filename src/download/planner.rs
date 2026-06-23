@@ -138,7 +138,7 @@ where
 }
 
 /// Persist the durable CloudKit identifier bridge used to resolve future
-/// `CPLAsset` hard-delete tombstones back to the `CPLMaster` keyed state row.
+/// `CPLAsset` hard-delete tombstones back to the matching state row family.
 pub(super) async fn upsert_asset_master_mapping<D>(
     db: &D,
     library: &str,
@@ -166,7 +166,7 @@ where
         return Ok(());
     };
     let library = asset.source_zone().unwrap_or(&config.library);
-    add_asset_album_with_retry(db, library, asset.id(), album_name, "icloud").await
+    add_asset_album_with_retry(db, library, asset.state_id(), album_name, "icloud").await
 }
 
 /// Bounded retry attempts for `add_asset_album`. SQLite-busy under WAL

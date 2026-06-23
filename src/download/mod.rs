@@ -2027,7 +2027,7 @@ async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxH
     let mut ids = FxHashSet::default();
     while let Some(item) = stream.next().await {
         let asset = item?;
-        ids.insert(asset.id().to_string());
+        ids.insert(asset.asset_record_name().to_string());
     }
     Ok(ids)
 }
@@ -2435,7 +2435,7 @@ async fn build_recent_frontier(
             break;
         }
         oldest_created = Some(oldest_created.map_or(created, |oldest| oldest.min(created)));
-        asset_ids.insert(asset.id().to_string());
+        asset_ids.insert(asset.asset_record_name().to_string());
     }
     Ok(Some(RecentFrontier {
         asset_ids: Arc::new(asset_ids),
@@ -2476,7 +2476,7 @@ fn filter_stream_to_enumeration_bounds(
                     Ok(asset)
                         if asset_ids
                             .as_ref()
-                            .map(|ids| ids.contains(asset.id()))
+                            .map(|ids| ids.contains(asset.asset_record_name()))
                             .unwrap_or(true) =>
                     {
                         Some(Ok(asset))
@@ -3099,6 +3099,18 @@ fn record_incremental_state_transition_result(
 }
 
 fn source_state_transition_key(event: &ChangeEvent) -> SourceStateTransitionKey<'_> {
+    if let Some(asset) = event.asset.as_ref() {
+        return SourceStateTransitionKey {
+            record_name: Cow::Borrowed(asset.state_id()),
+            record_type: if asset.state_id() == asset.id() {
+                Some("CPLMaster")
+            } else {
+                Some("CPLAsset")
+            },
+            unresolved_identity: false,
+        };
+    }
+
     if matches!(event.record_type.as_deref(), Some("CPLAsset")) {
         if let Some(master_record_name) = event.master_record_name.as_deref() {
             return SourceStateTransitionKey {
@@ -4215,7 +4227,7 @@ async fn download_photos_full_with_token(
                         let stream = stream.map(move |item| {
                             if let Ok(asset) = &item {
                                 if let Ok(mut ids) = deferred_ids.lock() {
-                                    ids.insert(asset.id().to_string());
+                                    ids.insert(asset.asset_record_name().to_string());
                                 }
                             }
                             item
@@ -4329,9 +4341,9 @@ async fn download_photos_full_with_token(
                     let stream =
                         track_deferred_unfiled_heartbeat(stream, library, stream_total_count)
                             .filter(move |item| {
-                                let keep = item
-                                    .as_ref()
-                                    .map_or(true, |asset| !excluded_ids.contains(asset.id()));
+                                let keep = item.as_ref().map_or(true, |asset| {
+                                    !excluded_ids.contains(asset.asset_record_name())
+                                });
                                 std::future::ready(keep)
                             });
                     let pass_result = run_full_pass_stream(
@@ -4756,6 +4768,44 @@ impl IncrementalDeltaSummary {
                 self.hard_deleted_count += 1;
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
                 if let Some(db) = &config.state_db {
+                    if event.record_type.is_none() && event.asset.is_none() {
+                        let unresolved_tombstone_key = SourceStateTransitionKey {
+                            record_name: Cow::Borrowed(&event.record_name),
+                            record_type: None,
+                            unresolved_identity: true,
+                        };
+                        match db
+                            .mark_master_family_soft_deleted_affected(
+                                &config.library,
+                                unresolved_tombstone_key.record_name(),
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(updated) if updated > 0 => {
+                                record_incremental_state_transition_result(
+                                    Ok(updated),
+                                    IncrementalStateTransition::HardDelete,
+                                    unresolved_tombstone_key,
+                                    &mut self.state_transition_failures,
+                                    &mut self.token_unsafe_reason,
+                                );
+                                return;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                record_incremental_state_transition_result(
+                                    Err(e),
+                                    IncrementalStateTransition::HardDelete,
+                                    unresolved_tombstone_key,
+                                    &mut self.state_transition_failures,
+                                    &mut self.token_unsafe_reason,
+                                );
+                                return;
+                            }
+                        }
+                    }
+
                     let state_key =
                         match hard_delete_state_transition_key(event, config, db.as_ref()).await {
                             Ok(state_key) => state_key,
@@ -4771,9 +4821,23 @@ impl IncrementalDeltaSummary {
                                 return;
                             }
                         };
-                    let result = db
-                        .mark_soft_deleted_affected(&config.library, state_key.record_name(), None)
-                        .await;
+                    let result = if matches!(state_key.record_type, Some("CPLMaster"))
+                        && !matches!(event.record_type.as_deref(), Some("CPLAsset") | None)
+                    {
+                        db.mark_master_family_soft_deleted_affected(
+                            &config.library,
+                            state_key.record_name(),
+                            None,
+                        )
+                        .await
+                    } else {
+                        db.mark_soft_deleted_affected(
+                            &config.library,
+                            state_key.record_name(),
+                            None,
+                        )
+                        .await
+                    };
                     record_incremental_state_transition_result(
                         result,
                         IncrementalStateTransition::HardDelete,
@@ -6606,7 +6670,7 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("expected path has filename");
-        let record = TestAssetRecord::new(asset.id())
+        let record = TestAssetRecord::new(asset.state_id())
             .library(library)
             .checksum(&expected_path.checksum)
             .filename(filename)
@@ -6617,7 +6681,7 @@ mod tests {
         db.upsert_seen(&record).await.expect("seed state row");
         db.mark_downloaded(
             library,
-            asset.id(),
+            asset.state_id(),
             expected_path.version_size.as_str(),
             &expected_path.path,
             "seeded-local-sha256",
@@ -6628,7 +6692,7 @@ mod tests {
         assert!(
             !db.should_download(
                 library,
-                asset.id(),
+                asset.state_id(),
                 expected_path.version_size.as_str(),
                 &expected_path.checksum,
                 &expected_path.path,
@@ -6689,43 +6753,51 @@ mod tests {
 
     fn mock_photo_records_with_filename(record_name: &str, filename: &str) -> Vec<Value> {
         vec![
-            json!({
-                "recordName": record_name,
-                "recordType": "CPLMaster",
-                "fields": {
-                    "filenameEnc": {"value": filename, "type": "STRING"},
-                    "resOriginalRes": {
-                        "value": {
-                            "downloadURL": "https://p01.icloud-content.com/photo.jpg",
-                            "size": 1024,
-                            "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-                        }
-                    },
-                    "resOriginalWidth": {"value": 100, "type": "INT64"},
-                    "resOriginalHeight": {"value": 100, "type": "INT64"},
-                    "resOriginalFileType": {"value": "public.jpeg"},
-                    "itemType": {"value": "public.jpeg"},
-                    "adjustmentRenderType": {"value": 0, "type": "INT64"}
-                },
-                "recordChangeTag": "ct1"
-            }),
-            json!({
-                "recordName": format!("asset-{record_name}"),
-                "recordType": "CPLAsset",
-                "fields": {
-                    "masterRef": {
-                        "value": {
-                            "recordName": record_name,
-                            "zoneID": {"zoneName": "PrimarySync"}
-                        },
-                        "type": "REFERENCE"
-                    },
-                    "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
-                    "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
-                },
-                "recordChangeTag": "ct2"
-            }),
+            mock_master_record_with_filename(record_name, filename),
+            mock_asset_record_for(&format!("asset-{record_name}"), record_name),
         ]
+    }
+
+    fn mock_master_record_with_filename(record_name: &str, filename: &str) -> Value {
+        json!({
+            "recordName": record_name,
+            "recordType": "CPLMaster",
+            "fields": {
+                "filenameEnc": {"value": filename, "type": "STRING"},
+                "resOriginalRes": {
+                    "value": {
+                        "downloadURL": "https://p01.icloud-content.com/photo.jpg",
+                        "size": 1024,
+                        "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                    }
+                },
+                "resOriginalWidth": {"value": 100, "type": "INT64"},
+                "resOriginalHeight": {"value": 100, "type": "INT64"},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "itemType": {"value": "public.jpeg"},
+                "adjustmentRenderType": {"value": 0, "type": "INT64"}
+            },
+            "recordChangeTag": "ct1"
+        })
+    }
+
+    fn mock_asset_record_for(asset_record_name: &str, master_record_name: &str) -> Value {
+        json!({
+            "recordName": asset_record_name,
+            "recordType": "CPLAsset",
+            "fields": {
+                "masterRef": {
+                    "value": {
+                        "recordName": master_record_name,
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    },
+                    "type": "REFERENCE"
+                },
+                "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+            },
+            "recordChangeTag": "ct2"
+        })
     }
 
     #[tokio::test]
@@ -7675,6 +7747,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_enumeration_sibling_cplassets_do_not_count_as_duplicate_asset_ids() {
+        let records = vec![
+            mock_asset_record_for("asset-sibling-b", "MASTER_SIBLING"),
+            mock_master_record_with_filename("MASTER_SIBLING", "sibling.jpg"),
+            mock_asset_record_for("asset-sibling-a", "MASTER_SIBLING"),
+        ];
+        let session = MockPhotosFlow::new()
+            .album_count(2)
+            .query_page(records.clone(), Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        let pass_config = config.with_pass(&passes[0]);
+        let first_asset = PhotoAsset::new(records[1].clone(), records[2].clone());
+        let second_asset = PhotoAsset::new(records[1].clone(), records[0].clone())
+            .with_state_record_name(Arc::from("asset-sibling-b"));
+        for asset in [&first_asset, &second_asset] {
+            let expected_path = filter::expected_paths_for(asset, &pass_config)
+                .into_iter()
+                .next()
+                .expect("mock sibling asset should have an expected path");
+            tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+                .await
+                .expect("create parent dir");
+            tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+                .await
+                .expect("seed existing file");
+            seed_downloaded_state_for_expected_path(
+                &mut config,
+                &pass_config,
+                asset,
+                &expected_path,
+            )
+            .await;
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("sibling CPLAssets should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.assets_seen, 2);
+        assert_eq!(result.stats.skipped.duplicates, 0);
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.pagination_shortfall_assets, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
+    }
+
+    #[tokio::test]
     async fn full_sync_blank_query_sync_token_blocks_advancement() {
         let records = mock_photo_records_with_filename("MASTER_BLANK_TOKEN", "blank-token.jpg");
         let session = MockPhotosFlow::new()
@@ -8274,6 +8412,34 @@ mod tests {
         assert!(!result.stats.sync_token_blocked);
         let pending = db.get_pending().await.unwrap();
         assert_source_flags(&pending, "TRACKED_MASTER", false, false);
+    }
+
+    #[tokio::test]
+    async fn incremental_unresolved_master_hard_delete_marks_sibling_asset_rows() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("asset-SIBLING").build())
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-SIBLING", "TRACKED_MASTER")
+            .await
+            .unwrap();
+
+        let result = run_incremental_change_records(
+            db.clone(),
+            vec![hard_deleted_change_record("TRACKED_MASTER")],
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+        let pending = db.get_pending().await.unwrap();
+        assert_source_flags(&pending, "TRACKED_MASTER", true, false);
+        assert_source_flags(&pending, "asset-SIBLING", true, false);
     }
 
     #[tokio::test]

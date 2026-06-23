@@ -407,8 +407,9 @@ CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
 /// V15 durable CPLAsset -> CPLMaster mapping.
 ///
 /// CloudKit hard-delete tombstones can arrive with only a `recordName` and no
-/// `recordType` or fields. The download state is keyed by `CPLMaster`, so keep
-/// the last observed `CPLAsset.recordName` bridge per library.
+/// `recordType` or fields. Download state normally uses `CPLMaster`, while
+/// sibling `CPLAsset` rows can use their own asset record names, so keep the
+/// last observed `CPLAsset.recordName` bridge per library.
 const SCHEMA_V15: &str = r"
 CREATE TABLE IF NOT EXISTS asset_master_mappings (
     library TEXT NOT NULL,

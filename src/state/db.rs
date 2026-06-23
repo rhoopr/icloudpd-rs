@@ -213,6 +213,15 @@ pub trait DownloadStateStore: Send + Sync {
             .await?;
         Ok(1)
     }
+    async fn mark_master_family_soft_deleted_affected(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        self.mark_soft_deleted_affected(library, master_record_name, deleted_at)
+            .await
+    }
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError>;
     async fn mark_hidden_at_source_affected(
         &self,
@@ -2782,6 +2791,34 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn mark_master_family_soft_deleted(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        let library = library.to_owned();
+        let master_record_name = master_record_name.to_owned();
+        self.with_conn("mark_master_family_soft_deleted", move |conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
+                     WHERE library = ?2 AND (id = ?3 OR id IN ( \
+                        SELECT asset_record_name FROM asset_master_mappings \
+                        WHERE library = ?2 AND master_record_name = ?3 \
+                     ))",
+                    rusqlite::params![
+                        deleted_at.map(|dt| dt.timestamp()),
+                        library,
+                        master_record_name
+                    ],
+                )
+                .map_err(|e| StateError::query("mark_master_family_soft_deleted", e))?;
+            Ok(updated)
+        })
+        .await
+    }
+
     pub(crate) async fn mark_hidden_at_source(
         &self,
         library: &str,
@@ -3136,6 +3173,21 @@ impl DownloadStateStore for SqliteStateDb {
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<usize, StateError> {
         SqliteStateDb::mark_soft_deleted(self, library, asset_id, deleted_at).await
+    }
+
+    async fn mark_master_family_soft_deleted_affected(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        SqliteStateDb::mark_master_family_soft_deleted(
+            self,
+            library,
+            master_record_name,
+            deleted_at,
+        )
+        .await
     }
 
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
@@ -3826,6 +3878,34 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn master_family_soft_delete_marks_sibling_asset_state_rows() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let master = TestAssetRecord::new("master-a").build();
+        let sibling = TestAssetRecord::new("asset-b").build();
+        let unrelated = TestAssetRecord::new("asset-c").build();
+
+        db.upsert_seen(&master).await.unwrap();
+        db.upsert_seen(&sibling).await.unwrap();
+        db.upsert_seen(&unrelated).await.unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-b", "master-a")
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-c", "master-other")
+            .await
+            .unwrap();
+
+        let updated = db
+            .mark_master_family_soft_deleted("PrimarySync", "master-a", None)
+            .await
+            .unwrap();
+
+        assert_eq!(updated, 2);
+        assert!(read_asset_writer_contract_row(&db, "master-a").is_deleted);
+        assert!(read_asset_writer_contract_row(&db, "asset-b").is_deleted);
+        assert!(!read_asset_writer_contract_row(&db, "asset-c").is_deleted);
     }
 
     #[derive(Debug)]

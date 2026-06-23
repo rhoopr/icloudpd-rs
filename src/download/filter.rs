@@ -509,13 +509,13 @@ fn build_payload(
     let albums = config
         .asset_groupings
         .albums
-        .get(asset.id())
+        .get(asset.state_id())
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let people = config
         .asset_groupings
         .people
-        .get(asset.id())
+        .get(asset.state_id())
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     Arc::new(MetadataPayload::from_metadata(asset.metadata()).with_asset_groupings(albums, people))
@@ -679,8 +679,16 @@ pub(crate) fn is_asset_filtered(
         tracing::warn!("Skipping malformed asset with empty CloudKit recordName");
         return Some(FilterReason::MalformedAsset);
     }
-    if config.exclude_asset_ids().contains(asset.id()) {
-        tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
+    if config
+        .exclude_asset_ids()
+        .contains(asset.asset_record_name())
+        || config.exclude_asset_ids().contains(asset.id())
+    {
+        tracing::debug!(
+            asset_id = %asset.id(),
+            asset_record_name = %asset.asset_record_name(),
+            "Skipping (excluded album asset)"
+        );
         return Some(FilterReason::ExcludedAlbum);
     }
     if asset.is_live_photo() && !config.media().live_photos {
@@ -1100,14 +1108,14 @@ pub(super) fn derive_primary(
 ) -> Option<DerivedPath> {
     let (version, effective_size) = select_primary(asset, config, ctx)?;
 
-    let mapped = mapped_version_filename(asset.id(), &ctx.base_filename, &version.asset_type);
+    let mapped = mapped_version_filename(asset.state_id(), &ctx.base_filename, &version.asset_type);
     let sized = match effective_size {
         AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
         AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
         _ => mapped,
     };
     let filename = match config.file_match_policy() {
-        FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.id()),
+        FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.state_id()),
         FileMatchPolicy::NameSizeDedupWithSuffix => sized,
     };
     let path = paths::local_download_path(
@@ -1144,10 +1152,10 @@ fn derive_suffixed_extra(
     suffix: &str,
     check_ampm_on_disk: bool,
 ) -> DerivedPath {
-    let mapped = mapped_version_filename(asset.id(), &ctx.base_filename, &version.asset_type);
+    let mapped = mapped_version_filename(asset.state_id(), &ctx.base_filename, &version.asset_type);
     let suffixed = paths::insert_literal_suffix(&mapped, suffix);
     let filename = match config.file_match_policy() {
-        FileMatchPolicy::NameId7 => paths::apply_name_id7(&suffixed, asset.id()),
+        FileMatchPolicy::NameId7 => paths::apply_name_id7(&suffixed, asset.state_id()),
         FileMatchPolicy::NameSizeDedupWithSuffix => suffixed,
     };
     let path = paths::local_download_path(
@@ -1250,7 +1258,7 @@ pub(super) fn derive_mov_companion(
     let live_base = match config.file_match_policy() {
         FileMatchPolicy::NameId7 => {
             let base = usable_asset_base_filename(asset, ctx);
-            paths::apply_name_id7(&base, asset.id())
+            paths::apply_name_id7(&base, asset.state_id())
         }
         FileMatchPolicy::NameSizeDedupWithSuffix => primary_effective_filename.map_or_else(
             || usable_asset_base_filename(asset, ctx),
@@ -1727,11 +1735,11 @@ pub(super) fn filter_asset_to_tasks(
             resolve_download_path(
                 &path,
                 size,
-                asset.id(),
+                asset.state_id(),
                 strategy,
                 &mut rctx,
                 check_ampm_on_disk,
-                |kind| size_or_identity_collision_filename(&filename, size, asset.id(), kind),
+                |kind| size_or_identity_collision_filename(&filename, size, asset.state_id(), kind),
                 "asset",
             )
         };
@@ -1750,7 +1758,7 @@ pub(super) fn filter_asset_to_tasks(
                 url,
                 download_path: p,
                 checksum,
-                asset_id: asset.id_arc(),
+                asset_id: asset.state_id_arc(),
                 library: Arc::clone(&task_library),
                 metadata: Arc::clone(&payload),
                 size,
@@ -1795,13 +1803,13 @@ pub(super) fn filter_asset_to_tasks(
             resolve_download_path(
                 &path,
                 size,
-                asset.id(),
+                asset.state_id(),
                 CollisionStrategy::SizeDedup {
                     skip_zero_size: true,
                 },
                 &mut rctx,
                 check_ampm_on_disk,
-                |kind| size_or_identity_collision_filename(&filename, size, asset.id(), kind),
+                |kind| size_or_identity_collision_filename(&filename, size, asset.state_id(), kind),
                 "asset extra",
             )
             .download_path()
@@ -1814,7 +1822,7 @@ pub(super) fn filter_asset_to_tasks(
                 url,
                 download_path: p,
                 checksum,
-                asset_id: asset.id_arc(),
+                asset_id: asset.state_id_arc(),
                 library: Arc::clone(&task_library),
                 metadata: Arc::clone(&payload),
                 size,
@@ -1840,7 +1848,7 @@ pub(super) fn filter_asset_to_tasks(
         if seen_urls.iter().any(|seen| seen.as_ref() == url.as_ref()) {
             return tasks;
         }
-        let asset_id = asset.id();
+        let asset_id = asset.state_id();
         let final_mov_path = {
             let mut rctx = ResolveContext {
                 config,
@@ -1870,7 +1878,7 @@ pub(super) fn filter_asset_to_tasks(
                 url,
                 download_path: p,
                 checksum,
-                asset_id: asset.id_arc(),
+                asset_id: asset.state_id_arc(),
                 library: task_library,
                 metadata: Arc::clone(&payload),
                 size,

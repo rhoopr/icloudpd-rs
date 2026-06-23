@@ -306,7 +306,7 @@ pub(super) async fn tag_if_needed<D>(
     let new_hash = asset.metadata().metadata_hash.as_deref();
     let library = asset.source_zone().unwrap_or(config.library.as_ref());
     for &(vs, _) in candidates {
-        if !ctx.needs_metadata_rewrite(library, asset.id(), vs, new_hash) {
+        if !ctx.needs_metadata_rewrite(library, asset.state_id(), vs, new_hash) {
             continue;
         }
         tracing::info!(
@@ -315,7 +315,7 @@ pub(super) async fn tag_if_needed<D>(
             "Metadata-only change detected; tagging for rewrite"
         );
         if let Err(e) = db
-            .record_metadata_write_failure(library, asset.id(), vs.as_str())
+            .record_metadata_write_failure(library, asset.state_id(), vs.as_str())
             .await
         {
             tracing::warn!(

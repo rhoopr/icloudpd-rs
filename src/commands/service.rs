@@ -934,7 +934,7 @@ async fn collect_album_asset_ids(
     tokio::pin!(stream);
     while let Some(result) = stream.next().await {
         let asset = result?;
-        into.insert(asset.id().to_string());
+        into.insert(asset.asset_record_name().to_string());
     }
     Ok(())
 }

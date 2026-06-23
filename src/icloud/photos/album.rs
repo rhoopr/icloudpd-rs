@@ -36,6 +36,18 @@ pub(crate) const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate"
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
 
+fn prune_paired_master_cache(
+    paired_masters: &mut FxHashMap<String, super::cloudkit::Record>,
+    max_records: usize,
+) {
+    if paired_masters.len() <= max_records {
+        return;
+    }
+    if let Some(key) = paired_masters.keys().next().cloned() {
+        paired_masters.remove(&key);
+    }
+}
+
 /// Keep signed CDN URLs close to the download workers that will consume them.
 ///
 /// A normal CloudKit page is optimized for fast enumeration, but each
@@ -1272,7 +1284,9 @@ impl PhotoAlbum {
             let mut saw_blank_sync_token = false;
             let mut pending_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
-            let mut pending_assets: FxHashMap<String, super::cloudkit::Record> =
+            let mut pending_assets: FxHashMap<String, Vec<super::cloudkit::Record>> =
+                FxHashMap::default();
+            let mut paired_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
             let mut consecutive_empty_pages: u32 = 0;
             let mut enumeration_incomplete = false;
@@ -1411,7 +1425,7 @@ impl PhotoAlbum {
 
                 // Collect current page's records, trying to pair with
                 // buffered unpaired records from previous pages.
-                let mut page_assets: FxHashMap<String, super::cloudkit::Record> =
+                let mut page_assets: FxHashMap<String, Vec<super::cloudkit::Record>> =
                     FxHashMap::default();
                 let mut page_masters: Vec<super::cloudkit::Record> = Vec::new();
                 let mut masters_seen_on_page = false;
@@ -1428,41 +1442,11 @@ impl PhotoAlbum {
                             .and_then(Value::as_str)
                         {
                             let master_id = master_id.to_string();
-                            // Try to pair with a buffered master from a previous page
-                            if let Some(master) = pending_masters.remove(&master_id) {
-                                if let Some(n) = limit {
-                                    if total_sent >= u64::from(n) {
-                                        limit_reached = true;
-                                        break;
-                                    }
-                                }
-                                let asset = PhotoAsset::from_records(master, &rec);
-                                if tx.send(Ok(asset)).await.is_err() {
-                                    return;
-                                }
-                                total_sent += 1;
-                            } else {
-                                page_assets.insert(master_id, rec);
-                            }
+                            page_assets.entry(master_id).or_default().push(rec);
                         }
                     } else if rec.record_type == "CPLMaster" {
                         masters_seen_on_page = true;
-                        if let Some(asset_rec) = pending_assets.remove(&rec.record_name) {
-                            if let Some(n) = limit {
-                                if total_sent >= u64::from(n) {
-                                    limit_reached = true;
-                                    break;
-                                }
-                            }
-                            let asset = PhotoAsset::from_records(rec, &asset_rec);
-                            if tx.send(Ok(asset)).await.is_err() {
-                                return;
-                            }
-                            total_sent += 1;
-                            offset += 1;
-                        } else {
-                            page_masters.push(rec);
-                        }
+                        page_masters.push(rec);
                     }
                 }
 
@@ -1477,7 +1461,7 @@ impl PhotoAlbum {
                     // asset count as a proxy for rank positions covered
                     // (each asset references one master/rank), with a minimum
                     // of 1 to guarantee forward progress.
-                    let advance = page_assets.len().max(1) as u64;
+                    let advance = page_assets.values().map(Vec::len).sum::<usize>().max(1) as u64;
                     offset += advance;
                     tracing::warn!(
                         album = %name,
@@ -1495,12 +1479,36 @@ impl PhotoAlbum {
                             break;
                         }
                     }
-                    if let Some(asset_rec) = page_assets.remove(&master.record_name) {
-                        let asset = PhotoAsset::from_records(master, &asset_rec);
-                        if tx.send(Ok(asset)).await.is_err() {
-                            return;
+                    let mut asset_records = pending_assets.remove(&master.record_name);
+                    if let Some(page_records) = page_assets.remove(&master.record_name) {
+                        asset_records
+                            .get_or_insert_with(Vec::new)
+                            .extend(page_records);
+                    }
+                    if let Some(mut asset_records) = asset_records {
+                        asset_records
+                            .sort_by(|left, right| left.record_name.cmp(&right.record_name));
+                        let sibling_count = asset_records.len();
+                        for (index, asset_rec) in asset_records.into_iter().enumerate() {
+                            if let Some(n) = limit {
+                                if total_sent >= u64::from(n) {
+                                    limit_reached = true;
+                                    break;
+                                }
+                            }
+                            let mut asset = PhotoAsset::from_records(master.clone(), &asset_rec);
+                            if sibling_count > 1 && index > 0 {
+                                asset = asset.with_state_record_name(Arc::from(
+                                    asset_rec.record_name.as_str(),
+                                ));
+                            }
+                            if tx.send(Ok(asset)).await.is_err() {
+                                return;
+                            }
+                            total_sent += 1;
                         }
-                        total_sent += 1;
+                        paired_masters.insert(master.record_name.clone(), master);
+                        prune_paired_master_cache(&mut paired_masters, max_pending_records);
                     } else {
                         // Buffer unpaired master for pairing on subsequent pages
                         pending_masters.insert(master.record_name.clone(), master);
@@ -1520,8 +1528,58 @@ impl PhotoAlbum {
                     break;
                 }
 
-                pending_assets.extend(page_assets);
-                let pending_record_count = pending_masters.len() + pending_assets.len();
+                for (master_id, records) in page_assets {
+                    if let Some(master) = pending_masters.remove(&master_id) {
+                        let mut records = records;
+                        records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
+                        let sibling_count = records.len();
+                        for (index, asset_rec) in records.into_iter().enumerate() {
+                            if let Some(n) = limit {
+                                if total_sent >= u64::from(n) {
+                                    limit_reached = true;
+                                    break;
+                                }
+                            }
+                            let mut asset = PhotoAsset::from_records(master.clone(), &asset_rec);
+                            if sibling_count > 1 && index > 0 {
+                                asset = asset.with_state_record_name(Arc::from(
+                                    asset_rec.record_name.as_str(),
+                                ));
+                            }
+                            if tx.send(Ok(asset)).await.is_err() {
+                                return;
+                            }
+                            total_sent += 1;
+                        }
+                        paired_masters.insert(master.record_name.clone(), master);
+                        prune_paired_master_cache(&mut paired_masters, max_pending_records);
+                    } else if let Some(master) = paired_masters.get(&master_id) {
+                        let mut records = records;
+                        records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
+                        for asset_rec in records {
+                            if let Some(n) = limit {
+                                if total_sent >= u64::from(n) {
+                                    limit_reached = true;
+                                    break;
+                                }
+                            }
+                            let asset = PhotoAsset::from_records(master.clone(), &asset_rec)
+                                .with_state_record_name(Arc::from(asset_rec.record_name.as_str()));
+                            if tx.send(Ok(asset)).await.is_err() {
+                                return;
+                            }
+                            total_sent += 1;
+                        }
+                    } else {
+                        pending_assets.entry(master_id).or_default().extend(records);
+                    }
+                }
+                if limit_reached {
+                    stopped_for_limit = true;
+                    break;
+                }
+                let pending_record_count =
+                    pending_masters.len() + pending_assets.values().map(Vec::len).sum::<usize>();
                 if pending_record_count > max_pending_records {
                     enumeration_incomplete = true;
                     let _ = tx
@@ -1544,20 +1602,21 @@ impl PhotoAlbum {
                 enumeration_incomplete = true;
                 tracing::warn!(
                     masters = pending_masters.len(),
-                    assets = pending_assets.len(),
+                    assets = pending_assets.values().map(Vec::len).sum::<usize>(),
                     "Unpaired CPLMaster/CPLAsset records after full enumeration"
                 );
                 for id in pending_masters.keys() {
                     tracing::debug!(master_id = %id, "Unpaired CPLMaster");
                 }
-                for id in pending_assets.keys() {
-                    tracing::debug!(master_id = %id, "Unpaired CPLAsset");
+                for (id, records) in &pending_assets {
+                    tracing::debug!(master_id = %id, count = records.len(), "Unpaired CPLAsset");
                 }
+                let pending_asset_count = pending_assets.values().map(Vec::len).sum::<usize>();
                 let _ = tx
                     .send(Err(anyhow::anyhow!(
                         "Photo enumeration is incomplete: {} unpaired CPLMaster records and {} unpaired CPLAsset records remained at the end of the stream.",
                         pending_masters.len(),
-                        pending_assets.len()
+                        pending_asset_count
                     )))
                     .await;
             }
@@ -2349,6 +2408,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_query_sibling_assets_share_master_without_clobbering() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .query_page(
+                vec![
+                    test_asset_record_for("asset-sibling-b", "master-sibling"),
+                    test_master_record("master-sibling"),
+                    test_asset_record_for("asset-sibling-a", "master-sibling"),
+                ],
+                Some("token-full"),
+            )
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 1);
+        tokio::pin!(stream);
+        let mut seen = Vec::new();
+        while let Some(result) = stream.next().await {
+            let asset = result.expect("sibling asset should parse");
+            seen.push((
+                asset.id().to_string(),
+                asset.asset_record_name().to_string(),
+                asset.state_id().to_string(),
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "master-sibling".to_string(),
+                    "asset-sibling-a".to_string(),
+                    "master-sibling".to_string(),
+                ),
+                (
+                    "master-sibling".to_string(),
+                    "asset-sibling-b".to_string(),
+                    "asset-sibling-b".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_query_late_sibling_asset_pairs_with_recent_master() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .query_page(
+                vec![
+                    test_master_record("master-late-sibling"),
+                    test_asset_record_for("asset-late-a", "master-late-sibling"),
+                ],
+                Some("token-full"),
+            )
+            .query_page(
+                vec![test_asset_record_for("asset-late-b", "master-late-sibling")],
+                Some("token-full"),
+            )
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 1);
+        tokio::pin!(stream);
+        let mut seen = Vec::new();
+        while let Some(result) = stream.next().await {
+            let asset = result.expect("late sibling asset should parse");
+            seen.push((
+                asset.id().to_string(),
+                asset.asset_record_name().to_string(),
+                asset.state_id().to_string(),
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "master-late-sibling".to_string(),
+                    "asset-late-a".to_string(),
+                    "master-late-sibling".to_string(),
+                ),
+                (
+                    "master-late-sibling".to_string(),
+                    "asset-late-b".to_string(),
+                    "asset-late-b".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full")
+        );
+    }
+
+    #[tokio::test]
     async fn full_query_unpaired_records_block_token() {
         let mock = MockPhotosFlow::new()
             .query_page(
@@ -2650,13 +2810,17 @@ mod tests {
     }
 
     fn test_asset_record(record_name: &str) -> Value {
+        test_asset_record_for(&format!("asset-{record_name}"), record_name)
+    }
+
+    fn test_asset_record_for(asset_record_name: &str, master_record_name: &str) -> Value {
         json!({
-            "recordName": format!("asset-{record_name}"),
+            "recordName": asset_record_name,
             "recordType": "CPLAsset",
             "fields": {
                 "masterRef": {
                     "value": {
-                        "recordName": record_name,
+                        "recordName": master_record_name,
                         "zoneID": {"zoneName": "PrimarySync"}
                     },
                     "type": "REFERENCE"
