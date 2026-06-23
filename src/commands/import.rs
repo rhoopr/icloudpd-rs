@@ -408,14 +408,16 @@ fn import_match_candidates(
         fname,
         candidate.expected_size,
     )));
-    candidates.push(parent.join(download::paths::insert_suffix(fname, asset_id)));
+    candidates.push(parent.join(download::paths::insert_asset_identity_suffix(
+        fname, asset_id,
+    )));
 
     if candidate.version_size.is_live_photo_motion() {
         if let Some(primary) = primary_expected_path(all_expected) {
             if let Some(primary_fname) = primary.path.file_name().and_then(|f| f.to_str()) {
                 let primary_collision_filenames = [
                     download::paths::add_dedup_suffix(primary_fname, primary.size),
-                    download::paths::insert_suffix(primary_fname, asset_id),
+                    download::paths::insert_asset_identity_suffix(primary_fname, asset_id),
                 ];
                 for primary_filename in primary_collision_filenames {
                     let mov_filename = match path_config.live_photo_mov_filename_policy() {
@@ -427,8 +429,10 @@ fn import_match_candidates(
                         }
                     };
                     candidates.push(parent.join(&mov_filename));
-                    candidates
-                        .push(parent.join(download::paths::insert_suffix(&mov_filename, asset_id)));
+                    candidates.push(parent.join(download::paths::insert_asset_identity_suffix(
+                        &mov_filename,
+                        asset_id,
+                    )));
                 }
             }
         }
@@ -2071,6 +2075,63 @@ mod wiremock_tests {
         assert!(rows
             .iter()
             .any(|r| r.filename.as_ref() == "IMG_0600-3000_HEVC-LIVE6-2.MOV"));
+    }
+
+    #[tokio::test]
+    async fn import_matches_live_photo_motion_from_sanitized_identity_suffixed_primary_stem() {
+        let server = crate::start_wiremock_or_skip!();
+        let asset = WiremockAsset::new("LIVE/SLASH6", "IMG_0610.HEIC", "public.heic")
+            .orig(3000, "ck_live_slash6", "public.heic")
+            .live_mov(2000, "ck_live_slash6_mov");
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        let primary = expected
+            .iter()
+            .find(|e| e.version_size == VersionSizeKey::Original)
+            .expect("primary path");
+        let mov = expected
+            .iter()
+            .find(|e| e.version_size == VersionSizeKey::LiveOriginal)
+            .expect("MOV path");
+        let primary_name = primary.path.file_name().and_then(|f| f.to_str()).unwrap();
+        let primary_collision =
+            primary
+                .path
+                .with_file_name(crate::download::paths::insert_asset_identity_suffix(
+                    primary_name,
+                    "LIVE/SLASH6",
+                ));
+        let mov_collision_base = crate::download::paths::live_photo_mov_path_suffix(
+            primary_collision
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap(),
+        );
+        let mov_collision = mov.path.with_file_name(
+            crate::download::paths::insert_asset_identity_ordinal_suffix(
+                &mov_collision_base,
+                "LIVE/SLASH6",
+                22,
+            ),
+        );
+        stage_file(&primary_collision, primary.size);
+        stage_file(&mov_collision, mov.size);
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.matched, 2);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert!(rows
+            .iter()
+            .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6.HEIC"));
+        assert!(rows
+            .iter()
+            .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6_HEVC-LIVE_SLASH6-22.MOV"));
     }
 
     #[tokio::test]

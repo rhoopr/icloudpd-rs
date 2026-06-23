@@ -317,6 +317,28 @@ pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
     }
 }
 
+/// Filesystem-safe asset id suffix for kei-generated identity collision names.
+///
+/// CloudKit record names can contain characters such as `/` that are invalid
+/// inside one filename component. Download path construction sanitizes the
+/// final filename, so every path that reconstructs or recognizes the generated
+/// suffix must sanitize the asset id the same way.
+pub(crate) fn asset_identity_suffix(asset_id: &str) -> String {
+    clean_filename(asset_id).into_owned()
+}
+
+/// Insert a filesystem-safe asset id before the file extension.
+pub(crate) fn insert_asset_identity_suffix(path: &str, asset_id: &str) -> String {
+    insert_suffix(path, &asset_identity_suffix(asset_id))
+}
+
+/// Insert a filesystem-safe asset id plus a stable collision ordinal before
+/// the file extension.
+pub(crate) fn insert_asset_identity_ordinal_suffix(path: &str, asset_id: &str, n: u64) -> String {
+    let suffix = format!("{}-{n}", asset_identity_suffix(asset_id));
+    insert_suffix(path, &suffix)
+}
+
 /// Return true when `candidate` is `base` with this asset id appended before
 /// the extension, optionally followed by kei's stable collision ordinal.
 ///
@@ -327,7 +349,11 @@ pub(crate) fn filename_matches_identity_collision(
     asset_id: &str,
     candidate: &str,
 ) -> bool {
-    if candidate == insert_suffix(base, asset_id) {
+    let base = clean_filename(base);
+    let asset_id = asset_identity_suffix(asset_id);
+    let base = base.as_ref();
+
+    if candidate == insert_suffix(base, &asset_id) {
         return true;
     }
 
@@ -913,6 +939,18 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_asset_identity_suffix_sanitizes_asset_id() {
+        assert_eq!(
+            insert_asset_identity_suffix("IMG_0001.MOV", "AcGO2/cr6V"),
+            "IMG_0001-AcGO2_cr6V.MOV"
+        );
+        assert_eq!(
+            insert_asset_identity_ordinal_suffix("IMG_0001.MOV", "AcGO2/cr6V", 22),
+            "IMG_0001-AcGO2_cr6V-22.MOV"
+        );
+    }
+
+    #[test]
     fn test_filename_matches_identity_collision() {
         assert!(filename_matches_identity_collision(
             "IMG_0001.MOV",
@@ -938,6 +976,20 @@ mod tests {
             "IMG_0001.MOV",
             "ASSET",
             "IMG_0001-ASSET-x.MOV"
+        ));
+    }
+
+    #[test]
+    fn test_filename_matches_identity_collision_sanitizes_asset_id() {
+        assert!(filename_matches_identity_collision(
+            "IMG_0001.MOV",
+            "AcGO2/cr6V",
+            "IMG_0001-AcGO2_cr6V.MOV"
+        ));
+        assert!(filename_matches_identity_collision(
+            "IMG_0001.MOV",
+            "AcGO2/cr6V",
+            "IMG_0001-AcGO2_cr6V-22.MOV"
         ));
     }
 

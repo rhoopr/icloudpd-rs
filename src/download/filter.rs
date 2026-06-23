@@ -1456,9 +1456,11 @@ fn size_or_identity_collision_filename(
 ) -> String {
     match kind {
         CollisionFilenameKind::Default => paths::add_dedup_suffix(filename, size),
-        CollisionFilenameKind::AssetIdentity => paths::insert_suffix(filename, asset_id),
+        CollisionFilenameKind::AssetIdentity => {
+            paths::insert_asset_identity_suffix(filename, asset_id)
+        }
         CollisionFilenameKind::AssetIdentityOrdinal(n) => {
-            paths::insert_suffix(filename, &format!("{asset_id}-{n}"))
+            paths::insert_asset_identity_ordinal_suffix(filename, asset_id, n)
         }
     }
 }
@@ -1470,10 +1472,10 @@ fn identity_collision_filename(
 ) -> String {
     match kind {
         CollisionFilenameKind::Default | CollisionFilenameKind::AssetIdentity => {
-            paths::insert_suffix(filename, asset_id)
+            paths::insert_asset_identity_suffix(filename, asset_id)
         }
         CollisionFilenameKind::AssetIdentityOrdinal(n) => {
-            paths::insert_suffix(filename, &format!("{asset_id}-{n}"))
+            paths::insert_asset_identity_ordinal_suffix(filename, asset_id, n)
         }
     }
 }

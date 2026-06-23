@@ -547,14 +547,14 @@ fn collision_family_base_filenames(
     let mut bases = vec![
         derived.filename.clone(),
         super::paths::add_dedup_suffix(&derived.filename, derived.size),
-        super::paths::insert_suffix(&derived.filename, asset_id),
+        super::paths::insert_asset_identity_suffix(&derived.filename, asset_id),
     ];
 
     if derived.version_size.is_live_photo_motion() {
         if let Some(primary) = primary_derived_path(derived_paths) {
             let primary_collision_filenames = [
                 super::paths::add_dedup_suffix(&primary.filename, primary.size),
-                super::paths::insert_suffix(&primary.filename, asset_id),
+                super::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
             ];
             for primary_filename in primary_collision_filenames {
                 bases.push(live_photo_motion_filename_for_primary(
@@ -591,6 +591,8 @@ fn live_photo_motion_filename_for_primary(
 }
 
 fn stored_filename_matches_base_family(stored_filename: &str, base: &str, asset_id: &str) -> bool {
+    let base = super::paths::clean_filename(base);
+    let base = base.as_ref();
     filenames_match_ampm_equivalent(stored_filename, base)
         || super::paths::filename_matches_identity_collision(base, asset_id, stored_filename)
         || super::paths::filename_matches_identity_collision(
@@ -5654,7 +5656,9 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("test path must have a UTF-8 filename");
-        bare_path.with_file_name(crate::download::paths::insert_suffix(filename, asset_id))
+        bare_path.with_file_name(crate::download::paths::insert_asset_identity_suffix(
+            filename, asset_id,
+        ))
     }
 
     fn suffixed_collision_asset(id: &str, checksum: &str) -> PhotoAsset {
@@ -5942,6 +5946,82 @@ mod tests {
         assert_eq!(result.downloaded, 0, "Live Photo must not be re-downloaded");
         assert_eq!(result.skip_summary.on_disk, 1);
         assert!(result.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_photo_motion_with_sanitized_identity_suffix_is_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset = live_photo_collision_asset("LIVE/ID_COLLISION");
+        let bare_primary = path_for_filename(&config, &asset, "IMG_0001.HEIC");
+        let stored_primary = path_for_filename(&config, &asset, "IMG_0001-LIVE_ID_COLLISION.HEIC");
+        let stored_motion = path_for_filename(
+            &config,
+            &asset,
+            "IMG_0001-LIVE_ID_COLLISION_HEVC-LIVE_ID_COLLISION-22.MOV",
+        );
+        fs::create_dir_all(bare_primary.parent().unwrap()).unwrap();
+        fs::write(&bare_primary, vec![9u8; 2000]).unwrap();
+        fs::write(&stored_primary, vec![1u8; 2000]).unwrap();
+        fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
+
+        record_downloaded_test_version(
+            db.as_ref(),
+            &asset,
+            VersionSizeKey::Original,
+            "heic_ck",
+            2000,
+            &stored_primary,
+        )
+        .await;
+        record_downloaded_test_version(
+            db.as_ref(),
+            &asset,
+            VersionSizeKey::LiveOriginal,
+            "mov_ck",
+            3000,
+            &stored_motion,
+        )
+        .await;
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.downloaded, 0,
+            "Live Photo with sanitized asset-id suffix must not be re-downloaded"
+        );
+        assert_eq!(result.skip_summary.on_disk, 1);
+        assert!(result.failed.is_empty());
+        assert!(
+            !path_for_filename(
+                &config,
+                &asset,
+                "IMG_0001-LIVE_ID_COLLISION_HEVC-LIVE_ID_COLLISION-23.MOV"
+            )
+            .exists(),
+            "sync must not create the next sanitized ordinal duplicate"
+        );
     }
 
     #[tokio::test]
