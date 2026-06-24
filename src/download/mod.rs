@@ -5690,7 +5690,13 @@ async fn download_photos_incremental_collecting(
     let mut task_planner = planner::TaskPlanner::new();
     let mut skip_breakdown = SkipBreakdown::default();
     let mut enumeration_errors = 0usize;
-    let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
+    // Incremental routing already decides whether a changed asset belongs to
+    // a selected album pass or the unfiled pass from trusted membership
+    // state. Re-enumerating every album here to rebuild unfiled excludes
+    // delays consumption of the fresh signed download URLs from
+    // `changes/zone`, which can make those URLs expire before downloads
+    // start on large album sets.
+    let pass_configs = build_pass_configs(passes, config);
 
     for (asset, pass_index) in &downloadable_assets {
         #[allow(
@@ -6177,16 +6183,43 @@ mod tests {
     #[derive(Clone)]
     struct CountingChangesZoneSession {
         changes_zone_calls: Arc<AtomicUsize>,
+        count_query_calls: Arc<AtomicUsize>,
+        records_query_calls: Arc<AtomicUsize>,
         records: Vec<Value>,
+        query_page: Value,
+        asset_count: u64,
     }
 
     fn changes_zone_session(
         changes_zone_calls: Arc<AtomicUsize>,
         records: Vec<Value>,
     ) -> CountingChangesZoneSession {
+        changes_zone_session_with_query_page(changes_zone_calls, records, json!({"records": []}), 0)
+    }
+
+    fn changes_zone_session_with_query_page(
+        changes_zone_calls: Arc<AtomicUsize>,
+        records: Vec<Value>,
+        query_page: Value,
+        asset_count: u64,
+    ) -> CountingChangesZoneSession {
         CountingChangesZoneSession {
             changes_zone_calls,
+            count_query_calls: Arc::new(AtomicUsize::new(0)),
+            records_query_calls: Arc::new(AtomicUsize::new(0)),
             records,
+            query_page,
+            asset_count,
+        }
+    }
+
+    impl CountingChangesZoneSession {
+        fn count_query_count(&self) -> usize {
+            self.count_query_calls.load(Ordering::SeqCst)
+        }
+
+        fn records_query_count(&self) -> usize {
+            self.records_query_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -6211,9 +6244,15 @@ mod tests {
             }
 
             if url.contains("/internal/records/query/batch") {
+                self.count_query_calls.fetch_add(1, Ordering::SeqCst);
                 return Ok(json!({
-                    "batch": [{"records": [{"fields": {"itemCount": {"value": 0}}}]}]
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": self.asset_count}}}]}]
                 }));
+            }
+
+            if url.contains("/records/query?") {
+                self.records_query_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(self.query_page.clone());
             }
 
             Ok(json!({"records": []}))
@@ -10197,6 +10236,66 @@ mod tests {
         assert!(
             album_rows.is_empty(),
             "asset outside selected albums should route only through the unfiled pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_multi_album_unfiled_uses_membership_without_album_enumeration() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let changes_calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session_with_query_page(
+            Arc::clone(&changes_calls),
+            incremental_photo_records("MASTER_CHANGED"),
+            mock_photo_query_page("VACATION_EXISTING", Some("album-token")),
+            1,
+        );
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album_with_container(
+                    "Vacation",
+                    Some("container-vacation"),
+                    session.clone(),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            unused_unfiled_changes_pass(),
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.folder_structure = "Unfiled".to_string();
+        config.folder_structure_albums = Arc::from("{album}");
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("incremental routing should not enumerate album passes");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            changes_calls.load(Ordering::SeqCst),
+            1,
+            "incremental sync should still read the zone delta once"
+        );
+        assert_eq!(
+            session.count_query_count(),
+            0,
+            "membership-backed incremental routing must not count albums before planning downloads"
+        );
+        assert_eq!(
+            session.records_query_count(),
+            0,
+            "membership-backed incremental routing must not enumerate albums before planning downloads"
         );
     }
 
