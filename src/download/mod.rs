@@ -2608,6 +2608,12 @@ struct RetryTaskKey {
     download_path: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct IncrementalRetrySource {
+    asset_record_name: Arc<str>,
+    pass_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PendingRetryTarget {
     library: Arc<str>,
@@ -2860,6 +2866,93 @@ async fn build_retry_download_tasks(
             refreshed = tasks.len(),
             missing = pending_keys.len(),
             "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
+        );
+    }
+
+    Ok(tasks)
+}
+
+/// Refresh expired incremental CDN URLs from `/changes/zone` and rebuild only
+/// the task tuples that actually failed. This keeps recovery close to the
+/// delta that produced the stale URLs instead of waiting for the next watch
+/// interval or re-enumerating every selected album.
+async fn build_incremental_expired_url_retry_tasks(
+    passes: &[crate::commands::AlbumPass],
+    pass_configs: &[Arc<DownloadConfig>],
+    retry_sources: &FxHashMap<RetryTaskKey, IncrementalRetrySource>,
+    failed_tasks: &[DownloadTask],
+    zone_sync_token: &str,
+    shutdown_token: CancellationToken,
+) -> Result<Vec<DownloadTask>> {
+    if failed_tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pending_keys: FxHashSet<RetryTaskKey> =
+        failed_tasks.iter().map(RetryTaskKey::from).collect();
+    let requested_count = pending_keys.len();
+    let mut pass_indices_by_asset: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
+
+    for task in failed_tasks {
+        let key = RetryTaskKey::from(task);
+        let Some(source) = retry_sources.get(&key) else {
+            tracing::warn!(
+                asset_id = %task.asset_id,
+                version_size = %task.version_size.as_str(),
+                path = %task.download_path.display(),
+                "Could not map expired incremental URL back to its source asset"
+            );
+            continue;
+        };
+        pass_indices_by_asset
+            .entry(source.asset_record_name.to_string())
+            .or_default()
+            .insert(source.pass_index);
+    }
+
+    let mut tasks = Vec::with_capacity(requested_count);
+    let mut task_planner = planner::TaskPlanner::new();
+    if !pass_indices_by_asset.is_empty() {
+        if pending_keys.is_empty() || shutdown_token.is_cancelled() {
+            return Ok(tasks);
+        }
+        let Some(pass) = passes.first() else {
+            return Ok(tasks);
+        };
+        let (mut change_stream, _token_rx) = pass.album.changes_stream(zone_sync_token);
+        while let Some(result) = change_stream.next().await {
+            if pending_keys.is_empty() || shutdown_token.is_cancelled() {
+                break;
+            }
+            let event = result?;
+            let Some(asset) = event.asset else {
+                continue;
+            };
+            let Some(pass_indices) = pass_indices_by_asset.remove(asset.asset_record_name()) else {
+                continue;
+            };
+            for pass_index in pass_indices {
+                let Some(pass_config) = pass_configs.get(pass_index) else {
+                    continue;
+                };
+                let plan = task_planner.plan_asset(&asset, pass_config).await;
+                if plan.filter_reason.is_some() {
+                    continue;
+                }
+                take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut tasks);
+            }
+            if pass_indices_by_asset.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if !pending_keys.is_empty() {
+        tracing::warn!(
+            requested = requested_count,
+            refreshed = tasks.len(),
+            missing = pending_keys.len(),
+            "Incremental expired-URL retry could not refresh every failed task"
         );
     }
 
@@ -3633,7 +3726,6 @@ async fn run_pending_retry_pass(
         ));
     }
 
-    let task_count = tasks.len();
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
@@ -3659,7 +3751,7 @@ async fn run_pending_retry_pass(
     let remaining_unmatched = unmatched.saturating_sub(pruned);
 
     let mut stats = SyncStats {
-        downloaded: task_count - failed,
+        downloaded: pass_result.downloaded,
         failed,
         stale_pending_pruned: pruned as u64,
         bytes_downloaded: pass_result.bytes_downloaded,
@@ -5697,6 +5789,7 @@ async fn download_photos_incremental_collecting(
     // `changes/zone`, which can make those URLs expire before downloads
     // start on large album sets.
     let pass_configs = build_pass_configs(passes, config);
+    let mut retry_sources: FxHashMap<RetryTaskKey, IncrementalRetrySource> = FxHashMap::default();
 
     for (asset, pass_index) in &downloadable_assets {
         #[allow(
@@ -5720,6 +5813,16 @@ async fn download_photos_incremental_collecting(
                 "Malformed CloudKit resource prevented incremental download planning"
             );
             continue;
+        }
+
+        for task in &plan.tasks {
+            retry_sources.insert(
+                RetryTaskKey::from(task),
+                IncrementalRetrySource {
+                    asset_record_name: asset.asset_record_name_arc(),
+                    pass_index: *pass_index,
+                },
+            );
         }
 
         // Upsert state records so mark_downloaded/mark_failed can find them.
@@ -5858,10 +5961,94 @@ async fn download_photos_incremental_collecting(
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
     };
-    let pass_result = run_download_pass(pass_config, tasks).await;
+    let planned_tasks = tasks.clone();
+    let mut pass_result = run_download_pass(pass_config, tasks).await;
+
+    if pass_result.url_expired_abort
+        && pass_result.auth_errors < AUTH_ERROR_THRESHOLD
+        && !shutdown_token.is_cancelled()
+    {
+        let downloaded_keys: FxHashSet<RetryTaskKey> = pass_result
+            .downloaded_tasks
+            .iter()
+            .map(RetryTaskKey::from)
+            .collect();
+        let expired_retry_candidates: Vec<DownloadTask> = planned_tasks
+            .iter()
+            .filter(|task| !downloaded_keys.contains(&RetryTaskKey::from(*task)))
+            .cloned()
+            .collect();
+        let retry_tasks = match build_incremental_expired_url_retry_tasks(
+            passes,
+            &pass_configs,
+            &retry_sources,
+            &expired_retry_candidates,
+            zone_sync_token,
+            shutdown_token.clone(),
+        )
+        .await
+        {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not refresh expired incremental download URLs; leaving failures for replay"
+                );
+                Vec::new()
+            }
+        };
+        if !retry_tasks.is_empty() {
+            let retry_task_count = retry_tasks.len();
+            tracing::info!(
+                count = retry_task_count,
+                "Refreshing expired incremental download URLs and retrying failed tasks"
+            );
+            let refreshed_keys: FxHashSet<RetryTaskKey> =
+                retry_tasks.iter().map(RetryTaskKey::from).collect();
+            let retry_pass_config = PassConfig {
+                client: download_client,
+                retry_config: &config.retry,
+                metadata: MetadataFlags::from(config.as_ref()),
+                concurrency: config.concurrent_downloads,
+                reporting: controls.reporting,
+                temp_suffix: Arc::clone(&config.temp_suffix),
+                shutdown_token: shutdown_token.clone(),
+                state_db: config.state_db.clone(),
+                rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bandwidth_limiter: config.bandwidth_limiter.clone(),
+                library: Arc::clone(&config.library),
+            };
+            let retry_result = run_download_pass(retry_pass_config, retry_tasks).await;
+
+            let mut still_failed: Vec<DownloadTask> = expired_retry_candidates
+                .into_iter()
+                .filter(|task| !refreshed_keys.contains(&RetryTaskKey::from(task)))
+                .collect();
+            let unrefreshed_expired_failures = still_failed.len();
+            still_failed.extend(retry_result.failed);
+            pass_result.failed = still_failed;
+            pass_result.downloaded += retry_result.downloaded;
+            pass_result
+                .downloaded_tasks
+                .extend(retry_result.downloaded_tasks);
+            pass_result.auth_errors += retry_result.auth_errors;
+            pass_result.exif_failures += retry_result.exif_failures;
+            pass_result.state_write_failures += retry_result.state_write_failures;
+            pass_result.bytes_downloaded += retry_result.bytes_downloaded;
+            pass_result.disk_bytes_written += retry_result.disk_bytes_written;
+            pass_result.rate_limit_observations += retry_result.rate_limit_observations;
+            pass_result.photos_downloaded += retry_result.photos_downloaded;
+            pass_result.videos_downloaded += retry_result.videos_downloaded;
+            pass_result.recap.merge(retry_result.recap);
+            pass_result.url_expired_abort =
+                retry_result.url_expired_abort || unrefreshed_expired_failures > 0;
+        } else if !expired_retry_candidates.is_empty() {
+            pass_result.failed = expired_retry_candidates;
+        }
+    }
 
     let failed = pass_result.failed.len();
-    let succeeded = task_count - failed;
+    let succeeded = pass_result.downloaded;
 
     // Log failed downloads before the summary
     if failed > 0 {
@@ -10297,6 +10484,122 @@ mod tests {
             0,
             "membership-backed incremental routing must not enumerate albums before planning downloads"
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired-url-1.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/expired-url-2.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/fresh-url-1.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fresh-url-2.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let stale_url_1 = format!("{}/expired-url-1.jpg", server.uri());
+        let stale_url_2 = format!("{}/expired-url-2.jpg", server.uri());
+        let fresh_url_1 = format!("{}/fresh-url-1.jpg", server.uri());
+        let fresh_url_2 = format!("{}/fresh-url-2.jpg", server.uri());
+        let mut stale_records =
+            incremental_photo_records_with_url("URL_AGED_ONE", "url-aged-1.jpg", &stale_url_1, 8);
+        stale_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(checksum.clone());
+        let mut second_stale =
+            incremental_photo_records_with_url("URL_AGED_TWO", "url-aged-2.jpg", &stale_url_2, 8);
+        second_stale[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(checksum.clone());
+        stale_records.extend(second_stale);
+
+        let mut fresh_records =
+            incremental_photo_records_with_url("URL_AGED_ONE", "url-aged-1.jpg", &fresh_url_1, 8);
+        fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(checksum.clone());
+        let mut second_fresh =
+            incremental_photo_records_with_url("URL_AGED_TWO", "url-aged-2.jpg", &fresh_url_2, 8);
+        second_fresh[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        fresh_records.extend(second_fresh);
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let album_session = MockPhotosFlow::new()
+            .changes_zone_page(stale_records, "zone-token-next", false)
+            .build();
+        let unfiled_session = MockPhotosFlow::new()
+            .changes_zone_page(fresh_records, "fresh-retry-token", false)
+            .build();
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: mock_album_with_container("Vacation", "container-vacation", album_session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: mock_album("", unfiled_session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("expired incremental URLs should be refreshed and retried");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 2);
+        assert_eq!(result.stats.failed, 0);
+        assert!(
+            !result.stats.interrupted,
+            "a recovered expired URL should not leave the cycle interrupted"
+        );
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 2);
+        assert_eq!(summary.failed, 0);
     }
 
     #[tokio::test]

@@ -765,6 +765,8 @@ impl std::fmt::Debug for PassConfig<'_> {
 /// Result of a download pass.
 #[derive(Debug)]
 pub(super) struct PassResult {
+    pub(super) downloaded: usize,
+    pub(super) downloaded_tasks: Vec<DownloadTask>,
     pub(super) exif_failures: usize,
     pub(super) failed: Vec<DownloadTask>,
     pub(super) auth_errors: usize,
@@ -2372,7 +2374,6 @@ pub(super) async fn build_download_outcome(
         "  Re-fetched failed tasks with fresh URLs"
     );
 
-    let phase2_task_count = fresh_tasks.len();
     let phase2_rate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pass_config = PassConfig {
         client: download_client,
@@ -2389,6 +2390,7 @@ pub(super) async fn build_download_outcome(
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
+    let phase2_downloaded = pass_result.downloaded;
     let remaining_failed = pass_result.failed;
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
@@ -2431,8 +2433,7 @@ pub(super) async fn build_download_outcome(
     }
 
     let failed = remaining_failed.len();
-    let phase2_succeeded = phase2_task_count - failed;
-    let succeeded = downloaded + phase2_succeeded;
+    let succeeded = downloaded + phase2_downloaded;
 
     // Log failed downloads before the summary. `retry_exhausted` is asset
     // rows the producer skipped because they already exceeded max attempts
@@ -2551,6 +2552,8 @@ pub(super) async fn run_download_pass(
         .buffer_unordered(concurrency);
 
     let mut failed: Vec<DownloadTask> = Vec::new();
+    let mut downloaded = 0usize;
+    let mut downloaded_tasks: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
     let mut exif_failures = 0usize;
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
@@ -2573,6 +2576,8 @@ pub(super) async fn run_download_pass(
     while let Some((task, result)) = download_stream.next().await {
         match &result {
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
+                downloaded += 1;
+                downloaded_tasks.push(task.clone());
                 bytes_downloaded_total += bytes_dl;
                 cleanup_bytes_counter.fetch_add(*bytes_dl, std::sync::atomic::Ordering::Relaxed);
                 disk_bytes_total += disk_bytes;
@@ -2697,6 +2702,8 @@ pub(super) async fn run_download_pass(
 
     pb.finish_and_clear();
     PassResult {
+        downloaded,
+        downloaded_tasks,
         exif_failures,
         failed,
         auth_errors,
