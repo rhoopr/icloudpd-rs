@@ -7022,6 +7022,50 @@ mod tests {
         album_with_session_and_container("PrimarySync", name, Some(container_id), Box::new(session))
     }
 
+    #[derive(Clone, Debug)]
+    struct SharedChangesZoneSession {
+        responses: Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
+    }
+
+    impl SharedChangesZoneSession {
+        fn new(responses: Vec<Value>) -> Self {
+            Self {
+                responses: Arc::new(std::sync::Mutex::new(responses.into())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for SharedChangesZoneSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            self.responses
+                .lock()
+                .expect("poisoned")
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("unexpected extra changes/zone call"))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn changes_zone_response(records: Vec<Value>, sync_token: &str) -> Value {
+        json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "syncToken": sync_token,
+                "moreComing": false,
+                "records": records,
+            }]
+        })
+    }
+
     fn album_with_session(zone: &str, name: &str, session: Box<dyn PhotosSession>) -> PhotoAlbum {
         album_with_session_and_container(zone, name, None, session)
     }
@@ -10551,21 +10595,24 @@ mod tests {
 
         let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
         seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
-        let album_session = MockPhotosFlow::new()
-            .changes_zone_page(stale_records, "zone-token-next", false)
-            .build();
-        let unfiled_session = MockPhotosFlow::new()
-            .changes_zone_page(fresh_records, "fresh-retry-token", false)
-            .build();
+        let album_session = SharedChangesZoneSession::new(vec![
+            changes_zone_response(stale_records, "zone-token-next"),
+            changes_zone_response(fresh_records, "zone-token-next"),
+        ]);
         let passes = vec![
             AlbumPass {
                 kind: PassKind::Album,
-                album: mock_album_with_container("Vacation", "container-vacation", album_session),
+                album: album_with_session_and_container(
+                    "PrimarySync",
+                    "Vacation",
+                    Some("container-vacation"),
+                    Box::new(album_session),
+                ),
                 exclude_ids: Arc::new(FxHashSet::default()),
             },
             AlbumPass {
                 kind: PassKind::Unfiled,
-                album: mock_album("", unfiled_session),
+                album: mock_album("", MockPhotosFlow::new().build()),
                 exclude_ids: Arc::new(FxHashSet::default()),
             },
         ];
