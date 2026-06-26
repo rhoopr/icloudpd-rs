@@ -2656,6 +2656,22 @@ impl From<&DownloadTask> for RetryTaskKey {
     }
 }
 
+fn retry_hydrator_pass_index(
+    passes: &[crate::commands::AlbumPass],
+    pass_indices: &FxHashSet<usize>,
+) -> Option<usize> {
+    pass_indices
+        .iter()
+        .copied()
+        .filter(|pass_index| {
+            passes
+                .get(*pass_index)
+                .is_some_and(|pass| pass.kind != crate::commands::PassKind::Unfiled)
+        })
+        .min()
+        .or_else(|| (!passes.is_empty()).then_some(0))
+}
+
 fn take_matching_pending_retry_tasks<I>(
     tasks: I,
     pending_targets: &mut FxHashSet<PendingRetryTarget>,
@@ -2927,7 +2943,7 @@ async fn build_incremental_expired_url_retry_tasks(
     {
         let mut missing_by_hydrator: FxHashMap<usize, FxHashSet<String>> = FxHashMap::default();
         for (asset_record_name, pass_indices) in &pass_indices_by_asset {
-            let Some(pass_index) = pass_indices.iter().next().copied() else {
+            let Some(pass_index) = retry_hydrator_pass_index(passes, pass_indices) else {
                 continue;
             };
             missing_by_hydrator
