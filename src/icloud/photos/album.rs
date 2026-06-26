@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -230,11 +231,15 @@ fn build_enumeration_plan(
     } else {
         1
     };
+    let range_limit_source = match (limit, total_count) {
+        (Some(lim), Some(total_count)) if u64::from(lim) >= total_count => None,
+        _ => limit,
+    };
     let initial_boundary_probe = profile.allow_initial_boundary_probe()
         && concurrency > 1
         && total >= page_size as u64
         && page_size > 1
-        && limit.is_some();
+        && range_limit_source.is_some();
     let chunk_size_items = {
         let raw = total.div_ceil(num_fetchers as u64);
         let ps = page_size as u64;
@@ -256,13 +261,18 @@ fn build_enumeration_plan(
                 end: boundary_end,
                 limit: Some(1),
             });
-            push_fetcher_range(&mut ranges, limit, start, end.min(boundary_start));
-            push_fetcher_range(&mut ranges, limit, boundary_end, end);
+            push_fetcher_range(
+                &mut ranges,
+                range_limit_source,
+                start,
+                end.min(boundary_start),
+            );
+            push_fetcher_range(&mut ranges, range_limit_source, boundary_end, end);
             continue;
         } else if initial_boundary_probe && i > 0 {
             start = start.max(page_size as u64);
         }
-        push_fetcher_range(&mut ranges, limit, start, end);
+        push_fetcher_range(&mut ranges, range_limit_source, start, end);
     }
 
     EnumerationPlan { page_size, ranges }
@@ -302,6 +312,35 @@ fn unanimous_fetcher_sync_token(album: &str, tokens: &[String]) -> Option<String
          blocking sync token advancement"
     );
     None
+}
+
+#[derive(Debug, Default)]
+struct FetcherSyncTokenCapture {
+    tokens: tokio::sync::Mutex<Vec<String>>,
+    suppressed: AtomicBool,
+}
+
+impl FetcherSyncTokenCapture {
+    async fn push(&self, token: String) {
+        self.tokens.lock().await.push(token);
+    }
+
+    fn suppress(&self) {
+        self.suppressed.store(true, Ordering::Relaxed);
+    }
+
+    async fn resolve(&self, album: &str) -> Option<String> {
+        if self.suppressed.load(Ordering::Relaxed) {
+            tracing::debug!(
+                album,
+                "Full enumeration stopped at the caller's limit; syncToken is not a complete-zone checkpoint"
+            );
+            return None;
+        }
+
+        let tokens = self.tokens.lock().await;
+        unanimous_fetcher_sync_token(album, &tokens)
+    }
 }
 
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
@@ -715,8 +754,7 @@ impl PhotoAlbum {
         }
 
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-        let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let fetcher_sync_tokens = Arc::new(FetcherSyncTokenCapture::default());
 
         let (stream, handles) = self.photo_stream_inner(
             limit,
@@ -740,8 +778,7 @@ impl PhotoAlbum {
             let final_token = if fetcher_panicked {
                 None
             } else {
-                let tokens = fetcher_sync_tokens.lock().await;
-                unanimous_fetcher_sync_token(&album_name, &tokens)
+                fetcher_sync_tokens.resolve(&album_name).await
             };
             let _ = token_tx.send(final_token);
         });
@@ -900,8 +937,7 @@ impl PhotoAlbum {
         treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-        let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let fetcher_sync_tokens = Arc::new(FetcherSyncTokenCapture::default());
 
         let (stream, handles) = self.photo_stream_inner(
             limit,
@@ -918,8 +954,7 @@ impl PhotoAlbum {
             let final_token = if fetcher_panicked {
                 None
             } else {
-                let tokens = fetcher_sync_tokens.lock().await;
-                unanimous_fetcher_sync_token(&album_name, &tokens)
+                fetcher_sync_tokens.resolve(&album_name).await
             };
             let _ = token_tx.send(final_token);
         });
@@ -1225,7 +1260,7 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
-        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        fetcher_sync_tokens: Option<Arc<FetcherSyncTokenCapture>>,
         preserve_blank_sync_tokens_for_diagnostics: bool,
         treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
@@ -1282,7 +1317,7 @@ impl PhotoAlbum {
         start_offset: u64,
         end_offset: u64,
         limit: Option<u32>,
-        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        fetcher_sync_tokens: Option<Arc<FetcherSyncTokenCapture>>,
         behavior: FetcherBehavior,
     ) -> JoinHandle<()> {
         let session = self.session.clone_box();
@@ -1603,6 +1638,10 @@ impl PhotoAlbum {
                 }
             }
 
+            if limit.is_some_and(|n| total_sent >= u64::from(n)) {
+                stopped_for_limit = true;
+            }
+
             // Surface any remaining unpaired records that couldn't be paired.
             // A full query stream cannot safely advance a sync token if it saw
             // only one half of a CPLMaster/CPLAsset pair.
@@ -1634,12 +1673,14 @@ impl PhotoAlbum {
 
             if !enumeration_incomplete {
                 if let Some(shared) = &fetcher_sync_tokens {
-                    if let Some(token) = last_sync_token {
-                        shared.lock().await.push(token);
+                    if stopped_for_limit {
+                        shared.suppress();
+                    } else if let Some(token) = last_sync_token {
+                        shared.push(token).await;
                     } else if saw_blank_sync_token
                         && behavior.preserve_blank_sync_tokens_for_diagnostics
                     {
-                        shared.lock().await.push(String::new());
+                        shared.push(String::new()).await;
                     }
                 }
             }
@@ -3179,8 +3220,9 @@ mod tests {
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].id(), "master-owner");
         assert_eq!(
-            token_rx.await.expect("sync token sender").as_deref(),
-            Some("owner-token")
+            token_rx.await.expect("sync token sender"),
+            None,
+            "recent-limited streams stop before the full owner-zone checkpoint"
         );
         assert_eq!(
             owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3268,8 +3310,9 @@ mod tests {
         assert_eq!(ids.first().map(String::as_str), Some("master-0000"));
         assert_eq!(ids.last().map(String::as_str), Some("master-0099"));
         assert_eq!(
-            token_rx.await.expect("sync token sender").as_deref(),
-            Some("zone-token")
+            token_rx.await.expect("sync token sender"),
+            None,
+            "unknown-total recent streams stop at the caller's cap, not a confirmed EOF"
         );
         assert_eq!(
             session.offsets().as_slice(),

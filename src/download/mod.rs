@@ -2481,6 +2481,7 @@ fn filter_stream_to_enumeration_bounds(
     stream: DownloadPhotoStream,
     config: &DownloadConfig,
     frontier: Option<&RecentFrontier>,
+    bounds_truncated: Arc<AtomicBool>,
 ) -> DownloadPhotoStream {
     let asset_ids = frontier.map(|frontier| Arc::clone(&frontier.asset_ids));
     let lower_created_bound = stream_created_lower_bound(config, frontier);
@@ -2488,9 +2489,15 @@ fn filter_stream_to_enumeration_bounds(
         stream
             .take_while(move |item| {
                 std::future::ready(match item {
-                    Ok(asset) => lower_created_bound
-                        .map(|boundary| asset.created() >= boundary)
-                        .unwrap_or(true),
+                    Ok(asset) => {
+                        let in_bounds = lower_created_bound
+                            .map(|boundary| asset.created() >= boundary)
+                            .unwrap_or(true);
+                        if !in_bounds {
+                            bounds_truncated.store(true, Ordering::Relaxed);
+                        }
+                        in_bounds
+                    }
                     Err(_) => true,
                 })
             })
@@ -3479,7 +3486,7 @@ async fn backfill_asset_master_mappings_from_album_history(db: &dyn DownloadStor
     }
 }
 
-fn clear_zone_token_block_from_targeted_backfill_stats(stats: &mut SyncStats) {
+fn clear_full_query_token_block_stats(stats: &mut SyncStats) {
     stats.sync_token_blocked = false;
     stats.sync_token_blocked_reason = None;
     stats.sync_token_blocked_source = None;
@@ -3587,7 +3594,7 @@ async fn download_photos_incremental_with_targeted_album_backfill(
     // Full album queries may report their own query sync-token telemetry, but
     // targeted backfill does not use that token. The zone token may advance
     // only after the following /changes/zone pass completes safely.
-    clear_zone_token_block_from_targeted_backfill_stats(&mut combined_stats);
+    clear_full_query_token_block_stats(&mut combined_stats);
 
     let incremental_result = if passes
         .iter()
@@ -3677,7 +3684,7 @@ async fn download_photos_incremental_with_smart_folder_refresh(
             Arc::clone(config)
         };
 
-    let smart_folder_result = download_photos_full_with_token(
+    let mut smart_folder_result = download_photos_full_with_token(
         download_client,
         &smart_folder_passes,
         &smart_folder_config,
@@ -3689,8 +3696,16 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     let smart_folder_refresh_failed =
         !matches!(smart_folder_result.outcome, DownloadOutcome::Success)
             || smart_folder_result.stats.interrupted
-            || smart_folder_result.stats.enumeration_errors > 0
-            || smart_folder_result.stats.sync_token_blocked;
+            || smart_folder_result.stats.enumeration_errors > 0;
+    if !smart_folder_refresh_failed {
+        // The token that matters for this mixed incremental cycle is the
+        // `/changes/zone` token captured below. A selected smart-folder
+        // records/query refresh can complete cleanly while still lacking a
+        // full-enumeration query token, especially under bounded modes. Keep
+        // refresh failures conservative, but do not let query-token telemetry
+        // veto the safe incremental zone checkpoint.
+        clear_full_query_token_block_stats(&mut smart_folder_result.stats);
+    }
 
     let SyncResult {
         outcome: incremental_outcome,
@@ -4420,6 +4435,7 @@ async fn download_photos_full_with_token(
     let deferred_unfiled = deferred_unfiled_index(passes);
     let recent_frontier =
         build_recent_frontier(passes, config, controls, shutdown_token.clone()).await?;
+    let bounds_truncated = Arc::new(AtomicBool::new(false));
     let strict_empty_tail_errors = config.recent.is_none()
         && config.skip_created_before.is_none()
         && !controls.run_mode.only_print_filenames()
@@ -4494,6 +4510,7 @@ async fn download_photos_full_with_token(
             let deferred_ids = deferred_ids.clone();
             let recent_frontier = recent_frontier.as_ref();
             let download_ctx = shared_download_ctx.clone();
+            let bounds_truncated = Arc::clone(&bounds_truncated);
             async move {
                 let album_snapshot = if record_album_snapshots {
                     AlbumSnapshotRecorder::start_for_pass(
@@ -4514,7 +4531,12 @@ async fn download_photos_full_with_token(
                     controls,
                     strict_empty_tail_errors,
                 );
-                let stream = filter_stream_to_enumeration_bounds(stream, config, recent_frontier);
+                let stream = filter_stream_to_enumeration_bounds(
+                    stream,
+                    config,
+                    recent_frontier,
+                    Arc::clone(&bounds_truncated),
+                );
 
                 if pass.kind == crate::commands::PassKind::Album {
                     if let Some(deferred_ids) = deferred_ids {
@@ -4631,6 +4653,7 @@ async fn download_photos_full_with_token(
                         stream,
                         config,
                         recent_frontier.as_ref(),
+                        Arc::clone(&bounds_truncated),
                     );
                     let stream =
                         track_deferred_unfiled_heartbeat(stream, library, stream_total_count)
@@ -4702,7 +4725,12 @@ async fn download_photos_full_with_token(
                     strict_empty_tail_errors,
                 );
                 token_receivers.push(token_rx);
-                filter_stream_to_enumeration_bounds(stream, config, recent_frontier.as_ref())
+                filter_stream_to_enumeration_bounds(
+                    stream,
+                    config,
+                    recent_frontier.as_ref(),
+                    Arc::clone(&bounds_truncated),
+                )
             })
             .collect();
 
@@ -4800,13 +4828,13 @@ async fn download_photos_full_with_token(
     // observe one coherent snapshot.
     // Don't advance the token for read-only operations or when the producer
     // stream was incomplete (would permanently skip missed assets).
-    // Do not persist a full-enumeration zone token for count-recent or
-    // skip-created-before runs. Those runs intentionally stop before the full
-    // pass is drained, so advancing the token would make older, unenumerated
-    // assets invisible to later incremental syncs.
-    let token_eligible = config.recent.is_none()
-        && config.skip_created_before.is_none()
-        && !controls.run_mode.only_print_filenames()
+    // Bounded runs are eligible to report a token only when the producer can
+    // prove the bound did not actually truncate the stream. A count-limited
+    // stream suppresses its token when it hits the cap, and lower-date-bound /
+    // global-recent filtering marks `bounds_truncated` when it stops before
+    // natural EOF.
+    let token_eligible = !controls.run_mode.only_print_filenames()
+        && !controls.run_mode.is_dry_run()
         && streaming_result.enumeration_complete
         && streaming_result.enumeration_errors == 0;
     let mut token_block_reason: Option<&'static str> = None;
@@ -4914,6 +4942,18 @@ async fn download_photos_full_with_token(
         stats.sync_token_receivers_dropped = token_receivers_dropped;
         stats.sync_token_unique_values = token_unique_values;
     }
+    let bounded_run = config.recent.is_some() || config.skip_created_before.is_some();
+    let bounded_limit_truncated = bounded_run
+        && (bounds_truncated.load(Ordering::Relaxed)
+            || (token_eligible
+                && sync_token.is_none()
+                && matches!(
+                    token_block_reason,
+                    Some("icloud_sync_token_missing")
+                        | Some("kei_internal_token_receiver_dropped")
+                        | Some("sync_token_unavailable")
+                        | None
+                )));
     if count_lookup_failed && token_eligible && sync_token.is_some() {
         if !stats.sync_token_blocked {
             tracing::warn!(
@@ -4922,8 +4962,9 @@ async fn download_photos_full_with_token(
                  sync token; recording diagnostic and allowing token advancement"
             );
         }
-    } else if (config.recent.is_some() || config.skip_created_before.is_some())
+    } else if bounded_limit_truncated
         && !controls.run_mode.only_print_filenames()
+        && !controls.run_mode.is_dry_run()
         && enumeration_errors == 0
     {
         let bounded_reason = if config.recent.is_some() {
@@ -9704,6 +9745,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smart_folder_refresh_blank_query_token_does_not_block_incremental_zone_token() {
+        let changes_calls = Arc::new(AtomicUsize::new(0));
+        let smart_session = CountingQuerySession::new(
+            json!({
+                "records": [],
+                "syncToken": ""
+            }),
+            0,
+        );
+        let passes = smart_folder_unfiled_passes(
+            Arc::clone(&changes_calls),
+            Vec::new(),
+            smart_session.clone(),
+        );
+        let dir = TempDir::new().expect("temp dir");
+        let config = incremental_test_config(&dir);
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("incremental sync plus smart-folder refresh should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            changes_calls.load(Ordering::SeqCst),
+            1,
+            "unfiled incremental changes should still be checked"
+        );
+        assert_eq!(smart_session.records_query_count(), 1);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(
+            !result.stats.sync_token_blocked,
+            "blank smart-folder query token is telemetry for the refresh, not a reason to block the incremental zone token"
+        );
+    }
+
+    #[tokio::test]
     async fn smart_folder_incremental_recent_global_does_not_build_library_frontier() {
         let changes_calls = Arc::new(AtomicUsize::new(0));
         let smart_session = CountingQuerySession::new(
@@ -13132,6 +13215,11 @@ mod tests {
             "single album enumeration should stop at the frontier boundary"
         );
         assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(RECENT_LIMITED_FULL_ENUMERATION_REASON)
+        );
     }
 
     #[tokio::test]
@@ -13192,6 +13280,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_sync_skip_created_before_saves_token_when_boundary_does_not_truncate() {
+        let newer_assets = recent_scope_assets("date-newer-only", 5, 1_700_000_000_000);
+        let session = RecentScopeSession::new(newer_assets.clone(), newer_assets.clone());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: recent_scope_album("Vacation", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.skip_created_before =
+            Some(DateTime::from_timestamp_millis(1_699_000_000_000).expect("valid test timestamp"));
+        for asset in newer_assets.iter().map(recent_scope_photo_asset) {
+            seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("non-truncating date-bounded full sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.assets_seen, 5);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
+        assert!(!result.stats.sync_token_blocked);
+    }
+
+    #[tokio::test]
     async fn full_sync_skip_created_after_drains_past_newer_prefix() {
         let newer_assets = recent_scope_assets("date-after-new", 5, 1_700_000_000_000);
         let older_assets = recent_scope_assets("date-after-old", 5, 1_699_000_000_000);
@@ -13241,7 +13366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_sync_recent_download_suppresses_token_without_shortfall() {
+    async fn full_sync_recent_download_saves_token_when_cap_does_not_bind() {
         let records = mock_photo_records_with_filename("MASTER_RECENT", "recent.jpg");
         let album_session = MockPhotosFlow::new()
             .query_page(records.clone(), Some("zone-token"))
@@ -13297,22 +13422,12 @@ mod tests {
             "recent-limited runs must not seed comparable inventory totals"
         );
         assert_eq!(
-            result.sync_token, None,
-            "recent-limited full sync must not advance a zone token"
+            result.sync_token.as_deref(),
+            Some("zone-token"),
+            "non-binding recent cap should still produce a complete-zone token"
         );
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(RECENT_LIMITED_FULL_ENUMERATION_REASON)
-        );
-        assert_eq!(result.stats.sync_token_blocked_source, Some("kei"));
-        assert_eq!(
-            result.stats.sync_token_blocked_explanation,
-            Some(sync_token_blocked_explanation(
-                RECENT_LIMITED_FULL_ENUMERATION_REASON
-            ))
-        );
-        assert_eq!(result.stats.sync_token_expected_receivers, None);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_expected_receivers, Some(1));
     }
 
     #[tokio::test]
@@ -13349,9 +13464,11 @@ mod tests {
         assert_eq!(result.stats.assets_seen, 100);
         assert_eq!(result.stats.enumeration_errors, 0);
         assert_eq!(
-            result.sync_token, None,
-            "recent-limited full sync must not advance a zone token"
+            result.sync_token.as_deref(),
+            Some("zone-token"),
+            "a recent run that still drains the selected stream to EOF should advance the zone token"
         );
+        assert!(!result.stats.sync_token_blocked);
         assert!(
             session.offsets().len() >= 5,
             "write-mode full sync should drain every reduced download page"
@@ -13423,7 +13540,11 @@ mod tests {
         assert_eq!(download_result.stats.assets_seen, ids.len() as u64);
         assert_eq!(print_result.sync_token, None);
         assert_eq!(dry_result.sync_token, None);
-        assert_eq!(download_result.sync_token, None);
+        assert_eq!(
+            download_result.sync_token.as_deref(),
+            Some("zone-token"),
+            "download mode may advance when the recent cap is exactly the selected stream"
+        );
     }
 
     #[tokio::test]
@@ -13490,7 +13611,11 @@ mod tests {
             "40 album assets plus 20 non-album unfiled assets should be counted"
         );
         assert_eq!(result.stats.enumeration_errors, 0);
-        assert_eq!(result.sync_token, None);
+        assert_eq!(
+            result.sync_token.as_deref(),
+            Some("zone-token"),
+            "recent deferred-unfiled sync may advance when the global frontier does not truncate"
+        );
         assert_eq!(
             unfiled_session.emitted_ids().len(),
             120,
@@ -13531,7 +13656,11 @@ mod tests {
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.stats.assets_seen, 60);
         assert_eq!(result.stats.enumeration_errors, 0);
-        assert_eq!(result.sync_token, None);
+        assert_eq!(
+            result.sync_token.as_deref(),
+            Some("zone-token"),
+            "smart-folder recent sync may advance when the cap does not truncate"
+        );
         assert!(
             session.offsets().len() >= 3,
             "smart-folder recent sync should drain every reduced page"
