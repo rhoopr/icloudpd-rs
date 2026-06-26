@@ -10794,6 +10794,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
+        config.recent = Some(10);
         config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
@@ -10961,7 +10962,6 @@ mod tests {
         let album_session = SharedChangesZoneSession::new(vec![
             changes_zone_response(relation_records(), "zone-token-next"),
             changes_zone_response(stale_records, "zone-token-next"),
-            changes_zone_response(relation_records(), "zone-token-next"),
             changes_zone_response(fresh_records, "zone-token-next"),
         ]);
         let passes = vec![AlbumPass {
