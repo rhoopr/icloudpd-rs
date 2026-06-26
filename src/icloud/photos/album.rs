@@ -131,6 +131,7 @@ struct FetcherRange {
     start: u64,
     end: u64,
     limit: Option<u32>,
+    suppress_token_on_limit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,7 +197,13 @@ fn range_limit(limit: Option<u32>, start: u64, end: u64) -> Option<u32> {
     })
 }
 
-fn push_fetcher_range(ranges: &mut Vec<FetcherRange>, limit: Option<u32>, start: u64, end: u64) {
+fn push_fetcher_range(
+    ranges: &mut Vec<FetcherRange>,
+    limit: Option<u32>,
+    start: u64,
+    end: u64,
+    suppress_token_on_limit: bool,
+) {
     if start >= end {
         return;
     }
@@ -204,6 +211,7 @@ fn push_fetcher_range(ranges: &mut Vec<FetcherRange>, limit: Option<u32>, start:
         start,
         end,
         limit: range_limit(limit, start, end),
+        suppress_token_on_limit,
     });
 }
 
@@ -221,6 +229,7 @@ fn build_enumeration_plan(
                 start: 0,
                 end: u64::MAX,
                 limit,
+                suppress_token_on_limit: limit.is_some(),
             }],
         };
     };
@@ -231,15 +240,16 @@ fn build_enumeration_plan(
     } else {
         1
     };
-    let range_limit_source = match (limit, total_count) {
-        (Some(lim), Some(total_count)) if u64::from(lim) >= total_count => None,
-        _ => limit,
+    let suppress_token_on_limit = match (limit, total_count) {
+        (Some(lim), Some(total_count)) => u64::from(lim) < total_count,
+        (Some(_), None) => true,
+        (None, _) => false,
     };
     let initial_boundary_probe = profile.allow_initial_boundary_probe()
         && concurrency > 1
         && total >= page_size as u64
         && page_size > 1
-        && range_limit_source.is_some();
+        && limit.is_some();
     let chunk_size_items = {
         let raw = total.div_ceil(num_fetchers as u64);
         let ps = page_size as u64;
@@ -260,19 +270,27 @@ fn build_enumeration_plan(
                 start: boundary_start,
                 end: boundary_end,
                 limit: Some(1),
+                suppress_token_on_limit,
             });
             push_fetcher_range(
                 &mut ranges,
-                range_limit_source,
+                limit,
                 start,
                 end.min(boundary_start),
+                suppress_token_on_limit,
             );
-            push_fetcher_range(&mut ranges, range_limit_source, boundary_end, end);
+            push_fetcher_range(
+                &mut ranges,
+                limit,
+                boundary_end,
+                end,
+                suppress_token_on_limit,
+            );
             continue;
         } else if initial_boundary_probe && i > 0 {
             start = start.max(page_size as u64);
         }
-        push_fetcher_range(&mut ranges, range_limit_source, start, end);
+        push_fetcher_range(&mut ranges, limit, start, end, suppress_token_on_limit);
     }
 
     EnumerationPlan { page_size, ranges }
@@ -1287,6 +1305,7 @@ impl PhotoAlbum {
                 range.start,
                 range.end,
                 range.limit,
+                range.suppress_token_on_limit,
                 fetcher_sync_tokens.clone(),
                 behavior,
             ));
@@ -1317,6 +1336,7 @@ impl PhotoAlbum {
         start_offset: u64,
         end_offset: u64,
         limit: Option<u32>,
+        suppress_token_on_limit: bool,
         fetcher_sync_tokens: Option<Arc<FetcherSyncTokenCapture>>,
         behavior: FetcherBehavior,
     ) -> JoinHandle<()> {
@@ -1503,7 +1523,7 @@ impl PhotoAlbum {
                 }
 
                 if limit_reached {
-                    stopped_for_limit = true;
+                    stopped_for_limit = suppress_token_on_limit;
                     break;
                 }
 
@@ -1574,7 +1594,7 @@ impl PhotoAlbum {
                 );
 
                 if limit_reached {
-                    stopped_for_limit = true;
+                    stopped_for_limit = suppress_token_on_limit;
                     break;
                 }
 
@@ -1621,7 +1641,7 @@ impl PhotoAlbum {
                     }
                 }
                 if limit_reached {
-                    stopped_for_limit = true;
+                    stopped_for_limit = suppress_token_on_limit;
                     break;
                 }
                 let pending_record_count =
@@ -1638,7 +1658,7 @@ impl PhotoAlbum {
                 }
             }
 
-            if limit.is_some_and(|n| total_sent >= u64::from(n)) {
+            if suppress_token_on_limit && limit.is_some_and(|n| total_sent >= u64::from(n)) {
                 stopped_for_limit = true;
             }
 
@@ -2080,6 +2100,7 @@ mod tests {
                 start: 0,
                 end: 1000,
                 limit: Some(1000),
+                suppress_token_on_limit: true,
             }]
         );
         assert!(
@@ -2123,6 +2144,7 @@ mod tests {
                 start: 0,
                 end: 100,
                 limit: Some(100),
+                suppress_token_on_limit: false,
             }]
         );
     }
