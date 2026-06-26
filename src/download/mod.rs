@@ -2947,6 +2947,74 @@ async fn build_incremental_expired_url_retry_tasks(
         }
     }
 
+    if !pending_keys.is_empty()
+        && !pass_indices_by_asset.is_empty()
+        && !shutdown_token.is_cancelled()
+    {
+        let mut missing_by_hydrator: FxHashMap<usize, FxHashSet<String>> = FxHashMap::default();
+        for (asset_record_name, pass_indices) in &pass_indices_by_asset {
+            let Some(pass_index) = pass_indices.iter().next().copied() else {
+                continue;
+            };
+            missing_by_hydrator
+                .entry(pass_index)
+                .or_default()
+                .insert(asset_record_name.clone());
+        }
+
+        let mut hydrated_asset_record_names = FxHashSet::default();
+        for (pass_index, mut missing) in missing_by_hydrator {
+            missing.retain(|asset_record_name| {
+                !hydrated_asset_record_names.contains(asset_record_name.as_str())
+            });
+            if missing.is_empty() || pending_keys.is_empty() || shutdown_token.is_cancelled() {
+                continue;
+            }
+
+            let Some(pass) = passes.get(pass_index) else {
+                continue;
+            };
+            let assets = match pass
+                .album
+                .hydrate_matching_assets_from_changes(&mut missing)
+                .await
+            {
+                Ok(assets) => assets,
+                Err(e) => {
+                    tracing::warn!(
+                        pass_index,
+                        error = %e,
+                        "Failed to hydrate expired incremental retry assets"
+                    );
+                    continue;
+                }
+            };
+
+            for asset in assets {
+                let asset_record_name = asset.asset_record_name().to_string();
+                hydrated_asset_record_names.insert(asset_record_name.clone());
+                let Some(pass_indices) = pass_indices_by_asset.remove(asset_record_name.as_str())
+                else {
+                    continue;
+                };
+
+                for pass_index in pass_indices {
+                    let Some(pass_config) = pass_configs.get(pass_index) else {
+                        continue;
+                    };
+                    let plan = task_planner.plan_asset(&asset, pass_config).await;
+                    if plan.filter_reason.is_some() {
+                        continue;
+                    }
+                    take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut tasks);
+                    if pending_keys.is_empty() || shutdown_token.is_cancelled() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     if !pending_keys.is_empty() {
         tracing::warn!(
             requested = requested_count,
@@ -10646,6 +10714,100 @@ mod tests {
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.downloaded, 2);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired-hydrated.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/fresh-hydrated.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let stale_url = format!("{}/expired-hydrated.jpg", server.uri());
+        let fresh_url = format!("{}/fresh-hydrated.jpg", server.uri());
+        let mut stale_records =
+            incremental_photo_records_with_url("MASTER_HYDRATED", "hydrated.jpg", &stale_url, 8);
+        stale_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(checksum.clone());
+        let mut fresh_records =
+            incremental_photo_records_with_url("MASTER_HYDRATED", "hydrated.jpg", &fresh_url, 8);
+        fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        let relation_records = || {
+            vec![relation_delta_record(
+                "container-vacation",
+                "asset-MASTER_HYDRATED",
+            )]
+        };
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let album_session = SharedChangesZoneSession::new(vec![
+            changes_zone_response(relation_records(), "zone-token-next"),
+            changes_zone_response(stale_records, "zone-token-next"),
+            changes_zone_response(relation_records(), "zone-token-next"),
+            changes_zone_response(fresh_records, "zone-token-next"),
+        ]);
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session_and_container(
+                "PrimarySync",
+                "Vacation",
+                Some("container-vacation"),
+                Box::new(album_session),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.folder_structure_albums = Arc::from("{album}");
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("relation-only incremental retry should hydrate fresh URLs");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(result.stats.failed, 0);
+        assert!(
+            !result.stats.interrupted,
+            "relation-only expired URL recovery should not leave the cycle interrupted"
+        );
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.failed, 0);
     }
 
