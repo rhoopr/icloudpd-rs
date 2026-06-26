@@ -10794,7 +10794,6 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
-        config.recent = Some(10);
         config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
@@ -10887,6 +10886,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
+        config.recent = Some(10);
         config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
