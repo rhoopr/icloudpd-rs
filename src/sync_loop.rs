@@ -673,8 +673,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // CloudKit session/routing recovery: if init or the first CloudKit query
     // surfaces a session-error signature (401 stale session, or 421 persisting
-    // after a pool reset), strip routing state and force SRP re-auth. A second
-    // failure bails cleanly instead of looping under Docker's restart policy.
+    // after a pool reset), first retry the normal persisted-session auth path
+    // before falling back to forced SRP. A second CloudKit failure bails cleanly
+    // instead of looping under Docker's restart policy.
     let mut pending_auth = Some(auth_result);
     let mut retried_after_session_error = false;
     let (shared_session, mut photos_service, libraries) = loop {
@@ -686,11 +687,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
                 tracing::warn!(
                     error = %e,
-                    "CloudKit init failed with stale-session signature; forcing SRP re-authentication"
+                    "CloudKit init failed with stale-session signature; retrying persisted-session authentication"
                 );
                 retried_after_session_error = true;
-                pending_auth =
-                    Some(reauth_with_srp(&config, &password_provider, &notifier, None).await?);
+                pending_auth = Some(
+                    reauth_after_session_error(&config, &password_provider, &notifier, None)
+                        .await?,
+                );
                 continue;
             }
             Err(e) => return Err(e),
@@ -700,11 +703,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
                 tracing::warn!(
                     error = %e,
-                    "CloudKit returned stale-session signature; forcing SRP re-authentication"
+                    "CloudKit returned stale-session signature; retrying persisted-session authentication"
                 );
                 retried_after_session_error = true;
                 pending_auth = Some(
-                    reauth_with_srp(&config, &password_provider, &notifier, Some((ss, ps))).await?,
+                    reauth_after_session_error(
+                        &config,
+                        &password_provider,
+                        &notifier,
+                        Some((ss, ps)),
+                    )
+                    .await?,
                 );
             }
             Err(e) => return Err(e),
@@ -1450,13 +1459,15 @@ async fn maybe_write_offline_fake_sync_report(
     Ok(true)
 }
 
-/// Re-authenticate via SRP after a session-error signature from CloudKit.
+/// Re-authenticate after a session-error signature from CloudKit.
 ///
-/// Drops any live session + service (releasing the file lock), strips routing
-/// state from the session file so `auth::authenticate` is forced onto SRP,
-/// then runs authentication — handling the 2FA-required case by notifying and
-/// waiting for `kei login submit-code`.
-async fn reauth_with_srp(
+/// Drops any live session + service (releasing the file lock), removes only the
+/// validation cache, then retries normal authentication so `/accountLogin` can
+/// consume persisted session state. If that cannot recover, falls back to the
+/// older forced-SRP path by stripping routing state. 2FA-required errors get one
+/// final persisted-session retry, then notify and wait for
+/// `kei login submit-code`.
+async fn reauth_after_session_error(
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
     notifier: &Notifier,
@@ -1467,11 +1478,64 @@ async fn reauth_with_srp(
         drop(ps);
         drop(ss);
     }
+
+    clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
+    match authenticate_sync_session(config, password_provider).await {
+        Ok(result) => return Ok(result),
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
+            if let Some(result) =
+                retry_persisted_session_after_two_factor(config, password_provider).await
+            {
+                return Ok(result);
+            }
+            return notify_and_wait_for_2fa(config, password_provider, notifier).await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Persisted-session authentication did not recover; forcing SRP re-authentication"
+            );
+        }
+    }
+
     let session_file =
         auth::session_file_path(&config.auth.cookie_directory, &config.auth.username);
     auth::strip_session_routing_state(&session_file).await;
 
-    match auth::authenticate_with_mode(
+    match authenticate_sync_session(config, password_provider).await {
+        Ok(result) => Ok(result),
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
+            if let Some(result) =
+                retry_persisted_session_after_two_factor(config, password_provider).await
+            {
+                return Ok(result);
+            }
+            notify_and_wait_for_2fa(config, password_provider, notifier).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn clear_validation_cache_for_reauth(cookie_dir: &std::path::Path, username: &str) {
+    let cache_path = auth::validation_cache_file_path(cookie_dir, username);
+    match tokio::fs::remove_file(&cache_path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::debug!(
+                path = %cache_path.display(),
+                error = %e,
+                "Could not remove validation cache before session recovery"
+            );
+        }
+    }
+}
+
+async fn authenticate_sync_session(
+    config: &config::Config,
+    password_provider: &crate::password::PasswordProvider,
+) -> anyhow::Result<auth::AuthResult> {
+    auth::authenticate_with_mode(
         &config.auth.cookie_directory,
         &config.auth.username,
         password_provider,
@@ -1482,37 +1546,49 @@ async fn reauth_with_srp(
         config.ui.personality_mode,
     )
     .await
-    {
-        Ok(result) => Ok(result),
-        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
-            let msg = format!(
-                "2FA required for {u}. Run: kei login get-code",
-                u = config.auth.username
+}
+
+async fn retry_persisted_session_after_two_factor(
+    config: &config::Config,
+    password_provider: &crate::password::PasswordProvider,
+) -> Option<auth::AuthResult> {
+    tracing::debug!(
+        "2FA-required auth wrote session state; retrying persisted-session auth once before waiting"
+    );
+    clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
+    match authenticate_sync_session(config, password_provider).await {
+        Ok(result) => Some(result),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "Persisted-session retry after 2FA-required auth did not recover"
             );
-            tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(
-                notifications::Event::TwoFaRequired,
-                &msg,
-                &config.auth.username,
-                None,
-                None,
-            );
-            wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
-                auth::authenticate_with_mode(
-                    &config.auth.cookie_directory,
-                    &config.auth.username,
-                    password_provider,
-                    config.auth.domain.as_str(),
-                    None,
-                    None,
-                    None,
-                    config.ui.personality_mode,
-                )
-            })
-            .await
+            None
         }
-        Err(e) => Err(e),
     }
+}
+
+async fn notify_and_wait_for_2fa(
+    config: &config::Config,
+    password_provider: &crate::password::PasswordProvider,
+    notifier: &Notifier,
+) -> anyhow::Result<auth::AuthResult> {
+    let msg = format!(
+        "2FA required for {u}. Run: kei login get-code",
+        u = config.auth.username
+    );
+    tracing::warn!(message = %msg, "2FA required");
+    notifier.notify(
+        notifications::Event::TwoFaRequired,
+        &msg,
+        &config.auth.username,
+        None,
+        None,
+    );
+    wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
+        authenticate_sync_session(config, password_provider)
+    })
+    .await
 }
 
 /// Walk every `downloaded` row in the state DB and warn when the
@@ -2604,7 +2680,7 @@ mod tests {
         let e: anyhow::Error = crate::icloud::error::ICloudError::MisdirectedRequest.into();
         assert!(
             is_session_error(&e),
-            "persistent 421 must trigger reauth (stale routing state needs fresh SRP)"
+            "persistent 421 must trigger persisted-session auth before forced SRP"
         );
     }
 
@@ -3884,6 +3960,66 @@ mod tests {
         let err: anyhow::Error =
             crate::icloud::error::ICloudError::SessionExpired { status: 401 }.into();
         assert!(should_retry_session_init(&err, false));
+    }
+
+    #[tokio::test]
+    async fn clear_validation_cache_for_reauth_preserves_routing_state() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let username = "reauth@example.com";
+        let session_path = auth::session_file_path(tempdir.path(), username);
+        let session_json = br#"{
+  "session_token": "tok_abc",
+  "trust_token": "trust_xyz",
+  "client_id": "client-1",
+  "ckdatabasews_url": "https://old.example.test"
+}"#;
+        tokio::fs::write(&session_path, session_json)
+            .await
+            .expect("write session metadata");
+        let cache_path = auth::validation_cache_file_path(tempdir.path(), username);
+        tokio::fs::write(&cache_path, br#"{"validated_at":1}"#)
+            .await
+            .expect("write validation cache");
+
+        clear_validation_cache_for_reauth(tempdir.path(), username).await;
+
+        assert!(
+            !cache_path.exists(),
+            "stale validation cache must be removed before retrying auth"
+        );
+        let session_after = tokio::fs::read(&session_path)
+            .await
+            .expect("session metadata should remain readable");
+        assert_eq!(
+            session_after, session_json,
+            "lenient recovery must preserve session_token so accountLogin can run before SRP"
+        );
+    }
+
+    #[test]
+    fn session_error_reauth_tries_persisted_session_before_stripping() {
+        let source = include_str!("sync_loop.rs");
+        let (_, tail) = source
+            .split_once("async fn reauth_after_session_error")
+            .expect("reauth helper should exist");
+        let (body, _) = tail
+            .split_once("async fn clear_validation_cache_for_reauth")
+            .expect("next helper should delimit reauth helper body");
+
+        let clear_cache = body
+            .find("clear_validation_cache_for_reauth")
+            .expect("session-error reauth must clear cache before retrying auth");
+        let lenient_auth = body
+            .find("authenticate_sync_session(config, password_provider)")
+            .expect("session-error reauth must try persisted-session auth");
+        let strip = body
+            .find("auth::strip_session_routing_state")
+            .expect("session-error reauth must keep forced-SRP fallback");
+
+        assert!(
+            clear_cache < lenient_auth && lenient_auth < strip,
+            "session-error recovery must try accountLogin-capable auth before stripping session_token"
+        );
     }
 
     #[test]
