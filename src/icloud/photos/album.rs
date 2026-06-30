@@ -1013,10 +1013,10 @@ impl PhotoAlbum {
         let mut ids = FxHashSet::default();
         self.scan_changes_zone(|record| {
             if record.record_type != "CPLContainerRelation" {
-                return;
+                return true;
             }
             if record.deleted == Some(true) {
-                return;
+                return true;
             }
             let container = record
                 .fields
@@ -1024,7 +1024,7 @@ impl PhotoAlbum {
                 .and_then(|f| f.get("value"))
                 .and_then(Value::as_str);
             if container != Some(container_id) {
-                return;
+                return true;
             }
             if let Some(item_id) = record
                 .fields
@@ -1034,6 +1034,7 @@ impl PhotoAlbum {
             {
                 ids.insert(item_id.to_string());
             }
+            true
         })
         .await?;
         Ok(ids)
@@ -1078,6 +1079,7 @@ impl PhotoAlbum {
                     matched.push(asset);
                 }
             }
+            !missing_asset_record_names.is_empty()
         })
         .await?;
 
@@ -1095,7 +1097,7 @@ impl PhotoAlbum {
 
     async fn scan_changes_zone<F>(&self, mut on_record: F) -> anyhow::Result<()>
     where
-        F: FnMut(super::cloudkit::Record),
+        F: FnMut(super::cloudkit::Record) -> bool,
     {
         let url = format!(
             "{}/changes/zone?{}",
@@ -1129,7 +1131,9 @@ impl PhotoAlbum {
             current_token = Some(zone_result.sync_token);
             let more_coming = zone_result.more_coming;
             for record in zone_result.records {
-                on_record(record);
+                if !on_record(record) {
+                    return Ok(());
+                }
             }
             if !more_coming {
                 return Ok(());
@@ -3739,6 +3743,27 @@ mod tests {
             },
             "recordChangeTag": "ct2"
         })
+    }
+
+    #[tokio::test]
+    async fn hydrate_matching_assets_from_changes_stops_after_all_targets_match() {
+        let records = vec![
+            changes_master("master-1"),
+            changes_asset("asset-1", "master-1"),
+        ];
+        let mock = MockPhotosSession::new().ok(canned_changes_page(&records, "token-page1", true));
+        let album = make_album_with_session(100, Box::new(mock));
+        let mut missing = FxHashSet::default();
+        missing.insert("asset-1".to_string());
+
+        let matched = album
+            .hydrate_matching_assets_from_changes(&mut missing)
+            .await
+            .expect("matching hydrate should stop without fetching the next page");
+
+        assert!(missing.is_empty());
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].asset_record_name(), "asset-1");
     }
 
     #[tokio::test]

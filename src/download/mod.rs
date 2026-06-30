@@ -493,6 +493,7 @@ const TARGETED_ALBUM_BACKFILL_FAILED_REASON: &str = "targeted_album_backfill_fai
 const PENDING_RETRY_UNMATCHED_REASON: &str = "pending_retry_unmatched";
 const PAGINATION_SHORTFALL_REASON: &str = "pagination_shortfall";
 const ICLOUD_ALBUM_COUNT_ERROR_REASON: &str = "icloud_album_count_error";
+const INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 pub(super) const PRODUCER_ENUMERATION_INCOMPLETE_REASON: &str = "producer_enumeration_incomplete";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
@@ -3015,6 +3016,96 @@ async fn build_incremental_expired_url_retry_tasks(
     }
 
     Ok(tasks)
+}
+
+async fn refresh_stale_incremental_tasks_before_download(
+    passes: &[crate::commands::AlbumPass],
+    pass_configs: &[Arc<DownloadConfig>],
+    retry_sources: &FxHashMap<RetryTaskKey, IncrementalRetrySource>,
+    tasks: Vec<DownloadTask>,
+    urls_obtained_at: Option<Instant>,
+    refresh_after: Duration,
+    shutdown_token: CancellationToken,
+) -> Vec<DownloadTask> {
+    if tasks.is_empty() || shutdown_token.is_cancelled() {
+        return tasks;
+    }
+    let Some(urls_obtained_at) = urls_obtained_at else {
+        return tasks;
+    };
+    let url_age = urls_obtained_at.elapsed();
+    if url_age < refresh_after {
+        return tasks;
+    }
+
+    let requested = tasks.len();
+    tracing::info!(
+        requested,
+        url_age_secs = url_age.as_secs_f64(),
+        threshold_secs = refresh_after.as_secs_f64(),
+        "Refreshing incremental download URLs before starting downloads"
+    );
+
+    let refreshed_tasks = match build_incremental_expired_url_retry_tasks(
+        passes,
+        pass_configs,
+        retry_sources,
+        &tasks,
+        shutdown_token,
+    )
+    .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(
+                requested,
+                error = %e,
+                "Could not refresh incremental download URLs before starting downloads; using original URLs"
+            );
+            return tasks;
+        }
+    };
+
+    if refreshed_tasks.is_empty() {
+        tracing::warn!(
+            requested,
+            "Pre-download incremental URL refresh returned no tasks; using original URLs"
+        );
+        return tasks;
+    }
+
+    let refreshed_count = refreshed_tasks.len();
+    let mut refreshed_by_key: FxHashMap<RetryTaskKey, DownloadTask> = refreshed_tasks
+        .into_iter()
+        .map(|task| (RetryTaskKey::from(&task), task))
+        .collect();
+    let mut ordered_tasks = Vec::with_capacity(requested);
+    let mut unrefreshed = 0usize;
+    for task in tasks {
+        let key = RetryTaskKey::from(&task);
+        if let Some(refreshed_task) = refreshed_by_key.remove(&key) {
+            ordered_tasks.push(refreshed_task);
+        } else {
+            unrefreshed += 1;
+            ordered_tasks.push(task);
+        }
+    }
+
+    if unrefreshed > 0 {
+        tracing::warn!(
+            requested,
+            refreshed = refreshed_count,
+            unrefreshed,
+            "Pre-download incremental URL refresh could not refresh every task; preserving original URLs for the rest"
+        );
+    } else {
+        tracing::info!(
+            requested,
+            refreshed = refreshed_count,
+            "Pre-download incremental URL refresh completed"
+        );
+    }
+    ordered_tasks
 }
 
 /// Download photos with syncToken support.
@@ -5692,6 +5783,27 @@ async fn download_photos_incremental_collecting(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    download_photos_incremental_collecting_inner(
+        download_client,
+        passes,
+        config,
+        zone_sync_token,
+        controls,
+        shutdown_token,
+        INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER,
+    )
+    .await
+}
+
+async fn download_photos_incremental_collecting_inner(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    zone_sync_token: &str,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+    preflight_url_refresh_after: Duration,
+) -> Result<SyncResult> {
     let started = Instant::now();
 
     // Each asset is paired with its source pass index so both `{album}`
@@ -5700,6 +5812,7 @@ async fn download_photos_incremental_collecting(
     // twice) can be applied downstream.
     let mut downloadable_assets: Vec<(PhotoAsset, usize)> = Vec::new();
     let mut change_events = Vec::new();
+    let mut first_download_url_obtained_at: Option<Instant> = None;
     let mut delta_summary = IncrementalDeltaSummary::default();
     let routing = IncrementalPassRouting::from_passes(passes);
     let selected_container_ids = routing.selected_container_refs();
@@ -5709,6 +5822,7 @@ async fn download_photos_incremental_collecting(
     // once per pass repeats the same `/changes/zone` pages on every watch
     // cycle with work.
     if let Some(pass) = passes.first() {
+        let phase_started = Instant::now();
         let (change_stream, token_rx) = pass.album.changes_stream(zone_sync_token);
         tokio::pin!(change_stream);
 
@@ -5717,6 +5831,9 @@ async fn download_photos_incremental_collecting(
                 break;
             }
             let event = result?;
+            if first_download_url_obtained_at.is_none() && event.asset.is_some() {
+                first_download_url_obtained_at = Some(Instant::now());
+            }
             delta_summary.observe_event(&event);
             change_events.push(event);
         }
@@ -5724,8 +5841,15 @@ async fn download_photos_incremental_collecting(
         if let Ok(token) = token_rx.await {
             delta_summary.sync_token = Some(token);
         }
+        tracing::debug!(
+            phase_elapsed = %format_duration(phase_started.elapsed()),
+            elapsed = %format_duration(started.elapsed()),
+            events = change_events.len(),
+            "Incremental changes read complete"
+        );
     }
 
+    let phase_started = Instant::now();
     let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
     for event in &change_events {
         IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
@@ -5745,7 +5869,14 @@ async fn download_photos_incremental_collecting(
     for event in &change_events {
         apply_incremental_album_delta(event, config, &mut delta_summary.token_unsafe_reason).await;
     }
+    tracing::debug!(
+        phase_elapsed = %format_duration(phase_started.elapsed()),
+        elapsed = %format_duration(started.elapsed()),
+        "Incremental album state phase complete"
+    );
 
+    let phase_started = Instant::now();
+    let downloadable_before_relation_hydration = downloadable_assets.len();
     hydrate_missing_selected_relation_assets(
         &change_events,
         passes,
@@ -5756,7 +5887,22 @@ async fn download_photos_incremental_collecting(
         &mut delta_summary,
     )
     .await;
+    if first_download_url_obtained_at.is_none()
+        && downloadable_assets.len() > downloadable_before_relation_hydration
+    {
+        first_download_url_obtained_at = Some(Instant::now());
+    }
+    let hydrated_assets = downloadable_assets
+        .len()
+        .saturating_sub(downloadable_before_relation_hydration);
+    tracing::debug!(
+        phase_elapsed = %format_duration(phase_started.elapsed()),
+        elapsed = %format_duration(started.elapsed()),
+        hydrated_assets,
+        "Incremental relation hydration phase complete"
+    );
 
+    let phase_started = Instant::now();
     for event in &change_events {
         apply_incremental_relation_delta(
             event,
@@ -5811,6 +5957,12 @@ async fn download_photos_incremental_collecting(
             }
         }
     }
+    tracing::debug!(
+        phase_elapsed = %format_duration(phase_started.elapsed()),
+        elapsed = %format_duration(started.elapsed()),
+        downloadable_assets = downloadable_assets.len(),
+        "Incremental routing phase complete"
+    );
 
     delta_summary.log_debug();
 
@@ -5880,6 +6032,7 @@ async fn download_photos_incremental_collecting(
     // delays consumption of the fresh signed download URLs from
     // `changes/zone`, which can make those URLs expire before downloads
     // start on large album sets.
+    let phase_started = Instant::now();
     let pass_configs = build_pass_configs(passes, config);
     let mut retry_sources: FxHashMap<RetryTaskKey, IncrementalRetrySource> = FxHashMap::default();
 
@@ -5956,6 +6109,12 @@ async fn download_photos_incremental_collecting(
         }
         tasks.extend(plan.tasks);
     }
+    tracing::debug!(
+        phase_elapsed = %format_duration(phase_started.elapsed()),
+        elapsed = %format_duration(started.elapsed()),
+        planned_tasks = tasks.len(),
+        "Incremental task planning phase complete"
+    );
 
     if skip_breakdown.by_state > 0 {
         tracing::debug!(
@@ -6033,9 +6192,23 @@ async fn download_photos_incremental_collecting(
         });
     }
 
+    if controls.run_mode.downloads_files() {
+        tasks = refresh_stale_incremental_tasks_before_download(
+            passes,
+            &pass_configs,
+            &retry_sources,
+            tasks,
+            first_download_url_obtained_at,
+            preflight_url_refresh_after,
+            shutdown_token.clone(),
+        )
+        .await;
+    }
+
     let task_count = tasks.len();
     tracing::info!(
         count = task_count,
+        url_age_secs = ?first_download_url_obtained_at.map(|instant| instant.elapsed().as_secs_f64()),
         "Downloading files from incremental sync"
     );
 
@@ -10819,6 +10992,82 @@ mod tests {
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.downloaded, 2);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_preflight_refreshes_aged_urls_before_first_download() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired-before-download.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/fresh-before-download.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let stale_url = format!("{}/expired-before-download.jpg", server.uri());
+        let fresh_url = format!("{}/fresh-before-download.jpg", server.uri());
+        let mut stale_records =
+            incremental_photo_records_with_url("URL_PREFLIGHT", "preflight.jpg", &stale_url, 8);
+        stale_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(checksum.clone());
+        let mut fresh_records =
+            incremental_photo_records_with_url("URL_PREFLIGHT", "preflight.jpg", &fresh_url, 8);
+        fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+
+        let session = SplitChangesZoneSession::new(
+            vec![changes_zone_response(stale_records, "zone-token-next")],
+            vec![changes_zone_response(fresh_records, "zone-token-next")],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.state_db = Some(db.clone());
+
+        let result = download_photos_incremental_collecting_inner(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("preflight refresh should replace aged URLs before first download");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.failed, 0);
     }
 
