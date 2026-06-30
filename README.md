@@ -50,7 +50,7 @@ Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](http
 > directory = "/photos"
 > ```
 >
-> Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full map.
+> Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full option-by-option TOML reference, including defaults and valid values.
 
 ```sh
 kei config setup

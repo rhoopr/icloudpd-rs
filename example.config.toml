@@ -1,84 +1,340 @@
-# Complete kei config dictionary for v0.20.
+# Complete kei config dictionary.
 #
-# Copy this to ~/.config/kei/config.toml or mount it at /config/config.toml in
-# Docker, then edit the values for your account and paths. Most defaults are
-# active below. Keys whose default is "unset" stay commented so copying this
-# file doesn't accidentally enable a feature or write to the wrong path.
+# Copy this file to ~/.config/kei/config.toml, or mount it at
+# /config/config.toml in Docker, then edit account and path values.
+#
+# Each option block lists:
+# - Option: TOML key name
+# - Default value: value used when the key is absent
+# - Valid values: accepted values or range
+# - Description: what the option controls
+#
+# Options whose default value is unset stay commented so copying this file does
+# not accidentally enable a feature, write to a path, or use a secret source.
 
-# data_dir = "~/.config/kei" # default: parent directory of the config file; Docker image sets KEI_DATA_DIR=/config
-log_level = "info" # options: debug, info, warn, error
+# Option: data_dir
+# Default value: parent directory of the resolved config file; Docker sets KEI_DATA_DIR=/config
+# Valid values: filesystem path; ~ expands to your home directory
+# Description: Stores sessions, state DBs, credentials, health data, and cookies.
+# data_dir = "~/.config/kei"
+
+# Option: log_level
+# Default value: info
+# Valid values: debug, info, warn, error
+# Description: Sets the tracing log level when --log-level is not provided.
+log_level = "info"
 
 [auth]
-# username = "you@example.com" # default: unset; ICLOUD_USERNAME also works for automation
-# password_file = "/run/secrets/icloud_password" # default: unset; Docker secrets and chmod-protected files
-# password_command = "op read 'op://vault/icloud/password'" # default: unset; Unix only; conflicts with password_file
-domain = "com" # options: com, cn
-# Plaintext [auth].password is not supported. Use kei password set, password_file, or password_command.
+# Option: auth.username
+# Default value: unset; ICLOUD_USERNAME can provide the account for automation
+# Valid values: non-empty Apple account email or identifier
+# Description: iCloud account username. Required for commands that authenticate.
+# username = "you@example.com"
+
+# Option: auth.password_file
+# Default value: unset; --password-file or KEI_PASSWORD_FILE can also provide it
+# Valid values: filesystem path; ~ expands to your home directory
+# Description: Reads the iCloud password from a file on each auth attempt, useful for Docker secrets.
+# password_file = "/run/secrets/icloud_password"
+
+# Option: auth.password_command
+# Default value: unset; --password-command or KEI_PASSWORD_COMMAND can also provide it
+# Valid values: shell command string on Unix; conflicts with password_file
+# Description: Runs a command on each auth attempt and uses stdout as the iCloud password.
+# password_command = "op read 'op://vault/icloud/password'"
+
+# Option: auth.domain
+# Default value: com
+# Valid values: com, cn
+# Description: Apple iCloud domain. Use cn only for China-region iCloud accounts.
+domain = "com"
+
+# Plaintext [auth].password is not a supported config option. Use kei password set,
+# auth.password_file, auth.password_command, or ICLOUD_PASSWORD for automation.
 
 [download]
-# directory = "/photos" # default: unset; required for sync/import
-folder_structure = "%Y/%m/%d" # default unfiled template; supports strftime and {library}
-folder_structure_albums = "{album}" # default album template; supports strftime, {library}, {album}
-folder_structure_smart_folders = "{smart-folder}" # default smart-folder template; supports strftime, {library}, {smart-folder}
-threads = 10 # range: 1..64; default becomes 1 when bandwidth_limit is set and threads is unset
-# bandwidth_limit = "10M" # default: unset; examples: 500K, 10M, 2Mi, or bare bytes/sec
-temp_suffix = ".kei-tmp" # temp suffix for partial downloads and metadata rewrites
+# Option: download.directory
+# Default value: unset
+# Valid values: filesystem path that is not a protected system directory; ~ expands to your home directory
+# Description: Destination root for synced and imported media. Required for sync and import-existing.
+# directory = "/photos"
+
+# Option: download.folder_structure
+# Default value: %Y/%m/%d
+# Valid values: strftime template plus optional leading {library}; use "none" for no date folders
+# Description: Directory template for unfiled and library-wide files. {album} and {smart-folder} are not valid here.
+folder_structure = "%Y/%m/%d"
+
+# Option: download.folder_structure_albums
+# Default value: {album}
+# Valid values: strftime template plus optional leading {library} and leading {album}
+# Description: Directory template for album passes. Put date folders after {album}, for example {album}/%Y/%m.
+folder_structure_albums = "{album}"
+
+# Option: download.folder_structure_smart_folders
+# Default value: {smart-folder}
+# Valid values: strftime template plus optional leading {library} and leading {smart-folder}
+# Description: Directory template for smart-folder passes. Put date folders after {smart-folder}.
+folder_structure_smart_folders = "{smart-folder}"
+
+# Option: download.threads
+# Default value: 10; default becomes 1 when bandwidth_limit is set and threads is unset
+# Valid values: integer 1..64
+# Description: Maximum parallel download workers.
+threads = 10
+
+# Option: download.bandwidth_limit
+# Default value: unset
+# Valid values: positive byte rate; suffixes K, M, G, Ki, Mi, Gi are accepted, for example 500K or 10M
+# Description: Caps total download throughput. When set without threads, kei uses one worker by default.
+# bandwidth_limit = "10M"
+
+# Option: download.temp_suffix
+# Default value: .kei-tmp
+# Valid values: non-empty filename suffix string
+# Description: Suffix used for partial downloads and metadata rewrite temp files before atomic rename.
+temp_suffix = ".kei-tmp"
 
 [download.retry]
-per_transfer = 3 # range: 0..100; retries inside one transfer
-per_asset = 10 # 0 disables lifetime attempt cap; default: 10
+# Option: download.retry.per_transfer
+# Default value: 3
+# Valid values: integer 0..100
+# Description: Retries inside a single transfer. The initial retry delay is derived from this value.
+per_transfer = 3
+
+# Option: download.retry.per_asset
+# Default value: 10
+# Valid values: integer 0 or greater; 0 disables the lifetime cap
+# Description: Lifetime cap on download attempts per asset across sync runs.
+per_asset = 10
 
 [filters]
-libraries = ["primary"] # selectors: primary, shared, all, none, zone name, !name, =literal
-albums = ["all"] # selectors: all, none, album name, !name, =literal
-smart_folders = ["none"] # selectors: none, all, all-with-sensitive, folder name, !name, =literal
-unfiled = true # true also syncs photos that are not in a user album
-media = ["photos", "videos", "live-photos"] # options: photos, videos, live-photos
-filename_exclude = [] # glob patterns, for example ["*.AAE", "Screenshot*"]
-# recent = 100 # default: unset; count like 100 or window like "30d"
-# recent_scope = "per-filter" # default: global; count-form recent only
-# skip_created_before = "2024-01-01" # default: unset; ISO date/datetime or interval like "30d"
-# skip_created_after = "2024-12-31" # default: unset; ISO date/datetime or interval like "7d"
+# Option: filters.libraries
+# Default value: ["primary"]
+# Valid values: array of selectors: primary, shared, all, none, zone name, !name exclusion, =literal escape
+# Description: Selects which iCloud Photos libraries are in scope for default library and unfiled passes.
+libraries = ["primary"]
+
+# Option: filters.albums
+# Default value: ["all"]
+# Valid values: array of selectors: all, none, album name, !name exclusion, =literal escape
+# Description: Selects user album passes. Explicit album selectors are searched across visible libraries.
+albums = ["all"]
+
+# Option: filters.smart_folders
+# Default value: ["none"]
+# Valid values: array of selectors: none, all, all-with-sensitive, folder name, !name exclusion, =literal escape
+# Description: Selects Apple smart-folder passes. all excludes Hidden and Recently Deleted unless all-with-sensitive is used.
+smart_folders = ["none"]
+
+# Option: filters.unfiled
+# Default value: true
+# Valid values: true, false
+# Description: When true, also syncs photos that are not in a user album.
+unfiled = true
+
+# Option: filters.media
+# Default value: ["photos", "videos", "live-photos"]
+# Valid values: non-empty array containing photos, videos, live-photos
+# Description: Selects media categories before download planning.
+media = ["photos", "videos", "live-photos"]
+
+# Option: filters.filename_exclude
+# Default value: []
+# Valid values: array of glob patterns, for example ["*.AAE", "Screenshot*"]
+# Description: Skips candidate files whose derived filename matches any pattern.
+filename_exclude = []
+
+# Option: filters.recent
+# Default value: unset
+# Valid values: positive integer count such as 100, or day window string such as "30d"
+# Description: Permanently limits sync to recent assets. Count form is a candidate cap; day form maps to skip_created_before.
+# recent = 100
+
+# Option: filters.recent_scope
+# Default value: global
+# Valid values: global, per-filter
+# Description: Controls where count-form recent applies. Only valid when recent is set to a count.
+# recent_scope = "global"
+
+# Option: filters.skip_created_before
+# Default value: unset
+# Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 30d
+# Description: Skips assets created before the resolved local timestamp.
+# skip_created_before = "2024-01-01"
+
+# Option: filters.skip_created_after
+# Default value: unset
+# Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 7d
+# Description: Skips assets created after the resolved local timestamp.
+# skip_created_after = "2024-12-31"
 
 [photos]
-resolution = "original" # options: original, medium, thumb, none
-live_resolution = "original" # options: original, medium, thumb
-live_photo_mode = "both" # options: both, image-only, video-only, skip
-live_photo_mov_filename_policy = "suffix" # options: suffix, original
-edited = false # true also downloads adjusted/edited stills and videos
-alternative = false # true also downloads alternative/RAW sibling resources
-raw_policy = "as-is" # options: as-is, prefer-raw, prefer-jpeg
-file_match_policy = "name-size-dedup-with-suffix" # options: name-size-dedup-with-suffix, name-id7
-force_resolution = false # true skips assets missing the selected primary resolution
-keep_unicode_in_filenames = false # false matches icloudpd-style ASCII-safe names
+# Option: photos.resolution
+# Default value: original
+# Valid values: original, medium, thumb, none
+# Description: Primary still/video rendition to download. none requires edited or alternative to be true.
+resolution = "original"
+
+# Option: photos.live_resolution
+# Default value: original
+# Valid values: original, medium, thumb
+# Description: Live Photo MOV rendition to download when live-photo video is included.
+live_resolution = "original"
+
+# Option: photos.live_photo_mode
+# Default value: both
+# Valid values: both, image-only, video-only, skip
+# Description: Controls whether Live Photos download the still image, MOV, both, or neither.
+live_photo_mode = "both"
+
+# Option: photos.live_photo_mov_filename_policy
+# Default value: suffix
+# Valid values: suffix, original
+# Description: Names Live Photo MOV files with kei's paired suffix or Apple's original MOV name.
+live_photo_mov_filename_policy = "suffix"
+
+# Option: photos.edited
+# Default value: false
+# Valid values: true, false
+# Description: Also downloads adjusted or edited stills and videos when Apple provides them.
+edited = false
+
+# Option: photos.alternative
+# Default value: false
+# Valid values: true, false
+# Description: Also downloads alternative or RAW sibling resources when Apple provides them.
+alternative = false
+
+# Option: photos.raw_policy
+# Default value: as-is
+# Valid values: as-is, prefer-raw, prefer-jpeg
+# Description: Chooses how RAW+JPEG pairs are aligned when both forms are available.
+raw_policy = "as-is"
+
+# Option: photos.file_match_policy
+# Default value: name-size-dedup-with-suffix
+# Valid values: name-size-dedup-with-suffix, name-id7
+# Description: Controls path matching for import-existing and skip-existing decisions.
+file_match_policy = "name-size-dedup-with-suffix"
+
+# Option: photos.force_resolution
+# Default value: false
+# Valid values: true, false
+# Description: When true, skips assets missing the selected primary resolution instead of falling back.
+force_resolution = false
+
+# Option: photos.keep_unicode_in_filenames
+# Default value: false
+# Valid values: true, false
+# Description: When false, filenames are ASCII-safe for icloudpd-style compatibility.
+keep_unicode_in_filenames = false
 
 [metadata]
-set_exif_datetime = false # writes capture date into JPEG/TIFF EXIF
-set_exif_rating = false # writes favorite/rating metadata where supported
-set_exif_gps = false # writes GPS metadata where supported
-set_exif_description = false # writes description metadata where supported
-embed_xmp = false # requires default xmp feature; embeds XMP in supported media
-xmp_sidecar = false # requires default xmp feature; writes .xmp sidecars
+# Option: metadata.set_exif_datetime
+# Default value: false
+# Valid values: true, false
+# Description: Writes capture date metadata into supported JPEG/TIFF EXIF fields.
+set_exif_datetime = false
+
+# Option: metadata.set_exif_rating
+# Default value: false
+# Valid values: true, false
+# Description: Writes favorite/rating metadata where supported.
+set_exif_rating = false
+
+# Option: metadata.set_exif_gps
+# Default value: false
+# Valid values: true, false
+# Description: Writes GPS metadata where supported.
+set_exif_gps = false
+
+# Option: metadata.set_exif_description
+# Default value: false
+# Valid values: true, false
+# Description: Writes description/caption metadata where supported.
+set_exif_description = false
+
+# Option: metadata.embed_xmp
+# Default value: false
+# Valid values: true, false; available in default builds with the xmp feature
+# Description: Embeds XMP metadata in supported media files.
+embed_xmp = false
+
+# Option: metadata.xmp_sidecar
+# Default value: false
+# Valid values: true, false; available in default builds with the xmp feature
+# Description: Writes XMP sidecar files next to downloaded media.
+xmp_sidecar = false
 
 [watch]
-# interval = 86400 # default: unset for kei sync; kei service run falls back to 86400 seconds
-# notify_systemd = false # default: auto-detects NOTIFY_SOCKET when unset; set false to force off
-# pid_file = "/run/kei.pid" # default: unset
-reconcile_every_n_cycles = 0 # 0 or unset disables periodic read-only reconcile
+# Option: watch.interval
+# Default value: unset for kei sync; kei service run falls back to 86400 seconds when unset
+# Valid values: integer seconds 60..86400
+# Description: Runs sync repeatedly with this delay between cycles.
+# interval = 86400
+
+# Option: watch.notify_systemd
+# Default value: auto-detect; true when NOTIFY_SOCKET is set, otherwise false
+# Valid values: true, false
+# Description: Sends systemd readiness and watchdog notifications.
+# notify_systemd = false
+
+# Option: watch.pid_file
+# Default value: unset
+# Valid values: filesystem path; ~ expands to your home directory
+# Description: Writes a PID file while sync/watch/service is running.
+# pid_file = "/run/kei.pid"
+
+# Option: watch.reconcile_every_n_cycles
+# Default value: 0
+# Valid values: integer 0 or greater; 0 disables periodic reconcile
+# Description: Runs read-only local-vs-state reconciliation every Nth watch cycle.
+reconcile_every_n_cycles = 0
 
 [notifications]
-# script = "/config/notify.sh" # default: unset; receives KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME, per-cycle KEI_* stats, and KEI_REPORT_JSON when [report].json is configured
+# Option: notifications.script
+# Default value: unset
+# Valid values: executable script path; ~ expands to your home directory
+# Description: Runs after sync events with KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME, KEI_REPORT_JSON, and KEI_* stats.
+# script = "/config/notify.sh"
 
 [report]
-# json = "/config/sync_report.json" # default: unset; latest sync report path
+# Option: report.json
+# Default value: unset
+# Valid values: filesystem path; ~ expands to your home directory
+# Description: Atomically writes the latest sync report JSON after each cycle.
+# json = "/config/sync_report.json"
 
 [server]
-bind = "0.0.0.0" # default: 0.0.0.0; use 127.0.0.1 for local-only
-port = 9090 # /healthz and /metrics port
+# Option: server.bind
+# Default value: 0.0.0.0
+# Valid values: IP address, for example 0.0.0.0 or 127.0.0.1
+# Description: Bind address for /healthz and /metrics in watch/service mode.
+bind = "0.0.0.0"
+
+# Option: server.port
+# Default value: 9090
+# Valid values: TCP port number 0..65535
+# Description: Port for /healthz and /metrics in watch/service mode.
+port = 9090
 
 [ui]
-# friendly = true # friendly terminal progress and summaries; auto off in service/container/machine-output contexts
-progress_bar = true # false is the durable form of --no-progress-bar
+# Option: ui.friendly
+# Default value: auto; on for plain interactive terminals, off for service/container/machine-output contexts
+# Valid values: true, false
+# Description: Requests friendly terminal progress and summaries when the environment allows it.
+# friendly = true
+
+# Option: ui.progress_bar
+# Default value: true
+# Valid values: true, false
+# Description: Durable progress-bar preference. --no-progress-bar can still disable it for one run.
+progress_bar = true
 
 [import]
-strict = false # true verifies a cloud prefix before adopting same-name, same-size files
+# Option: import.strict
+# Default value: false
+# Valid values: true, false
+# Description: During import-existing, verifies a cloud prefix before adopting same-name, same-size files.
+strict = false

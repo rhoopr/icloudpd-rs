@@ -212,6 +212,10 @@ username = "you@example.com"
 directory = "~/Photos/iCloud"
 ```
 
+For the full TOML option dictionary with defaults and valid values, see
+[`example.config.toml`](../example.config.toml) and the wiki
+[Configuration](https://github.com/rhoopr/kei/wiki/Configuration) page.
+
 After the first 2FA approval, kei stores session state under `data_dir`
 (default `~/.config/kei`; `KEI_DATA_DIR` can override it for automation). Run
 `kei password set` or `kei sync --save-password` if you want kei to store the
