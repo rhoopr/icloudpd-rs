@@ -296,7 +296,7 @@ reconcile_every_n_cycles = 0
 # Option: notifications.script
 # Default value: unset
 # Valid values: executable script path; ~ expands to your home directory
-# Description: Runs after sync events with KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME, KEI_REPORT_JSON, and KEI_* stats.
+# Description: Runs after sync events; receives KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME, per-cycle KEI_* stats, and KEI_REPORT_JSON when [report].json is configured.
 # script = "/config/notify.sh"
 
 [report]

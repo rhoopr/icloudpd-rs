@@ -1,7 +1,7 @@
 //! HTTP observability server (watch-mode only).
 //!
 //! In watch mode, spawns an axum HTTP server on `[server] port` (default 9091) that serves:
-//! - `GET /healthz`  — JSON health status (same data as `health.json`)
+//! - `GET /healthz`  — liveness JSON; after the first cycle, same data as `health.json`
 //! - `GET /metrics`  — Prometheus text format
 //!
 //! Metrics are updated after every sync cycle by calling [`MetricsHandle::update`].
@@ -53,6 +53,9 @@ pub(crate) static MARK_DOWNLOADED_ZERO_ROWS: LazyLock<Counter> = LazyLock::new(C
 /// persisted, so the asset will re-enumerate and re-fail next sync until
 /// the buggy call site is found. Mirrors `MARK_DOWNLOADED_ZERO_ROWS`.
 pub(crate) static MARK_FAILED_ZERO_ROWS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+const UNHEALTHY_CONSECUTIVE_FAILURES: u32 = 5;
+const STARTING_HEALTH_BODY: &str = r#"{"status":"no sync cycle completed yet"}"#;
 
 // ── Label types ──────────────────────────────────────────────────────────────
 
@@ -497,7 +500,8 @@ async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoRespons
             };
             match serde_json::to_string_pretty(h) {
                 Ok(json) => {
-                    let status = if consecutive_failures >= 5 || stale {
+                    let status = if consecutive_failures >= UNHEALTHY_CONSECUTIVE_FAILURES || stale
+                    {
                         StatusCode::SERVICE_UNAVAILABLE
                     } else {
                         StatusCode::OK
@@ -525,12 +529,12 @@ async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoRespons
             }
         }
         None => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::OK,
             [(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )],
-            r#"{"status":"no sync cycle completed yet"}"#.to_string(),
+            STARTING_HEALTH_BODY.to_string(),
         ),
     }
 }
@@ -973,10 +977,13 @@ mod tests {
     // ── /healthz endpoint ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn healthz_returns_503_before_first_cycle() {
+    async fn healthz_returns_200_before_first_cycle() {
         let handle = MetricsHandle::new(None);
-        let (status, _body) = render_healthz(&handle).await;
-        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let (status, body) = render_healthz(&handle).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("healthz body should be valid JSON");
+        assert_eq!(json["status"], "no sync cycle completed yet");
     }
 
     #[tokio::test]
@@ -996,7 +1003,10 @@ mod tests {
     async fn healthz_returns_503_when_consecutive_failures_reaches_threshold() {
         let handle = MetricsHandle::new(None);
         handle
-            .update(&SyncStats::default(), &healthy_status(5))
+            .update(
+                &SyncStats::default(),
+                &healthy_status(UNHEALTHY_CONSECUTIVE_FAILURES),
+            )
             .await;
 
         let (status, _body) = render_healthz(&handle).await;
@@ -1007,7 +1017,10 @@ mod tests {
     async fn healthz_returns_200_when_consecutive_failures_below_threshold() {
         let handle = MetricsHandle::new(None);
         handle
-            .update(&SyncStats::default(), &healthy_status(4))
+            .update(
+                &SyncStats::default(),
+                &healthy_status(UNHEALTHY_CONSECUTIVE_FAILURES - 1),
+            )
             .await;
 
         let (status, _body) = render_healthz(&handle).await;
@@ -1095,7 +1108,10 @@ mod tests {
         // Both conditions at once -> 503
         let handle = MetricsHandle::new(None);
         handle
-            .update(&SyncStats::default(), &healthy_status(5))
+            .update(
+                &SyncStats::default(),
+                &healthy_status(UNHEALTHY_CONSECUTIVE_FAILURES),
+            )
             .await;
         set_threshold(&handle, Some(chrono::Duration::seconds(60))).await;
         backdate_last_success(&handle, 120).await;
@@ -1289,18 +1305,13 @@ mod tests {
             return;
         }
         let token = CancellationToken::new();
-        let (handle, task, addr) = spawn_server(
+        let (_handle, task, addr) = spawn_server(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             0,
             token.clone(),
             Some(chrono::Duration::seconds(3600)),
         )
         .expect("spawn_server should bind and spawn");
-
-        // Push a healthy cycle so /healthz returns 200 instead of the pre-first-cycle 503.
-        handle
-            .update(&SyncStats::default(), &healthy_status(0))
-            .await;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -1344,6 +1355,10 @@ mod tests {
             .await
             .expect("GET /healthz should succeed");
         assert_eq!(healthz_resp.status(), reqwest::StatusCode::OK);
+        let body = healthz_resp.text().await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("healthz body should be valid JSON");
+        assert_eq!(json["status"], "no sync cycle completed yet");
 
         token.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
