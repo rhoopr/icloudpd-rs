@@ -2009,6 +2009,72 @@ mod tests {
     use super::*;
     use crate::cli::SyncArgs;
 
+    fn documented_config_options() -> BTreeSet<&'static str> {
+        [
+            "data_dir",
+            "log_level",
+            "auth.username",
+            "auth.password_file",
+            "auth.password_command",
+            "auth.domain",
+            "download.directory",
+            "download.folder_structure",
+            "download.folder_structure_albums",
+            "download.folder_structure_smart_folders",
+            "download.threads",
+            "download.bandwidth_limit",
+            "download.temp_suffix",
+            "download.retry.per_transfer",
+            "download.retry.per_asset",
+            "filters.libraries",
+            "filters.albums",
+            "filters.smart_folders",
+            "filters.unfiled",
+            "filters.media",
+            "filters.filename_exclude",
+            "filters.recent",
+            "filters.recent_scope",
+            "filters.skip_created_before",
+            "filters.skip_created_after",
+            "photos.resolution",
+            "photos.live_resolution",
+            "photos.live_photo_mode",
+            "photos.live_photo_mov_filename_policy",
+            "photos.edited",
+            "photos.alternative",
+            "photos.raw_policy",
+            "photos.file_match_policy",
+            "photos.force_resolution",
+            "photos.keep_unicode_in_filenames",
+            "metadata.set_exif_datetime",
+            "metadata.set_exif_rating",
+            "metadata.set_exif_gps",
+            "metadata.set_exif_description",
+            "metadata.embed_xmp",
+            "metadata.xmp_sidecar",
+            "watch.interval",
+            "watch.notify_systemd",
+            "watch.pid_file",
+            "watch.reconcile_every_n_cycles",
+            "notifications.script",
+            "report.json",
+            "server.bind",
+            "server.port",
+            "ui.friendly",
+            "ui.progress_bar",
+            "import.strict",
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn example_config_option_markers(raw: &str) -> BTreeSet<&str> {
+        raw.lines()
+            .filter_map(|line| line.trim().strip_prefix("# Option: "))
+            .map(str::trim)
+            .collect()
+    }
+
     #[test]
     fn example_config_toml_parses() {
         let raw = include_str!("../example.config.toml");
@@ -2040,6 +2106,25 @@ mod tests {
         ] {
             assert!(present, "example config should include [{section}]");
         }
+    }
+
+    #[test]
+    fn example_config_documents_supported_options() {
+        let raw = include_str!("../example.config.toml");
+        let documented = example_config_option_markers(raw);
+        let expected = documented_config_options();
+        assert_eq!(
+            documented, expected,
+            "example.config.toml # Option markers must stay in sync with supported TOML options"
+        );
+        assert!(
+            !documented.contains("auth.password"),
+            "plaintext [auth].password must not be listed as a supported option"
+        );
+        assert!(
+            raw.contains("Plaintext [auth].password is not a supported config option"),
+            "example config must keep the plaintext password migration note"
+        );
     }
 
     // ── validate_template_tokens ─────────────────────────────────────
