@@ -10603,6 +10603,14 @@ mod tests {
         let session = MockPhotosFlow::new()
             .changes_zone_page(Vec::new(), "zone-token-next", false)
             .query_page(expired_records, Some("ignored-query-token"))
+            // Full-query pending retry probes through consecutive empty pages
+            // after the match; keep the hydration response queued for the
+            // same-cycle expired-URL retry.
+            .empty_query_page(Some("ignored-query-token"))
+            .empty_query_page(Some("ignored-query-token"))
+            .empty_query_page(Some("ignored-query-token"))
+            .empty_query_page(Some("ignored-query-token"))
+            .empty_query_page(Some("ignored-query-token"))
             .changes_zone_page(fresh_records, "zone-token-hydrated", false)
             .build();
         let passes = vec![AlbumPass {
