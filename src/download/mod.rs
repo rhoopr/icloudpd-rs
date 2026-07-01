@@ -7454,6 +7454,67 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct PendingRetryExpiredUrlSession {
+        query_calls: Arc<AtomicUsize>,
+        expired_records: Arc<Vec<Value>>,
+        fresh_records: Arc<Vec<Value>>,
+    }
+
+    impl PendingRetryExpiredUrlSession {
+        fn new(expired_records: Vec<Value>, fresh_records: Vec<Value>) -> Self {
+            Self {
+                query_calls: Arc::new(AtomicUsize::new(0)),
+                expired_records: Arc::new(expired_records),
+                fresh_records: Arc::new(fresh_records),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for PendingRetryExpiredUrlSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                let request: Value = serde_json::from_str(&body)?;
+                let has_sync_token = request["zones"]
+                    .as_array()
+                    .and_then(|zones| zones.first())
+                    .and_then(|zone| zone.get("syncToken"))
+                    .and_then(Value::as_str)
+                    .is_some();
+                let records = if has_sync_token {
+                    Vec::new()
+                } else {
+                    self.fresh_records.as_ref().clone()
+                };
+                return Ok(changes_zone_response(records, "zone-token-next"));
+            }
+
+            if url.contains("/records/query?") {
+                let call = self.query_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(if call == 0 {
+                    json!({
+                        "records": self.expired_records.as_ref().clone(),
+                        "syncToken": "ignored-query-token"
+                    })
+                } else {
+                    json!({"records": [], "syncToken": "ignored-query-token"})
+                });
+            }
+
+            Ok(json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     fn changes_zone_response(records: Vec<Value>, sync_token: &str) -> Value {
         json!({
             "zones": [{
@@ -10600,22 +10661,10 @@ mod tests {
             8,
         );
         fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(Vec::new(), "zone-token-next", false)
-            .query_page(expired_records, Some("ignored-query-token"))
-            // Full-query pending retry probes through consecutive empty pages
-            // after the match; keep the hydration response queued for the
-            // same-cycle expired-URL retry.
-            .empty_query_page(Some("ignored-query-token"))
-            .empty_query_page(Some("ignored-query-token"))
-            .empty_query_page(Some("ignored-query-token"))
-            .empty_query_page(Some("ignored-query-token"))
-            .empty_query_page(Some("ignored-query-token"))
-            .changes_zone_page(fresh_records, "zone-token-hydrated", false)
-            .build();
+        let session = PendingRetryExpiredUrlSession::new(expired_records, fresh_records);
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
-            album: mock_album("", session),
+            album: album_with_session("PrimarySync", "", Box::new(session)),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
 
@@ -10637,7 +10686,10 @@ mod tests {
         .await
         .expect("expired pending retry URL should hydrate and retry");
 
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "result: {result:?}"
+        );
         assert!(!result.stats.interrupted);
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
         let summary = db.get_summary().await.expect("summary");
