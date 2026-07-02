@@ -187,6 +187,7 @@ async fn authenticate_inner(
     session.set_client_id(&client_id);
 
     let mut data: Option<AccountLoginResponse> = None;
+    let mut validated_existing_session = false;
     let has_session_token = session.session_data.contains_key("session_token");
 
     // Fast path: if we validated recently, skip the Apple /validate call entirely.
@@ -224,7 +225,7 @@ async fn authenticate_inner(
         match twofa::validate_token(&mut session, endpoints).await {
             Ok(d) => {
                 tracing::debug!("Existing session token is valid");
-                session.save_validation_cache(&d).await;
+                validated_existing_session = true;
                 data = Some(d);
             }
             Err(e) => match classify_auth_flow_error(&e) {
@@ -347,7 +348,7 @@ async fn authenticate_inner(
     let data =
         data.ok_or_else(|| anyhow::anyhow!("Apple authentication did not return account data."))?;
 
-    let requires_2fa = check_requires_2fa(&data);
+    let requires_2fa = !validated_existing_session && check_requires_2fa(&data);
     if requires_2fa {
         tracing::info!("Two-factor authentication is required");
 
@@ -649,6 +650,8 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
 
     fn make_response(
         hsa_version: i64,
@@ -867,6 +870,71 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "password provider must not run when endpoint resolution fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_validate_success_uses_existing_session_even_with_hsa_flags() {
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("POST"))
+            .and(path("/setup/ws/1/validate"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(make_response(2, true, false, true)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::new(
+            cookies.path(),
+            "validated@example.com",
+            &server.uri(),
+            Some(5),
+        )
+        .await
+        .expect("session");
+        session
+            .session_data
+            .insert("session_token".into(), "valid-token".into());
+
+        let password_called = Arc::new(AtomicBool::new(false));
+        let called_for_provider = Arc::clone(&password_called);
+        let provider: crate::password::PasswordProvider = Arc::new(move || {
+            called_for_provider.store(true, Ordering::SeqCst);
+            Some(SecretString::from("should-not-be-read"))
+        });
+        let endpoints = Endpoints::for_test_base(&server.uri());
+
+        let result = authenticate_inner(
+            session,
+            &endpoints,
+            "validated@example.com",
+            &provider,
+            "com",
+            None,
+            None,
+            crate::personality::Mode::Off,
+        )
+        .await
+        .expect("live validate success should authenticate the persisted session");
+
+        assert!(
+            !result.requires_2fa,
+            "successful /validate proves the existing session is usable"
+        );
+        assert!(
+            !password_called.load(Ordering::SeqCst),
+            "valid existing session must not fall through to SRP"
+        );
+        let cached = result
+            .session
+            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+            .await
+            .expect("validate success should refresh the cache");
+        assert!(
+            check_requires_2fa(&cached),
+            "regression guard must cover HSA flags that would otherwise demand 2FA"
         );
     }
 

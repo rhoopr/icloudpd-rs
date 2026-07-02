@@ -660,6 +660,7 @@ fn audit_ignores_carry_removal_triggers() {
     for expected in [
         "Remove this ignore once little_exif drops paste",
         "Remove this ignore once reqwest's QUIC stack no longer pulls rand",
+        "Remove these ignores once plist and little_exif can both resolve",
     ] {
         assert!(
             audit.contains(expected),
