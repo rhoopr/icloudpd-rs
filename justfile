@@ -8,16 +8,13 @@ set tempdir := "/tmp"
 _default:
     @just --list
 
-# Pre-push gate: fmt + clippy + offline tests + doc + audit + workflow hardening + typos +
-# round-trip property gate. The round-trip gate fails when this branch
-# adds/changes a serializer in src/ without a paired round-trip test;
-# see scripts/check-roundtrip-gate.sh for the detector and override.
-gate:
+# Static source/tooling checks. Does not run behavior tests.
+# The round-trip gate fails when this branch adds/changes a serializer in src/
+# without a paired round-trip test; see scripts/check-roundtrip-gate.sh.
+static-checks:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy --all-targets --no-default-features -- -D warnings
-    cargo test --all-features
-    cargo test --no-default-features
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
     cargo audit --deny warnings
@@ -26,6 +23,12 @@ gate:
     scripts/check-contracts
     typos
     bash scripts/check-roundtrip-gate.sh
+
+# Pre-push gate: static checks + offline behavior tests.
+gate:
+    just static-checks
+    cargo test --all-features
+    cargo test --no-default-features
 
 # Check GitHub workflow helpers with the repo hardening guard plus optional
 # actionlint when it is installed locally.
@@ -174,18 +177,55 @@ check-contracts:
 release-smoke:
     scripts/full-test/run_release_regression_smoke.sh
 
-# Test dispatcher: offline | fast | live | concurrency | state | docker | PATTERN.
-test MODE="":
+# Test dispatcher: offline | fast | scenario NAME | scenarios | live | live-smoke | live-shell | packaging | docker-full | service | host-service | PATTERN.
+test MODE="" *ARGS="":
     #!/usr/bin/env bash
     set -euo pipefail
-    # Shared live-auth setup: sources .env if needed, applies the
-    # maintainer's album default. Cookie dir falls through to the
-    # harness default (./.test-cookies) when unset. Overridable via
-    # the environment.
     _live_env() {
         source scripts/just/live-env.sh
     }
-    case "{{MODE}}" in
+    run_drift_tests() {
+        local covered_re='^(cli|behavioral|service_cli|service_linux|service_macos|service_status|service_windows|sync|state_auth|import_existing_live|branch_static)$'
+        local test_file t
+        while read -r test_file; do
+            t="${test_file%.rs}"
+            [[ -z "$t" ]] && continue
+            [[ "$t" =~ $covered_re ]] && continue
+            cargo test --test "$t"
+        done < <(find tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' | sort)
+    }
+    run_scenario() {
+        local name="$1"
+        local script="scripts/test-scenarios/$name.sh"
+        if [[ ! -f "$script" ]]; then
+            echo "unknown scenario: $name" >&2
+            echo "available scenarios:" >&2
+            scripts/test-scenarios/list.sh >&2
+            exit 2
+        fi
+        bash "$script"
+    }
+    run_live_smokes() {
+        scripts/full-test/run_live_smokes.sh
+        scripts/full-test/run_live_import_rehearsal.sh
+        if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then
+            scripts/full-test/run_cross_zone_album_hydration.sh
+        fi
+    }
+    run_docker_full() {
+        just docker build
+        scripts/full-test/run_docker_puid_smoke.sh
+        just docker multiarch
+        docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --version
+        docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --help
+        set +e
+        timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com "${KEI_DOCKER_IMAGE:-kei:dev}"
+        rc=$?
+        set -e
+        [[ $rc -ne 2 ]]
+    }
+    mode="{{MODE}}"
+    case "$mode" in
         "")
             cargo test --all-features
             ;;
@@ -193,11 +233,42 @@ test MODE="":
             cargo test --lib -- --test-threads=1
             cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
             ;;
+        offline)
+            cargo test --all-features
+            run_drift_tests
+            cargo test --no-default-features
+            cargo test scope_contract_matrix --lib
+            ;;
+        scenarios)
+            while read -r scenario; do
+                run_scenario "$scenario"
+            done < <(scripts/test-scenarios/list.sh)
+            ;;
+        scenario)
+            args=({{ARGS}})
+            if [[ ${#args[@]} -ne 1 ]]; then
+                echo "usage: just test scenario NAME" >&2
+                scripts/test-scenarios/list.sh >&2
+                exit 2
+            fi
+            run_scenario "${args[0]}"
+            ;;
+        scenario-*)
+            run_scenario "${mode#scenario-}"
+            ;;
         live)
             _live_env
             cargo test --all-features --test sync -- --ignored --test-threads=1
             cargo test --all-features --test state_auth -- --ignored --test-threads=1
             cargo test --all-features --test import_existing_live -- --ignored --test-threads=1
+            ;;
+        live-smoke)
+            _live_env
+            run_live_smokes
+            ;;
+        live-shell)
+            _live_env
+            scripts/full-test/run_shell_suites.sh
             ;;
         concurrency)
             _live_env
@@ -211,8 +282,31 @@ test MODE="":
             _live_env
             ./tests/shell/docker.sh
             ;;
+        packaging|package)
+            cargo build --release
+            scripts/full-test/run_release_archive_smoke.sh
+            ;;
+        docker-full)
+            run_docker_full
+            ;;
+        service)
+            just service-smoke
+            ;;
+        host-service)
+            KEI_FULL_TEST_REAL_SERVICE=1 scripts/full-test/run_real_service_lifecycle.sh
+            ;;
+        nightly-tools)
+            if rustup toolchain list 2>/dev/null | grep -q '^nightly' && command -v cargo-fuzz >/dev/null 2>&1; then
+                cargo +nightly fuzz build
+            else
+                echo "nightly-tools: skipping fuzz build; nightly toolchain or cargo-fuzz not installed" >&2
+            fi
+            cargo +nightly --version >/dev/null
+            cargo udeps --version >/dev/null
+            cargo +nightly udeps --all-targets
+            ;;
         *)
-            cargo test "{{MODE}}"
+            cargo test "$mode"
             ;;
     esac
 

@@ -6,26 +6,17 @@
 # Phases run in this order:
 #   begin_run    -- staging + concurrency guard, clears flag files
 #   prereqs      -- check_prereqs.sh; sets .live-skipped if .env / cookies bad
-#   0  gate            offline lib/cli/behavioral, fmt, clippy, audit, doc
-#   0  drift           any tests/*.rs not covered by gate's --test list
-#   0.5 nodefault      clippy + test with --no-default-features (xmp off)
-#   0.75 fuzz_build    cargo +nightly fuzz build (skip if missing)
-#   0.8  udeps         cargo +nightly udeps --all-targets
-#   0.9  offline_all   cargo test --all-features
-#   0.95 scope_matrix  matrix test for library/album/smart-folder/unfiled scope
-#   1    build_release cargo build --release
-#   1.5  release_archive_smoke
-#   2    docker_build      just docker build
-#   2    docker_multiarch  just docker multiarch
-#   2    docker_puid_smoke
-#   2    docker_version, docker_help, docker_default_cmd
-#   3  test_live       live cargo (just test live)        --live
-#   4  test_shell_*    auto-discovered shell suites       --live
-#   5  live_*          binary smokes (run_live_smokes.sh) --live
-#   5.5  live_import_rehearsal                            --live
-#   opt  live_cross_zone_album when KEI_FULL_TEST_CROSS_ZONE_ALBUM is set --live
-#   6  service_smoke   just service-smoke when supported
-#   opt  real_service_lifecycle when KEI_FULL_TEST_REAL_SERVICE=1 --live
+#   static_checks    fmt, clippy, docs, audit, workflow/script lint, contracts, typos
+#   offline_core     offline all-feature/no-default tests, drift tests, scope matrix
+#   scenarios        named behavior slices from scripts/test-scenarios
+#   nightly_tools    fuzz build when available + cargo-udeps
+#   package          release build + archive smoke
+#   docker_full      Docker build, PUID smoke, multiarch, CLI/default-command smokes
+#   live_provider    live cargo (just test live)               --live
+#   live_shell       auto-discovered shell suites              --live
+#   live_binary      release-binary live smokes/import checks  --live
+#   service          service-smoke when supported
+#   host_service     real service lifecycle when KEI_FULL_TEST_REAL_SERVICE=1 --live
 #   finalize_run + diff_runs on success
 #
 # Live-tagged phases honor .live-skipped (prereq fail) and .rate-limited
@@ -108,82 +99,38 @@ run_live_phase() {
   tp --live "$@"
 }
 
-# --- Phase 0: gate --------------------------------------------------------
-run_phase gate -- just gate
+# --- Static + offline behavior -------------------------------------------
+run_phase static_checks -- just static-checks
+run_phase offline_core -- just test offline
+run_phase scenarios -- just test scenarios
+run_phase nightly_tools -- just test nightly-tools
 
-# --- Phase 0: drift check (extra integration tests not in gate's list) ----
-covered_re='^(cli|behavioral|service_cli|service_linux|service_macos|service_status|service_windows|sync|state_auth|import_existing_live)$'
-while read -r test_file; do
-  t="${test_file%.rs}"
-  [[ -z "$t" ]] && continue
-  [[ "$t" =~ $covered_re ]] && continue
-  run_phase "test_$t" -- cargo test --test "$t"
-done < <(find tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' | sort)
+# --- Build/package/container ----------------------------------------------
+run_phase package -- just test packaging
+run_phase docker_full -- just test docker-full
 
-# --- Phase 0.5: nodefault --------------------------------------------------
-run_phase nodefault -- bash -c 'cargo clippy --all-targets --no-default-features -- -D warnings && cargo test --no-default-features'
+# --- Live provider + shell + release-binary smokes ------------------------
+run_live_phase live_provider -- env ICLOUD_TEST_COOKIE_DIR="$ICLOUD_TEST_COOKIE_DIR" just test live
 
-# --- Phase 0.75: fuzz_build (compile only) ---------------------------------
-if rustup toolchain list 2>/dev/null | grep -q '^nightly' && command -v cargo-fuzz >/dev/null 2>&1; then
-  run_phase fuzz_build -- cargo +nightly fuzz build
-else
-  "$script_dir/record_skip.sh" fuzz_build skipped "nightly toolchain or cargo-fuzz not installed"
-fi
-
-# --- Phase 0.8: unused dependencies ---------------------------------------
-current_phase="udeps"
-cargo +nightly --version >/dev/null 2>&1 || {
-  echo "ERROR: nightly toolchain not installed. Run: rustup toolchain install nightly" >&2
-  exit 1
-}
-cargo udeps --version >/dev/null 2>&1 || {
-  echo "ERROR: cargo-udeps not installed. Run: cargo install cargo-udeps" >&2
-  exit 1
-}
-run_phase udeps -- cargo +nightly udeps --all-targets
-
-# --- Phase 0.9: full offline ----------------------------------------------
-run_phase offline_all -- cargo test --all-features
-
-# --- Phase 0.95: scope matrix ----------------------------------------------
-run_phase scope_matrix -- cargo test scope_contract_matrix --lib
-
-# --- Phase 1 + 2: release build + docker builds ---------------------------
-run_phase build_release -- cargo build --release
-run_phase release_archive_smoke -- "$script_dir/run_release_archive_smoke.sh"
-run_phase docker_build -- just docker build
-run_phase docker_puid_smoke -- "$script_dir/run_docker_puid_smoke.sh"
-run_phase docker_multiarch -- just docker multiarch
-
-# --- Phase 2 (cont.): docker smokes ---------------------------------------
-run_phase docker_version       -- docker run --rm "$KEI_DOCKER_IMAGE" --version
-run_phase docker_help          -- docker run --rm "$KEI_DOCKER_IMAGE" --help
-run_phase docker_default_cmd   -- bash -c 'timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com "$KEI_DOCKER_IMAGE"; rc=$?; [[ $rc -ne 2 ]]'
-
-# --- Phase 3: live cargo --------------------------------------------------
-run_live_phase test_live -- env ICLOUD_TEST_COOKIE_DIR="$ICLOUD_TEST_COOKIE_DIR" just test live
-
-# --- Phase 4: shell suites (auto-discovered) ------------------------------
-current_phase="test_shell"
+current_phase="live_shell"
 "$script_dir/run_shell_suites.sh"
 
-# --- Phase 5: live binary smokes ------------------------------------------
-current_phase="live_smokes"
+current_phase="live_binary"
 "$script_dir/run_live_smokes.sh"
 run_live_phase live_import_rehearsal -- "$script_dir/run_live_import_rehearsal.sh"
 if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then
   run_live_phase live_cross_zone_album -- "$script_dir/run_cross_zone_album_hydration.sh"
 fi
 
-# --- Phase 6: service smoke ------------------------------------------------
+# --- Service smoke ---------------------------------------------------------
 if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then
-  "$script_dir/record_skip.sh" service_smoke skipped "not Linux or macOS"
+  "$script_dir/record_skip.sh" service skipped "not Linux or macOS"
 else
-  run_phase service_smoke -- just service-smoke
+  run_phase service -- just test service
 fi
 
 if [[ "${KEI_FULL_TEST_REAL_SERVICE:-0}" == "1" ]]; then
-  run_live_phase real_service_lifecycle -- "$script_dir/run_real_service_lifecycle.sh"
+  run_live_phase host_service -- just test host-service
 fi
 
 # --- Cleanup --------------------------------------------------------------

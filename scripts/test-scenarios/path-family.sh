@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cargo test --lib identity_collision
+cargo test --lib live_photo_motion_with_size_suffixed_primary_stem_is_on_disk_skipped
+cargo test --lib live_photo_motion_with_identity_suffixed_primary_stem_is_on_disk_skipped
+cargo test --lib live_photo_motion_with_sanitized_identity_suffix_is_on_disk_skipped
+cargo test --lib live_photo_motion_original_policy_with_primary_collision_is_on_disk_skipped
+cargo test --lib import_matches_live_photo_motion_from_size_suffixed_primary_stem
+cargo test --lib import_matches_live_photo_motion_from_sanitized_identity_suffixed_primary_stem
+cargo test --lib pending_same_size_collision_does_not_adopt_other_assets_bare_file
+cargo test --lib truncated_suffixed_downloaded_file_is_forwarded_not_on_disk_skipped

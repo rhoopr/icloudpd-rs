@@ -40,6 +40,7 @@ tests/
 | `scripts/full-test/run_cross_zone_album_hydration.sh` | 1 | yes | `just full-test` when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set |
 | `scripts/full-test/run_docker_puid_smoke.sh` | 1 | no | `just full-test` |
 | `scripts/full-test/run_release_archive_smoke.sh` | 1 | no | `just full-test` |
+| `scripts/test-scenarios/*.sh` | focused slices | no | `just test scenario NAME` or `just test scenarios` |
 | `scripts/full-test/run_release_regression_smoke.sh` | 8 | no | `just release-smoke` |
 | `.github/workflows/service-smoke.yml` | 3 (linux/macos/windows) | no | `just service-smoke` (linux/macOS) |
 
@@ -48,16 +49,25 @@ Counts are approximate and drift as tests are added.
 ## Running
 
 ```sh
-just test fast        # offline trio (unit + cli + behavioral)
-just test             # everything offline (cargo test --all-features)
-just test live        # live sync + state_auth against iCloud
-just test concurrency # shell: concurrent/resume/partial-fail
-just test state       # shell: token + config-hash invariants
-just test docker      # shell: docker container scenarios
-just test PATTERN     # passes through to cargo test PATTERN
-just gate             # full pre-push gate (what CI runs)
-just release-smoke    # fast offline v0.20 hotfix regression smoke
-just full-test        # pre-release battery, including Docker and live smokes
+just test fast                  # fast offline unit + key integration targets
+just test                       # all-feature offline tests
+just test offline               # offline all-feature/no-default/drift/scope checks
+just test scenario NAME         # focused behavior slice from scripts/test-scenarios/
+just test scenarios             # every focused offline scenario slice
+just test live                  # live sync + state_auth + import-existing against iCloud
+just test live-shell            # discovered live shell suites
+just test live-smoke            # release-binary live CLI/import smokes
+just test concurrency           # shell: concurrent/resume/partial-fail
+just test state                 # shell: token + config-hash invariants
+just test docker                # shell: Docker container scenarios
+just test packaging             # release build + archive smoke
+just test docker-full           # Docker build, PUID, multiarch, CLI/default-command smokes
+just test service               # local service-smoke wrapper
+just test PATTERN               # passes through to cargo test PATTERN
+just static-checks              # fmt, clippy, docs, audit, lint, contracts, typos
+just gate                       # static checks + offline behavior tests
+just release-smoke              # fast offline v0.20 hotfix regression smoke
+just full-test                  # grouped full battery with logs, live skips, metrics
 ```
 
 Without `just`, run the raw commands directly:
@@ -201,6 +211,11 @@ happens:
   resolution): `import_assets` falls back to the size-suffixed path when
   the bare name doesn't match, so libraries with collisions still
   match cleanly.
+- **`scripts/test-scenarios/`** - focused offline behavior slices named by
+  risk class, not release history. Current slices cover URL refresh,
+  identity/tombstone deltas, path-family collisions, auth/session flows,
+  service health, config docs, and full-test harness reachability. Use these
+  before a broad gate when touching the matching owner path.
 - **`shell/concurrency.sh`** - things that need `kill -9` mid-process,
   `chmod 555` on a target dir, direct sqlite3 assertions on the state
   DB mid-test. Hard to do cleanly from Rust.
@@ -210,17 +225,20 @@ happens:
   mode + SIGTERM, healthcheck probes inside the container.
 - **`scripts/full-test/run_release_archive_smoke.sh`** - packages the host
   release binary into a temp archive, extracts it, and runs basic CLI/config
-  probes against the extracted binary.
+  probes against the extracted binary. `just test packaging` runs the host
+  release build plus this smoke.
 - **`scripts/full-test/run_release_regression_smoke.sh`** - fast offline
   v0.20 hotfix gate. Run `just release-smoke` before any `v0.20.x` hotfix and
   before release branches that touch sync tokens, retry state, download
   validation, config paths, or reporting.
 - **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
   checks for PUID/PGID drop, volume chown, `MALLOC_ARENA_MAX=2`, root-default
-  behavior, and invalid env rejection.
+  behavior, and invalid env rejection. `just test docker-full` runs this with
+  Docker build, multiarch, and CLI/default-command smokes.
 - **`scripts/full-test/run_live_import_rehearsal.sh`** - live mini rehearsal
   for v0.20's TOML-first import path: seed a tiny real tree, import it into a
-  fresh DB, and verify a repeat dry-run stays matched.
+  fresh DB, and verify a repeat dry-run stays matched. `just test live-smoke`
+  runs this after the release-binary live CLI smokes.
 - **`scripts/full-test/run_cross_zone_album_hydration.sh`** - opt-in live
   release-binary check for accounts with a prepared cross-zone album fixture.
   It selects the named album with `libraries = ["all"]` and fails unless the

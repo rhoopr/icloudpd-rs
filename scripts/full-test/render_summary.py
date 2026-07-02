@@ -9,6 +9,27 @@ from pathlib import Path
 from typing import Any
 
 PHASE_ORDER = {
+    "static_checks": 10,
+    "offline_core": 20,
+    "scenarios": 25,
+    "nightly_tools": 30,
+    "package": 40,
+    "docker_full": 50,
+    "live_provider": 60,
+    "live_status": 70,
+    "live_libraries": 71,
+    "live_albums": 72,
+    "live_dryrun": 73,
+    "live_config_show": 74,
+    "live_verify": 75,
+    "live_reconcile_dryrun": 76,
+    "live_password_backend": 77,
+    "live_import_dryrun": 78,
+    "live_import_rehearsal": 79,
+    "live_cross_zone_album": 80,
+    "service": 90,
+    "host_service": 91,
+    # Legacy phase names from earlier full-test layouts.
     "gate": 10,
     "nodefault": 15,
     "fuzz_build": 17,
@@ -23,30 +44,16 @@ PHASE_ORDER = {
     "docker_version": 33,
     "docker_help": 34,
     "docker_default_cmd": 35,
-    "test_live": 40,
-    "test_shell_state_machine": 50,
-    "test_shell_concurrency": 51,
-    "test_shell_docker": 52,
-    "live_status": 60,
-    "live_libraries": 61,
-    "live_albums": 62,
-    "live_dryrun": 63,
-    "live_config_show": 64,
-    "live_verify": 65,
-    "live_reconcile_dryrun": 66,
-    "live_password_backend": 67,
-    "live_import_dryrun": 68,
-    "live_import_rehearsal": 69,
-    "live_cross_zone_album": 70,
-    "service_smoke": 71,
-    "real_service_lifecycle": 72,
+    "test_live": 60,
+    "service_smoke": 90,
+    "real_service_lifecycle": 91,
 }
 
 
 def sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, str]:
     name, _phase = item
     if name.startswith("test_shell_"):
-        return (50, name)
+        return (65, name)
     if name.startswith("test_"):
         return (12, name)
     return (PHASE_ORDER.get(name, 999), name)

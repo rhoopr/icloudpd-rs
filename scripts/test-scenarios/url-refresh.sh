@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cargo test --lib incremental_multi_album_unfiled_uses_membership_without_album_enumeration
+cargo test --lib incremental_expired_urls_are_refreshed_and_retried_same_cycle
+cargo test --lib incremental_preflight_refreshes_aged_urls_before_first_download
+cargo test --lib incremental_expired_url_retry_hydrates_instead_of_replaying_stale_delta
+cargo test --lib incremental_expired_url_retry_hydrates_relation_only_album_assets
+cargo test --lib pending_retry_expired_url_hydrates_current_records

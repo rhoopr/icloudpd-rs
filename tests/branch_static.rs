@@ -223,8 +223,8 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
         .find(shell_scratch_export)
         .expect("full-test must export KEI_TEST_SCRATCH_DIR before shell tests");
     let live_pos = run_all
-        .find("run_live_phase test_live")
-        .expect("full-test live phase must still exist");
+        .find("run_live_phase live_provider")
+        .expect("full-test live provider phase must still exist");
     let shell_pos = run_all
         .find("run_shell_suites.sh")
         .expect("full-test shell phase must still exist");
@@ -273,10 +273,16 @@ fn full_test_reports_include_newer_phase_metadata() {
     let diff = repo_file("scripts/full-test/diff_runs.sh");
 
     for phase in [
-        "release_archive_smoke",
-        "docker_puid_smoke",
+        "static_checks",
+        "offline_core",
+        "scenarios",
+        "nightly_tools",
+        "package",
+        "docker_full",
+        "live_provider",
         "live_import_rehearsal",
-        "real_service_lifecycle",
+        "service",
+        "host_service",
     ] {
         assert!(
             render.contains(phase),
@@ -285,6 +291,77 @@ fn full_test_reports_include_newer_phase_metadata() {
         assert!(
             diff.contains(phase),
             "diff_runs.sh must assign phase number/test metadata for {phase}"
+        );
+    }
+}
+
+#[test]
+fn scenario_fulltest_harness_rejects_unreferenced_helpers() {
+    let full_test_dir = repo_path("scripts/full-test");
+    let mut corpus = String::new();
+    for path in [
+        "justfile",
+        "tests/README.md",
+        "scripts/full-test/run_all.sh",
+    ] {
+        corpus.push_str(&repo_file(path));
+        corpus.push('\n');
+    }
+    for entry in std::fs::read_dir(&full_test_dir)
+        .unwrap_or_else(|e| panic!("read dir {}: {e}", full_test_dir.display()))
+    {
+        let entry =
+            entry.unwrap_or_else(|e| panic!("read dir entry {}: {e}", full_test_dir.display()));
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("script file name must be utf8");
+        if matches!(name, "run_all.sh") {
+            continue;
+        }
+        let mut references = corpus.clone();
+        for other in std::fs::read_dir(&full_test_dir)
+            .unwrap_or_else(|e| panic!("read dir {}: {e}", full_test_dir.display()))
+        {
+            let other =
+                other.unwrap_or_else(|e| panic!("read dir entry {}: {e}", full_test_dir.display()));
+            let other_path = other.path();
+            if other_path == path || !other_path.is_file() {
+                continue;
+            }
+            references.push_str(
+                &std::fs::read_to_string(&other_path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", other_path.display())),
+            );
+            references.push('\n');
+        }
+        assert!(
+            references.contains(name),
+            "scripts/full-test/{name} is not referenced by the live harness, just recipes, tests, or docs"
+        );
+    }
+
+    let justfile = repo_file("justfile");
+    let run_all = repo_file("scripts/full-test/run_all.sh");
+    let finalize = repo_file("scripts/full-test/finalize_run.sh");
+    assert!(
+        !justfile.contains("backfill_metrics")
+            && !run_all.contains("backfill_metrics")
+            && !finalize.contains("backfill_metrics"),
+        "historical metrics backfill helper must not be part of the current full-test path"
+    );
+    for expected in [
+        r#"metrics_json=$("$script_dir/collect_metrics.py" 2>/dev/null || echo "{}")"#,
+        "\"metrics\": json.loads(metrics_json or \"{}\")",
+        "phases[phase] = rec",
+    ] {
+        assert!(
+            finalize.contains(expected),
+            "finalize_run must keep current metrics generation without a backfill step: {expected}"
         );
     }
 }
@@ -345,26 +422,32 @@ fn full_test_checks_gnu_linux_userland_before_begin_run() {
 #[test]
 fn full_test_docker_smokes_quote_configured_image() {
     let run_all = repo_file("scripts/full-test/run_all.sh");
+    let justfile = repo_file("justfile");
     let shell_suites = repo_file("scripts/full-test/run_shell_suites.sh");
     let docker_puid = repo_file("scripts/full-test/run_docker_puid_smoke.sh");
     let shell_lib = repo_file("tests/shell/lib.sh");
 
+    assert!(
+        run_all.contains(r#"export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}""#),
+        "full-test must export the configured docker image default"
+    );
+    assert!(
+        run_all.contains("run_phase docker_full -- just test docker-full"),
+        "full-test docker group must route through the named docker-full recipe"
+    );
+
     for expected in [
-        r#"export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}""#,
-        r#"docker run --rm "$KEI_DOCKER_IMAGE" --version"#,
-        r#"docker run --rm "$KEI_DOCKER_IMAGE" --help"#,
-        r#"bash -c 'timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com "$KEI_DOCKER_IMAGE"; rc=$?; [[ $rc -ne 2 ]]'"#,
+        r#"docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --version"#,
+        r#"docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --help"#,
+        r#"timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com "${KEI_DOCKER_IMAGE:-kei:dev}""#,
+        "set +e",
+        "[[ $rc -ne 2 ]]",
     ] {
         assert!(
-            run_all.contains(expected),
-            "full-test docker smokes must use the exported, quoted docker image: {expected}"
+            justfile.contains(expected),
+            "docker-full recipe must use the configured, quoted docker image: {expected}"
         );
     }
-
-    assert!(
-        !run_all.contains(" $KEI_DOCKER_IMAGE; rc=\\$?"),
-        "full-test docker_default_cmd must not interpolate the image into the bash -c body unquoted"
-    );
 
     for expected in [
         r#"image="${KEI_DOCKER_IMAGE:-kei:dev}""#,
@@ -391,6 +474,7 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
     let ci = repo_file(".github/workflows/ci.yml");
 
     for expected in [
+        "static-checks:",
         "lint-workflows:",
         "python3 .github/scripts/check_workflow_hardening.py",
         "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile .github/scripts/*.py",
@@ -408,12 +492,28 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         );
     }
 
+    let static_checks = justfile
+        .split_once("static-checks:\n")
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.split_once("\n\n").map(|(recipe, _)| recipe))
+        .expect("justfile must keep static-checks recipe");
+    for expected in ["just lint-workflows", "just lint-scripts"] {
+        assert!(
+            static_checks.contains(expected),
+            "just static-checks must run {expected}"
+        );
+    }
+
     let gate = justfile
         .split_once("gate:\n")
         .map(|(_, tail)| tail)
         .and_then(|tail| tail.split_once("\n\n").map(|(gate, _)| gate))
         .expect("justfile must keep gate recipe");
-    for expected in ["just lint-workflows", "just lint-scripts"] {
+    for expected in [
+        "just static-checks",
+        "cargo test --all-features",
+        "cargo test --no-default-features",
+    ] {
         assert!(gate.contains(expected), "just gate must run {expected}");
     }
 
