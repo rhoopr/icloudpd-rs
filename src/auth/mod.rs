@@ -451,6 +451,16 @@ pub async fn send_2fa_push(
     domain: &str,
 ) -> Result<()> {
     let endpoints = Endpoints::for_domain(domain)?;
+    send_2fa_push_inner(cookie_dir, apple_id, password_provider, domain, &endpoints).await
+}
+
+async fn send_2fa_push_inner(
+    cookie_dir: &Path,
+    apple_id: &str,
+    password_provider: &crate::password::PasswordProvider,
+    domain: &str,
+    endpoints: &Endpoints,
+) -> Result<()> {
     let mut session = Session::new(cookie_dir, apple_id, endpoints.home, None).await?;
 
     let client_id = session
@@ -462,21 +472,23 @@ pub async fn send_2fa_push(
     let mut data: Option<AccountLoginResponse> = None;
     let has_session_token = session.session_data.contains_key("session_token");
 
-    if has_session_token {
-        if let Some(cached) = session
+    if has_session_token
+        && session
             .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
             .await
-        {
-            data = Some(cached);
-        }
+            .is_some()
+    {
+        tracing::debug!("Session validated recently; no 2FA push is needed for cached session");
+        return already_authenticated();
     }
 
     let mut pool_reset = false;
     if data.is_none() && has_session_token {
-        match twofa::validate_token(&mut session, &endpoints).await {
+        match twofa::validate_token(&mut session, endpoints).await {
             Ok(d) => {
                 session.save_validation_cache(&d).await;
-                data = Some(d);
+                tracing::debug!("Existing session token is valid; no 2FA push is needed");
+                return already_authenticated();
             }
             Err(e) => match classify_auth_flow_error(&e) {
                 AuthFlowErrorClass::TransientAppleFailure => {
@@ -501,7 +513,7 @@ pub async fn send_2fa_push(
     // Try accountLogin before SRP (same rationale as authenticate_inner:
     // validate_token is strict, accountLogin is lenient).
     if data.is_none() && has_session_token {
-        match twofa::authenticate_with_token(&mut session, &endpoints).await {
+        match twofa::authenticate_with_token(&mut session, endpoints).await {
             Ok(d) => {
                 data = Some(d);
             }
@@ -534,14 +546,14 @@ pub async fn send_2fa_push(
             })?;
         srp::authenticate_srp(
             &mut session,
-            &endpoints,
+            endpoints,
             apple_id,
             password.expose_secret(),
             &client_id,
             domain,
         )
         .await?;
-        let account_data = match twofa::authenticate_with_token(&mut session, &endpoints).await {
+        let account_data = match twofa::authenticate_with_token(&mut session, endpoints).await {
             Ok(d) => d,
             Err(e) if classify_auth_flow_error(&e) == AuthFlowErrorClass::MisdirectedRequest => {
                 tracing::warn!(
@@ -550,7 +562,7 @@ pub async fn send_2fa_push(
                      resetting HTTP pool and retrying once"
                 );
                 session.reset_http_clients()?;
-                twofa::authenticate_with_token(&mut session, &endpoints).await?
+                twofa::authenticate_with_token(&mut session, endpoints).await?
             }
             Err(e) => return Err(e),
         };
@@ -561,10 +573,14 @@ pub async fn send_2fa_push(
         data.ok_or_else(|| anyhow::anyhow!("Apple authentication did not return account data."))?;
 
     if !check_requires_2fa(&data) {
-        anyhow::bail!("This iCloud session is already authenticated; no 2FA code is needed.");
+        return already_authenticated();
     }
 
-    twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
+    twofa::trigger_push_notification(&mut session, endpoints, &client_id, domain).await
+}
+
+fn already_authenticated() -> Result<()> {
+    anyhow::bail!("This iCloud session is already authenticated; no 2FA code is needed.")
 }
 
 /// Check if the current session token is still valid by calling Apple's
@@ -870,6 +886,106 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "password provider must not run when endpoint resolution fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_2fa_push_treats_fresh_validation_cache_as_authenticated() {
+        let server = crate::start_wiremock_or_skip!();
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let apple_id = "cached-get-code@example.com";
+        tokio::fs::write(
+            session_file_path(cookies.path(), apple_id),
+            r#"{"session_token":"valid-token"}"#,
+        )
+        .await
+        .expect("session file");
+        let cache = responses::ValidationCache {
+            validated_at: chrono::Utc::now().timestamp(),
+            account_data: make_response(2, true, false, true),
+        };
+        let cache_json = serde_json::to_vec(&cache).expect("cache json");
+        tokio::fs::write(
+            validation_cache_file_path(cookies.path(), apple_id),
+            cache_json,
+        )
+        .await
+        .expect("validation cache");
+
+        let password_called = Arc::new(AtomicBool::new(false));
+        let called_for_provider = Arc::clone(&password_called);
+        let provider: crate::password::PasswordProvider = Arc::new(move || {
+            called_for_provider.store(true, Ordering::SeqCst);
+            Some(SecretString::from("should-not-be-read"))
+        });
+
+        let err = send_2fa_push_inner(cookies.path(), apple_id, &provider, "com", &endpoints)
+            .await
+            .expect_err("validated session should not need a 2FA push");
+
+        assert!(
+            err.to_string().contains("already authenticated"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !password_called.load(Ordering::SeqCst),
+            "fresh validation cache must not fall through to SRP"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_2fa_push_treats_live_validate_success_as_authenticated() {
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("POST"))
+            .and(path("/setup/ws/1/validate"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(make_response(2, true, false, true)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let apple_id = "live-get-code@example.com";
+        tokio::fs::write(
+            session_file_path(cookies.path(), apple_id),
+            r#"{"session_token":"valid-token"}"#,
+        )
+        .await
+        .expect("session file");
+
+        let password_called = Arc::new(AtomicBool::new(false));
+        let called_for_provider = Arc::clone(&password_called);
+        let provider: crate::password::PasswordProvider = Arc::new(move || {
+            called_for_provider.store(true, Ordering::SeqCst);
+            Some(SecretString::from("should-not-be-read"))
+        });
+
+        let err = send_2fa_push_inner(cookies.path(), apple_id, &provider, "com", &endpoints)
+            .await
+            .expect_err("validated session should not need a 2FA push");
+
+        assert!(
+            err.to_string().contains("already authenticated"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !password_called.load(Ordering::SeqCst),
+            "valid existing session must not fall through to SRP"
+        );
+
+        let session = Session::new(cookies.path(), apple_id, &server.uri(), Some(5))
+            .await
+            .expect("session");
+        let cached = session
+            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+            .await
+            .expect("validate success should refresh the cache");
+        assert!(
+            check_requires_2fa(&cached),
+            "regression guard must cover HSA flags that would otherwise demand 2FA"
         );
     }
 
