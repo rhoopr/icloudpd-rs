@@ -140,6 +140,12 @@ pub trait DownloadStateStore: Send + Sync {
     async fn reset_failed(&self) -> Result<u64, StateError>;
     async fn prepare_for_retry(&self, library: Option<&str>)
         -> Result<(u64, u64, u64), StateError>;
+    async fn prune_source_deleted_retries(
+        &self,
+        _library: Option<&str>,
+    ) -> Result<u64, StateError> {
+        Ok(0)
+    }
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
     async fn prune_stale_pending_not_seen_since(
         &self,
@@ -213,6 +219,21 @@ pub trait DownloadStateStore: Send + Sync {
             .await?;
         Ok(1)
     }
+    /// Resolve a provider delete while respecting local download state.
+    ///
+    /// Downloaded rows stay in the catalog with a source tombstone so kei can
+    /// keep reporting locally protected files. Pending/failed rows are removed:
+    /// there is no source left to retry, and keeping them would create stale
+    /// unresolved work.
+    async fn resolve_source_deleted_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        self.mark_soft_deleted_affected(library, asset_id, deleted_at)
+            .await
+    }
     async fn mark_master_family_soft_deleted_affected(
         &self,
         library: &str,
@@ -220,6 +241,15 @@ pub trait DownloadStateStore: Send + Sync {
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<usize, StateError> {
         self.mark_soft_deleted_affected(library, master_record_name, deleted_at)
+            .await
+    }
+    async fn resolve_master_family_source_deleted_affected(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        self.mark_master_family_soft_deleted_affected(library, master_record_name, deleted_at)
             .await
     }
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError>;
@@ -1806,6 +1836,33 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn prune_source_deleted_retries(
+        &self,
+        library: Option<&str>,
+    ) -> Result<u64, StateError> {
+        let library = library.map(ToOwned::to_owned);
+        self.with_conn("prune_source_deleted_retries", move |conn| {
+            let pruned = if let Some(library) = library.as_deref() {
+                conn.execute(
+                    "DELETE FROM assets \
+                     WHERE library = ?1 AND is_deleted = 1 AND status IN ('pending', 'failed')",
+                    rusqlite::params![library],
+                )
+            } else {
+                conn.execute(
+                    "DELETE FROM assets \
+                     WHERE is_deleted = 1 AND status IN ('pending', 'failed')",
+                    [],
+                )
+            }
+            .map_err(|e| StateError::query("prune_source_deleted_retries", e))?
+                as u64;
+
+            Ok(pruned)
+        })
+        .await
+    }
+
     pub(crate) async fn promote_pending_to_failed(
         &self,
         seen_since: i64,
@@ -2788,10 +2845,43 @@ impl SqliteStateDb {
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
                  WHERE library = ?2 AND id = ?3",
-                    rusqlite::params![deleted_at.map(|dt| dt.timestamp()), library, asset_id],
+                    rusqlite::params![deleted_at.map(|dt| dt.timestamp()), &library, &asset_id],
                 )
                 .map_err(|e| StateError::query("mark_soft_deleted", e))?;
             Ok(updated)
+        })
+        .await
+    }
+
+    pub(crate) async fn resolve_source_deleted(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        self.with_conn_mut("resolve_source_deleted", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("resolve_source_deleted::begin", e))?;
+            let marked = tx
+                .execute(
+                    "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
+                     WHERE library = ?2 AND id = ?3 AND status = 'downloaded'",
+                    rusqlite::params![deleted_at.map(|dt| dt.timestamp()), library, asset_id],
+                )
+                .map_err(|e| StateError::query("resolve_source_deleted::mark", e))?;
+            let pruned = tx
+                .execute(
+                    "DELETE FROM assets \
+                     WHERE library = ?1 AND id = ?2 AND status IN ('pending', 'failed')",
+                    rusqlite::params![&library, &asset_id],
+                )
+                .map_err(|e| StateError::query("resolve_source_deleted::prune", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("resolve_source_deleted::commit", e))?;
+            Ok(marked + pruned)
         })
         .await
     }
@@ -2814,12 +2904,55 @@ impl SqliteStateDb {
                      ))",
                     rusqlite::params![
                         deleted_at.map(|dt| dt.timestamp()),
-                        library,
-                        master_record_name
+                        &library,
+                        &master_record_name
                     ],
                 )
                 .map_err(|e| StateError::query("mark_master_family_soft_deleted", e))?;
             Ok(updated)
+        })
+        .await
+    }
+
+    pub(crate) async fn resolve_master_family_source_deleted(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        let library = library.to_owned();
+        let master_record_name = master_record_name.to_owned();
+        self.with_conn_mut("resolve_master_family_source_deleted", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("resolve_master_family_source_deleted::begin", e))?;
+            let marked = tx
+                .execute(
+                    "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
+                     WHERE library = ?2 AND status = 'downloaded' AND (id = ?3 OR id IN ( \
+                        SELECT asset_record_name FROM asset_master_mappings \
+                        WHERE library = ?2 AND master_record_name = ?3 \
+                     ))",
+                    rusqlite::params![
+                        deleted_at.map(|dt| dt.timestamp()),
+                        library,
+                        master_record_name
+                    ],
+                )
+                .map_err(|e| StateError::query("resolve_master_family_source_deleted::mark", e))?;
+            let pruned = tx
+                .execute(
+                    "DELETE FROM assets \
+                     WHERE library = ?1 AND status IN ('pending', 'failed') AND (id = ?2 OR id IN ( \
+                        SELECT asset_record_name FROM asset_master_mappings \
+                        WHERE library = ?1 AND master_record_name = ?2 \
+                     ))",
+                    rusqlite::params![&library, &master_record_name],
+                )
+                .map_err(|e| StateError::query("resolve_master_family_source_deleted::prune", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("resolve_master_family_source_deleted::commit", e))?;
+            Ok(marked + pruned)
         })
         .await
     }
@@ -3079,6 +3212,10 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::prepare_for_retry(self, library).await
     }
 
+    async fn prune_source_deleted_retries(&self, library: Option<&str>) -> Result<u64, StateError> {
+        SqliteStateDb::prune_source_deleted_retries(self, library).await
+    }
+
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
         SqliteStateDb::promote_pending_to_failed(self, seen_since).await
     }
@@ -3180,6 +3317,15 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::mark_soft_deleted(self, library, asset_id, deleted_at).await
     }
 
+    async fn resolve_source_deleted_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        SqliteStateDb::resolve_source_deleted(self, library, asset_id, deleted_at).await
+    }
+
     async fn mark_master_family_soft_deleted_affected(
         &self,
         library: &str,
@@ -3187,6 +3333,21 @@ impl DownloadStateStore for SqliteStateDb {
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<usize, StateError> {
         SqliteStateDb::mark_master_family_soft_deleted(
+            self,
+            library,
+            master_record_name,
+            deleted_at,
+        )
+        .await
+    }
+
+    async fn resolve_master_family_source_deleted_affected(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        SqliteStateDb::resolve_master_family_source_deleted(
             self,
             library,
             master_record_name,
@@ -7678,6 +7839,169 @@ mod tests {
             );
             assert_eq!(rec.metadata.deleted_at, Some(when));
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_source_deleted_prunes_pending_and_failed_but_preserves_downloaded() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let pending = TestAssetRecord::new("SRC_DEL")
+            .version_size(VersionSizeKey::Original)
+            .checksum("pending")
+            .build();
+        let failed = TestAssetRecord::new("SRC_DEL")
+            .version_size(VersionSizeKey::Medium)
+            .checksum("failed")
+            .build();
+        let downloaded = TestAssetRecord::new("SRC_DEL")
+            .version_size(VersionSizeKey::Thumb)
+            .checksum("downloaded")
+            .build();
+        db.upsert_seen(&pending).await.unwrap();
+        db.upsert_seen(&failed).await.unwrap();
+        db.upsert_seen(&downloaded).await.unwrap();
+        db.mark_failed(
+            "PrimarySync",
+            "SRC_DEL",
+            VersionSizeKey::Medium.as_str(),
+            "prior failure",
+        )
+        .await
+        .unwrap();
+        let dir = test_dir();
+        let path = dir.path().join("source-deleted-thumb.jpg");
+        std::fs::write(&path, b"x").unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "SRC_DEL",
+            VersionSizeKey::Thumb.as_str(),
+            &path,
+            "local_hash",
+            Some("download_hash"),
+        )
+        .await
+        .unwrap();
+
+        let deleted_at = Utc.timestamp_opt(1_700_000_003, 0).unwrap();
+        let updated = db
+            .resolve_source_deleted("PrimarySync", "SRC_DEL", Some(deleted_at))
+            .await
+            .unwrap();
+
+        assert_eq!(updated, 3);
+        assert!(db.get_pending().await.unwrap().is_empty());
+        assert!(db.get_failed().await.unwrap().is_empty());
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].version_size, VersionSizeKey::Thumb);
+        assert!(downloaded[0].metadata.is_deleted);
+        assert_eq!(downloaded[0].metadata.deleted_at, Some(deleted_at));
+        assert_eq!(downloaded[0].local_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn resolve_master_family_source_deleted_prunes_pending_siblings() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_seen(&TestAssetRecord::new("MASTER_FAMILY").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("asset-FAMILY-SIBLING").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("OTHER_MASTER").build())
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-FAMILY-SIBLING", "MASTER_FAMILY")
+            .await
+            .unwrap();
+
+        let updated = db
+            .resolve_master_family_source_deleted("PrimarySync", "MASTER_FAMILY", None)
+            .await
+            .unwrap();
+
+        assert_eq!(updated, 2);
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.as_ref(), "OTHER_MASTER");
+    }
+
+    #[tokio::test]
+    async fn prune_source_deleted_retries_removes_only_retry_tombstones() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_seen(&TestAssetRecord::new("PENDING_DELETED").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("FAILED_DELETED").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("DOWNLOADED_DELETED").build())
+            .await
+            .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("PENDING_LIVE").build())
+            .await
+            .unwrap();
+        db.upsert_seen(
+            &TestAssetRecord::new("SHARED_DELETED")
+                .library("SharedSync-AAAA")
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_failed(
+            "PrimarySync",
+            "FAILED_DELETED",
+            VersionSizeKey::Original.as_str(),
+            "prior failure",
+        )
+        .await
+        .unwrap();
+        let dir = test_dir();
+        let path = dir.path().join("downloaded-deleted.jpg");
+        std::fs::write(&path, b"x").unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DOWNLOADED_DELETED",
+            VersionSizeKey::Original.as_str(),
+            &path,
+            "local_hash",
+            Some("download_hash"),
+        )
+        .await
+        .unwrap();
+        for asset_id in [
+            "PENDING_DELETED",
+            "FAILED_DELETED",
+            "DOWNLOADED_DELETED",
+            "SHARED_DELETED",
+        ] {
+            let library = if asset_id == "SHARED_DELETED" {
+                "SharedSync-AAAA"
+            } else {
+                "PrimarySync"
+            };
+            db.mark_soft_deleted(library, asset_id, None).await.unwrap();
+        }
+
+        let pruned = db
+            .prune_source_deleted_retries(Some("PrimarySync"))
+            .await
+            .unwrap();
+
+        assert_eq!(pruned, 2);
+        assert!(db.get_failed().await.unwrap().is_empty());
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().any(|record| {
+            record.library.as_ref() == "PrimarySync" && record.id.as_ref() == "PENDING_LIVE"
+        }));
+        assert!(pending.iter().any(|record| {
+            record.library.as_ref() == "SharedSync-AAAA" && record.id.as_ref() == "SHARED_DELETED"
+        }));
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].id.as_ref(), "DOWNLOADED_DELETED");
+        assert!(downloaded[0].metadata.is_deleted);
+        assert_eq!(downloaded[0].local_path.as_deref(), Some(path.as_path()));
     }
 
     #[tokio::test]

@@ -3514,7 +3514,7 @@ async fn run_source_state_update(
 ) -> Result<usize, crate::state::error::StateError> {
     match update {
         SourceStateUpdate::SoftDeleted { deleted_at } => {
-            db.mark_soft_deleted_affected(&config.library, key.record_name(), deleted_at)
+            db.resolve_source_deleted_affected(&config.library, key.record_name(), deleted_at)
                 .await
         }
         SourceStateUpdate::Hidden => {
@@ -4191,6 +4191,18 @@ pub async fn download_photos_with_sync(
     // failed -> pending (with attempts reset), and stale attempt counts on
     // pending assets cleared so the per-sync cap starts from zero.
     let (_retry_failed_count, total_pending) = if let Some(db) = &config.state_db {
+        match db.prune_source_deleted_retries(Some(&config.library)).await {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(
+                    count,
+                    "Pruned source-deleted pending/failed assets from retry queue"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to prune source-deleted retry assets");
+            }
+        }
         match db.prepare_for_retry(Some(&config.library)).await {
             Ok((failed, stale, total_pending)) => {
                 if failed > 0 {
@@ -5299,7 +5311,7 @@ impl IncrementalDeltaSummary {
                             unresolved_identity: true,
                         };
                         match db
-                            .mark_master_family_soft_deleted_affected(
+                            .resolve_master_family_source_deleted_affected(
                                 &config.library,
                                 unresolved_tombstone_key.record_name(),
                                 None,
@@ -5348,14 +5360,14 @@ impl IncrementalDeltaSummary {
                     let result = if matches!(state_key.record_type, Some("CPLMaster"))
                         && !matches!(event.record_type.as_deref(), Some("CPLAsset") | None)
                     {
-                        db.mark_master_family_soft_deleted_affected(
+                        db.resolve_master_family_source_deleted_affected(
                             &config.library,
                             state_key.record_name(),
                             None,
                         )
                         .await
                     } else {
-                        db.mark_soft_deleted_affected(
+                        db.resolve_source_deleted_affected(
                             &config.library,
                             state_key.record_name(),
                             None,
@@ -6500,6 +6512,7 @@ mod tests {
         mock_photo_records_for_zone_with_filename_and_asset_date, DynamicRecentPhotosSession,
         MockPhotosFlow, TestAssetRecord, TracingCapture,
     };
+    use chrono::TimeZone;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9250,8 +9263,13 @@ mod tests {
             "print-only incremental runs must not advance the sync token"
         );
         let pending = db.get_pending().await.unwrap();
-        assert_source_flags(&pending, "SOFT_DELETE", true, false);
-        assert_source_flags(&pending, "HARD_DELETE", true, false);
+        assert!(
+            pending
+                .iter()
+                .all(|record| record.id.as_ref() != "SOFT_DELETE"
+                    && record.id.as_ref() != "HARD_DELETE"),
+            "source-deleted pending rows must be pruned: {pending:?}"
+        );
         assert_source_flags(&pending, "HIDDEN_ASSET", false, true);
     }
 
@@ -9365,7 +9383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_cplasset_soft_delete_marks_master_ref_row() {
+    async fn incremental_cplasset_soft_delete_prunes_master_ref_pending_row() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
             .await
@@ -9383,8 +9401,10 @@ mod tests {
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
         assert_eq!(result.stats.state_write_failures, 0);
         assert!(!result.stats.sync_token_blocked);
-        let pending = db.get_pending().await.unwrap();
-        assert_source_flags(&pending, "TRACKED_MASTER", true, false);
+        assert!(
+            db.get_pending().await.unwrap().is_empty(),
+            "source-deleted pending row should be removed"
+        );
     }
 
     #[tokio::test]
@@ -9411,7 +9431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_cplasset_soft_delete_marks_sibling_state_row_before_master_ref() {
+    async fn incremental_cplasset_soft_delete_prunes_sibling_pending_row_before_master_ref() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
             .await
@@ -9438,7 +9458,12 @@ mod tests {
         assert!(!result.stats.sync_token_blocked);
         let pending = db.get_pending().await.unwrap();
         assert_source_flags(&pending, "TRACKED_MASTER", false, false);
-        assert_source_flags(&pending, "asset-TRACKED_SIBLING", true, false);
+        assert!(
+            pending
+                .iter()
+                .all(|record| record.id.as_ref() != "asset-TRACKED_SIBLING"),
+            "source-deleted sibling pending row should be removed: {pending:?}"
+        );
     }
 
     #[tokio::test]
@@ -9531,7 +9556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_unresolved_master_hard_delete_marks_sibling_asset_rows() {
+    async fn incremental_unresolved_master_hard_delete_prunes_sibling_pending_rows() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
             .await
@@ -9553,9 +9578,10 @@ mod tests {
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
         assert_eq!(result.stats.state_write_failures, 0);
         assert!(!result.stats.sync_token_blocked);
-        let pending = db.get_pending().await.unwrap();
-        assert_source_flags(&pending, "TRACKED_MASTER", true, false);
-        assert_source_flags(&pending, "asset-SIBLING", true, false);
+        assert!(
+            db.get_pending().await.unwrap().is_empty(),
+            "master-family hard delete should remove pending retry rows"
+        );
     }
 
     #[tokio::test]
@@ -9594,19 +9620,16 @@ mod tests {
         assert!(!result.stats.sync_token_blocked);
 
         let pending = db.get_pending().await.unwrap();
-        let primary = pending
-            .iter()
-            .find(|record| record.library.as_ref() == "PrimarySync")
-            .expect("primary row");
+        assert!(
+            pending
+                .iter()
+                .all(|record| record.library.as_ref() != "PrimarySync"),
+            "primary source-deleted pending row should be removed: {pending:?}"
+        );
         let shared = pending
             .iter()
             .find(|record| record.library.as_ref() == "SharedSync-AAAA")
             .expect("shared row");
-        assert_eq!(primary.id.as_ref(), "PRIMARY_MASTER");
-        assert!(
-            primary.metadata.is_deleted,
-            "PrimarySync mapping should resolve and mark the master row deleted"
-        );
         assert_eq!(shared.id.as_ref(), "SHARED_MASTER");
         assert!(
             !shared.metadata.is_deleted,
@@ -10756,7 +10779,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_with_unmatched_pending_rows_prunes_after_targeted_retry() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-        let record = crate::test_helpers::TestAssetRecord::new("PENDING_DELETED_UPSTREAM")
+        let record = TestAssetRecord::new("PENDING_DELETED_UPSTREAM")
             .filename("pending-deleted-upstream.jpg")
             .checksum("ck_pending_deleted_upstream")
             .size(1024)
@@ -10801,6 +10824,91 @@ mod tests {
         assert_eq!(result.stats.stale_pending_pruned, 1);
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.pending, 0);
+        assert!(db.get_pending().await.expect("pending page").is_empty());
+    }
+
+    async fn run_bounded_incremental_sync(
+        db: Arc<crate::state::SqliteStateDb>,
+        records: Vec<Value>,
+    ) -> SyncResult {
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(records, "zone-token-next", false)
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+        config.recent = Some(300);
+        config.skip_created_before = Some(Utc.timestamp_opt(1_746_994_800, 0).unwrap());
+
+        download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("bounded incremental sync should complete")
+    }
+
+    #[tokio::test]
+    async fn incremental_source_delete_prunes_pending_row_in_bounded_sync() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("PENDING_SOURCE_DELETED")
+            .filename("pending-source-deleted.jpg")
+            .checksum("ck_pending_source_deleted")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+
+        let result = run_bounded_incremental_sync(
+            db.clone(),
+            vec![hard_deleted_change_record("PENDING_SOURCE_DELETED")],
+        )
+        .await;
+
+        assert!(
+            !result.full_enumeration_ran,
+            "source delete cleanup should not force full enumeration"
+        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(!result.stats.sync_token_blocked);
+        assert!(db.get_pending().await.expect("pending page").is_empty());
+    }
+
+    #[tokio::test]
+    async fn incremental_prunes_existing_source_deleted_pending_row_without_wide_sync() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("STALE_SOURCE_DELETED")
+            .filename("stale-source-deleted.jpg")
+            .checksum("ck_stale_source_deleted")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        db.mark_soft_deleted("PrimarySync", "STALE_SOURCE_DELETED", None)
+            .await
+            .expect("simulate old source-deleted pending row");
+
+        let result = run_bounded_incremental_sync(db.clone(), Vec::new()).await;
+
+        assert!(
+            !result.full_enumeration_ran,
+            "cleanup should not force full enumeration"
+        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(!result.stats.sync_token_blocked);
         assert!(db.get_pending().await.expect("pending page").is_empty());
     }
 
