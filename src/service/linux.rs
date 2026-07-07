@@ -27,13 +27,13 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
 
 use crate::cli::UninstallArgs;
 use crate::service::env::{
-    current_executable, effective_uid, purge_kei_state, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
+    SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable, effective_uid, purge_kei_state,
 };
 use crate::service::plan::{self, InstallPlan};
 use crate::service::status::ServiceState;

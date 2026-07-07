@@ -13,22 +13,22 @@ pub mod session;
 pub(crate) mod smart_folders;
 pub mod types;
 
+#[cfg(test)]
+pub(crate) use album::MAX_EMPTY_PAGE_PROBES;
 pub use album::PhotoAlbum;
 #[cfg(test)]
 pub use album::PhotoAlbumConfig;
-#[cfg(test)]
-pub(crate) use album::MAX_EMPTY_PAGE_PROBES;
 pub(crate) use album::{ProviderRecordId, RecordLookupRequest, RecordResolution};
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
-pub(crate) use library::{is_shared_zone, PRIMARY_ZONE_NAME};
+pub(crate) use library::{PRIMARY_ZONE_NAME, is_shared_zone};
 pub use session::{PhotosSession, SyncTokenError};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::icloud::error::ICloudError;
 use crate::icloud::photos::cloudkit::ChangesDatabaseResponse;

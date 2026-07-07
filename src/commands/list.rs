@@ -22,7 +22,9 @@ pub(crate) async fn run_list(
     let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
-        anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username before listing iCloud Photos.");
+        anyhow::bail!(
+            "Set your iCloud username with ICLOUD_USERNAME or [auth].username before listing iCloud Photos."
+        );
     }
 
     let password_provider =

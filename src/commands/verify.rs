@@ -10,7 +10,7 @@ use crate::config;
 use crate::download;
 use crate::state;
 
-use super::{print_truncation_tail, LISTING_CAP};
+use super::{LISTING_CAP, print_truncation_tail};
 
 /// Run the verify command.
 pub(crate) async fn run_verify(
@@ -157,12 +157,14 @@ mod tests {
         let file_path = dir.path().join("local_mismatch.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
 
-        assert!(!verify_local_checksum(
-            &file_path,
-            "0000000000000000000000000000000000000000000000000000000000000000"
-        )
-        .await
-        .unwrap());
+        assert!(
+            !verify_local_checksum(
+                &file_path,
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[tokio::test]

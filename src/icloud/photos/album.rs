@@ -1,20 +1,20 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use anyhow::Context;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
 
 use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use super::cloudkit::ChangesZoneResponse;
-use super::queries::{build_changes_zone_request, encode_params, DESIRED_KEYS_VALUES};
-use super::session::{check_changes_zone_error, PhotosSession};
+use super::queries::{DESIRED_KEYS_VALUES, build_changes_zone_request, encode_params};
+use super::session::{PhotosSession, check_changes_zone_error};
 use crate::retry::RetryConfig;
 
 /// How many consecutive empty /records/query pages trigger true EOF.
@@ -193,11 +193,11 @@ fn download_stream_page_size(default_page_size: usize, download_concurrency: usi
 async fn await_fetcher_handles(handles: Vec<JoinHandle<()>>) -> bool {
     let mut panicked = false;
     for handle in handles {
-        if let Err(e) = handle.await {
-            if e.is_panic() {
-                tracing::error!(error = ?e, "Photo fetcher task panicked");
-                panicked = true;
-            }
+        if let Err(e) = handle.await
+            && e.is_panic()
+        {
+            tracing::error!(error = ?e, "Photo fetcher task panicked");
+            panicked = true;
         }
     }
     panicked
@@ -2011,11 +2011,11 @@ impl PhotoAlbum {
                             ) {
                                 continue;
                             }
-                            if let Some(n) = limit {
-                                if total_sent >= u64::from(n) {
-                                    limit_reached = true;
-                                    break;
-                                }
+                            if let Some(n) = limit
+                                && total_sent >= u64::from(n)
+                            {
+                                limit_reached = true;
+                                break;
                             }
                             let mut asset = PhotoAsset::from_records(master.clone(), &asset_rec);
                             if sibling_count > 1 && index > 0 {
@@ -2063,11 +2063,11 @@ impl PhotoAlbum {
                             ) {
                                 continue;
                             }
-                            if let Some(n) = limit {
-                                if total_sent >= u64::from(n) {
-                                    limit_reached = true;
-                                    break;
-                                }
+                            if let Some(n) = limit
+                                && total_sent >= u64::from(n)
+                            {
+                                limit_reached = true;
+                                break;
                             }
                             let mut asset = PhotoAsset::from_records(master.clone(), &asset_rec);
                             if sibling_count > 1 && index > 0 {
@@ -2094,11 +2094,11 @@ impl PhotoAlbum {
                             ) {
                                 continue;
                             }
-                            if let Some(n) = limit {
-                                if total_sent >= u64::from(n) {
-                                    limit_reached = true;
-                                    break;
-                                }
+                            if let Some(n) = limit
+                                && total_sent >= u64::from(n)
+                            {
+                                limit_reached = true;
+                                break;
                             }
                             let asset = PhotoAsset::from_records(master.clone(), &asset_rec)
                                 .with_state_record_name(Arc::from(asset_rec.record_name.as_str()));
@@ -2229,10 +2229,10 @@ impl PhotoAlbum {
             }),
         ];
 
-        if let Some(qf) = query_filter {
-            if let Some(arr) = qf.as_array() {
-                filter_by.extend(arr.iter().cloned());
-            }
+        if let Some(qf) = query_filter
+            && let Some(arr) = qf.as_array()
+        {
+            filter_by.extend(arr.iter().cloned());
         }
 
         let query_part = json!({
@@ -2319,11 +2319,11 @@ impl PhotoAlbum {
 mod tests {
     use super::*;
     use crate::test_helpers::{
-        mock_photo_query_page, DynamicRecentPhotosSession, MockPhotosFlow, MockPhotosSession,
+        DynamicRecentPhotosSession, MockPhotosFlow, MockPhotosSession, mock_photo_query_page,
     };
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct BatchCountSession {
@@ -3275,12 +3275,14 @@ mod tests {
         let (mut stream, token_rx) =
             album.photo_stream_with_token_for_download_policy(None, Some(1), 1, true);
 
-        assert!(stream
-            .next()
-            .await
-            .transpose()
-            .expect("first asset")
-            .is_some());
+        assert!(
+            stream
+                .next()
+                .await
+                .transpose()
+                .expect("first asset")
+                .is_some()
+        );
         drop(stream);
 
         assert_eq!(token_rx.await.expect("sync token sender"), None);

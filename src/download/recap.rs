@@ -13,8 +13,8 @@
 //! the off path allocates only a handful of bytes per cycle
 //! (`Default::default()`).
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use chrono::{DateTime, Local};
 
@@ -83,19 +83,18 @@ impl RunRecap {
     /// result for one cycle). `other` wins ties on biggest because the
     /// later pass observed it last; deterministic enough for display.
     pub fn merge(&mut self, other: RunRecap) {
-        if let Some(b) = other.biggest {
-            if self.biggest.as_ref().is_none_or(|cur| b.bytes >= cur.bytes) {
-                self.biggest = Some(b);
-            }
+        if let Some(b) = other.biggest
+            && self.biggest.as_ref().is_none_or(|cur| b.bytes >= cur.bytes)
+        {
+            self.biggest = Some(b);
         }
-        if let Some(o) = other.oldest {
-            if self
+        if let Some(o) = other.oldest
+            && self
                 .oldest
                 .as_ref()
                 .is_none_or(|cur| o.created_local <= cur.created_local)
-            {
-                self.oldest = Some(o);
-            }
+        {
+            self.oldest = Some(o);
         }
         for (label, asset) in other.albums {
             self.albums

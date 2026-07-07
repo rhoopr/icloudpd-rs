@@ -690,10 +690,10 @@ fn expand_tilde_with_home(path: &str, home: &Path) -> PathBuf {
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return expand_tilde_with_home(path, &home);
-        }
+    if path.starts_with("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return expand_tilde_with_home(path, &home);
     }
     PathBuf::from(path)
 }
@@ -1389,14 +1389,14 @@ impl Config {
             .map(parse_date_or_interval)
             .transpose()?;
 
-        if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after) {
-            if before >= after {
-                tracing::warn!(
-                    before = %before.format("%Y-%m-%d"),
-                    after = %after.format("%Y-%m-%d"),
-                    "skip-created-before >= skip-created-after, no assets can match",
-                );
-            }
+        if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after)
+            && before >= after
+        {
+            tracing::warn!(
+                before = %before.format("%Y-%m-%d"),
+                after = %after.format("%Y-%m-%d"),
+                "skip-created-before >= skip-created-after, no assets can match",
+            );
         }
 
         let watch_with_interval = overrides
@@ -1980,24 +1980,23 @@ pub(crate) fn persist_first_run_config(
 /// - ISO date: `"2025-01-02"` (midnight local time)
 /// - ISO datetime: `"2025-01-02T14:30:00"` (local time)
 pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
-    if let Some(days_str) = s.strip_suffix('d') {
-        if let Ok(days) = days_str.parse::<u64>() {
-            let days = i64::try_from(days)
-                .map_err(|_e| anyhow::anyhow!("Date interval '{s}' is too large"))?;
-            return Ok(Local::now() - chrono::Duration::days(days));
-        }
+    if let Some(days_str) = s.strip_suffix('d')
+        && let Ok(days) = days_str.parse::<u64>()
+    {
+        let days = i64::try_from(days)
+            .map_err(|_e| anyhow::anyhow!("Date interval '{s}' is too large"))?;
+        return Ok(Local::now() - chrono::Duration::days(days));
     }
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        if let Some(naive_dt) = date.and_hms_opt(0, 0, 0) {
-            if let Some(dt) = naive_dt.and_local_timezone(Local).single() {
-                return Ok(dt);
-            }
-        }
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        && let Some(naive_dt) = date.and_hms_opt(0, 0, 0)
+        && let Some(dt) = naive_dt.and_local_timezone(Local).single()
+    {
+        return Ok(dt);
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        if let Some(local) = dt.and_local_timezone(Local).single() {
-            return Ok(local);
-        }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        && let Some(local) = dt.and_local_timezone(Local).single()
+    {
+        return Ok(local);
     }
     anyhow::bail!(
         "Could not parse '{s}' as a date. Use a date like 2025-01-02, a datetime like 2025-01-02T14:30:00, or an interval like 20d."
@@ -6205,9 +6204,10 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.filename_exclude = vec!["[invalid".to_string()];
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Invalid --filename-exclude pattern"));
+        assert!(
+            err.to_string()
+                .contains("Invalid --filename-exclude pattern")
+        );
     }
 
     #[test]
@@ -6511,18 +6511,20 @@ mod tests {
         .unwrap();
         let toml = cfg.to_toml();
         // Default value is suppressed on round-trip so config dumps stay clean.
-        assert!(toml
-            .download
-            .as_ref()
-            .unwrap()
-            .folder_structure_albums
-            .is_none());
-        assert!(toml
-            .download
-            .as_ref()
-            .unwrap()
-            .folder_structure_smart_folders
-            .is_none());
+        assert!(
+            toml.download
+                .as_ref()
+                .unwrap()
+                .folder_structure_albums
+                .is_none()
+        );
+        assert!(
+            toml.download
+                .as_ref()
+                .unwrap()
+                .folder_structure_smart_folders
+                .is_none()
+        );
     }
 
     #[test]

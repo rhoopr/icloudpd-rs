@@ -151,10 +151,10 @@ pub(super) async fn download_file_with_mode<C: DownloadClient>(
     Box::pin(retry::retry_with_backoff_with_mode(
         retry_config,
         |e: &DownloadError| {
-            if e.is_rate_limited() {
-                if let Some(counter) = limits.rate_limit_counter {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+            if e.is_rate_limited()
+                && let Some(counter) = limits.rate_limit_counter
+            {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if e.is_retryable() {
                 RetryAction::Retry
@@ -291,14 +291,14 @@ async fn attempt_download<C: DownloadClient>(
     // writing to disk. Delete any stale .part file so the next successful
     // attempt starts fresh rather than appending to data from a previous
     // (possibly different) response.
-    if let Some(ct) = &response.content_type {
-        if let Some(reason) = rejecting_content_type_reason(ct) {
-            crate::fs_util::log_remove_async(part_path).await;
-            return Err(DownloadError::InvalidContent {
-                path: path_str.into(),
-                reason: format!("server returned {reason} content-type: {ct}").into(),
-            });
-        }
+    if let Some(ct) = &response.content_type
+        && let Some(reason) = rejecting_content_type_reason(ct)
+    {
+        crate::fs_util::log_remove_async(part_path).await;
+        return Err(DownloadError::InvalidContent {
+            path: path_str.into(),
+            reason: format!("server returned {reason} content-type: {ct}").into(),
+        });
     }
 
     let content_length = response.content_length;
@@ -312,25 +312,26 @@ async fn attempt_download<C: DownloadClient>(
     // reconcile with the API-reported size, the resource on the server has
     // likely been rotated since we wrote the .part. Discard and restart
     // cleanly rather than appending new bytes to a stale prefix.
-    if status == 206 && resume_offset > 0 {
-        if let (Some(cl), Some(expected)) = (content_length, expected_size) {
-            let server_total = resume_offset.saturating_add(cl);
-            if server_total != expected {
-                tracing::warn!(
-                    path = %path_str,
-                    resume_offset,
-                    server_remaining = cl,
-                    server_total,
-                    expected,
-                    "Resume bytes inconsistent with API-reported size; discarding .part and restarting"
-                );
-                crate::fs_util::log_remove_async(part_path).await;
-                return Err(DownloadError::ContentLengthMismatch {
-                    path: path_str.into(),
-                    expected,
-                    received: server_total,
-                });
-            }
+    if status == 206
+        && resume_offset > 0
+        && let (Some(cl), Some(expected)) = (content_length, expected_size)
+    {
+        let server_total = resume_offset.saturating_add(cl);
+        if server_total != expected {
+            tracing::warn!(
+                path = %path_str,
+                resume_offset,
+                server_remaining = cl,
+                server_total,
+                expected,
+                "Resume bytes inconsistent with API-reported size; discarding .part and restarting"
+            );
+            crate::fs_util::log_remove_async(part_path).await;
+            return Err(DownloadError::ContentLengthMismatch {
+                path: path_str.into(),
+                expected,
+                received: server_total,
+            });
         }
     }
 
@@ -438,15 +439,15 @@ async fn attempt_download<C: DownloadClient>(
 
     // Verify total bytes written matches the API-reported size (if known).
     // Catches truncation when the CDN omits Content-Length (chunked transfer).
-    if let Some(expected) = expected_size {
-        if bytes_written != expected {
-            crate::fs_util::log_remove_async(part_path).await;
-            return Err(DownloadError::ContentLengthMismatch {
-                path: path_str.into(),
-                expected,
-                received: bytes_written,
-            });
-        }
+    if let Some(expected) = expected_size
+        && bytes_written != expected
+    {
+        crate::fs_util::log_remove_async(part_path).await;
+        return Err(DownloadError::ContentLengthMismatch {
+            path: path_str.into(),
+            expected,
+            received: bytes_written,
+        });
     }
 
     // Defense-in-depth: log when neither size indicator is available.
@@ -693,7 +694,7 @@ async fn publish_part_no_replace(
 #[cfg(windows)]
 fn move_file_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
     fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();

@@ -7,10 +7,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::icloud::photos::session::PhotosSession;
 use crate::icloud::photos::PhotoAsset;
+use crate::icloud::photos::session::PhotosSession;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
 #[cfg(test)]

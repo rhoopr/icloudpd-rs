@@ -252,9 +252,11 @@ mod tests {
         assert_eq!(parsed["stats"]["inventory_drop_library"], "PrimarySync");
         assert_eq!(parsed["stats"]["skipped"]["by_state"], 300);
         assert_eq!(parsed["options"]["username"], "user@example.com");
-        assert!(parsed["options"]["set_exif_datetime"]
-            .as_bool()
-            .unwrap_or(false));
+        assert!(
+            parsed["options"]["set_exif_datetime"]
+                .as_bool()
+                .unwrap_or(false)
+        );
     }
 
     #[test]

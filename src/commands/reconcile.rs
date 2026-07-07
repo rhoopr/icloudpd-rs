@@ -29,7 +29,7 @@ use crate::config;
 use crate::state;
 use crate::state::{ReportStateStore, VersionSizeKey};
 
-use super::{print_truncation_tail, LISTING_CAP};
+use super::{LISTING_CAP, print_truncation_tail};
 
 /// Stable sentinels written to `assets.last_error` so monitoring tools can
 /// key on the reason a row flipped from downloaded back to failed.
@@ -321,7 +321,9 @@ pub(crate) async fn run_reconcile(
     }
 
     if mark_errors > 0 {
-        anyhow::bail!("Reconcile found {mark_errors} drifted files that could not be marked failed in the state database.");
+        anyhow::bail!(
+            "Reconcile found {mark_errors} drifted files that could not be marked failed in the state database."
+        );
     }
 
     Ok(())

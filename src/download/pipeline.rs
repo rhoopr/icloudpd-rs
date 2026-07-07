@@ -22,27 +22,27 @@ use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 use super::filter::{
-    derive_expected_paths, determine_media_type, extract_skip_candidates, is_asset_filtered,
-    DerivedPath, DownloadTask,
+    DerivedPath, DownloadTask, derive_expected_paths, determine_media_type,
+    extract_skip_candidates, is_asset_filtered,
 };
 #[cfg(test)]
 use super::finalize::update_metadata_marker_for_test as update_metadata_marker;
 use super::finalize::{
-    check_state_write_circuit_breaker, finalize_downloaded, finalize_failed,
-    flush_pending_state_writes, flush_pending_state_writes_retaining_failures,
-    state_db_unwritable_error, state_write_circuit_breaker_tripped, DownloadedFinalization,
-    PendingStateWrite, StateWriteFlush,
+    DownloadedFinalization, PendingStateWrite, StateWriteFlush, check_state_write_circuit_breaker,
+    finalize_downloaded, finalize_failed, flush_pending_state_writes,
+    flush_pending_state_writes_retaining_failures, state_db_unwritable_error,
+    state_write_circuit_breaker_tripped,
 };
 #[cfg(test)]
 use super::finalize::{STATE_DB_UNWRITABLE_THRESHOLD, STATE_WRITE_MAX_RETRIES};
 #[cfg(test)]
-use super::planner::add_asset_album_with_retry;
-#[cfg(test)]
 use super::planner::ADD_ASSET_ALBUM_MAX_RETRIES;
+#[cfg(test)]
+use super::planner::add_asset_album_with_retry;
 use super::planner::{self, ExistingPathMatch, TaskPlanner};
 use super::{
-    metadata_rewrite, preload_download_context, DownloadConfig, DownloadContext, DownloadControls,
-    DownloadOutcome, DownloadReporting, DownloadStore,
+    DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome, DownloadReporting,
+    DownloadStore, metadata_rewrite, preload_download_context,
 };
 
 pub(super) use metadata_rewrite::MetadataFlags;
@@ -550,18 +550,18 @@ fn collision_family_base_filenames(
         super::paths::insert_asset_identity_suffix(&derived.filename, asset_id),
     ];
 
-    if derived.version_size.is_live_photo_motion() {
-        if let Some(primary) = primary_derived_path(derived_paths) {
-            let primary_collision_filenames = [
-                super::paths::add_dedup_suffix(&primary.filename, primary.size),
-                super::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
-            ];
-            for primary_filename in primary_collision_filenames {
-                bases.push(live_photo_motion_filename_for_primary(
-                    &primary_filename,
-                    config,
-                ));
-            }
+    if derived.version_size.is_live_photo_motion()
+        && let Some(primary) = primary_derived_path(derived_paths)
+    {
+        let primary_collision_filenames = [
+            super::paths::add_dedup_suffix(&primary.filename, primary.size),
+            super::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
+        ];
+        for primary_filename in primary_collision_filenames {
+            bases.push(live_photo_motion_filename_for_primary(
+                &primary_filename,
+                config,
+            ));
         }
     }
 
@@ -1132,14 +1132,14 @@ where
     // Refuse to start if free disk space is critically low (< 100 MiB).
     // The per-asset batch_forecast_decision catches the rest mid-stream.
     const MIN_FREE_BYTES_HARD: u64 = 100 * 1024 * 1024; // 100 MiB
-    if let Some(free) = initial_free_at_start {
-        if free < MIN_FREE_BYTES_HARD {
-            return Err(anyhow::anyhow!(
-                "Not enough free disk space: only {} bytes are available on {}, but kei needs at least {MIN_FREE_BYTES_HARD} bytes. Free up space or choose a different [download].directory.",
-                free,
-                config.directory.display(),
-            ));
-        }
+    if let Some(free) = initial_free_at_start
+        && free < MIN_FREE_BYTES_HARD
+    {
+        return Err(anyhow::anyhow!(
+            "Not enough free disk space: only {} bytes are available on {}, but kei needs at least {MIN_FREE_BYTES_HARD} bytes. Free up space or choose a different [download].directory.",
+            free,
+            config.directory.display(),
+        ));
     }
 
     let pipeline_shutdown = shutdown_token.child_token();
@@ -1233,23 +1233,22 @@ where
                 total_so_far + size,
                 last_resnapshot_total.load(std::sync::atomic::Ordering::Relaxed),
                 FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES,
-            ) {
-                if let Some(refreshed) = crate::available_disk_space(&directory_for_resnapshot) {
-                    let prior = initial_free_atomic.load(std::sync::atomic::Ordering::Relaxed);
-                    initial_free_atomic.store(refreshed, std::sync::atomic::Ordering::Relaxed);
-                    last_resnapshot_total
-                        .store(total_so_far + size, std::sync::atomic::Ordering::Relaxed);
-                    tracing::debug!(
-                        prior_free_bytes = if prior == FREE_PROBE_NONE_SENTINEL {
-                            0
-                        } else {
-                            prior
-                        },
-                        refreshed_free_bytes = refreshed,
-                        queued_bytes = total_so_far + size,
-                        "Refreshed free-disk snapshot"
-                    );
-                }
+            ) && let Some(refreshed) = crate::available_disk_space(&directory_for_resnapshot)
+            {
+                let prior = initial_free_atomic.load(std::sync::atomic::Ordering::Relaxed);
+                initial_free_atomic.store(refreshed, std::sync::atomic::Ordering::Relaxed);
+                last_resnapshot_total
+                    .store(total_so_far + size, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    prior_free_bytes = if prior == FREE_PROBE_NONE_SENTINEL {
+                        0
+                    } else {
+                        prior
+                    },
+                    refreshed_free_bytes = refreshed,
+                    queued_bytes = total_so_far + size,
+                    "Refreshed free-disk snapshot"
+                );
             }
             let raw = initial_free_atomic.load(std::sync::atomic::Ordering::Relaxed);
             let initial_free = if raw == FREE_PROBE_NONE_SENTINEL {
@@ -1396,39 +1395,33 @@ where
                             // Mark assets that have exceeded the retry limit as failed.
                             if let Some(attempts) =
                                 download_ctx.attempt_count(&task.library, &task.asset_id)
+                                && config.max_download_attempts > 0
+                                && attempts >= config.max_download_attempts
                             {
-                                if config.max_download_attempts > 0
-                                    && attempts >= config.max_download_attempts
-                                {
-                                    tracing::warn!(
-                                        asset_id = %task.asset_id,
-                                        attempts,
-                                        max = config.max_download_attempts,
-                                        "Asset exceeded max download attempts, marking as failed"
+                                tracing::warn!(
+                                    asset_id = %task.asset_id,
+                                    attempts,
+                                    max = config.max_download_attempts,
+                                    "Asset exceeded max download attempts, marking as failed"
+                                );
+                                if let Some(db) = &producer_state_db {
+                                    let error = format!(
+                                        "Exceeded max download attempts ({attempts}/{})",
+                                        config.max_download_attempts
                                     );
-                                    if let Some(db) = &producer_state_db {
-                                        let error = format!(
-                                            "Exceeded max download attempts ({attempts}/{})",
-                                            config.max_download_attempts
+                                    if let Err(e) =
+                                        finalize_failed(db.as_ref(), &task.library, &task, &error)
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            asset_id = %task.asset_id,
+                                            error = %e,
+                                            "Failed to mark asset as failed"
                                         );
-                                        if let Err(e) = finalize_failed(
-                                            db.as_ref(),
-                                            &task.library,
-                                            &task,
-                                            &error,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(
-                                                asset_id = %task.asset_id,
-                                                error = %e,
-                                                "Failed to mark asset as failed"
-                                            );
-                                        }
                                     }
-                                    disposition = disposition.max(AssetDisposition::RetryExhausted);
-                                    continue;
                                 }
+                                disposition = disposition.max(AssetDisposition::RetryExhausted);
+                                continue;
                             }
 
                             if config.retry_only
@@ -1453,15 +1446,14 @@ where
                                     &asset,
                                 )
                                 .await
+                                    && let Some(album) = config.album_name.as_deref()
                                 {
-                                    if let Some(album) = config.album_name.as_deref() {
-                                        tracing::warn!(
-                                            asset_id = %asset.id(),
-                                            album = %album,
-                                            error = %e,
-                                            "Failed to record album membership after retries"
-                                        );
-                                    }
+                                    tracing::warn!(
+                                        asset_id = %asset.id(),
+                                        album = %album,
+                                        error = %e,
+                                        "Failed to record album membership after retries"
+                                    );
                                 }
 
                                 if let Some(adoption) = adopt_pending_on_disk_task(
@@ -1716,26 +1708,25 @@ where
         // loop exiting and touch_last_seen_many returning), stuck-pipeline
         // promotion is delayed by exactly one sync. The same row hits the
         // same path next run and gets adopted or promoted then. No data loss.
-        if let Some(db) = &producer_state_db {
-            if !touched_assets.is_empty() {
-                let mut touched_by_library: FxHashMap<Arc<str>, Vec<Arc<str>>> =
-                    FxHashMap::default();
-                for (library, id) in touched_assets {
-                    touched_by_library.entry(library).or_default().push(id);
-                }
-                for (library, ids) in touched_by_library {
-                    let touched_count = ids.len();
-                    let id_refs: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
-                    if let Err(e) = db.touch_last_seen_many(&library, &id_refs).await {
-                        producer_pb.suspend(|| {
-                            tracing::warn!(
-                                error = %e,
-                                count = touched_count,
-                                library = %library,
-                                "Failed to batch-update last_seen_at for skipped assets"
-                            );
-                        });
-                    }
+        if let Some(db) = &producer_state_db
+            && !touched_assets.is_empty()
+        {
+            let mut touched_by_library: FxHashMap<Arc<str>, Vec<Arc<str>>> = FxHashMap::default();
+            for (library, id) in touched_assets {
+                touched_by_library.entry(library).or_default().push(id);
+            }
+            for (library, ids) in touched_by_library {
+                let touched_count = ids.len();
+                let id_refs: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
+                if let Err(e) = db.touch_last_seen_many(&library, &id_refs).await {
+                    producer_pb.suspend(|| {
+                        tracing::warn!(
+                            error = %e,
+                            count = touched_count,
+                            library = %library,
+                            "Failed to batch-update last_seen_at for skipped assets"
+                        );
+                    });
                 }
             }
         }
@@ -1879,22 +1870,21 @@ async fn consume_stream_download_tasks(
                                 );
                             });
                             pending_state_writes.push(write);
-                            if state_write_circuit_error.is_none() {
-                                if let Some(err) = check_state_write_circuit_breaker(
+                            if state_write_circuit_error.is_none()
+                                && let Some(err) = check_state_write_circuit_breaker(
                                     db.as_ref(),
                                     &mut pending_state_writes,
                                 )
                                 .await
-                                {
-                                    pb.suspend(|| {
-                                        tracing::error!(
-                                            error = %err,
-                                            "State write circuit breaker opened; halting downloads"
-                                        );
-                                    });
-                                    state_write_circuit_error = Some(err);
-                                    pipeline_shutdown.cancel();
-                                }
+                            {
+                                pb.suspend(|| {
+                                    tracing::error!(
+                                        error = %err,
+                                        "State write circuit breaker opened; halting downloads"
+                                    );
+                                });
+                                state_write_circuit_error = Some(err);
+                                pipeline_shutdown.cancel();
                             }
                         }
                     }
@@ -1945,16 +1935,15 @@ async fn consume_stream_download_tasks(
                         });
                     }
                 }
-                if let Some(db) = &state_db {
-                    if let Err(e) =
+                if let Some(db) = &state_db
+                    && let Err(e) =
                         finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
-                    {
-                        tracing::warn!(
-                            asset_id = %task.asset_id,
-                            error = %e,
-                            "Failed to mark failure"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        error = %e,
+                        "Failed to mark failure"
+                    );
                 }
                 failed.push(task);
             }
@@ -2031,17 +2020,20 @@ async fn finalize_streaming_download(
                 || consumer.url_expired_abort,
             ..Default::default()
         };
-        if let Err(e) = db.complete_sync_run(run_id, &stats).await {
-            tracing::warn!(error = %e, "Failed to complete sync run tracking");
-            complete_sync_failed = true;
-        } else {
-            tracing::debug!(
-                run_id,
-                assets_seen = assets_seen_count,
-                downloaded = consumer.downloaded,
-                failed = consumer.failed.len(),
-                "Completed sync run"
-            );
+        match db.complete_sync_run(run_id, &stats).await {
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to complete sync run tracking");
+                complete_sync_failed = true;
+            }
+            Ok(()) => {
+                tracing::debug!(
+                    run_id,
+                    assets_seen = assets_seen_count,
+                    downloaded = consumer.downloaded,
+                    failed = consumer.failed.len(),
+                    "Completed sync run"
+                );
+            }
         }
     }
 
@@ -2083,18 +2075,18 @@ async fn finalize_streaming_download(
     // from a previous one). This re-applies EXIF/XMP on the existing files
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
-    if consumer.state_write_circuit_error.is_none() {
-        if let Some(db) = &state_db {
-            let metadata_flags = MetadataFlags::from(config.as_ref());
-            if metadata_flags.has_any_write() {
-                consumer.exif_failures += metadata_rewrite::run_pending(
-                    db.as_ref(),
-                    metadata_flags,
-                    Arc::clone(&config.temp_suffix),
-                    &pipeline_shutdown,
-                )
-                .await;
-            }
+    if consumer.state_write_circuit_error.is_none()
+        && let Some(db) = &state_db
+    {
+        let metadata_flags = MetadataFlags::from(config.as_ref());
+        if metadata_flags.has_any_write() {
+            consumer.exif_failures += metadata_rewrite::run_pending(
+                db.as_ref(),
+                metadata_flags,
+                Arc::clone(&config.temp_suffix),
+                &pipeline_shutdown,
+            )
+            .await;
         }
     }
 
@@ -2634,22 +2626,21 @@ pub(super) async fn run_download_pass(
                                 );
                             });
                             pending_state_writes.push(write);
-                            if !state_write_circuit_open {
-                                if let Some(err) = check_state_write_circuit_breaker(
+                            if !state_write_circuit_open
+                                && let Some(err) = check_state_write_circuit_breaker(
                                     db.as_ref(),
                                     &mut pending_state_writes,
                                 )
                                 .await
-                                {
-                                    pb.suspend(|| {
+                            {
+                                pb.suspend(|| {
                                         tracing::error!(
                                             error = %err,
                                             "State write circuit breaker opened; halting cleanup downloads"
                                         );
                                     });
-                                    state_write_circuit_open = true;
-                                    pass_shutdown.cancel();
-                                }
+                                state_write_circuit_open = true;
+                                pass_shutdown.cancel();
                             }
                         }
                     }
@@ -2686,16 +2677,15 @@ pub(super) async fn run_download_pass(
                         });
                     }
                 }
-                if let Some(db) = &state_db {
-                    if let Err(e) =
+                if let Some(db) = &state_db
+                    && let Err(e) =
                         finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
-                    {
-                        tracing::warn!(
-                            asset_id = %task.asset_id,
-                            error = %e,
-                            "Failed to mark failure"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        error = %e,
+                        "Failed to mark failure"
+                    );
                 }
                 failed.push(task);
             }
@@ -3287,7 +3277,7 @@ mod tests {
     fn batch_forecast_decision_crossing_100pct_bails() {
         let queued = AtomicU64::new(800);
         let warn = AtomicBool::new(true); // already warned at 800
-                                          // 800 + 250 = 1050 ≥ 1000 → bail
+        // 800 + 250 = 1050 ≥ 1000 → bail
         let (decision, total) = batch_forecast_decision(250, Some(1000), &queued, &warn);
         assert_eq!(decision, BatchForecast::Bail);
         assert_eq!(total, 1050);

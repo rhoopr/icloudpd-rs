@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug)]
 pub(crate) struct FolderDef {

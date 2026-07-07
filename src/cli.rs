@@ -828,10 +828,10 @@ impl Command {
     /// the active command carries.
     pub fn inject_env_password(&mut self, env_password: Option<String>) {
         let Some(pw) = env_password else { return };
-        if let Some(args) = self.password_args_mut() {
-            if args.password.is_none() {
-                args.password = Some(pw);
-            }
+        if let Some(args) = self.password_args_mut()
+            && args.password.is_none()
+        {
+            args.password = Some(pw);
         }
     }
 

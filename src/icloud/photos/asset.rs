@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::cloudkit::Record;
 use super::enc;
 use super::metadata;
-use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
+use super::queries::{PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP, item_type_from_str};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
 use crate::state::AssetMetadata;
 
@@ -160,20 +160,18 @@ fn resolve_item_type(fields: &Value, filename: Option<&str>) -> AssetItemType {
         .get("itemType")
         .and_then(|f| f.get("value"))
         .and_then(Value::as_str)
+        && let Some(t) = item_type_from_str(s)
     {
-        if let Some(t) = item_type_from_str(s) {
-            return t;
-        }
+        return t;
     }
-    if let Some(ext) = filename.and_then(|n| std::path::Path::new(n).extension()) {
-        if ext.eq_ignore_ascii_case("heic")
+    if let Some(ext) = filename.and_then(|n| std::path::Path::new(n).extension())
+        && (ext.eq_ignore_ascii_case("heic")
             || ext.eq_ignore_ascii_case("png")
             || ext.eq_ignore_ascii_case("jpg")
             || ext.eq_ignore_ascii_case("jpeg")
-            || ext.eq_ignore_ascii_case("webp")
-        {
-            return AssetItemType::Image;
-        }
+            || ext.eq_ignore_ascii_case("webp"))
+    {
+        return AssetItemType::Image;
     }
     AssetItemType::Movie
 }
@@ -613,21 +611,19 @@ pub(crate) fn classify_change_reason(record: &Record) -> ChangeReason {
     }
 
     // Soft delete: fields.isDeleted.value == 1
-    if let Some(is_deleted) = record.fields.get("isDeleted") {
-        if let Some(val) = is_deleted.get("value") {
-            if val.as_i64() == Some(1) {
-                return ChangeReason::SoftDeleted;
-            }
-        }
+    if let Some(is_deleted) = record.fields.get("isDeleted")
+        && let Some(val) = is_deleted.get("value")
+        && val.as_i64() == Some(1)
+    {
+        return ChangeReason::SoftDeleted;
     }
 
     // Hidden: fields.isHidden.value == 1
-    if let Some(is_hidden) = record.fields.get("isHidden") {
-        if let Some(val) = is_hidden.get("value") {
-            if val.as_i64() == Some(1) {
-                return ChangeReason::Hidden;
-            }
-        }
+    if let Some(is_hidden) = record.fields.get("isHidden")
+        && let Some(val) = is_hidden.get("value")
+        && val.as_i64() == Some(1)
+    {
+        return ChangeReason::Hidden;
     }
 
     // Default: Created (new or modified record)
@@ -889,11 +885,7 @@ impl DeltaRecordBuffer {
                 ChangeReason::Created => 0,
             }
         }
-        if severity(a) >= severity(b) {
-            a
-        } else {
-            b
-        }
+        if severity(a) >= severity(b) { a } else { b }
     }
 
     fn emit_paired(

@@ -58,7 +58,7 @@ async fn dispatch(plan: InstallPlan, config_path: &Path) -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn dispatch(plan: InstallPlan, config_path: &Path) -> Result<()> {
-    use crate::service::env::{current_executable, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER};
+    use crate::service::env::{SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable};
     let exe = current_executable()?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,

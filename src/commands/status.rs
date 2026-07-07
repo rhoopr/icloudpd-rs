@@ -9,7 +9,7 @@ use crate::service::status::{render_oneline, service_state};
 use crate::state;
 use crate::state::AssetRecord;
 
-use super::{print_truncation_tail, LISTING_CAP};
+use super::{LISTING_CAP, print_truncation_tail};
 
 /// Run the status command.
 pub(crate) async fn run_status(
@@ -74,13 +74,13 @@ pub(crate) async fn run_status(
             started.format("%Y-%m-%d %H:%M:%S UTC")
         );
     }
-    if summary.active_sync_started.is_none() {
-        if let Some(completed) = &summary.last_sync_completed {
-            println!(
-                "Last sync completed: {}",
-                completed.format("%Y-%m-%d %H:%M:%S UTC")
-            );
-        }
+    if summary.active_sync_started.is_none()
+        && let Some(completed) = &summary.last_sync_completed
+    {
+        println!(
+            "Last sync completed: {}",
+            completed.format("%Y-%m-%d %H:%M:%S UTC")
+        );
     }
     if !summary.active_enumeration_zones.is_empty() {
         println!(
@@ -158,10 +158,9 @@ fn backup_status_line(summary: &state::types::SyncSummary) -> String {
         .last_sync_status
         .as_deref()
         .is_some_and(|status| status != "complete")
+        && let Some(status) = &summary.last_sync_status
     {
-        if let Some(status) = &summary.last_sync_status {
-            reasons.push(format!("last sync status is {status}"));
-        }
+        reasons.push(format!("last sync status is {status}"));
     }
     if summary.last_sync_completed.is_none() {
         reasons.push("last sync did not record completion".to_string());
@@ -219,11 +218,7 @@ fn count_phrase(count: u64, singular: &str) -> String {
 }
 
 const fn remain_verb(count: u64) -> &'static str {
-    if count == 1 {
-        "remains"
-    } else {
-        "remain"
-    }
+    if count == 1 { "remains" } else { "remain" }
 }
 
 /// Prints the `Service:` line at the top of `kei status`. Errors from

@@ -9,9 +9,9 @@
 use std::fmt;
 
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::fmt::{format::Writer, FmtContext, FormatEvent, FormatFields};
-use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, format::Writer};
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::personality::Mode;
 

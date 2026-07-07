@@ -163,10 +163,12 @@ mod tests {
     #[test]
     fn is_session_error_false_for_other_variants() {
         assert!(!ICloudError::Connection("x".into()).is_session_error());
-        assert!(!ICloudError::ServiceNotActivated {
-            code: "ADP".into(),
-            reason: "y".into()
-        }
-        .is_session_error());
+        assert!(
+            !ICloudError::ServiceNotActivated {
+                code: "ADP".into(),
+                reason: "y".into()
+            }
+            .is_session_error()
+        );
     }
 }

@@ -107,30 +107,31 @@ pub(super) async fn write_download_metadata(
 ) -> MetadataWriteOutcome {
     let mut outcome = MetadataWriteOutcome::default();
 
-    if request.flags.any_embed() && super::metadata::is_embed_writable_path(request.final_path) {
-        if let Some(embed_path) = request.embed_path {
-            outcome.embed_failed = !write_embed_metadata(
-                embed_path,
-                Arc::clone(&request.payload),
-                request.created_local,
-                request.flags,
-                request.temp_suffix,
-            )
-            .await;
-        }
+    if request.flags.any_embed()
+        && super::metadata::is_embed_writable_path(request.final_path)
+        && let Some(embed_path) = request.embed_path
+    {
+        outcome.embed_failed = !write_embed_metadata(
+            embed_path,
+            Arc::clone(&request.payload),
+            request.created_local,
+            request.flags,
+            request.temp_suffix,
+        )
+        .await;
     }
 
     #[cfg(feature = "xmp")]
-    if request.flags.contains(MetadataFlags::XMP_SIDECAR) {
-        if let Some(sidecar_path) = request.sidecar_path {
-            outcome.sidecar_failed = !write_sidecar_metadata(
-                sidecar_path,
-                Arc::clone(&request.payload),
-                request.created_local,
-                request.temp_suffix,
-            )
-            .await;
-        }
+    if request.flags.contains(MetadataFlags::XMP_SIDECAR)
+        && let Some(sidecar_path) = request.sidecar_path
+    {
+        outcome.sidecar_failed = !write_sidecar_metadata(
+            sidecar_path,
+            Arc::clone(&request.payload),
+            request.created_local,
+            request.temp_suffix,
+        )
+        .await;
     }
 
     outcome
@@ -157,12 +158,12 @@ async fn write_embed_metadata(
         if write.is_empty() {
             return true;
         }
-        if let Err(e) = super::metadata::apply_metadata(&embed_path, &write, &metadata_temp_suffix)
-        {
-            tracing::warn!(path = %embed_path.display(), error = %e, "Failed to write metadata");
-            false
-        } else {
-            true
+        match super::metadata::apply_metadata(&embed_path, &write, &metadata_temp_suffix) {
+            Err(e) => {
+                tracing::warn!(path = %embed_path.display(), error = %e, "Failed to write metadata");
+                false
+            }
+            Ok(()) => true,
         }
     })
     .await
@@ -189,13 +190,12 @@ async fn write_sidecar_metadata(
         if write.is_empty() {
             return true;
         }
-        if let Err(e) =
-            super::metadata::write_sidecar(&sidecar_path, &write, &sidecar_temp_suffix)
-        {
-            tracing::warn!(path = %sidecar_path.display(), error = %e, "Failed to write XMP sidecar");
-            false
-        } else {
-            true
+        match super::metadata::write_sidecar(&sidecar_path, &write, &sidecar_temp_suffix) {
+            Err(e) => {
+                tracing::warn!(path = %sidecar_path.display(), error = %e, "Failed to write XMP sidecar");
+                false
+            }
+            Ok(()) => true,
         }
     })
     .await
@@ -413,8 +413,8 @@ where
         .await;
 
         if !outcome.any_failed() {
-            if let Some(new_hash) = record.metadata.metadata_hash.as_deref() {
-                if let Err(e) = db
+            if let Some(new_hash) = record.metadata.metadata_hash.as_deref()
+                && let Err(e) = db
                     .update_metadata_hash(
                         &record.library,
                         &record.id,
@@ -422,9 +422,8 @@ where
                         new_hash,
                     )
                     .await
-                {
-                    tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
-                }
+            {
+                tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
             }
             if let Err(e) = db
                 .clear_metadata_write_failure(&record.library, &record.id, version_size.as_str())
@@ -691,8 +690,8 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn run_pending_skips_missing_file_and_leaves_marker() {
-        use crate::state::types::AssetMetadata;
         use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
 
         let dir = tempfile::tempdir().unwrap();
         let vanished_path = dir.path().join("never_written.jpg");
@@ -738,8 +737,8 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn cancel_returns_partial_and_keeps_retry_marker() {
-        use crate::state::types::AssetMetadata;
         use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
 
         let dir = tempfile::tempdir().unwrap();
         let photo_path = dir.path().join("rewrite_cancel.jpg");

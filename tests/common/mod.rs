@@ -3,8 +3,8 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set when any test detects an Apple 503 rate-limit response.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
@@ -306,7 +306,7 @@ fn refresh_auth() {
 /// Does **not** retry on 503 rate limits or other errors.
 #[allow(dead_code)]
 pub fn with_auth_retry(f: impl Fn()) {
-    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
     match catch_unwind(AssertUnwindSafe(&f)) {
         Ok(()) => {}

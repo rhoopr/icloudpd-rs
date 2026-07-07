@@ -7,7 +7,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use console::Style;
 use dialoguer::{Confirm, Input, Password, Select};
 use indicatif::ProgressBar;
@@ -1134,7 +1134,9 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 // any are added or renamed.
                 let known: Vec<&'static str> =
                     crate::icloud::photos::smart_folders::smart_folder_names().collect();
-                println!("  Enter one smart-folder name per line. Press Enter on a blank line to finish.");
+                println!(
+                    "  Enter one smart-folder name per line. Press Enter on a blank line to finish."
+                );
                 println!("  Names are case-sensitive. Available smart folders:");
                 println!("  {}.", known.join(", "));
                 loop {

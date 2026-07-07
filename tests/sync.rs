@@ -793,7 +793,7 @@ fn sync_set_exif_datetime_embeds_date() {
         assert!(!jpeg_files.is_empty(), "should have at least one JPEG file");
 
         // Read XMP from the first JPEG and verify DateTimeOriginal is present
-        use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile};
+        use xmp_toolkit::{OpenFileOptions, XmpFile, xmp_ns};
         let mut file = XmpFile::new().expect("xmp file handle");
         file.open_file(jpeg_files[0], OpenFileOptions::default().for_read())
             .expect("open JPEG for XMP read");

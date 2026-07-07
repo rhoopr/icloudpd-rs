@@ -9,16 +9,16 @@ use std::sync::Arc;
 use chrono::{DateTime, Local};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::icloud::photos::types::AssetVersion;
 use crate::icloud::photos::VersionsMap;
+use crate::icloud::photos::types::AssetVersion;
 use crate::state::{MediaType, VersionSizeKey};
 use crate::types::{
     AssetItemType, AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
     RawPolicy,
 };
 
-use super::paths;
 use super::DownloadConfig;
+use super::paths;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MalformedTaskResource {
@@ -607,7 +607,9 @@ impl<'a> VersionsView<'a> {
         }
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = (AssetVersionSize, &'a AssetVersion)> + 'a {
+    pub(super) fn iter(
+        &self,
+    ) -> impl Iterator<Item = (AssetVersionSize, &'a AssetVersion)> + 'a + use<'a> {
         let swap = self.swap;
         self.versions.iter().enumerate().map(move |(idx, (k, v))| {
             let key = match swap {
@@ -711,31 +713,29 @@ pub(crate) fn is_asset_filtered(
         return Some(FilterReason::LivePhoto);
     }
     let created_utc = asset.created();
-    if let Some(before) = config.skip_created_before() {
-        if created_utc < before {
-            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
-            return Some(FilterReason::DateRange);
-        }
+    if let Some(before) = config.skip_created_before()
+        && created_utc < before
+    {
+        tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
+        return Some(FilterReason::DateRange);
     }
-    if let Some(after) = config.skip_created_after() {
-        if created_utc > after {
-            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
-            return Some(FilterReason::DateRange);
-        }
+    if let Some(after) = config.skip_created_after()
+        && created_utc > after
+    {
+        tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
+        return Some(FilterReason::DateRange);
     }
     // Only check filename exclusion when the asset has a real filename.
     // filter_asset_to_tasks separately handles fallback fingerprint filenames.
-    if !config.filename_exclude().is_empty() {
-        if let Some(filename) = asset.filename() {
-            if config
-                .filename_exclude()
-                .iter()
-                .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
-            {
-                tracing::debug!(asset_id = %asset.id(), filename, "Skipping (filename_exclude match)");
-                return Some(FilterReason::Filename);
-            }
-        }
+    if !config.filename_exclude().is_empty()
+        && let Some(filename) = asset.filename()
+        && config
+            .filename_exclude()
+            .iter()
+            .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
+    {
+        tracing::debug!(asset_id = %asset.id(), filename, "Skipping (filename_exclude match)");
+        return Some(FilterReason::Filename);
     }
     None
 }
@@ -1075,24 +1075,22 @@ pub(super) fn malformed_no_task_resource(
         return None;
     }
 
-    if !matches!(
+    if (!matches!(
         config.live_photo_mode(),
         LivePhotoMode::Skip | LivePhotoMode::VideoOnly
-    ) || !asset.is_live_photo()
+    ) || !asset.is_live_photo())
+        && let Some(resource) = malformed_for_keys(asset, primary_candidate_keys(config))
     {
-        if let Some(resource) = malformed_for_keys(asset, primary_candidate_keys(config)) {
-            return Some(resource);
-        }
+        return Some(resource);
     }
 
     if matches!(
         config.live_photo_mode(),
         LivePhotoMode::Both | LivePhotoMode::VideoOnly
     ) && asset.item_type() == Some(AssetItemType::Image)
+        && let Some(resource) = malformed_for_keys(asset, live_candidate_keys(config))
     {
-        if let Some(resource) = malformed_for_keys(asset, live_candidate_keys(config)) {
-            return Some(resource);
-        }
+        return Some(resource);
     }
 
     None
@@ -1541,11 +1539,7 @@ fn available_collision_path(
     let unavailable =
         ctx.dir_cache.exists(&path) || ctx.claimed_paths.contains_key(normalized.as_str());
     tried.push(normalized.into_boxed_str());
-    if unavailable {
-        None
-    } else {
-        Some(path)
-    }
+    if unavailable { None } else { Some(path) }
 }
 
 /// Resolve the final download path for a single version, handling on-disk
@@ -1900,9 +1894,9 @@ mod tests {
     use chrono::Utc;
     use rustc_hash::FxHashSet;
 
-    use crate::icloud::photos::PhotoAsset;
     #[cfg(unix)]
     use crate::icloud::photos::PRIMARY_ZONE_NAME;
+    use crate::icloud::photos::PhotoAsset;
     #[cfg(unix)]
     use crate::state::SqliteStateDb;
     #[cfg(unix)]
@@ -3325,11 +3319,13 @@ mod tests {
         assert_eq!(tasks[0].size, 2000);
         assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_mov");
         assert_eq!(tasks[1].size, 3000);
-        assert!(tasks[1]
-            .download_path
-            .to_str()
-            .unwrap()
-            .contains("IMG_0001_HEVC.MOV"));
+        assert!(
+            tasks[1]
+                .download_path
+                .to_str()
+                .unwrap()
+                .contains("IMG_0001_HEVC.MOV")
+        );
     }
 
     #[test]
@@ -3349,11 +3345,13 @@ mod tests {
         config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert!(tasks[1]
-            .download_path
-            .to_str()
-            .unwrap()
-            .contains("IMG_0001.MOV"));
+        assert!(
+            tasks[1]
+                .download_path
+                .to_str()
+                .unwrap()
+                .contains("IMG_0001.MOV")
+        );
     }
 
     #[test]

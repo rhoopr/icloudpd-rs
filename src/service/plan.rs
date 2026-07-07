@@ -5,7 +5,7 @@
 //! whether it is preview-only, and which system-scope requests are safe to
 //! proceed with.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::cli::InstallArgs;
 
@@ -189,14 +189,18 @@ mod tests {
 
     #[test]
     fn unsupported_platform_system_errors_live_in_policy() {
-        assert!(reject_macos_system_install()
-            .expect_err("macOS system install must fail")
-            .to_string()
-            .contains("per-user only"));
-        assert!(reject_windows_system_install()
-            .expect_err("Windows system install must fail")
-            .to_string()
-            .contains("not supported on Windows"));
+        assert!(
+            reject_macos_system_install()
+                .expect_err("macOS system install must fail")
+                .to_string()
+                .contains("per-user only")
+        );
+        assert!(
+            reject_windows_system_install()
+                .expect_err("Windows system install must fail")
+                .to_string()
+                .contains("not supported on Windows")
+        );
     }
 
     #[cfg(target_os = "linux")]

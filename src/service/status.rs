@@ -136,10 +136,10 @@ pub(crate) fn render_oneline(state: &ServiceState) -> String {
             if let Some(pid) = pid {
                 detail.push_str(&format!(", pid {pid}"));
             }
-            if *state_label == RUNNING_LABEL {
-                if let Some(since) = since {
-                    detail.push_str(&format!(", since {}", since.format("%Y-%m-%d %H:%M UTC")));
-                }
+            if *state_label == RUNNING_LABEL
+                && let Some(since) = since
+            {
+                detail.push_str(&format!(", since {}", since.format("%Y-%m-%d %H:%M UTC")));
             }
             detail.push(')');
             detail

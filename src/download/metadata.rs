@@ -26,7 +26,7 @@ use little_exif::metadata::Metadata;
 #[cfg(not(feature = "xmp"))]
 use little_exif::rational::uR64;
 #[cfg(feature = "xmp")]
-use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile, XmpMeta, XmpValue};
+use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, XmpValue, xmp_ns};
 
 #[cfg(feature = "xmp")]
 use super::heif;
@@ -522,7 +522,7 @@ fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) 
         Ok(metadata) => metadata,
         Err(e) if e.to_string().contains("No EXIF data found") => Metadata::new(),
         Err(e) => {
-            return Err(e).with_context(|| format!("Could not read EXIF from {}", path.display()))
+            return Err(e).with_context(|| format!("Could not read EXIF from {}", path.display()));
         }
     };
     if let Some(dt) = &write.datetime {
@@ -1657,17 +1657,17 @@ mod tests {
         use mp4_atom::{Any, DecodeMaybe, FourCC, Iinf};
         let mut cursor: &[u8] = bytes;
         while let Ok(Some(atom)) = Any::decode_maybe(&mut cursor) {
-            if let Any::Meta(meta) = atom {
-                if let Some(iinf) = meta.get::<Iinf>() {
-                    return iinf
-                        .item_infos
-                        .iter()
-                        .filter(|e| {
-                            e.item_type == Some(FourCC::new(b"mime"))
-                                && e.content_type.as_deref() == Some("application/rdf+xml")
-                        })
-                        .count();
-                }
+            if let Any::Meta(meta) = atom
+                && let Some(iinf) = meta.get::<Iinf>()
+            {
+                return iinf
+                    .item_infos
+                    .iter()
+                    .filter(|e| {
+                        e.item_type == Some(FourCC::new(b"mime"))
+                            && e.content_type.as_deref() == Some("application/rdf+xml")
+                    })
+                    .count();
             }
         }
         0

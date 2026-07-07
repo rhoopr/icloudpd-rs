@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::types::{AssetItemType, AssetVersionSize};
 
@@ -263,10 +263,10 @@ pub(crate) fn build_changes_zone_request(
         "zoneID": zone_id,
         "resultsLimit": results_limit,
     });
-    if let Some(token) = sync_token {
-        if let Some(obj) = zone_entry.as_object_mut() {
-            obj.insert("syncToken".into(), json!(token));
-        }
+    if let Some(token) = sync_token
+        && let Some(obj) = zone_entry.as_object_mut()
+    {
+        obj.insert("syncToken".into(), json!(token));
     }
     json!({"zones": [zone_entry]})
 }

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::retry::{self, parse_retry_after_header, RetryAction, RetryConfig};
+use crate::retry::{self, RetryAction, RetryConfig, parse_retry_after_header};
 
 /// Upper bound on any `Retry-After` hint from CloudKit, chosen so a
 /// pathological server value can't stall the retry loop.

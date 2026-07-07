@@ -759,8 +759,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn invoke_password_provider_yields_runtime_for_blocking_closure() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
         let interleaved = StdArc::new(AtomicBool::new(false));

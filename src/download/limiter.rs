@@ -10,7 +10,7 @@
 //! [`BandwidthLimiter::consume`] before writing each received chunk. When no
 //! limit is configured, downloads hold `None` and skip the call entirely.
 
-use async_speed_limit::{clock::StandardClock, Limiter};
+use async_speed_limit::{Limiter, clock::StandardClock};
 
 #[derive(Clone)]
 pub(crate) struct BandwidthLimiter {

@@ -5,7 +5,7 @@
 //! fields that don't fit the canonical schema are preserved verbatim in
 //! `provider_data` so that invariant 4 (capture everything available) holds.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::state::AssetMetadata;
@@ -90,10 +90,10 @@ pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
     meta.title = enc::decode_string(asset_fields, "captionEnc");
     meta.description = enc::decode_string(asset_fields, "extendedDescEnc");
 
-    if let Some(keywords) = enc::decode_keywords(asset_fields) {
-        if !keywords.is_empty() {
-            meta.keywords = serde_json::to_string(&keywords).ok();
-        }
+    if let Some(keywords) = enc::decode_keywords(asset_fields)
+        && !keywords.is_empty()
+    {
+        meta.keywords = serde_json::to_string(&keywords).ok();
     }
 
     meta.media_subtype = map_media_subtype(asset_fields);

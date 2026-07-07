@@ -520,19 +520,18 @@ pub(crate) fn insert_xmp<W: Write>(
         })
         .collect();
 
-    if let Any::Meta(meta) = &mut atoms[meta_idx] {
-        if let Some(iloc) = meta.get_mut::<Iloc>() {
-            remap_file_offsets(iloc, &file_offset_map);
-            // Now fill in the XMP entry's offset (last iloc entry).
-            if let Some(xmp_loc) = iloc
-                .item_locations
-                .iter_mut()
-                .find(|l| l.item_id == new_item_id)
-            {
-                if let Some(extent) = xmp_loc.extents.first_mut() {
-                    extent.offset = xmp_file_offset;
-                }
-            }
+    if let Any::Meta(meta) = &mut atoms[meta_idx]
+        && let Some(iloc) = meta.get_mut::<Iloc>()
+    {
+        remap_file_offsets(iloc, &file_offset_map);
+        // Now fill in the XMP entry's offset (last iloc entry).
+        if let Some(xmp_loc) = iloc
+            .item_locations
+            .iter_mut()
+            .find(|l| l.item_id == new_item_id)
+            && let Some(extent) = xmp_loc.extents.first_mut()
+        {
+            extent.offset = xmp_file_offset;
         }
     }
 
@@ -937,7 +936,7 @@ mod tests {
         dfla.extend_from_slice(&0x18_u32.to_be_bytes()); // size = 24
         dfla.extend_from_slice(b"dfLa");
         dfla.extend_from_slice(&[0; 4]); // version+flags
-                                         // metadata block header: last_block=1, type=4 (vorbis_comment), length=8
+        // metadata block header: last_block=1, type=4 (vorbis_comment), length=8
         dfla.extend_from_slice(&[0x84, 0x00, 0x00, 0x08]);
         // vorbis comment body: vendor_string_length=0, number_of_fields=0xFFFF_FFFF
         dfla.extend_from_slice(&0_u32.to_le_bytes());

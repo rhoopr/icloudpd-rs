@@ -414,10 +414,10 @@ where
         // Invalidate the validation cache so authenticate() actually checks
         // with Apple instead of returning stale cached data from before 2FA.
         let cache_path = auth::validation_cache_file_path(cookie_dir, username);
-        if cache_path.exists() {
-            if let Err(e) = tokio::fs::remove_file(&cache_path).await {
-                tracing::debug!(error = %e, "Could not remove validation cache");
-            }
+        if cache_path.exists()
+            && let Err(e) = tokio::fs::remove_file(&cache_path).await
+        {
+            tracing::debug!(error = %e, "Could not remove validation cache");
         }
 
         for attempt in 0..3 {
@@ -1372,8 +1372,8 @@ mod tests {
     use crate::test_helpers::MockPhotosSession;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn short_2fa_wait_config(timeout: Duration) -> TwoFaWaitConfig {
         TwoFaWaitConfig {
@@ -2669,14 +2669,18 @@ libraries = ["shared"]
                 .collect();
             assert_eq!(primary_smart_names, vec![smart_name.to_string()]);
             assert_eq!(shared_smart_names, vec![smart_name.to_string()]);
-            assert!(primary_plan
-                .passes
-                .iter()
-                .any(|pass| pass.kind == PassKind::Unfiled));
-            assert!(!shared_plan
-                .passes
-                .iter()
-                .any(|pass| pass.kind == PassKind::Unfiled));
+            assert!(
+                primary_plan
+                    .passes
+                    .iter()
+                    .any(|pass| pass.kind == PassKind::Unfiled)
+            );
+            assert!(
+                !shared_plan
+                    .passes
+                    .iter()
+                    .any(|pass| pass.kind == PassKind::Unfiled)
+            );
         }
     }
 

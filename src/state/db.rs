@@ -160,7 +160,7 @@ pub trait DownloadStateStore: Send + Sync {
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
     async fn reset_failed(&self) -> Result<u64, StateError>;
     async fn prepare_for_retry(&self, library: Option<&str>)
-        -> Result<(u64, u64, u64), StateError>;
+    -> Result<(u64, u64, u64), StateError>;
     async fn prune_source_deleted_retries(
         &self,
         _library: Option<&str>,
@@ -8094,10 +8094,11 @@ mod tests {
         db.complete_album_membership_snapshot("PrimarySync", "container-a", generation)
             .await
             .unwrap();
-        assert!(db
-            .selected_album_containers_have_complete_snapshots("PrimarySync", &["container-a"])
-            .await
-            .unwrap());
+        assert!(
+            db.selected_album_containers_have_complete_snapshots("PrimarySync", &["container-a"])
+                .await
+                .unwrap()
+        );
 
         db.mark_album_container_deleted("PrimarySync", "container-a")
             .await

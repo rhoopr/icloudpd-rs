@@ -31,9 +31,9 @@ use uuid::Uuid;
 use self::endpoints::Endpoints;
 use self::error::AuthError;
 pub use self::responses::AccountLoginResponse;
-pub(crate) use self::session::strip_session_routing_state;
 use self::session::Session;
 pub use self::session::SharedSession;
+pub(crate) use self::session::strip_session_routing_state;
 
 /// Path to the session data file for a given user, without needing a `Session`.
 pub fn session_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
@@ -193,18 +193,18 @@ async fn authenticate_inner(
     // Fast path: if we validated recently, skip the Apple /validate call entirely.
     // The cookies and session token are still in the session file; if they've
     // actually gone stale, the first CloudKit call will 421 and trigger re-auth.
-    if has_session_token && code.is_none() {
-        if let Some(cached) = session
+    if has_session_token
+        && code.is_none()
+        && let Some(cached) = session
             .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
             .await
-        {
-            tracing::debug!("Session validated recently, skipping /validate call");
-            return Ok(AuthResult {
-                session,
-                data: cached,
-                requires_2fa: false,
-            });
-        }
+    {
+        tracing::debug!("Session validated recently, skipping /validate call");
+        return Ok(AuthResult {
+            session,
+            data: cached,
+            requires_2fa: false,
+        });
     }
 
     // The 421-recovery flow below is bounded. Each branch takes at most one
@@ -616,15 +616,15 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
                         .and_then(|ws| ws.ckdatabasews.as_ref())
                         .map(|ep| ep.url.as_str());
                     let stored_url = session.session_data.get("ckdatabasews_url");
-                    if let (Some(fresh), Some(stored)) = (fresh_url, stored_url) {
-                        if fresh != stored {
-                            tracing::info!(
-                                old_url = %stored,
-                                new_url = %fresh,
-                                "CloudKit partition changed, forcing full re-auth"
-                            );
-                            return Ok(false);
-                        }
+                    if let (Some(fresh), Some(stored)) = (fresh_url, stored_url)
+                        && fresh != stored
+                    {
+                        tracing::info!(
+                            old_url = %stored,
+                            new_url = %fresh,
+                            "CloudKit partition changed, forcing full re-auth"
+                        );
+                        return Ok(false);
                     }
                     session.save_validation_cache(&d).await;
                     Ok(true)
@@ -663,8 +663,8 @@ mod tests {
     use crate::auth::responses::{AccountLoginResponse, DsInfo};
     use secrecy::SecretString;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};

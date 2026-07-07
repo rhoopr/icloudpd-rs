@@ -13,10 +13,10 @@ use crate::cli;
 use crate::config;
 use crate::download;
 use crate::download::filter::{
-    expected_paths_for, is_asset_filtered, ExpectedAssetPath, PathDerivationConfig,
-    PathDerivationSource,
+    ExpectedAssetPath, PathDerivationConfig, PathDerivationSource, expected_paths_for,
+    is_asset_filtered,
 };
-use crate::download::paths::{normalize_ampm, DirCache};
+use crate::download::paths::{DirCache, normalize_ampm};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
@@ -412,29 +412,28 @@ fn import_match_candidates(
         fname, asset_id,
     )));
 
-    if candidate.version_size.is_live_photo_motion() {
-        if let Some(primary) = primary_expected_path(all_expected) {
-            if let Some(primary_fname) = primary.path.file_name().and_then(|f| f.to_str()) {
-                let primary_collision_filenames = [
-                    download::paths::add_dedup_suffix(primary_fname, primary.size),
-                    download::paths::insert_asset_identity_suffix(primary_fname, asset_id),
-                ];
-                for primary_filename in primary_collision_filenames {
-                    let mov_filename = match path_config.live_photo_mov_filename_policy() {
-                        LivePhotoMovFilenamePolicy::Suffix => {
-                            download::paths::live_photo_mov_path_suffix(&primary_filename)
-                        }
-                        LivePhotoMovFilenamePolicy::Original => {
-                            download::paths::live_photo_mov_path_original(&primary_filename)
-                        }
-                    };
-                    candidates.push(parent.join(&mov_filename));
-                    candidates.push(parent.join(download::paths::insert_asset_identity_suffix(
-                        &mov_filename,
-                        asset_id,
-                    )));
+    if candidate.version_size.is_live_photo_motion()
+        && let Some(primary) = primary_expected_path(all_expected)
+        && let Some(primary_fname) = primary.path.file_name().and_then(|f| f.to_str())
+    {
+        let primary_collision_filenames = [
+            download::paths::add_dedup_suffix(primary_fname, primary.size),
+            download::paths::insert_asset_identity_suffix(primary_fname, asset_id),
+        ];
+        for primary_filename in primary_collision_filenames {
+            let mov_filename = match path_config.live_photo_mov_filename_policy() {
+                LivePhotoMovFilenamePolicy::Suffix => {
+                    download::paths::live_photo_mov_path_suffix(&primary_filename)
                 }
-            }
+                LivePhotoMovFilenamePolicy::Original => {
+                    download::paths::live_photo_mov_path_original(&primary_filename)
+                }
+            };
+            candidates.push(parent.join(&mov_filename));
+            candidates.push(parent.join(download::paths::insert_asset_identity_suffix(
+                &mov_filename,
+                asset_id,
+            )));
         }
     }
 
@@ -452,10 +451,10 @@ async fn match_exact_or_ampm_variant(
     expected_size: u64,
     dir_cache: &mut DirCache,
 ) -> Option<(PathBuf, std::fs::Metadata)> {
-    if let Ok(m) = tokio::fs::metadata(path).await {
-        if m.len() == expected_size {
-            return Some((path.to_path_buf(), m));
-        }
+    if let Ok(m) = tokio::fs::metadata(path).await
+        && m.len() == expected_size
+    {
+        return Some((path.to_path_buf(), m));
     }
 
     let needs_probe = path
@@ -945,7 +944,7 @@ pub(crate) async fn run_import_existing(
         let empty_zones: Vec<&str> = libraries
             .iter()
             .zip(&counts)
-            .filter(|(_, &count)| count == 0)
+            .filter(|&(_, &count)| count == 0)
             .map(|(library, _)| library.zone_name())
             .collect();
         validate_non_empty_libraries(&empty_zones, prior_db_total)?;
@@ -1043,7 +1042,7 @@ fn build_import_selection(
     toml_filters: Option<&config::TomlFilters>,
     libraries: &crate::selection::LibrarySelector,
 ) -> anyhow::Result<crate::selection::Selection> {
-    use crate::selection::{parse_album_selector, parse_smart_folder_selector, Selection};
+    use crate::selection::{Selection, parse_album_selector, parse_smart_folder_selector};
 
     let raw_albums: Vec<String> = toml_filters
         .and_then(|f| f.albums.as_ref())
@@ -1335,14 +1334,14 @@ mod wiremock_tests {
     use std::sync::Arc;
 
     use rustc_hash::FxHashSet;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use wiremock::matchers::{header, method as wm_method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        import_assets, verify_strict_prefix, ImportRunOptions, ImportStats, StrictImportDecision,
-        StrictImportVerifier,
+        ImportRunOptions, ImportStats, StrictImportDecision, StrictImportVerifier, import_assets,
+        verify_strict_prefix,
     };
     use crate::download::filter::expected_paths_for;
     use crate::download::paths::DirCache;
@@ -2077,12 +2076,14 @@ mod wiremock_tests {
 
         assert_eq!(stats.matched, 2);
         let rows = all_downloaded(db.as_ref()).await;
-        assert!(rows
-            .iter()
-            .any(|r| r.filename.as_ref() == "IMG_0600-3000.HEIC"));
-        assert!(rows
-            .iter()
-            .any(|r| r.filename.as_ref() == "IMG_0600-3000_HEVC-LIVE6-2.MOV"));
+        assert!(
+            rows.iter()
+                .any(|r| r.filename.as_ref() == "IMG_0600-3000.HEIC")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.filename.as_ref() == "IMG_0600-3000_HEVC-LIVE6-2.MOV")
+        );
     }
 
     #[tokio::test]
@@ -2134,12 +2135,14 @@ mod wiremock_tests {
 
         assert_eq!(stats.matched, 2);
         let rows = all_downloaded(db.as_ref()).await;
-        assert!(rows
-            .iter()
-            .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6.HEIC"));
-        assert!(rows
-            .iter()
-            .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6_HEVC-LIVE_SLASH6-22.MOV"));
+        assert!(
+            rows.iter()
+                .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6.HEIC")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.filename.as_ref() == "IMG_0610-LIVE_SLASH6_HEVC-LIVE_SLASH6-22.MOV")
+        );
     }
 
     #[tokio::test]
@@ -3872,8 +3875,8 @@ mod heartbeat_tests {
     //! end-to-end tests live in `wiremock_tests` because they need the
     //! full wiremock + on-disk staging setup; this module covers the
     //! snapshot + guard behaviour in isolation.
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     /// `HeartbeatState::snapshot` must mirror the live atomics so the
     /// emitted log line reflects whatever the scan loop has counted up

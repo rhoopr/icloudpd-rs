@@ -827,21 +827,24 @@ mod tests {
         assert_eq!(get_schema_version(&conn).unwrap(), 3);
 
         // Verify local_checksum exists but download_checksum does not
-        assert!(conn
-            .prepare("SELECT local_checksum FROM assets LIMIT 0")
-            .is_ok());
-        assert!(conn
-            .prepare("SELECT download_checksum FROM assets LIMIT 0")
-            .is_err());
+        assert!(
+            conn.prepare("SELECT local_checksum FROM assets LIMIT 0")
+                .is_ok()
+        );
+        assert!(
+            conn.prepare("SELECT download_checksum FROM assets LIMIT 0")
+                .is_err()
+        );
 
         // Migrate should bring it to v4
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // download_checksum should now exist
-        assert!(conn
-            .prepare("SELECT download_checksum FROM assets LIMIT 0")
-            .is_ok());
+        assert!(
+            conn.prepare("SELECT download_checksum FROM assets LIMIT 0")
+                .is_ok()
+        );
 
         // Verify data survives migration: insert a row using all columns
         conn.execute(
@@ -881,9 +884,10 @@ mod tests {
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // Column should be usable
-        assert!(conn
-            .prepare("SELECT download_checksum FROM assets LIMIT 0")
-            .is_ok());
+        assert!(
+            conn.prepare("SELECT download_checksum FROM assets LIMIT 0")
+                .is_ok()
+        );
     }
 
     /// T-9: Simulate crash after V3+V4 columns added but version left at V2.
@@ -907,9 +911,10 @@ mod tests {
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         // Both columns should exist and be queryable
-        assert!(conn
-            .prepare("SELECT local_checksum, download_checksum FROM assets LIMIT 0")
-            .is_ok());
+        assert!(
+            conn.prepare("SELECT local_checksum, download_checksum FROM assets LIMIT 0")
+                .is_ok()
+        );
 
         // Database should be fully usable (insert + query round-trip)
         conn.execute(

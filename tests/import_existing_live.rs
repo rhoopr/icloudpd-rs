@@ -1015,8 +1015,7 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
         // import-existing doesn't expose media selection as a flag. Use TOML
         // to force it.
         let test_data = tempdir().unwrap();
-        let media_filter_toml =
-            "[filters]\nalbums = [\"none\"]\nunfiled = true\nmedia = [\"photos\", \"live-photos\"]\n";
+        let media_filter_toml = "[filters]\nalbums = [\"none\"]\nunfiled = true\nmedia = [\"photos\", \"live-photos\"]\n";
         let toml_path = write_kei_toml(test_data.path(), download_dir, media_filter_toml);
 
         let recent = ROUNDTRIP_RECENT.to_string();

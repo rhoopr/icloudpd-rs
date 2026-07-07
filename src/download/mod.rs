@@ -21,24 +21,24 @@ mod retry;
 pub(crate) use limiter::BandwidthLimiter;
 
 use pipeline::{
+    AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, PassResult, StreamRuntime, StreamingResult,
     build_download_outcome, format_duration, log_sync_summary, run_download_pass,
-    stream_and_download_from_stream, MetadataFlags, PassConfig, PassResult, StreamRuntime,
-    StreamingResult, AUTH_ERROR_THRESHOLD,
+    stream_and_download_from_stream,
 };
 
-pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
 use filter::DownloadTask;
+pub(crate) use filter::determine_media_type;
 #[cfg(test)]
 use retry::take_matching_pending_retry_tasks;
-use retry::{build_pending_retry_download_tasks, PendingRetryPlan, PendingRetryTarget};
+use retry::{PendingRetryPlan, PendingRetryTarget, build_pending_retry_download_tasks};
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -46,8 +46,8 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use futures_util::stream::{self, StreamExt};
 use futures_util::Stream;
+use futures_util::stream::{self, StreamExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -1743,11 +1743,7 @@ impl DownloadContext {
             );
         }
 
-        if trust_state {
-            Some(false)
-        } else {
-            None
-        }
+        if trust_state { Some(false) } else { None }
     }
 
     fn downloaded_local_path(
@@ -4421,10 +4417,10 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
     cleanup_orphan_part_files(&config).await;
-    if matches!(config.sync_mode, SyncMode::Incremental { .. }) {
-        if let Some(db) = &config.state_db {
-            backfill_asset_master_mappings_from_album_history(db.as_ref()).await;
-        }
+    if matches!(config.sync_mode, SyncMode::Incremental { .. })
+        && let Some(db) = &config.state_db
+    {
+        backfill_asset_master_mappings_from_album_history(db.as_ref()).await;
     }
 
     // Give every non-downloaded asset a fresh start this sync:
@@ -4598,20 +4594,20 @@ pub async fn download_photos_with_sync(
 
     // Pending is transient — anything still pending after a complete sync either
     // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
-    if let Some(db) = &config.state_db {
-        if !shutdown_token.is_cancelled() {
-            match db.promote_pending_to_failed(sync_started_at).await {
-                Ok(promoted) if promoted > 0 => {
-                    tracing::warn!(
-                        count = promoted,
-                        "Promoted unresolved pending assets to failed"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to promote pending assets");
-                }
-                _ => {}
+    if let Some(db) = &config.state_db
+        && !shutdown_token.is_cancelled()
+    {
+        match db.promote_pending_to_failed(sync_started_at).await {
+            Ok(promoted) if promoted > 0 => {
+                tracing::warn!(
+                    count = promoted,
+                    "Promoted unresolved pending assets to failed"
+                );
             }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to promote pending assets");
+            }
+            _ => {}
         }
     }
 
@@ -4933,33 +4929,33 @@ async fn download_photos_full_with_token_policy(
                         Arc::clone(&bounds_truncated),
                     );
 
-                    if pass.kind == crate::commands::PassKind::Album {
-                        if let Some(deferred_ids) = deferred_ids {
-                            let stream = stream.map(move |item| {
-                                if let Ok(asset) = &item {
-                                    if let Ok(mut ids) = deferred_ids.lock() {
-                                        ids.insert(asset.asset_record_name().to_string());
-                                    }
-                                }
-                                item
-                            });
-                            return run_full_pass_stream(
-                                download_client,
-                                stream,
-                                token_rx,
-                                pass_config,
-                                FullPassStreamOptions {
-                                    pass_index,
-                                    controls,
-                                    count,
-                                    kind: pass.kind,
-                                    shutdown_token,
-                                    download_ctx: download_ctx.clone(),
-                                    album_snapshot,
-                                },
-                            )
-                            .await;
-                        }
+                    if pass.kind == crate::commands::PassKind::Album
+                        && let Some(deferred_ids) = deferred_ids
+                    {
+                        let stream = stream.map(move |item| {
+                            if let Ok(asset) = &item
+                                && let Ok(mut ids) = deferred_ids.lock()
+                            {
+                                ids.insert(asset.asset_record_name().to_string());
+                            }
+                            item
+                        });
+                        return run_full_pass_stream(
+                            download_client,
+                            stream,
+                            token_rx,
+                            pass_config,
+                            FullPassStreamOptions {
+                                pass_index,
+                                controls,
+                                count,
+                                kind: pass.kind,
+                                shutdown_token,
+                                download_ctx: download_ctx.clone(),
+                                album_snapshot,
+                            },
+                        )
+                        .await;
                     }
 
                     run_full_pass_stream(
@@ -5216,39 +5212,35 @@ async fn download_photos_full_with_token_policy(
     if !count_lookup_failed
         && !controls.run_mode.only_print_filenames()
         && !controls.run_mode.is_dry_run()
+        && let Some(total) = exact_total.filter(|total| *total > 0)
     {
-        if let Some(total) = exact_total.filter(|total| *total > 0) {
-            let duplicate_asset_ids =
-                u64::try_from(streaming_result.skip_summary.duplicates).unwrap_or(u64::MAX);
-            let decision = classify_pagination_shortfall(
-                total,
-                streaming_result.assets_seen,
-                duplicate_asset_ids,
-            );
-            match decision {
-                PaginationShortfall::Match => {}
-                PaginationShortfall::DuplicateCompensated { shortfall } => {
-                    tracing::warn!(
-                        expected = total,
-                        seen = streaming_result.assets_seen,
-                        shortfall,
-                        duplicate_asset_ids,
-                        "Enumeration count shortfall was explained by duplicate asset IDs; \
+        let duplicate_asset_ids =
+            u64::try_from(streaming_result.skip_summary.duplicates).unwrap_or(u64::MAX);
+        let decision =
+            classify_pagination_shortfall(total, streaming_result.assets_seen, duplicate_asset_ids);
+        match decision {
+            PaginationShortfall::Match => {}
+            PaginationShortfall::DuplicateCompensated { shortfall } => {
+                tracing::warn!(
+                    expected = total,
+                    seen = streaming_result.assets_seen,
+                    shortfall,
+                    duplicate_asset_ids,
+                    "Enumeration count shortfall was explained by duplicate asset IDs; \
                          continuing sync token capture"
-                    );
-                }
-                PaginationShortfall::Shortfall { shortfall } => {
-                    pagination_shortfall_assets = shortfall;
-                    pagination_shortfall_warnings = 1;
-                    tracing::warn!(
-                        expected = total,
-                        seen = streaming_result.assets_seen,
-                        duplicate_asset_ids,
-                        shortfall,
-                        "Enumeration saw fewer assets than the count side-channel reported; \
+                );
+            }
+            PaginationShortfall::Shortfall { shortfall } => {
+                pagination_shortfall_assets = shortfall;
+                pagination_shortfall_warnings = 1;
+                tracing::warn!(
+                    expected = total,
+                    seen = streaming_result.assets_seen,
+                    duplicate_asset_ids,
+                    shortfall,
+                    "Enumeration saw fewer assets than the count side-channel reported; \
                          recording diagnostic and continuing sync token capture"
-                    );
-                }
+                );
             }
         }
     }
@@ -5684,12 +5676,10 @@ async fn download_photos_full_with_token_policy(
     // doesn't leave the marker set forever. Shutdown still suppresses the
     // clear because the producer's cancellation path leaves
     // `enumeration_complete = false`.
-    if enumeration_complete {
-        if let Some(db) = &config.state_db {
-            for zone in &enum_zones {
-                if let Err(e) = db.end_enum_progress(zone).await {
-                    tracing::debug!(error = %e, zone, "Failed to clear enumeration marker");
-                }
+    if enumeration_complete && let Some(db) = &config.state_db {
+        for zone in &enum_zones {
+            if let Err(e) = db.end_enum_progress(zone).await {
+                tracing::debug!(error = %e, zone, "Failed to clear enumeration marker");
             }
         }
     }
@@ -6233,10 +6223,10 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             match event.reason {
                 ChangeReason::Created => {
                     summary.record_created();
-                    if let Some(asset) = event.asset {
-                        if asset_tx.send(Ok(asset)).await.is_err() {
-                            return Ok(summary);
-                        }
+                    if let Some(asset) = event.asset
+                        && asset_tx.send(Ok(asset)).await.is_err()
+                    {
+                        return Ok(summary);
                     }
                 }
                 ChangeReason::SoftDeleted | ChangeReason::HardDeleted | ChangeReason::Hidden => {
@@ -6705,16 +6695,15 @@ async fn download_photos_incremental_collecting_inner(
             if let Err(e) =
                 planner::record_album_membership_if_named(db.as_ref(), effective_config, asset)
                     .await
+                && let Some(album_name) = effective_config.album_name.as_deref()
             {
-                if let Some(album_name) = effective_config.album_name.as_deref() {
-                    tracing::warn!(
-                        asset_id = %asset.id(),
-                        album = %album_name,
-                        library = %effective_config.library,
-                        error = %e,
-                        "Failed to record album membership after retries"
-                    );
-                }
+                tracing::warn!(
+                    asset_id = %asset.id(),
+                    album = %album_name,
+                    library = %effective_config.library,
+                    error = %e,
+                    "Failed to record album membership after retries"
+                );
             }
         }
 
@@ -7003,12 +6992,12 @@ mod tests {
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
     use crate::state::SqliteStateDb;
     use crate::test_helpers::{
+        DynamicRecentPhotosSession, MockPhotosFlow, TestAssetRecord, TracingCapture,
         mock_photo_query_page, mock_photo_records_for_zone_with_filename,
-        mock_photo_records_for_zone_with_filename_and_asset_date, DynamicRecentPhotosSession,
-        MockPhotosFlow, TestAssetRecord, TracingCapture,
+        mock_photo_records_for_zone_with_filename_and_asset_date,
     };
     use chrono::TimeZone;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -14843,7 +14832,8 @@ mod tests {
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(
-            result.stats.assets_seen, 10,
+            result.stats.assets_seen,
+            10,
             "each album should plan only assets inside the library-wide recent frontier; offsets={:?}",
             session.album_offsets()
         );

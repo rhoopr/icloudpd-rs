@@ -184,8 +184,8 @@ async fn watchdog_heartbeat_loop<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn disabled_notifier_is_noop() {

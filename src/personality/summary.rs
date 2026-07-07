@@ -139,11 +139,7 @@ fn format_duration(d: Duration) -> String {
 }
 
 fn plural<'a>(n: u64, singular: &'a str, plural: &'a str) -> &'a str {
-    if n == 1 {
-        singular
-    } else {
-        plural
-    }
+    if n == 1 { singular } else { plural }
 }
 
 #[cfg(test)]

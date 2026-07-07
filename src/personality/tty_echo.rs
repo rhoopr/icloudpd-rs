@@ -21,7 +21,7 @@
 mod platform {
     use std::sync::Mutex;
 
-    use libc::{tcgetattr, tcsetattr, termios, ECHOCTL, STDIN_FILENO, TCSANOW};
+    use libc::{ECHOCTL, STDIN_FILENO, TCSANOW, tcgetattr, tcsetattr, termios};
 
     /// Saved `c_lflag` from the call to `install`. Held in a `Mutex<Option<...>>`
     /// so a manual `restore_now()` from the shutdown path and the `Drop` of
@@ -105,7 +105,7 @@ mod platform {
     pub fn restore_now() {}
 }
 
-pub use platform::{restore_now, EchoGuard};
+pub use platform::{EchoGuard, restore_now};
 
 #[cfg(test)]
 mod tests {

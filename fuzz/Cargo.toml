@@ -2,7 +2,7 @@
 name = "kei-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 # Fuzz harnesses depend on the kei lib through the `__fuzz_internals`
 # feature, which exposes a `kei::__fuzz` module of `pub fn` wrappers around

@@ -12,28 +12,28 @@ use std::path::Path;
 /// The async sibling `log_remove_async` is available for callers already on a
 /// tokio task.
 pub(crate) fn log_remove(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to remove file during cleanup"
-            );
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "Failed to remove file during cleanup"
+        );
     }
 }
 
 /// Async sibling of [`log_remove`] for callers already on a tokio task;
 /// uses `tokio::fs::remove_file` so it doesn't block a runtime worker.
 pub(crate) async fn log_remove_async(path: &Path) {
-    if let Err(e) = tokio::fs::remove_file(path).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to remove file during cleanup"
-            );
-        }
+    if let Err(e) = tokio::fs::remove_file(path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "Failed to remove file during cleanup"
+        );
     }
 }
 

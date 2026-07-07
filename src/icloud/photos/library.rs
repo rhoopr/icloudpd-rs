@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use base64::Engine;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::album::{
-    PhotoAlbum, PhotoAlbumConfig, DEFAULT_PAGE_SIZE, QUERY_ALL_LIST, QUERY_ALL_OBJ,
+    DEFAULT_PAGE_SIZE, PhotoAlbum, PhotoAlbumConfig, QUERY_ALL_LIST, QUERY_ALL_OBJ,
     QUERY_FOLDER_LIST,
 };
 use super::queries::encode_params;
@@ -39,13 +39,13 @@ const PROJECT_ROOT_FOLDER: &str = "----Project-Root-Folder----";
 /// Map typed CloudKit initialization failures to the library-level iCloud
 /// contract consumed by sync orchestration.
 fn map_library_init_error(error: &anyhow::Error) -> ICloudError {
-    if let Some(ck) = error.downcast_ref::<crate::icloud::photos::session::CloudKitServerError>() {
-        if ck.service_not_activated {
-            return ICloudError::ServiceNotActivated {
-                code: ck.code.to_string(),
-                reason: ck.reason.to_string(),
-            };
-        }
+    if let Some(ck) = error.downcast_ref::<crate::icloud::photos::session::CloudKitServerError>()
+        && ck.service_not_activated
+    {
+        return ICloudError::ServiceNotActivated {
+            code: ck.code.to_string(),
+            reason: ck.reason.to_string(),
+        };
     }
     if let Some(http_err) = error.downcast_ref::<crate::icloud::photos::session::HttpStatusError>()
     {

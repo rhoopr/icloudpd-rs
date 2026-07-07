@@ -651,29 +651,28 @@ pub(crate) async fn run_cycle(
     // pipeline's `config_hash` (which tracks path-affecting fields only).
     // Using a single key for both would cause the two hashes to overwrite
     // each other every cycle, permanently preventing incremental sync.
-    if !config.runtime.dry_run {
-        if let Some(db) = state_db {
-            enum_config_hash_outcome =
-                check_and_persist_enum_config_hash(db, &enum_config_hash).await;
-            force_full_for_config_hash = enum_config_hash_outcome.must_force_full_sync();
-            if matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed) {
-                let recovery = RecoveryAction::ReconcileInventory(
-                    download::FullEnumerationReason::EnumConfigHashDrift,
-                );
-                if let Err(e) = db
-                    .set_metadata(LAST_RECOVERY_ACTION_KEY, recovery.as_str())
-                    .await
-                {
-                    tracing::debug!(error = %e, "Failed to persist inventory reconciliation action");
-                }
+    if !config.runtime.dry_run
+        && let Some(db) = state_db
+    {
+        enum_config_hash_outcome = check_and_persist_enum_config_hash(db, &enum_config_hash).await;
+        force_full_for_config_hash = enum_config_hash_outcome.must_force_full_sync();
+        if matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed) {
+            let recovery = RecoveryAction::ReconcileInventory(
+                download::FullEnumerationReason::EnumConfigHashDrift,
+            );
+            if let Err(e) = db
+                .set_metadata(LAST_RECOVERY_ACTION_KEY, recovery.as_str())
+                .await
+            {
+                tracing::debug!(error = %e, "Failed to persist inventory reconciliation action");
             }
-            if matches!(
-                enum_config_hash_outcome,
-                EnumConfigHashOutcome::ChangedTokenPurgeFailed | EnumConfigHashOutcome::ReadFailed
-            ) {
-                checkpoint_transition_state_safe = false;
-                db_sync_token_advance_safe = false;
-            }
+        }
+        if matches!(
+            enum_config_hash_outcome,
+            EnumConfigHashOutcome::ChangedTokenPurgeFailed | EnumConfigHashOutcome::ReadFailed
+        ) {
+            checkpoint_transition_state_safe = false;
+            db_sync_token_advance_safe = false;
         }
     }
 
@@ -683,24 +682,24 @@ pub(crate) async fn run_cycle(
     // into the new directory/template. Detect that before choosing
     // incremental mode. Path-only drift keeps source tracking incremental;
     // the pending marker drives separate catalog/targeted rehydration work.
-    if !config.runtime.dry_run {
-        if let (Some(db), Some(first_library)) = (state_db, library_states.first()) {
-            let probe_config = build_download_config(
-                download::SyncMode::Full,
-                Arc::new(rustc_hash::FxHashSet::default()),
-                Arc::new(download::AssetGroupings::default()),
-                Arc::from(first_library.zone_name.as_str()),
-            );
-            let download_config_hash = download::hash_download_config(&probe_config);
-            let outcome = check_download_config_hash_for_cycle(db, &download_config_hash).await;
-            force_full_for_download_config_hash = outcome.must_force_full_sync();
-            if matches!(outcome, DownloadConfigHashOutcome::Changed) {
-                pending_download_config_hash = Some(download_config_hash);
-            }
-            if outcome.token_purge_failed() {
-                checkpoint_transition_state_safe = false;
-                db_sync_token_advance_safe = false;
-            }
+    if !config.runtime.dry_run
+        && let (Some(db), Some(first_library)) = (state_db, library_states.first())
+    {
+        let probe_config = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(first_library.zone_name.as_str()),
+        );
+        let download_config_hash = download::hash_download_config(&probe_config);
+        let outcome = check_download_config_hash_for_cycle(db, &download_config_hash).await;
+        force_full_for_download_config_hash = outcome.must_force_full_sync();
+        if matches!(outcome, DownloadConfigHashOutcome::Changed) {
+            pending_download_config_hash = Some(download_config_hash);
+        }
+        if outcome.token_purge_failed() {
+            checkpoint_transition_state_safe = false;
+            db_sync_token_advance_safe = false;
         }
     }
 
@@ -779,13 +778,12 @@ pub(crate) async fn run_cycle(
             download::SyncMode::Incremental { .. } => "incremental",
         };
         if let Some(reason) = sync_mode_decision.full_enumeration_reason {
-            if let Some(db) = state_db {
-                if let Err(e) = db
+            if let Some(db) = state_db
+                && let Err(e) = db
                     .set_metadata(LAST_FULL_ENUMERATION_REASON_KEY, reason.as_str())
                     .await
-                {
-                    tracing::debug!(error = %e, "Failed to persist full-enumeration reason");
-                }
+            {
+                tracing::debug!(error = %e, "Failed to persist full-enumeration reason");
             }
             tracing::info!(
                 sync_mode = sync_mode_label,
@@ -952,16 +950,15 @@ pub(crate) async fn run_cycle(
         if library_completed_without_errors
             && !cycle_has_stale_plan
             && download_controls.run_mode.downloads_files()
+            && let Some(db) = state_db
         {
-            if let Some(db) = state_db {
-                update_inventory_anchor_for_cycle(
-                    db,
-                    &enum_config_hash,
-                    &lib_state.zone_name,
-                    &mut sync_result.stats,
-                )
-                .await;
-            }
+            update_inventory_anchor_for_cycle(
+                db,
+                &enum_config_hash,
+                &lib_state.zone_name,
+                &mut sync_result.stats,
+            )
+            .await;
         }
 
         // Provider cursor safety is independent from transfer completion.
@@ -1075,8 +1072,8 @@ pub(crate) async fn run_cycle(
                 checkpoint_hold_action = Some(recovery.as_str());
                 crate::metrics::record_checkpoint_decision("preserved", reason.as_str());
                 db_sync_token_advance_safe = false;
-                if let Some(db) = state_db {
-                    if let Err(e) = db
+                if let Some(db) = state_db
+                    && let Err(e) = db
                         .commit_checkpoint_transition(state::CheckpointTransition {
                             metadata_updates: vec![
                                 (
@@ -1091,9 +1088,8 @@ pub(crate) async fn run_cycle(
                             metadata_deletes: Vec::new(),
                         })
                         .await
-                    {
-                        tracing::debug!(error = %e, "Failed to persist checkpoint hold status");
-                    }
+                {
+                    tracing::debug!(error = %e, "Failed to persist checkpoint hold status");
                 }
                 let diagnostic = sync_result
                     .stats
@@ -1145,71 +1141,68 @@ pub(crate) async fn run_cycle(
         && db_sync_token_advance_safe
         && !cycle_session_expired
         && !shutdown_token.is_cancelled()
+        && let Some(db) = state_db
     {
-        if let Some(db) = state_db {
-            let mut metadata_updates = Vec::new();
-            let mut metadata_deletes = Vec::new();
-            if force_full_for_config_hash {
-                for lib_state in library_states
-                    .iter()
-                    .copied()
-                    .filter(|state| has_active_passes(state))
-                {
-                    let candidate_key =
-                        pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
-                    let Some(token) = db
-                        .get_metadata(&candidate_key)
-                        .await?
-                        .filter(|token| !token.trim().is_empty())
-                    else {
-                        db_sync_token_advance_safe = false;
-                        tracing::warn!(
-                            zone = %lib_state.zone_name,
-                            "Config reconciliation has no completed checkpoint for selected zone"
-                        );
-                        break;
-                    };
-                    metadata_updates.push((lib_state.sync_token_key.clone(), token));
-                    metadata_deletes.push(candidate_key);
-                }
-                if db_sync_token_advance_safe {
-                    metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));
-                    metadata_deletes.push(PENDING_ENUM_CONFIG_HASH_KEY.to_owned());
-                }
+        let mut metadata_updates = Vec::new();
+        let mut metadata_deletes = Vec::new();
+        if force_full_for_config_hash {
+            for lib_state in library_states
+                .iter()
+                .copied()
+                .filter(|state| has_active_passes(state))
+            {
+                let candidate_key = pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
+                let Some(token) = db
+                    .get_metadata(&candidate_key)
+                    .await?
+                    .filter(|token| !token.trim().is_empty())
+                else {
+                    db_sync_token_advance_safe = false;
+                    tracing::warn!(
+                        zone = %lib_state.zone_name,
+                        "Config reconciliation has no completed checkpoint for selected zone"
+                    );
+                    break;
+                };
+                metadata_updates.push((lib_state.sync_token_key.clone(), token));
+                metadata_deletes.push(candidate_key);
             }
             if db_sync_token_advance_safe {
-                metadata_updates
-                    .push((LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()));
-                metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
-                if let Err(e) = db
-                    .commit_checkpoint_transition(state::CheckpointTransition {
-                        metadata_updates,
-                        metadata_deletes,
-                    })
-                    .await
-                {
-                    db_sync_token_advance_safe = false;
-                    tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
-                }
+                metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));
+                metadata_deletes.push(PENDING_ENUM_CONFIG_HASH_KEY.to_owned());
+            }
+        }
+        if db_sync_token_advance_safe {
+            metadata_updates.push((LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()));
+            metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
+            if let Err(e) = db
+                .commit_checkpoint_transition(state::CheckpointTransition {
+                    metadata_updates,
+                    metadata_deletes,
+                })
+                .await
+            {
+                db_sync_token_advance_safe = false;
+                tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
             }
         }
     }
 
-    if path_reconciliation_complete && !cycle_session_expired && !shutdown_token.is_cancelled() {
-        if let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash) {
-            if let Err(e) = db
-                .commit_checkpoint_transition(state::CheckpointTransition {
-                    metadata_updates: vec![(
-                        download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
-                        download_config_hash,
-                    )],
-                    metadata_deletes: vec![PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned()],
-                })
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
-            }
-        }
+    if path_reconciliation_complete
+        && !cycle_session_expired
+        && !shutdown_token.is_cancelled()
+        && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
+        && let Err(e) = db
+            .commit_checkpoint_transition(state::CheckpointTransition {
+                metadata_updates: vec![(
+                    download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                    download_config_hash,
+                )],
+                metadata_deletes: vec![PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned()],
+            })
+            .await
+    {
+        tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
     }
 
     Ok(CycleResult {

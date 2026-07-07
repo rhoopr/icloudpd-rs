@@ -20,8 +20,8 @@
 
 use std::time::Duration;
 
-use crate::personality::active_bar;
 use crate::personality::Mode;
+use crate::personality::active_bar;
 
 /// Renders a short human-readable elapsed duration for the per-album done
 /// line. Fixed-width columns (`NNs` or `Nm NNs` or `Nh NNm`).

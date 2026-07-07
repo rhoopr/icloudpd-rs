@@ -19,7 +19,7 @@
 use anyhow::Result;
 
 use crate::config;
-use crate::service::env::{current_executable, SERVICE_IDENTIFIER};
+use crate::service::env::{SERVICE_IDENTIFIER, current_executable};
 use crate::sync_loop;
 
 pub(crate) async fn run(globals: &config::GlobalArgs, args: sync_loop::SyncArgs) -> Result<()> {

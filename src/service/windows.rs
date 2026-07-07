@@ -28,12 +28,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::cli::UninstallArgs;
 use crate::service::env::{
-    current_executable, kei_state_dir_dotted, purge_kei_state, SERVICE_DESCRIPTION,
-    SERVICE_IDENTIFIER,
+    SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable, kei_state_dir_dotted,
+    purge_kei_state,
 };
 use crate::service::plan::{self, InstallPlan};
 use crate::service::status::ServiceState;
@@ -288,10 +288,10 @@ fn render_status(inputs: StatusInputs) -> String {
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn current_user_name() -> Option<String> {
-    if let Ok(u) = std::env::var("USERNAME") {
-        if !u.is_empty() {
-            return Some(u);
-        }
+    if let Ok(u) = std::env::var("USERNAME")
+        && !u.is_empty()
+    {
+        return Some(u);
     }
     // USERPROFILE is `C:\Users\Alice`; the basename is the account name.
     let profile = std::env::var("USERPROFILE").ok()?;
@@ -363,8 +363,8 @@ mod scm_impl {
             .map_err(|_| anyhow!("internal: SCM payload mutex poisoned"))
     }
 
-    fn lock_scm_shutdown_tx(
-    ) -> Result<MutexGuard<'static, Option<tokio::sync::oneshot::Sender<()>>>> {
+    fn lock_scm_shutdown_tx()
+    -> Result<MutexGuard<'static, Option<tokio::sync::oneshot::Sender<()>>>> {
         SCM_SHUTDOWN_TX
             .lock()
             .map_err(|_| anyhow!("internal: SCM shutdown mutex poisoned"))

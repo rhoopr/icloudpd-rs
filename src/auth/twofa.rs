@@ -2,17 +2,17 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::header::HeaderMap;
 use reqwest::Response;
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 
+use super::AUTH_RETRY_CONFIG;
 use super::endpoints::Endpoints;
 use super::session::Session;
 use super::srp::get_auth_headers;
-use super::AUTH_RETRY_CONFIG;
 use crate::auth::error::AuthError;
 use crate::auth::responses::AccountLoginResponse;
-use crate::retry::{parse_retry_after_header, RetryConfig};
+use crate::retry::{RetryConfig, parse_retry_after_header};
 
 const TWO_FA_CODE_LENGTH: usize = 6;
 
@@ -86,20 +86,20 @@ fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
         .or_else(|| body.get("serviceErrors"))
         .and_then(Value::as_array);
 
-    if let Some(errors) = errors {
-        if let Some(first) = errors.first() {
-            let code = first
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let raw_message = first
-                .get("message")
-                .and_then(Value::as_str)
-                .filter(|m| !m.is_empty())
-                .or_else(|| first.get("title").and_then(Value::as_str))
-                .unwrap_or("Apple reported an error");
-            return Err(AuthError::service_error(code, raw_message));
-        }
+    if let Some(errors) = errors
+        && let Some(first) = errors.first()
+    {
+        let code = first
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let raw_message = first
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .or_else(|| first.get("title").and_then(Value::as_str))
+            .unwrap_or("Apple reported an error");
+        return Err(AuthError::service_error(code, raw_message));
     }
 
     if has_error {
@@ -364,11 +364,11 @@ async fn submit_2fa_code_inner(
     }
 
     // Apple can return HTTP 200 with error indicators in the body
-    if let Ok(body) = serde_json::from_str::<Value>(&text) {
-        if let Err(e) = check_apple_service_errors(&body) {
-            tracing::error!(error = %e, "2FA verification returned service error");
-            return Ok(false);
-        }
+    if let Ok(body) = serde_json::from_str::<Value>(&text)
+        && let Err(e) = check_apple_service_errors(&body)
+    {
+        tracing::error!(error = %e, "2FA verification returned service error");
+        return Ok(false);
     }
 
     tracing::debug!("Code verification successful");

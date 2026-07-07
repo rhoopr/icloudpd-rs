@@ -44,7 +44,9 @@ pub enum AuthError {
     )]
     TerminalAppleAuth { code: String, message: String },
 
-    #[error("Two-factor authentication is required. Run `kei login get-code`, then `kei login submit-code <CODE>`.")]
+    #[error(
+        "Two-factor authentication is required. Run `kei login get-code`, then `kei login submit-code <CODE>`."
+    )]
     TwoFactorRequired,
 
     /// The Apple ID has FIDO/WebAuthn hardware security keys registered.
@@ -201,16 +203,20 @@ mod tests {
             !AuthError::terminal_apple_auth(APPLE_ACCOUNT_LOCKED_CODE, "locked")
                 .is_two_factor_required()
         );
-        assert!(!AuthError::ApiError {
-            code: 401,
-            message: "test".into()
-        }
-        .is_two_factor_required());
-        assert!(!AuthError::ServiceError {
-            code: "test".into(),
-            message: "test".into()
-        }
-        .is_two_factor_required());
+        assert!(
+            !AuthError::ApiError {
+                code: 401,
+                message: "test".into()
+            }
+            .is_two_factor_required()
+        );
+        assert!(
+            !AuthError::ServiceError {
+                code: "test".into(),
+                message: "test".into()
+            }
+            .is_two_factor_required()
+        );
     }
 
     #[test]
@@ -234,11 +240,13 @@ mod tests {
     fn other_variants_are_not_terminal_apple_auth() {
         assert!(!AuthError::FailedLogin("test".into()).is_terminal_apple_auth());
         assert!(!AuthError::TwoFactorRequired.is_terminal_apple_auth());
-        assert!(!AuthError::ApiError {
-            code: 403,
-            message: "forbidden".into()
-        }
-        .is_terminal_apple_auth());
+        assert!(
+            !AuthError::ApiError {
+                code: 403,
+                message: "forbidden".into()
+            }
+            .is_terminal_apple_auth()
+        );
     }
 
     #[test]

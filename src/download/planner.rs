@@ -11,12 +11,12 @@ use rustc_hash::FxHashMap;
 use crate::icloud::photos::PhotoAsset;
 use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 
+use super::DownloadConfig;
 use super::filter::{
-    determine_media_type, filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
-    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath,
+    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, determine_media_type,
+    filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
 };
 use super::paths;
-use super::DownloadConfig;
 
 /// Mutable path-planning state carried across assets in one pass.
 #[derive(Debug)]

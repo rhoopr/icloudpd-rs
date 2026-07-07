@@ -20,7 +20,9 @@ pub(crate) enum DownloadError {
     #[error("Could not write to disk: {0}")]
     Disk(Box<std::io::Error>),
 
-    #[error("Download failed for {path} after {bytes_written} bytes (HTTP {status}, content length {content_length:?}): {source}")]
+    #[error(
+        "Download failed for {path} after {bytes_written} bytes (HTTP {status}, content length {content_length:?}): {source}"
+    )]
     Http {
         source: Box<dyn std::error::Error + Send + Sync>,
         path: Box<str>,

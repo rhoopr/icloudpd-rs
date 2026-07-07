@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 
-use crate::personality::{active_bar, progress_card, Mode};
+use crate::personality::{Mode, active_bar, progress_card};
 
 /// Progress bar plus shared byte counter for multi-pass download loops.
 #[derive(Debug)]

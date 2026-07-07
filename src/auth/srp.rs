@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use num_bigint::BigUint;
 use rand::RngExt;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -9,12 +9,12 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::AUTH_RETRY_CONFIG;
 use super::endpoints::Endpoints;
 use super::responses::AppleServiceError;
 use super::session::Session;
 use super::twofa::{check_rscd_from_headers, rscd_service_error};
-use super::AUTH_RETRY_CONFIG;
-use crate::auth::error::{is_terminal_apple_auth_code, AuthError};
+use crate::auth::error::{AuthError, is_terminal_apple_auth_code};
 use crate::retry::parse_retry_after_header;
 
 /// Buffered HTTP response for SRP authentication steps.
@@ -317,23 +317,23 @@ pub(crate) fn get_auth_headers(
         HeaderValue::from_static(APPLE_WIDGET_KEY),
     );
 
-    if let Some(scnt) = session_data.get("scnt") {
-        if let Ok(v) = HeaderValue::from_str(scnt) {
-            headers.insert("scnt", v);
-        }
+    if let Some(scnt) = session_data.get("scnt")
+        && let Ok(v) = HeaderValue::from_str(scnt)
+    {
+        headers.insert("scnt", v);
     }
-    if let Some(session_id) = session_data.get("session_id") {
-        if let Ok(v) = HeaderValue::from_str(session_id) {
-            headers.insert("X-Apple-ID-Session-Id", v);
-        }
+    if let Some(session_id) = session_data.get("session_id")
+        && let Ok(v) = HeaderValue::from_str(session_id)
+    {
+        headers.insert("X-Apple-ID-Session-Id", v);
     }
 
     if let Some(ovr) = overrides {
         for &(key, val) in ovr {
-            if let Ok(v) = HeaderValue::from_str(val) {
-                if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-                    headers.insert(name, v);
-                }
+            if let Ok(v) = HeaderValue::from_str(val)
+                && let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            {
+                headers.insert(name, v);
             }
         }
     }
@@ -712,10 +712,9 @@ where
     let mut last_transient: Option<SrpResponse> = None;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..total_attempts {
-        let headers = if let Some(h) = prebuilt_headers.take() {
-            h
-        } else {
-            rebuild_headers(transport.session_data())?
+        let headers = match prebuilt_headers.take() {
+            Some(h) => h,
+            None => rebuild_headers(transport.session_data())?,
         };
         match transport.post(url, Some(body), Some(headers)).await {
             Ok(resp) => {
@@ -1093,9 +1092,10 @@ mod tests {
         let err = run_srp(vec![response(200, b"not json".to_vec())])
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Apple login returned an unexpected response during SRP setup"));
+        assert!(
+            err.to_string()
+                .contains("Apple login returned an unexpected response during SRP setup")
+        );
     }
 
     #[tokio::test]

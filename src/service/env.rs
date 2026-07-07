@@ -115,12 +115,15 @@ pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
 pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<()> {
     if let Some(username) = read_config_username(kei_dir) {
         let store = crate::credential::CredentialStore::new(&username, kei_dir);
-        if let Err(e) = store.delete() {
-            // delete() bails when neither backend has anything to remove,
-            // which is fine for purge — we're cleaning up regardless.
-            tracing::debug!(error = %e, "credential delete during purge: nothing to remove");
-        } else {
-            tracing::info!(username, "cleared stored credential");
+        match store.delete() {
+            Err(e) => {
+                // delete() bails when neither backend has anything to remove,
+                // which is fine for purge - we're cleaning up regardless.
+                tracing::debug!(error = %e, "credential delete during purge: nothing to remove");
+            }
+            Ok(()) => {
+                tracing::info!(username, "cleared stored credential");
+            }
         }
     }
 

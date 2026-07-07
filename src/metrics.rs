@@ -16,11 +16,11 @@ use std::sync::{Arc, LazyLock};
 
 use chrono::Utc;
 
+use axum::Router;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;

@@ -13,10 +13,10 @@ use crate::cli;
 #[cfg(test)]
 use crate::commands::PassScope;
 use crate::commands::{
-    attempt_reauth, build_collection_context, collection_libraries, init_photos_service,
-    pass_scope_for_zone, resolve_cross_zone_libraries_for_album_hydration, resolve_libraries,
-    resolve_passes_for_scope, wait_and_retry_2fa, zone_name_set, CollectionContext,
-    MAX_REAUTH_ATTEMPTS,
+    CollectionContext, MAX_REAUTH_ATTEMPTS, attempt_reauth, build_collection_context,
+    collection_libraries, init_photos_service, pass_scope_for_zone,
+    resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
+    wait_and_retry_2fa, zone_name_set,
 };
 use crate::config;
 use crate::credential;
@@ -27,14 +27,14 @@ use crate::password::{self, ExposeSecret, SecretString};
 use crate::retry;
 use crate::shutdown;
 use crate::state;
-use crate::sync_cycle::{run_cycle, sync_token_key as make_sync_token_key, LibraryState};
+use crate::sync_cycle::{LibraryState, run_cycle, sync_token_key as make_sync_token_key};
 
 #[cfg(test)]
 use crate::sync_cycle::{
+    CycleResult, DownloadConfigHashOutcome, ENUM_CONFIG_HASH_KEY, EnumConfigHashOutcome,
+    PENDING_DOWNLOAD_CONFIG_HASH_KEY, PENDING_ENUM_CONFIG_HASH_KEY, SYNC_TOKEN_PREFIX,
     check_and_persist_enum_config_hash, check_download_config_hash_for_cycle, determine_sync_mode,
     pending_zone_token_key, should_store_sync_token, should_store_sync_token_for_cycle,
-    CycleResult, DownloadConfigHashOutcome, EnumConfigHashOutcome, ENUM_CONFIG_HASH_KEY,
-    PENDING_DOWNLOAD_CONFIG_HASH_KEY, PENDING_ENUM_CONFIG_HASH_KEY, SYNC_TOKEN_PREFIX,
 };
 
 #[cfg(all(test, feature = "xmp"))]
@@ -42,8 +42,8 @@ use crate::sync_cycle::preload_asset_groupings;
 
 use crate::systemd::SystemdNotifier;
 use crate::{
-    available_disk_space, check_min_disk_space, make_password_provider, PartialSyncError,
-    PidFileGuard,
+    PartialSyncError, PidFileGuard, available_disk_space, check_min_disk_space,
+    make_password_provider,
 };
 #[cfg(test)]
 use tokio_util::sync::CancellationToken;
@@ -362,19 +362,18 @@ async fn maybe_notify_shared_libraries(
     };
 
     let Some(msg) = should_notify_shared_libraries(selector, shared_count, already_notified) else {
-        if shared_count == 0 {
-            if let Err(e) = db
+        if shared_count == 0
+            && let Err(e) = db
                 .set_metadata(
                     SHARED_LIBRARY_NOTICE_CHECKED_KEY,
                     &chrono::Utc::now().timestamp().to_string(),
                 )
                 .await
-            {
-                tracing::debug!(
-                    error = %e,
-                    "shared-library notice: failed to persist no-shared check marker"
-                );
-            }
+        {
+            tracing::debug!(
+                error = %e,
+                "shared-library notice: failed to persist no-shared check marker"
+            );
         }
         return;
     };
@@ -465,12 +464,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // runs don't need the same env again. Only when the user explicitly chose
     // a config path (--config), to avoid surprise writes at the default
     // location during tests or one-off runs.
-    if !toml_existed && config_explicitly_set {
-        if let Err(e) =
+    if !toml_existed
+        && config_explicitly_set
+        && let Err(e) =
             config::persist_first_run_config(&config_path, &config, cli_data_dir.as_deref())
-        {
-            tracing::warn!(error = %e, "Failed to save first-run config");
-        }
+    {
+        tracing::warn!(error = %e, "Failed to save first-run config");
     }
 
     // One-shot operations — never inherit watch mode from TOML config,
@@ -493,10 +492,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
 
     // Install password redaction now that we know the password
-    if let Some(pw) = &config.auth.password {
-        if let Ok(mut guard) = redact_password.lock() {
-            *guard = Some(SecretString::from(pw.expose_secret().to_owned()));
-        }
+    if let Some(pw) = &config.auth.password
+        && let Ok(mut guard) = redact_password.lock()
+    {
+        *guard = Some(SecretString::from(pw.expose_secret().to_owned()));
     }
 
     // Prevent core dumps from leaking in-memory credentials
@@ -1095,16 +1094,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             WatchPrecheck::proceed_all()
         };
 
-        if !config.runtime.dry_run && !config.runtime.only_print_filenames {
-            if let Some(db) = state_db.as_deref() {
-                let drift = run_bounded_local_drift_probe(db, cycle_index).await;
-                if drift.marked_failed > 0 {
-                    tracing::warn!(
-                        marked_failed = drift.marked_failed,
-                        "Local drift probe found missing or damaged files; forcing this cycle to retry them"
-                    );
-                    watch_precheck = WatchPrecheck::proceed_all();
-                }
+        if !config.runtime.dry_run
+            && !config.runtime.only_print_filenames
+            && let Some(db) = state_db.as_deref()
+        {
+            let drift = run_bounded_local_drift_probe(db, cycle_index).await;
+            if drift.marked_failed > 0 {
+                tracing::warn!(
+                    marked_failed = drift.marked_failed,
+                    "Local drift probe found missing or damaged files; forcing this cycle to retry them"
+                );
+                watch_precheck = WatchPrecheck::proceed_all();
             }
         }
 
@@ -1318,11 +1318,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // for operators who want to sweep the whole state DB immediately.
         if is_watch_mode
             && should_reconcile_this_cycle(cycle_index, config.watch.reconcile_every_n_cycles)
+            && let Some(db) = state_db.as_ref()
         {
-            if let Some(db) = state_db.as_ref() {
-                run_periodic_reconcile(db.as_ref() as &dyn state::ReportStateStore, cycle_index)
-                    .await;
-            }
+            run_periodic_reconcile(db.as_ref() as &dyn state::ReportStateStore, cycle_index).await;
         }
 
         if let Some(interval) = config.watch.interval {
@@ -1602,7 +1600,7 @@ async fn notify_and_wait_for_2fa(
 /// the periodic walk is a diagnostic, not a load-bearing correctness gate,
 /// and a transient SQLite hiccup must not crash the watch daemon.
 async fn run_periodic_reconcile(db: &dyn state::ReportStateStore, cycle_index: u64) {
-    use crate::commands::reconcile::{scan_local_drift, LocalDriftAsset, LocalDriftKind};
+    use crate::commands::reconcile::{LocalDriftAsset, LocalDriftKind, scan_local_drift};
     tracing::info!(
         cycle_index,
         "Periodic reconciliation: scanning state DB for missing or damaged local files"
@@ -2981,21 +2979,15 @@ mod tests {
         // template content or active-pass selection.
         let sel = selection_all_passes_active();
         let states0 = commingle_test_states(0, &sel);
-        assert!(find_multi_library_commingle_flags(
-            &states0,
-            "%Y/%m/%d",
-            "{album}",
-            "{smart-folder}"
-        )
-        .is_empty());
+        assert!(
+            find_multi_library_commingle_flags(&states0, "%Y/%m/%d", "{album}", "{smart-folder}")
+                .is_empty()
+        );
         let states1 = commingle_test_states(1, &sel);
-        assert!(find_multi_library_commingle_flags(
-            &states1,
-            "%Y/%m/%d",
-            "{album}",
-            "{smart-folder}"
-        )
-        .is_empty());
+        assert!(
+            find_multi_library_commingle_flags(&states1, "%Y/%m/%d", "{album}", "{smart-folder}")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3121,8 +3113,8 @@ mod tests {
     }
 
     #[test]
-    fn find_multi_library_commingle_flags_reports_all_missing_when_every_active_template_lacks_token(
-    ) {
+    fn find_multi_library_commingle_flags_reports_all_missing_when_every_active_template_lacks_token()
+     {
         let sel = selection_all_passes_active();
         let states = commingle_test_states(2, &sel);
         let missing =
@@ -3654,7 +3646,7 @@ mod tests {
         Arc<download::AssetGroupings>,
         Arc<str>,
     ) -> Arc<download::DownloadConfig>
-           + '_ {
+    + '_ {
         make_run_cycle_download_config_builder_with_options(
             download_dir,
             db,
@@ -3672,7 +3664,7 @@ mod tests {
         Arc<download::AssetGroupings>,
         Arc<str>,
     ) -> Arc<download::DownloadConfig>
-           + '_ {
+    + '_ {
         move |sync_mode, exclude_asset_ids, asset_groupings, library| {
             let mut config = download::DownloadConfig::test_default();
             config.directory = Arc::from(download_dir);
@@ -3706,7 +3698,7 @@ mod tests {
         Arc<download::AssetGroupings>,
         Arc<str>,
     ) -> Arc<download::DownloadConfig>
-           + '_ {
+    + '_ {
         let build_download_config = make_run_cycle_download_config_builder(download_dir, db);
         move |sync_mode, exclude_asset_ids, asset_groupings, library| {
             observed_modes
@@ -6398,11 +6390,12 @@ mod tests {
                 .as_deref(),
             Some("old-enum-hash")
         );
-        assert!(db
-            .get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -6451,11 +6444,13 @@ mod tests {
         .expect("legacy cleanup cycle");
 
         assert!(result.db_sync_token_advance_safe);
-        assert!(observed_modes
-            .lock()
-            .expect("observed modes lock")
-            .iter()
-            .any(|mode| matches!(mode, download::SyncMode::Incremental { .. })));
+        assert!(
+            observed_modes
+                .lock()
+                .expect("observed modes lock")
+                .iter()
+                .any(|mode| matches!(mode, download::SyncMode::Incremental { .. }))
+        );
         assert!(result.stats.full_enumeration_reason.is_none());
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")

@@ -59,8 +59,8 @@ pub fn sanitize_username(username: &str) -> String {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         });
         let prefix_len = MAX_SANITIZED_USERNAME_LEN - 17; // room for "_" + 16 hex digits
-                                                          // Find the last char boundary at or before prefix_len to avoid
-                                                          // panicking on multi-byte UTF-8 (e.g. CJK usernames).
+        // Find the last char boundary at or before prefix_len to avoid
+        // panicking on multi-byte UTF-8 (e.g. CJK usernames).
         let prefix_end = sanitized[..prefix_len]
             .char_indices()
             .last()
@@ -94,12 +94,12 @@ fn broad_cookie_domain(host: Option<&str>) -> Option<&str> {
 /// Check if a Set-Cookie header string represents an expired cookie.
 /// Parses the `cookie` crate's `Cookie::parse()` to extract `Expires`.
 fn is_cookie_expired(cookie_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
-    if let Ok(parsed) = cookie::Cookie::parse(cookie_str) {
-        if let Some(expires) = parsed.expires_datetime() {
-            let expires_utc =
-                chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::from(expires));
-            return expires_utc < *now;
-        }
+    if let Ok(parsed) = cookie::Cookie::parse(cookie_str)
+        && let Some(expires) = parsed.expires_datetime()
+    {
+        let expires_utc =
+            chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::from(expires));
+        return expires_utc < *now;
     }
     false
 }
@@ -608,14 +608,14 @@ impl Session {
         let headers = response.headers();
         let mut session_changed = false;
         for &(header_name, session_key) in HEADER_DATA {
-            if let Some(val) = headers.get(header_name) {
-                if let Ok(val_str) = val.to_str() {
-                    let existing = self.session_data.get(session_key);
-                    if existing.map(std::string::String::as_str) != Some(val_str) {
-                        self.session_data
-                            .insert(session_key.to_string(), val_str.to_string());
-                        session_changed = true;
-                    }
+            if let Some(val) = headers.get(header_name)
+                && let Ok(val_str) = val.to_str()
+            {
+                let existing = self.session_data.get(session_key);
+                if existing.map(std::string::String::as_str) != Some(val_str) {
+                    self.session_data
+                        .insert(session_key.to_string(), val_str.to_string());
+                    session_changed = true;
                 }
             }
         }
@@ -699,14 +699,12 @@ impl Session {
 
         // Check if the cookie file already has the same content to avoid
         // redundant disk writes during high-frequency API calls.
-        if cookiejar_path.exists() {
-            if let Ok(contents) = fs::read_to_string(&cookiejar_path).await {
-                if let Ok(existing) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
-                    if existing == entries {
-                        return Ok(());
-                    }
-                }
-            }
+        if cookiejar_path.exists()
+            && let Ok(contents) = fs::read_to_string(&cookiejar_path).await
+            && let Ok(existing) = serde_json::from_str::<Vec<CookieEntry>>(&contents)
+            && existing == entries
+        {
+            return Ok(());
         }
 
         atomic_write(
@@ -1067,12 +1065,16 @@ mod tests {
         let contents = std::fs::read_to_string(&cookie_path).unwrap();
         let entries: Vec<CookieEntry> = serde_json::from_str(&contents).unwrap();
         assert!(entries.len() >= 2);
-        assert!(entries
-            .iter()
-            .any(|e| e.cookie.contains("X-APPLE-WEBAUTH-TOKEN")));
-        assert!(entries
-            .iter()
-            .any(|e| e.cookie.contains("X-APPLE-DS-WEB-SESSION-TOKEN")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.cookie.contains("X-APPLE-WEBAUTH-TOKEN"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.cookie.contains("X-APPLE-DS-WEB-SESSION-TOKEN"))
+        );
 
         // Drop the session and create a new one — cookies should be loaded back
         drop(session);

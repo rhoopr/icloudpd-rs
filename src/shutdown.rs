@@ -4,8 +4,8 @@
 //! [`tokio_util::sync::CancellationToken`] so the download pipeline can
 //! drain in-flight work before exiting. A second signal force-exits.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -54,7 +54,7 @@ pub(crate) fn install_signal_handler(
 
     #[cfg(unix)]
     let (mut sigterm, mut sighup) = {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         (
             signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?,
             signal(SignalKind::hangup()).context("failed to register SIGHUP handler")?,
