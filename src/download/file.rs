@@ -532,6 +532,48 @@ enum PublishResult {
     DestinationExists,
 }
 
+/// Copy an existing catalog file to a new derived path without replacing any
+/// file already present at the destination. The copy is verified before the
+/// same no-overwrite `.part` publication used by provider downloads.
+pub(crate) async fn copy_local_file_no_replace(
+    source: &Path,
+    destination: &Path,
+    temp_suffix: &str,
+) -> anyhow::Result<Option<String>> {
+    if fs::try_exists(destination).await? {
+        let source_hash = compute_sha256(source).await?;
+        let destination_hash = compute_sha256(destination).await?;
+        return Ok((source_hash == destination_hash).then_some(destination_hash));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let filename = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("reconciled");
+    let part_path = destination.with_file_name(format!("{filename}{temp_suffix}-reconcile"));
+    crate::fs_util::log_remove_async(&part_path).await;
+    fs::copy(source, &part_path).await?;
+    let source_hash = compute_sha256(source).await?;
+    let copied_hash = compute_sha256(&part_path).await?;
+    if source_hash != copied_hash {
+        crate::fs_util::log_remove_async(&part_path).await;
+        anyhow::bail!("local path reconciliation checksum mismatch");
+    }
+    match publish_part_no_replace(&part_path, destination).await? {
+        PublishResult::Published => {
+            crate::fs_util::fsync_parent_dir_async_best_effort(destination).await;
+            Ok(Some(copied_hash))
+        }
+        PublishResult::DestinationExists => {
+            crate::fs_util::log_remove_async(&part_path).await;
+            let destination_hash = compute_sha256(destination).await?;
+            Ok((source_hash == destination_hash).then_some(destination_hash))
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn publish_part_no_replace(
     part_path: &Path,
@@ -1022,6 +1064,28 @@ mod tests {
     use tempfile::TempDir;
 
     const ISSUE_507_JPEG_HEADER: [u8; 8] = [0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x80, 0x45, 0x78];
+
+    #[tokio::test]
+    async fn local_reconciliation_copy_preserves_source_and_refuses_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        let destination = dir.path().join("nested/destination.jpg");
+        std::fs::write(&source, b"catalog bytes").unwrap();
+
+        let copied = copy_local_file_no_replace(&source, &destination, ".part")
+            .await
+            .unwrap();
+        assert!(copied.is_some());
+        assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"catalog bytes");
+
+        std::fs::write(&destination, b"user bytes").unwrap();
+        let conflict = copy_local_file_no_replace(&source, &destination, ".part")
+            .await
+            .unwrap();
+        assert_eq!(conflict, None);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"user bytes");
+    }
 
     #[test]
     fn test_base32_encode() {

@@ -45,10 +45,13 @@ pub(crate) struct LibraryState {
 /// both would cause each cycle to overwrite the other's value and
 /// permanently invalidate incremental sync.
 pub(crate) const ENUM_CONFIG_HASH_KEY: &str = "enum_config_hash";
+pub(crate) const PENDING_ENUM_CONFIG_HASH_KEY: &str = "pending_enum_config_hash";
+pub(crate) const PENDING_DOWNLOAD_CONFIG_HASH_KEY: &str = "pending_download_config_hash";
+const LAST_CHECKPOINT_STATUS_KEY: &str = "last_checkpoint_status";
+const LAST_RECOVERY_ACTION_KEY: &str = "last_recovery_action";
+const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
 
-/// Prefix for every per-zone CloudKit sync token row in the metadata
-/// table. Cleared en masse when [`ENUM_CONFIG_HASH_KEY`] changes so the
-/// next cycle falls back to full enumeration.
+/// Prefix for every per-zone CloudKit sync token row in the metadata table.
 pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
 const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor:";
 const INVENTORY_DROP_THRESHOLD_PERCENT: f64 = 5.0;
@@ -109,6 +112,190 @@ pub(crate) struct CycleResult {
     pub(crate) db_sync_token_advance_safe: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointBasis {
+    IncrementalDelta,
+    CompleteInventory,
+    InventoryWithDeltaBridge,
+}
+
+impl CheckpointBasis {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IncrementalDelta => "incremental_delta",
+            Self::CompleteInventory => "complete_inventory",
+            Self::InventoryWithDeltaBridge => "inventory_with_delta_bridge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointHoldReason {
+    DryRun,
+    StalePassPlan,
+    Interrupted,
+    SessionExpired,
+    EnumerationIncomplete,
+    StateNotDurable,
+    TokenProofIncomplete,
+}
+
+impl CheckpointHoldReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::StalePassPlan => "stale_pass_plan",
+            Self::Interrupted => "interrupted",
+            Self::SessionExpired => "session_expired",
+            Self::EnumerationIncomplete => "enumeration_incomplete",
+            Self::StateNotDurable => "state_not_durable",
+            Self::TokenProofIncomplete => "token_proof_incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryAction {
+    ContinueTail,
+    RetryPasses(Vec<download::PassKey>),
+    RevalidateRecords(Vec<crate::icloud::photos::ProviderRecordId>),
+    ReplayFromPriorToken,
+    #[allow(
+        dead_code,
+        reason = "typed recovery vocabulary includes the final fallback even when current branches select narrower actions"
+    )]
+    ReconcileInventory(download::FullEnumerationReason),
+    Reauthenticate,
+    Stop,
+}
+
+impl RecoveryAction {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ContinueTail => "continue_tail",
+            Self::RetryPasses(_) => "retry_passes",
+            Self::RevalidateRecords(_) => "revalidate_records",
+            Self::ReplayFromPriorToken => "replay_from_prior_token",
+            Self::ReconcileInventory(_) => "reconcile_inventory",
+            Self::Reauthenticate => "reauthenticate",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceCheckpointDecision {
+    Advance {
+        token: String,
+        basis: CheckpointBasis,
+    },
+    Preserve {
+        reason: CheckpointHoldReason,
+        recovery: RecoveryAction,
+    },
+}
+
+fn source_checkpoint_decision(
+    result: &download::SyncResult,
+    dry_run: bool,
+    stale_pass_plan: bool,
+    basis: CheckpointBasis,
+) -> SourceCheckpointDecision {
+    let preserve = |reason, recovery| SourceCheckpointDecision::Preserve { reason, recovery };
+    if dry_run {
+        return preserve(CheckpointHoldReason::DryRun, RecoveryAction::Stop);
+    }
+    if stale_pass_plan {
+        return preserve(
+            CheckpointHoldReason::StalePassPlan,
+            RecoveryAction::ReplayFromPriorToken,
+        );
+    }
+    if matches!(
+        result.outcome,
+        download::DownloadOutcome::SessionExpired { .. }
+    ) {
+        return preserve(
+            CheckpointHoldReason::SessionExpired,
+            RecoveryAction::Reauthenticate,
+        );
+    }
+    if result.stats.interrupted {
+        return preserve(
+            CheckpointHoldReason::Interrupted,
+            RecoveryAction::ReplayFromPriorToken,
+        );
+    }
+    if result.stats.enumeration_errors > 0 || result.stats.enumeration_incomplete {
+        return preserve(
+            CheckpointHoldReason::EnumerationIncomplete,
+            RecoveryAction::ContinueTail,
+        );
+    }
+    if result.stats.state_write_failures > 0 {
+        return preserve(
+            CheckpointHoldReason::StateNotDurable,
+            RecoveryAction::ReplayFromPriorToken,
+        );
+    }
+    let Some(token) = result
+        .sync_token
+        .as_ref()
+        .filter(|token| !token.trim().is_empty())
+    else {
+        let recovery = if result.stats.sync_token_blocked_reason == Some("pending_retry_unmatched")
+        {
+            RecoveryAction::RevalidateRecords(Vec::new())
+        } else {
+            RecoveryAction::RetryPasses(Vec::new())
+        };
+        return preserve(CheckpointHoldReason::TokenProofIncomplete, recovery);
+    };
+    if result.stats.sync_token_blocked {
+        return preserve(
+            CheckpointHoldReason::TokenProofIncomplete,
+            RecoveryAction::RetryPasses(Vec::new()),
+        );
+    }
+    SourceCheckpointDecision::Advance {
+        token: token.clone(),
+        basis,
+    }
+}
+
+fn merge_download_outcomes(
+    first: &download::DownloadOutcome,
+    second: &download::DownloadOutcome,
+) -> download::DownloadOutcome {
+    match (first, second) {
+        (download::DownloadOutcome::SessionExpired { auth_error_count }, _)
+        | (_, download::DownloadOutcome::SessionExpired { auth_error_count }) => {
+            download::DownloadOutcome::SessionExpired {
+                auth_error_count: *auth_error_count,
+            }
+        }
+        (
+            download::DownloadOutcome::PartialFailure {
+                failed_count: first,
+            },
+            download::DownloadOutcome::PartialFailure {
+                failed_count: second,
+            },
+        ) => download::DownloadOutcome::PartialFailure {
+            failed_count: first.saturating_add(*second),
+        },
+        (download::DownloadOutcome::PartialFailure { failed_count }, _)
+        | (_, download::DownloadOutcome::PartialFailure { failed_count }) => {
+            download::DownloadOutcome::PartialFailure {
+                failed_count: *failed_count,
+            }
+        }
+        (download::DownloadOutcome::Success, download::DownloadOutcome::Success) => {
+            download::DownloadOutcome::Success
+        }
+    }
+}
+
 /// Decide whether the per-zone `sync_token` should be persisted to the state
 /// DB after a download pass.
 ///
@@ -124,6 +311,7 @@ pub(crate) struct CycleResult {
 ///
 /// The returned bool is the gate: callers still check that `sync_token` is
 /// `Some(_)` and that a state DB is configured before persisting.
+#[cfg(test)]
 pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_run: bool) -> bool {
     matches!(outcome, download::DownloadOutcome::Success) && !dry_run
 }
@@ -135,6 +323,7 @@ pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_r
 /// the wrong pass, so the affected zone must not advance. Unaffected zones
 /// can still store their own zone tokens; the broader database pre-check
 /// token remains conservative until every selected zone is clean.
+#[cfg(test)]
 pub(crate) fn should_store_sync_token_for_cycle(
     outcome: &download::DownloadOutcome,
     dry_run: bool,
@@ -262,12 +451,11 @@ pub(crate) enum EnumConfigHashOutcome {
     /// have written.
     Initial,
     Unchanged,
-    /// Hash drifted; sync tokens cleared and new hash persisted so this
-    /// cycle falls back to full enumeration.
+    /// Hash drifted; the candidate hash was staged while active tokens and
+    /// the active hash remain unchanged until reconciliation succeeds.
     Changed,
-    /// Hash drift was detected, but the stale sync-token rows could not be
-    /// cleared. The new hash was not persisted, and the current cycle must
-    /// force full enumeration rather than trusting any surviving tokens.
+    /// Hash drift was detected, but the pending reconciliation hash could
+    /// not be staged.
     ChangedTokenPurgeFailed,
     /// The stored hash could not be read, so the cycle cannot prove whether
     /// existing sync tokens still match the current config.
@@ -294,7 +482,7 @@ pub(crate) enum DownloadConfigHashOutcome {
 
 impl DownloadConfigHashOutcome {
     const fn must_force_full_sync(self) -> bool {
-        !matches!(self, Self::Unchanged)
+        matches!(self, Self::ReadFailed | Self::TokenPurgeFailed)
     }
 
     const fn token_purge_failed(self) -> bool {
@@ -308,11 +496,8 @@ pub(crate) struct SyncModeDecision {
     pub(crate) full_enumeration_reason: Option<download::FullEnumerationReason>,
 }
 
-/// Compare the current download-config hash against the one stored in
-/// the state DB and react to drift. Storage failures are logged at warn
-/// and swallowed, but the new hash is never persisted unless stale sync
-/// tokens were cleared first. Otherwise a failed purge could leave old
-/// tokens behind while the updated hash makes later cycles trust them.
+/// Compare the current enumeration-config hash against the active value.
+/// Drift is staged without deleting the last safe provider checkpoint.
 pub(crate) async fn check_and_persist_enum_config_hash<D>(
     db: &D,
     current_hash: &str,
@@ -328,34 +513,38 @@ where
         }
     };
     let outcome = match stored_hash.as_deref() {
-        Some(h) if h == current_hash => return EnumConfigHashOutcome::Unchanged,
+        Some(h) if h == current_hash => {
+            if let Err(e) = db
+                .delete_metadata_by_prefix(PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+            {
+                tracing::debug!(error = %e, "Failed to clear reverted pending enum config hash");
+            }
+            return EnumConfigHashOutcome::Unchanged;
+        }
         Some(_) => EnumConfigHashOutcome::Changed,
         None => EnumConfigHashOutcome::Initial,
     };
 
-    if matches!(outcome, EnumConfigHashOutcome::Changed) {
-        tracing::info!("Download config changed since last sync, clearing sync tokens");
-        match db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX).await {
-            Ok(n) if n > 0 => {
-                tracing::debug!(cleared = n, "Cleared stale sync tokens");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to clear sync tokens; enum_config_hash will not advance"
-                );
-                return EnumConfigHashOutcome::ChangedTokenPurgeFailed;
-            }
-            _ => {}
+    let key = if matches!(outcome, EnumConfigHashOutcome::Changed) {
+        tracing::info!(
+            "Enumeration config changed since last sync; preserving active checkpoints and staging reconciliation"
+        );
+        PENDING_ENUM_CONFIG_HASH_KEY
+    } else {
+        ENUM_CONFIG_HASH_KEY
+    };
+    if let Err(e) = db.set_metadata(key, current_hash).await {
+        tracing::warn!(error = %e, key, "Failed to persist enum config hash state");
+        if matches!(outcome, EnumConfigHashOutcome::Changed) {
+            return EnumConfigHashOutcome::ChangedTokenPurgeFailed;
         }
-    }
-    if let Err(e) = db.set_metadata(ENUM_CONFIG_HASH_KEY, current_hash).await {
-        tracing::warn!(error = %e, "Failed to persist enum_config_hash");
     }
     outcome
 }
 
-/// Check the path-affecting download config hash.
+/// Check the path-affecting download config hash without deleting provider
+/// cursors. Reconciliation promotes the pending hash only after it succeeds.
 ///
 /// This hash does not prove CloudKit cursor safety. It proves local
 /// path/state trust: after a directory or filename-template change, an
@@ -369,7 +558,15 @@ where
     D: state::SyncTokenStore + ?Sized,
 {
     match db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY).await {
-        Ok(Some(stored)) if stored == current_hash => DownloadConfigHashOutcome::Unchanged,
+        Ok(Some(stored)) if stored == current_hash => {
+            if let Err(e) = db
+                .delete_metadata_by_prefix(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+            {
+                tracing::debug!(error = %e, "Failed to clear reverted pending download config hash");
+            }
+            DownloadConfigHashOutcome::Unchanged
+        }
         Ok(None) => {
             if let Err(e) = db
                 .set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, current_hash)
@@ -381,31 +578,23 @@ where
             DownloadConfigHashOutcome::Unchanged
         }
         Ok(Some(_stored)) => {
-            tracing::info!("Download config changed since last sync, verifying all files");
-            match db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX).await {
-                Ok(n) => {
-                    if n > 0 {
-                        tracing::debug!(
-                            cleared = n,
-                            "Cleared sync tokens after download config hash drift"
-                        );
-                    }
-                    if let Err(e) = db
-                        .set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, current_hash)
-                        .await
-                    {
-                        tracing::warn!(error = %e, "Failed to persist download config_hash");
-                        return DownloadConfigHashOutcome::TokenPurgeFailed;
-                    }
-                    DownloadConfigHashOutcome::Changed
+            tracing::info!(
+                "Download path config changed since last sync; preserving provider checkpoints and staging local reconciliation"
+            );
+            if let Err(e) = db
+                .set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, current_hash)
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to stage pending download config_hash");
+                DownloadConfigHashOutcome::TokenPurgeFailed
+            } else {
+                if let Err(e) = db
+                    .set_metadata(LAST_RECOVERY_ACTION_KEY, "reconcile_local_paths")
+                    .await
+                {
+                    tracing::debug!(error = %e, "Failed to persist local path reconciliation state");
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to clear sync tokens after download config hash drift"
-                    );
-                    DownloadConfigHashOutcome::TokenPurgeFailed
-                }
+                DownloadConfigHashOutcome::Changed
             }
         }
         Err(e) => {
@@ -440,6 +629,11 @@ pub(crate) async fn run_cycle(
     let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
     let mut force_full_for_config_hash = false;
     let mut force_full_for_download_config_hash = false;
+    let mut checkpoint_transition_state_safe = true;
+    let mut enum_config_hash_outcome = EnumConfigHashOutcome::Unchanged;
+    let mut pending_download_config_hash = None;
+    let mut path_reconciliation_complete = true;
+    let mut candidate_zone_tokens = Vec::new();
     let enum_config_hash = download::compute_config_hash(config);
 
     // Check if token-unsafe eligibility config changed since last sync. If
@@ -456,13 +650,14 @@ pub(crate) async fn run_cycle(
     // each other every cycle, permanently preventing incremental sync.
     if !config.runtime.dry_run {
         if let Some(db) = state_db {
-            let config_hash_outcome =
+            enum_config_hash_outcome =
                 check_and_persist_enum_config_hash(db, &enum_config_hash).await;
-            force_full_for_config_hash = config_hash_outcome.must_force_full_sync();
+            force_full_for_config_hash = enum_config_hash_outcome.must_force_full_sync();
             if matches!(
-                config_hash_outcome,
+                enum_config_hash_outcome,
                 EnumConfigHashOutcome::ChangedTokenPurgeFailed | EnumConfigHashOutcome::ReadFailed
             ) {
+                checkpoint_transition_state_safe = false;
                 db_sync_token_advance_safe = false;
             }
         }
@@ -472,7 +667,8 @@ pub(crate) async fn run_cycle(
     // unsafe, but it does make an incremental cycle insufficient: with no
     // changed assets, `/changes/zone` would never re-plan already-known media
     // into the new directory/template. Detect that before choosing
-    // incremental mode and force a full reconciliation for this cycle.
+    // incremental mode. Path-only drift keeps source tracking incremental;
+    // the pending marker drives separate catalog/targeted rehydration work.
     if !config.runtime.dry_run {
         if let (Some(db), Some(first_library)) = (state_db, library_states.first()) {
             let probe_config = build_download_config(
@@ -484,21 +680,28 @@ pub(crate) async fn run_cycle(
             let download_config_hash = download::hash_download_config(&probe_config);
             let outcome = check_download_config_hash_for_cycle(db, &download_config_hash).await;
             force_full_for_download_config_hash = outcome.must_force_full_sync();
+            if matches!(outcome, DownloadConfigHashOutcome::Changed) {
+                pending_download_config_hash = Some(download_config_hash);
+            }
             if outcome.token_purge_failed() {
+                checkpoint_transition_state_safe = false;
                 db_sync_token_advance_safe = false;
             }
         }
     }
 
-    for lib_state in library_states {
+    for lib_state in library_states
+        .iter()
+        .copied()
+        .filter(|state| has_active_passes(state))
+    {
         if shutdown_token.is_cancelled() {
             break;
         }
 
-        // Determine sync mode per-library
-        // retry-failed must always use full enumeration: incremental
-        // sync only returns NEW iCloud changes, missing previously-
-        // failed assets that were already enumerated but not downloaded.
+        // Determine source-enumeration mode per library. Failed transfers are
+        // rehydrated from durable pending state by the download engine and do
+        // not require replaying the provider inventory.
         let sync_mode_decision = if force_full_for_config_hash {
             let reason = download::FullEnumerationReason::EnumConfigHashDrift;
             tracing::debug!(
@@ -538,6 +741,14 @@ pub(crate) async fn run_cycle(
             download::SyncMode::Incremental { .. } => "incremental",
         };
         if let Some(reason) = sync_mode_decision.full_enumeration_reason {
+            if let Some(db) = state_db {
+                if let Err(e) = db
+                    .set_metadata(LAST_FULL_ENUMERATION_REASON_KEY, reason.as_str())
+                    .await
+                {
+                    tracing::debug!(error = %e, "Failed to persist full-enumeration reason");
+                }
+            }
             tracing::info!(
                 sync_mode = sync_mode_label,
                 zone = %lib_state.zone_name,
@@ -563,10 +774,24 @@ pub(crate) async fn run_cycle(
         let download_config = build_download_config(
             sync_mode,
             Arc::new(rustc_hash::FxHashSet::default()),
-            asset_groupings,
+            Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
         let download_client = shared_session.read().await.download_client().clone();
+        if pending_download_config_hash.is_some() {
+            let reconciliation = download::reconcile_catalog_paths(
+                &lib_state.plan.passes,
+                Arc::clone(&download_config),
+                shutdown_token.clone(),
+            )
+            .await?;
+            path_reconciliation_complete = path_reconciliation_complete && reconciliation.complete;
+            cycle_failed_count = cycle_failed_count
+                .saturating_add(reconciliation.stats.failed)
+                .saturating_add(reconciliation.stats.exif_failures)
+                .saturating_add(reconciliation.stats.state_write_failures);
+            cycle_stats.accumulate(&reconciliation.stats);
+        }
         let mut sync_result = download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
@@ -575,6 +800,92 @@ pub(crate) async fn run_cycle(
             shutdown_token.clone(),
         )
         .await?;
+
+        let mut checkpoint_basis = if sync_result.full_enumeration_ran {
+            CheckpointBasis::CompleteInventory
+        } else {
+            CheckpointBasis::IncrementalDelta
+        };
+
+        // Eligibility reconciliation begins from a trusted prior cursor when
+        // one exists. The inventory covers unchanged newly eligible assets;
+        // replaying the prior cursor then bridges changes that occurred while
+        // that inventory was running. Only the bridged token may replace the
+        // active checkpoint.
+        if matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
+            && sync_result.full_enumeration_ran
+            && checkpoint_transition_state_safe
+        {
+            let prior_token = if let Some(db) = state_db {
+                db.get_metadata(&lib_state.sync_token_key).await?
+            } else {
+                None
+            };
+            if let Some(prior_token) = prior_token.filter(|token| !token.trim().is_empty()) {
+                let inventory_decision = source_checkpoint_decision(
+                    &sync_result,
+                    config.runtime.dry_run,
+                    lib_state.plan_is_stale,
+                    CheckpointBasis::CompleteInventory,
+                );
+                if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. }) {
+                    let bridge_config = build_download_config(
+                        download::SyncMode::Incremental {
+                            zone_sync_token: prior_token,
+                        },
+                        Arc::new(rustc_hash::FxHashSet::default()),
+                        Arc::clone(&asset_groupings),
+                        Arc::from(lib_state.zone_name.as_str()),
+                    );
+                    tracing::info!(
+                        zone = %lib_state.zone_name,
+                        "Inventory reconciliation complete; bridging changes from the preserved provider checkpoint"
+                    );
+                    let bridge_result = download::download_photos_with_sync(
+                        &download_client,
+                        &lib_state.plan.passes,
+                        bridge_config,
+                        download_controls,
+                        shutdown_token.clone(),
+                    )
+                    .await?;
+                    let bridge_decision = source_checkpoint_decision(
+                        &bridge_result,
+                        config.runtime.dry_run,
+                        lib_state.plan_is_stale,
+                        CheckpointBasis::IncrementalDelta,
+                    );
+                    let bridge_outcome =
+                        merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
+                    sync_result.stats.accumulate(&bridge_result.stats);
+                    sync_result.outcome = bridge_outcome;
+                    if !bridge_result.full_enumeration_ran {
+                        if let SourceCheckpointDecision::Advance { token, .. } = bridge_decision {
+                            sync_result.sync_token = Some(token);
+                            checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;
+                        } else {
+                            sync_result.sync_token = None;
+                            sync_result.stats.sync_token_blocked = true;
+                            sync_result.stats.sync_token_blocked_reason =
+                                Some("inventory_delta_bridge_failed");
+                            sync_result.stats.sync_token_blocked_source = Some("kei");
+                            sync_result.stats.sync_token_blocked_explanation = Some(
+                                "the inventory completed, but replay from the preserved provider checkpoint did not finish safely",
+                            );
+                        }
+                    } else {
+                        sync_result.sync_token = None;
+                        sync_result.stats.sync_token_blocked = true;
+                        sync_result.stats.sync_token_blocked_reason =
+                            Some("inventory_delta_bridge_failed");
+                        sync_result.stats.sync_token_blocked_source = Some("kei");
+                        sync_result.stats.sync_token_blocked_explanation = Some(
+                            "the prior provider checkpoint could not be replayed incrementally after inventory reconciliation",
+                        );
+                    }
+                }
+            }
+        }
 
         if sync_result.full_enumeration_ran && sync_result.stats.full_enumeration_reason.is_none() {
             sync_result.stats.full_enumeration_reason = sync_mode_decision.full_enumeration_reason;
@@ -615,105 +926,124 @@ pub(crate) async fn run_cycle(
             }
         }
 
-        // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE - store the zone
-        // token only after the download engine has returned a clean result and
-        // flushed all batch state writes. `Success` excludes partial failures;
-        // the extra interrupted and shutdown gates below catch cancellation
-        // paths that can still carry a token. A crash before this metadata
-        // write leaves the old token in place, so the zone replays next cycle
-        // instead of skipping unfinalized work.
-        let should_store_token = should_store_sync_token_for_cycle(
-            &sync_result.outcome,
-            config.runtime.dry_run,
-            lib_state.plan_is_stale,
-        ) && !sync_result.stats.interrupted
-            && !shutdown_token.is_cancelled();
-        if should_store_token {
-            match (&sync_result.sync_token, state_db) {
-                (Some(token), Some(db)) => {
-                    if let Err(e) = db.set_metadata(&lib_state.sync_token_key, token).await {
+        // Provider cursor safety is independent from transfer completion.
+        // The download pipeline persists every planned work item before this
+        // boundary, so failed transfers may advance while state, identity,
+        // enumeration, auth, and token-proof failures preserve the old cursor.
+        let checkpoint_decision =
+            if checkpoint_transition_state_safe && !shutdown_token.is_cancelled() {
+                source_checkpoint_decision(
+                    &sync_result,
+                    config.runtime.dry_run,
+                    lib_state.plan_is_stale,
+                    checkpoint_basis,
+                )
+            } else if shutdown_token.is_cancelled() {
+                SourceCheckpointDecision::Preserve {
+                    reason: CheckpointHoldReason::Interrupted,
+                    recovery: RecoveryAction::ReplayFromPriorToken,
+                }
+            } else {
+                SourceCheckpointDecision::Preserve {
+                    reason: CheckpointHoldReason::StateNotDurable,
+                    recovery: RecoveryAction::ReplayFromPriorToken,
+                }
+            };
+
+        match checkpoint_decision {
+            SourceCheckpointDecision::Advance { token, basis } => {
+                crate::metrics::record_checkpoint_decision("advanced", basis.as_str());
+                crate::metrics::record_deferred_transfers(
+                    sync_result
+                        .stats
+                        .failed
+                        .saturating_add(sync_result.stats.exif_failures),
+                );
+                if let Some(db) = state_db {
+                    let reconciliation_active = force_full_for_config_hash;
+                    if reconciliation_active {
+                        candidate_zone_tokens.push((lib_state.sync_token_key.clone(), token));
+                    } else if let Err(e) = db
+                        .commit_checkpoint_transition(state::CheckpointTransition {
+                            metadata_updates: vec![
+                                (lib_state.sync_token_key.clone(), token),
+                                (LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()),
+                                (LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()),
+                            ],
+                            metadata_deletes: Vec::new(),
+                        })
+                        .await
+                    {
                         db_sync_token_advance_safe = false;
-                        tracing::warn!(error = %e, "Failed to store sync token");
+                        tracing::warn!(error = %e, "Failed to store provider checkpoint");
                     } else {
                         if cycle_has_stale_plan && !lib_state.plan_is_stale {
                             tracing::warn!(
                                 zone = %lib_state.zone_name,
                                 diagnostic = "stale_plan_unaffected_zone",
-                                "Stored clean zone sync token despite another selected zone's stale plan"
+                                "Stored clean zone checkpoint despite another selected zone's stale plan"
                             );
                         }
-                        tracing::debug!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
+                        if sync_result.stats.failed > 0 || sync_result.stats.exif_failures > 0 {
+                            tracing::info!(
+                                zone = %lib_state.zone_name,
+                                basis = ?basis,
+                                deferred_transfers = sync_result.stats.failed,
+                                metadata_failures = sync_result.stats.exif_failures,
+                                "Provider checkpoint advanced: incomplete local work is durably queued for targeted retry"
+                            );
+                        } else {
+                            tracing::debug!(zone = %lib_state.zone_name, basis = ?basis, "Stored provider checkpoint for next incremental sync");
+                        }
                     }
-                }
-                (Some(_), None) => {
+                } else {
                     db_sync_token_advance_safe = false;
                     tracing::debug!(
                         zone = %lib_state.zone_name,
-                        "Sync token available but no state DB is configured"
+                        "Provider checkpoint available but no state DB is configured"
                     );
                 }
-                (None, _) => {
-                    db_sync_token_advance_safe = false;
-                    let reason = sync_result
-                        .stats
-                        .sync_token_blocked_reason
-                        .unwrap_or("sync_token_missing");
-                    let source = sync_result
-                        .stats
-                        .sync_token_blocked_source
-                        .unwrap_or_else(|| download::sync_token_blocked_source(reason));
-                    let explanation = sync_result
-                        .stats
-                        .sync_token_blocked_explanation
-                        .as_ref()
-                        .copied()
-                        .unwrap_or_else(|| download::sync_token_blocked_explanation(reason));
-                    let observation = match (
-                        sync_result.stats.sync_token_expected_receivers,
-                        sync_result.stats.sync_token_receivers_with_token,
-                    ) {
-                        (Some(expected), Some(with_token)) => {
-                            let missing = sync_result.stats.sync_token_receivers_missing.unwrap_or(0);
-                            let blank = sync_result.stats.sync_token_receivers_blank.unwrap_or(0);
-                            let dropped = sync_result.stats.sync_token_receivers_dropped.unwrap_or(0);
-                            let unique = sync_result.stats.sync_token_unique_values.unwrap_or(0);
-                            format!(
-                                "Observed usable sync tokens on {with_token}/{expected} passes (missing: {missing}, blank: {blank}, dropped: {dropped}, unique values: {unique})"
-                            )
-                        }
-                        _ => "No per-pass sync token observation details were collected for this reason"
-                            .to_string(),
-                    };
-                    if let Some(message) = download::sync_token_blocked_bounded_log_message(reason)
+            }
+            SourceCheckpointDecision::Preserve { reason, recovery } => {
+                crate::metrics::record_checkpoint_decision("preserved", reason.as_str());
+                db_sync_token_advance_safe = false;
+                if let Some(db) = state_db {
+                    if let Err(e) = db
+                        .commit_checkpoint_transition(state::CheckpointTransition {
+                            metadata_updates: vec![
+                                (
+                                    LAST_CHECKPOINT_STATUS_KEY.to_owned(),
+                                    "preserved".to_owned(),
+                                ),
+                                (
+                                    LAST_RECOVERY_ACTION_KEY.to_owned(),
+                                    recovery.as_str().to_owned(),
+                                ),
+                            ],
+                            metadata_deletes: Vec::new(),
+                        })
+                        .await
                     {
-                        tracing::info!(
-                            zone = %lib_state.zone_name,
-                            reason,
-                            source,
-                            explanation,
-                            observation,
-                            "{message}"
-                        );
-                    } else {
-                        tracing::warn!(
-                            zone = %lib_state.zone_name,
-                            reason,
-                            source,
-                            explanation,
-                            observation,
-                            "Sync token did not advance after this successful sync. Here's why: {}. {}. Next cycle will run full enumeration",
-                            explanation,
-                            observation
-                        );
+                        tracing::debug!(error = %e, "Failed to persist checkpoint hold status");
                     }
                 }
+                let diagnostic = sync_result
+                    .stats
+                    .sync_token_blocked_reason
+                    .unwrap_or("provider_checkpoint_preserved");
+                let explanation = sync_result
+                    .stats
+                    .sync_token_blocked_explanation
+                    .unwrap_or_else(|| download::sync_token_blocked_explanation(diagnostic));
+                tracing::warn!(
+                    zone = %lib_state.zone_name,
+                    reason = ?reason,
+                    recovery = ?recovery,
+                    diagnostic,
+                    explanation,
+                    "Provider checkpoint preserved; recovery will use the narrowest safe action"
+                );
             }
-        } else if sync_result.sync_token.is_some() {
-            db_sync_token_advance_safe = false;
-            tracing::info!(
-                zone = %lib_state.zone_name,
-                "Sync token NOT advanced (incomplete sync -- will replay changes next cycle)"
-            );
         }
 
         if sync_result.stats.sync_token_blocked
@@ -738,6 +1068,51 @@ pub(crate) async fn run_cycle(
             }
             download::DownloadOutcome::PartialFailure { failed_count } => {
                 cycle_failed_count += failed_count;
+            }
+        }
+    }
+
+    let reconciliation_active = force_full_for_config_hash;
+    if reconciliation_active
+        && db_sync_token_advance_safe
+        && !cycle_session_expired
+        && !shutdown_token.is_cancelled()
+    {
+        if let Some(db) = state_db {
+            let mut metadata_updates = candidate_zone_tokens;
+            let mut metadata_deletes = Vec::new();
+            if force_full_for_config_hash {
+                metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));
+                metadata_deletes.push(PENDING_ENUM_CONFIG_HASH_KEY.to_owned());
+            }
+            metadata_updates.push((LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()));
+            metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
+            if let Err(e) = db
+                .commit_checkpoint_transition(state::CheckpointTransition {
+                    metadata_updates,
+                    metadata_deletes,
+                })
+                .await
+            {
+                db_sync_token_advance_safe = false;
+                tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
+            }
+        }
+    }
+
+    if path_reconciliation_complete && !cycle_session_expired && !shutdown_token.is_cancelled() {
+        if let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash) {
+            if let Err(e) = db
+                .commit_checkpoint_transition(state::CheckpointTransition {
+                    metadata_updates: vec![(
+                        download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                        download_config_hash,
+                    )],
+                    metadata_deletes: vec![PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned()],
+                })
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
             }
         }
     }
@@ -790,8 +1165,8 @@ where
 
 /// Determine the sync mode for a library: full enumeration or incremental.
 pub(crate) async fn determine_sync_mode_decision<D>(
-    is_retry_failed: bool,
-    library_count: usize,
+    _is_retry_failed: bool,
+    _library_count: usize,
     state_db: Option<&D>,
     sync_token_key: &str,
     zone_name: &str,
@@ -799,19 +1174,7 @@ pub(crate) async fn determine_sync_mode_decision<D>(
 where
     D: state::SyncTokenStore + ?Sized,
 {
-    if is_retry_failed {
-        let reason = download::FullEnumerationReason::ExplicitRetryFailed;
-        if library_count == 1 {
-            tracing::info!(
-                full_enumeration_reason = reason.as_str(),
-                "Retry-failed always runs full enumeration because incremental sync only returns new iCloud changes and can miss older failed assets"
-            );
-        }
-        SyncModeDecision {
-            mode: download::SyncMode::Full,
-            full_enumeration_reason: Some(reason),
-        }
-    } else if let Some(db) = state_db {
+    if let Some(db) = state_db {
         match db.get_metadata(sync_token_key).await {
             Ok(Some(ref token)) if !token.is_empty() => {
                 tracing::debug!(zone = %zone_name, "Stored sync token found, using incremental sync");
@@ -955,6 +1318,49 @@ mod tests {
     }
 
     #[test]
+    fn durable_transfer_failure_can_advance_source_checkpoint() {
+        let result = download::SyncResult {
+            outcome: download::DownloadOutcome::PartialFailure { failed_count: 1 },
+            sync_token: Some("zone-token-next".to_string()),
+            stats: download::SyncStats {
+                failed: 1,
+                ..download::SyncStats::default()
+            },
+            full_enumeration_ran: false,
+        };
+
+        assert_eq!(
+            source_checkpoint_decision(&result, false, false, CheckpointBasis::IncrementalDelta,),
+            SourceCheckpointDecision::Advance {
+                token: "zone-token-next".to_string(),
+                basis: CheckpointBasis::IncrementalDelta,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_retry_state_write_preserves_source_checkpoint() {
+        let result = download::SyncResult {
+            outcome: download::DownloadOutcome::PartialFailure { failed_count: 1 },
+            sync_token: Some("zone-token-next".to_string()),
+            stats: download::SyncStats {
+                failed: 1,
+                state_write_failures: 1,
+                ..download::SyncStats::default()
+            },
+            full_enumeration_ran: false,
+        };
+
+        assert_eq!(
+            source_checkpoint_decision(&result, false, false, CheckpointBasis::IncrementalDelta,),
+            SourceCheckpointDecision::Preserve {
+                reason: CheckpointHoldReason::StateNotDurable,
+                recovery: RecoveryAction::ReplayFromPriorToken,
+            }
+        );
+    }
+
+    #[test]
     fn inventory_drop_classifier_uses_five_percent_threshold() {
         assert_eq!(classify_inventory_drop(100, 96), None);
         assert_eq!(
@@ -1071,11 +1477,12 @@ mod tests {
 
         let retry =
             determine_sync_mode_decision(true, 1, Some(&db), &sync_token_key, "PrimarySync").await;
-        assert!(matches!(retry.mode, download::SyncMode::Full));
-        assert_eq!(
-            retry.full_enumeration_reason,
-            Some(download::FullEnumerationReason::ExplicitRetryFailed)
-        );
+        assert!(matches!(
+            retry.mode,
+            download::SyncMode::Incremental { ref zone_sync_token }
+                if zone_sync_token == "stored-token-abc"
+        ));
+        assert_eq!(retry.full_enumeration_reason, None);
 
         db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX)
             .await

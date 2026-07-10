@@ -16,6 +16,9 @@ pub mod types;
 pub use album::PhotoAlbum;
 #[cfg(test)]
 pub use album::PhotoAlbumConfig;
+#[cfg(test)]
+pub(crate) use album::MAX_EMPTY_PAGE_PROBES;
+pub(crate) use album::{ProviderRecordId, RecordLookupRequest, RecordResolution};
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub(crate) use library::{is_shared_zone, PRIMARY_ZONE_NAME};

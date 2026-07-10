@@ -71,6 +71,39 @@ struct FullEnumerationLabels {
     reason: &'static str,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct CheckpointDecisionLabels {
+    decision: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct RecordLookupLabels {
+    outcome: &'static str,
+}
+
+static CHECKPOINT_DECISIONS: LazyLock<Family<CheckpointDecisionLabels, Counter>> =
+    LazyLock::new(Family::default);
+static TARGETED_RECORD_LOOKUPS: LazyLock<Family<RecordLookupLabels, Counter>> =
+    LazyLock::new(Family::default);
+static TRANSFERS_DEFERRED_AFTER_CHECKPOINT: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+pub(crate) fn record_checkpoint_decision(decision: &'static str, reason: &'static str) {
+    CHECKPOINT_DECISIONS
+        .get_or_create(&CheckpointDecisionLabels { decision, reason })
+        .inc();
+}
+
+pub(crate) fn record_targeted_lookup(outcome: &'static str, count: usize) {
+    TARGETED_RECORD_LOOKUPS
+        .get_or_create(&RecordLookupLabels { outcome })
+        .inc_by(count as u64);
+}
+
+pub(crate) fn record_deferred_transfers(count: usize) {
+    TRANSFERS_DEFERRED_AFTER_CHECKPOINT.inc_by(count as u64);
+}
+
 /// Label set for the `kei_db_assets_total` and `kei_db_assets_size_bytes` gauge families.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
 struct StatusLabels {
@@ -112,7 +145,11 @@ pub(crate) struct MetricsHandle {
     enumeration_errors: Counter,
     pagination_shortfall_warnings: Counter,
     pagination_shortfall_assets: Counter,
+    tail_probes: Counter,
+    count_undercount_assets: Counter,
     sync_token_blocked_cycles: Counter,
+    same_cycle_recovery_attempts: Counter,
+    same_cycle_recovery_successes: Counter,
     full_enumeration_reasons: Family<FullEnumerationLabels, Counter>,
     session_expirations: Counter,
     cycle_duration_seconds: Gauge<f64, AtomicU64>,
@@ -122,6 +159,7 @@ pub(crate) struct MetricsHandle {
     // DB-backed gauges (only populated when --metrics-port is set).
     db_assets_total: Family<StatusLabels, Gauge>,
     db_assets_size_bytes: Family<StatusLabels, Gauge>,
+    pending_verification_age_seconds: Gauge,
     db_last_sync_assets_seen: Gauge,
     db_summary_read_failures: Counter,
 }
@@ -215,11 +253,52 @@ impl MetricsHandle {
             sync_token_blocked_cycles.clone(),
         );
 
+        let tail_probes = Counter::default();
+        registry.register(
+            "kei_sync_tail_probes",
+            "Total number of count-backed tail probes opened to prove natural EOF",
+            tail_probes.clone(),
+        );
+        let count_undercount_assets = Counter::default();
+        registry.register(
+            "kei_sync_count_undercount_assets",
+            "Total assets discovered beyond provider count hints",
+            count_undercount_assets.clone(),
+        );
+
+        let same_cycle_recovery_attempts = Counter::default();
+        registry.register(
+            "kei_sync_same_cycle_recovery_attempts",
+            "Total number of bounded same-cycle checkpoint recovery rounds attempted",
+            same_cycle_recovery_attempts.clone(),
+        );
+        let same_cycle_recovery_successes = Counter::default();
+        registry.register(
+            "kei_sync_same_cycle_recovery_successes",
+            "Total number of same-cycle checkpoint recovery rounds that completed proof",
+            same_cycle_recovery_successes.clone(),
+        );
+
         let full_enumeration_reasons: Family<FullEnumerationLabels, Counter> = Family::default();
         registry.register(
             "kei_sync_full_enumeration_reason",
             "Total number of full-enumeration sync cycles, by bounded reason",
             full_enumeration_reasons.clone(),
+        );
+        registry.register(
+            "kei_sync_checkpoint_decisions",
+            "Total provider checkpoint decisions by outcome and bounded reason",
+            CHECKPOINT_DECISIONS.clone(),
+        );
+        registry.register(
+            "kei_sync_targeted_record_lookups",
+            "Total targeted provider record lookup results by outcome",
+            TARGETED_RECORD_LOOKUPS.clone(),
+        );
+        registry.register(
+            "kei_sync_transfers_deferred_after_checkpoint",
+            "Total local transfers deferred after provider checkpoint advancement",
+            TRANSFERS_DEFERRED_AFTER_CHECKPOINT.clone(),
         );
 
         let session_expirations = Counter::default();
@@ -271,6 +350,13 @@ impl MetricsHandle {
             db_assets_size_bytes.clone(),
         );
 
+        let pending_verification_age_seconds: Gauge = Gauge::default();
+        registry.register(
+            "kei_pending_provider_verification_age_seconds",
+            "Age in seconds of the oldest unresolved targeted provider verification",
+            pending_verification_age_seconds.clone(),
+        );
+
         let db_last_sync_assets_seen: Gauge = Gauge::default();
         registry.register(
             "kei_db_last_sync_assets_seen",
@@ -319,7 +405,11 @@ impl MetricsHandle {
             enumeration_errors,
             pagination_shortfall_warnings,
             pagination_shortfall_assets,
+            tail_probes,
+            count_undercount_assets,
             sync_token_blocked_cycles,
+            same_cycle_recovery_attempts,
+            same_cycle_recovery_successes,
             full_enumeration_reasons,
             session_expirations,
             cycle_duration_seconds,
@@ -328,6 +418,7 @@ impl MetricsHandle {
             interrupted_cycles,
             db_assets_total,
             db_assets_size_bytes,
+            pending_verification_age_seconds,
             db_last_sync_assets_seen,
             db_summary_read_failures,
         }
@@ -353,9 +444,16 @@ impl MetricsHandle {
             .inc_by(stats.pagination_shortfall_warnings as u64);
         self.pagination_shortfall_assets
             .inc_by(stats.pagination_shortfall_assets);
+        self.tail_probes.inc_by(stats.tail_probes as u64);
+        self.count_undercount_assets
+            .inc_by(stats.count_undercount_assets);
         if stats.sync_token_blocked {
             self.sync_token_blocked_cycles.inc();
         }
+        self.same_cycle_recovery_attempts
+            .inc_by(stats.same_cycle_recovery_attempts as u64);
+        self.same_cycle_recovery_successes
+            .inc_by(stats.same_cycle_recovery_successes as u64);
         if let Some(reason) = stats.full_enumeration_reason {
             self.full_enumeration_reasons
                 .get_or_create(&FullEnumerationLabels {
@@ -421,6 +519,26 @@ impl MetricsHandle {
         self.db_assets_total
             .get_or_create(&StatusLabels { status: "failed" })
             .set(i64::try_from(summary.failed).unwrap_or(i64::MAX));
+        self.db_assets_total
+            .get_or_create(&StatusLabels {
+                status: "awaiting_provider_verification",
+            })
+            .set(i64::try_from(summary.awaiting_provider_verification).unwrap_or(i64::MAX));
+        self.db_assets_total
+            .get_or_create(&StatusLabels {
+                status: "source_deleted",
+            })
+            .set(i64::try_from(summary.source_deleted).unwrap_or(i64::MAX));
+        let verification_age = summary
+            .oldest_provider_verification_at
+            .map(|checked_at| {
+                Utc::now()
+                    .signed_duration_since(checked_at)
+                    .num_seconds()
+                    .max(0)
+            })
+            .unwrap_or(0);
+        self.pending_verification_age_seconds.set(verification_age);
         self.db_assets_size_bytes
             .get_or_create(&StatusLabels {
                 status: "downloaded",
@@ -760,6 +878,35 @@ mod tests {
             ),
             "output:\n{output}"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_metrics_export_counters_and_bounded_decisions() {
+        let handle = MetricsHandle::new(None);
+        let stats = SyncStats {
+            tail_probes: 2,
+            count_undercount_assets: 3,
+            same_cycle_recovery_attempts: 1,
+            same_cycle_recovery_successes: 1,
+            ..SyncStats::default()
+        };
+        record_checkpoint_decision("preserved", "pass_token_missing");
+        record_targeted_lookup("present", 4);
+        record_deferred_transfers(5);
+        handle.update(&stats, &healthy_status(0)).await;
+
+        let output = render_metrics(&handle).await;
+        for expected in [
+            "kei_sync_tail_probes_total 2",
+            "kei_sync_count_undercount_assets_total 3",
+            "kei_sync_same_cycle_recovery_attempts_total 1",
+            "kei_sync_same_cycle_recovery_successes_total 1",
+            "kei_sync_checkpoint_decisions_total{decision=\"preserved\",reason=\"pass_token_missing\"}",
+            "kei_sync_targeted_record_lookups_total{outcome=\"present\"}",
+            "kei_sync_transfers_deferred_after_checkpoint_total",
+        ] {
+            assert!(output.contains(expected), "missing {expected}:\n{output}");
+        }
     }
 
     #[tokio::test]
@@ -1148,6 +1295,12 @@ mod tests {
             downloaded,
             pending,
             failed,
+            awaiting_provider_verification: 0,
+            source_deleted: 0,
+            oldest_provider_verification_at: None,
+            provider_checkpoint_status: None,
+            last_recovery_action: None,
+            last_full_enumeration_reason: None,
             downloaded_bytes,
             active_sync_started: None,
             active_enumeration_zones: Vec::new(),
@@ -1185,6 +1338,35 @@ mod tests {
             output.contains(r#"kei_db_assets_total{status="failed"} 2"#),
             "failed count missing or wrong:\n{output}"
         );
+    }
+
+    #[tokio::test]
+    async fn update_db_stats_exports_verification_and_source_deleted_gauges() {
+        let handle = MetricsHandle::new(None);
+        let mut summary = make_summary(10, 2, 1, 1_000);
+        summary.awaiting_provider_verification = 2;
+        summary.source_deleted = 7;
+        summary.oldest_provider_verification_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        handle.update_db_stats(&summary, 13);
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains(r#"kei_db_assets_total{status="awaiting_provider_verification"} 2"#),
+            "output:\n{output}"
+        );
+        assert!(
+            output.contains(r#"kei_db_assets_total{status="source_deleted"} 7"#),
+            "output:\n{output}"
+        );
+        let age_line = output
+            .lines()
+            .find(|line| line.starts_with("kei_pending_provider_verification_age_seconds "))
+            .expect("verification age gauge");
+        let age = age_line
+            .split_once(' ')
+            .and_then(|(_, value)| value.parse::<i64>().ok())
+            .expect("integer verification age");
+        assert!((60..=65).contains(&age), "age line: {age_line}");
     }
 
     #[tokio::test]

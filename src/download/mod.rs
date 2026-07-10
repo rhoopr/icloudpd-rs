@@ -16,6 +16,7 @@ pub mod paths;
 pub(crate) mod pipeline;
 pub(crate) mod planner;
 pub(crate) mod recap;
+mod retry;
 
 pub(crate) use limiter::BandwidthLimiter;
 
@@ -28,6 +29,9 @@ use pipeline::{
 pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
 use filter::DownloadTask;
+#[cfg(test)]
+use retry::take_matching_pending_retry_tasks;
+use retry::{build_pending_retry_download_tasks, PendingRetryPlan, PendingRetryTarget};
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -49,7 +53,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::asset::ChangeEvent;
-use crate::icloud::photos::{PhotoAsset, SyncTokenError};
+use crate::icloud::photos::{
+    PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution, SyncTokenError,
+};
 use crate::retry::RetryConfig;
 use crate::state::{
     DownloadStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore, SyncTokenStore,
@@ -108,6 +114,10 @@ pub enum FullEnumerationReason {
     AlbumRelationHydrationIncomplete,
     EnumConfigHashDrift,
     DownloadConfigHashDrift,
+    #[allow(
+        dead_code,
+        reason = "serialized public reason retained for report compatibility after retry work moved off full enumeration"
+    )]
     ExplicitRetryFailed,
     OtherStaticReason,
 }
@@ -289,6 +299,10 @@ pub struct SyncStats {
     pub pagination_shortfall_warnings: usize,
     /// Sum of missing assets reported by diagnostic pagination shortfalls.
     pub pagination_shortfall_assets: u64,
+    /// Count-backed tail owners opened to prove natural EOF.
+    pub tail_probes: usize,
+    /// Assets discovered beyond the provider's pre-enumeration count hint.
+    pub count_undercount_assets: u64,
     /// True when the asset producer stopped before naturally exhausting the
     /// iCloud stream for a reason other than an external interrupt.
     pub enumeration_incomplete: bool,
@@ -358,6 +372,10 @@ pub struct SyncStats {
     /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_unique_values: Option<usize>,
+    /// Bounded pass-token recovery rounds attempted in this cycle.
+    pub same_cycle_recovery_attempts: usize,
+    /// Pass-token recovery rounds that completed checkpoint proof.
+    pub same_cycle_recovery_successes: usize,
     pub elapsed_secs: f64,
     pub interrupted: bool,
     /// Number of tasks that observed at least one HTTP 429 / 503 response
@@ -419,6 +437,8 @@ impl SyncStats {
         self.stale_pending_pruned += other.stale_pending_pruned;
         self.pagination_shortfall_warnings += other.pagination_shortfall_warnings;
         self.pagination_shortfall_assets += other.pagination_shortfall_assets;
+        self.tail_probes += other.tail_probes;
+        self.count_undercount_assets += other.count_undercount_assets;
         self.enumeration_incomplete = self.enumeration_incomplete || other.enumeration_incomplete;
         self.inventory_drop_warnings += other.inventory_drop_warnings;
         if other.inventory_drop_assets > self.inventory_drop_assets {
@@ -462,6 +482,8 @@ impl SyncStats {
         if self.sync_token_unique_values.is_none() {
             self.sync_token_unique_values = other.sync_token_unique_values;
         }
+        self.same_cycle_recovery_attempts += other.same_cycle_recovery_attempts;
+        self.same_cycle_recovery_successes += other.same_cycle_recovery_successes;
         self.elapsed_secs += other.elapsed_secs;
         self.interrupted = self.interrupted || other.interrupted;
         self.rate_limited += other.rate_limited;
@@ -521,20 +543,6 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | UNKNOWN_ALBUM_RELATION_ASSET_REASON
         | UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => "icloud",
         _ => "unknown",
-    }
-}
-
-pub(crate) fn sync_token_blocked_bounded_log_message(reason: &str) -> Option<&'static str> {
-    match reason {
-        RECENT_LIMITED_FULL_ENUMERATION_REASON => Some(
-            "--recent mode is bounded and does not persist a full enumeration sync token. Run \
-             without --recent for checkpointed incremental token flow.",
-        ),
-        DATE_BOUNDED_FULL_ENUMERATION_REASON => Some(
-            "Date-bounded mode is bounded and does not persist a full enumeration sync token. \
-             Run without the lower date bound for checkpointed incremental token flow.",
-        ),
-        _ => None,
     }
 }
 
@@ -600,7 +608,7 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
             "a targeted album backfill did not complete safely"
         }
         PENDING_RETRY_UNMATCHED_REASON => {
-            "kei could not refresh every pending retry target, so token advancement stayed blocked"
+            "kei could not refresh every pending retry target; the rows remain durable for a later cycle"
         }
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
@@ -2093,12 +2101,119 @@ async fn build_pass_configs_resolving_deferred_excludes(
 
 #[derive(Debug)]
 struct PerPassStreamingResult {
+    pass_index: usize,
     kind: crate::commands::PassKind,
     label: String,
     count: u64,
     elapsed: std::time::Duration,
     token_rx: tokio::sync::oneshot::Receiver<Option<String>>,
     result: StreamingResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PassKey {
+    index: usize,
+    kind: crate::commands::PassKind,
+    label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PassTokenResult {
+    Present(String),
+    Missing,
+    Blank,
+    ReceiverDropped,
+    EnumerationIncomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassTokenObservation {
+    pass: PassKey,
+    result: PassTokenResult,
+}
+
+struct PassTokenReceiver {
+    pass: PassKey,
+    receiver: tokio::sync::oneshot::Receiver<Option<String>>,
+    enumeration_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenGap {
+    Missing,
+    Blank,
+    ReceiverDropped,
+    EnumerationIncomplete,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ZoneTokenEvidence {
+    Complete {
+        token: String,
+    },
+    Recoverable {
+        passes: Vec<PassKey>,
+        reason: TokenGap,
+    },
+    Incomplete {
+        reason: TokenGap,
+    },
+}
+
+fn classify_zone_token_evidence(observations: &[PassTokenObservation]) -> ZoneTokenEvidence {
+    let passes_without_tokens = || {
+        observations
+            .iter()
+            .filter(|observation| !matches!(observation.result, PassTokenResult::Present(_)))
+            .map(|observation| observation.pass.clone())
+            .collect()
+    };
+
+    for (result, reason) in [
+        (
+            PassTokenResult::EnumerationIncomplete,
+            TokenGap::EnumerationIncomplete,
+        ),
+        (PassTokenResult::ReceiverDropped, TokenGap::ReceiverDropped),
+        (PassTokenResult::Blank, TokenGap::Blank),
+        (PassTokenResult::Missing, TokenGap::Missing),
+    ] {
+        if observations.iter().any(|observation| {
+            std::mem::discriminant(&observation.result) == std::mem::discriminant(&result)
+        }) {
+            return ZoneTokenEvidence::Recoverable {
+                passes: passes_without_tokens(),
+                reason,
+            };
+        }
+    }
+
+    let tokens: Vec<&str> = observations
+        .iter()
+        .filter_map(|observation| match &observation.result {
+            PassTokenResult::Present(token) => Some(token.as_str()),
+            _ => None,
+        })
+        .collect();
+    let Some(first) = tokens.first() else {
+        return ZoneTokenEvidence::Incomplete {
+            reason: TokenGap::Missing,
+        };
+    };
+    if tokens.iter().all(|token| token == first) {
+        ZoneTokenEvidence::Complete {
+            token: (*first).to_string(),
+        }
+    } else {
+        ZoneTokenEvidence::Recoverable {
+            passes: observations
+                .iter()
+                .map(|observation| observation.pass.clone())
+                .collect(),
+            reason: TokenGap::Mismatch,
+        }
+    }
 }
 
 type DownloadPhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
@@ -2232,6 +2347,7 @@ struct RecentFrontier {
 }
 
 struct FullPassStreamOptions {
+    pass_index: usize,
     controls: DownloadControls,
     count: u64,
     kind: crate::commands::PassKind,
@@ -2586,6 +2702,7 @@ where
     let elapsed = pass_start.elapsed();
     pass_pb.finish_and_clear();
     Ok(PerPassStreamingResult {
+        pass_index: options.pass_index,
         kind: options.kind,
         label: pass_config.pass_label().to_string(),
         count: options.count,
@@ -2609,6 +2726,27 @@ fn merge_streaming_result(combined: &mut StreamingResult, result: StreamingResul
     combined.enumeration_complete = combined.enumeration_complete && result.enumeration_complete;
 }
 
+fn merge_token_recovery_result(combined: &mut StreamingResult, result: StreamingResult) {
+    // A token-recovery pass replays an already observed pass through the real
+    // planner and state pipeline. Preserve the original inventory/progress
+    // counts rather than double-counting every replayed asset, but retain all
+    // transfer, durability, and error outcomes produced by the repair.
+    combined.downloaded += result.downloaded;
+    combined.exif_failures += result.exif_failures;
+    combined.failed.extend(result.failed);
+    combined.auth_errors += result.auth_errors;
+    combined.state_write_failures += result.state_write_failures;
+    combined.enumeration_errors += result.enumeration_errors;
+    combined.bytes_downloaded += result.bytes_downloaded;
+    combined.disk_bytes_written += result.disk_bytes_written;
+    combined.rate_limit_observations += result.rate_limit_observations;
+    combined.url_expired_abort = combined.url_expired_abort || result.url_expired_abort;
+    combined.photos_downloaded += result.photos_downloaded;
+    combined.videos_downloaded += result.videos_downloaded;
+    combined.recap.merge(result.recap);
+    combined.enumeration_complete = combined.enumeration_complete && result.enumeration_complete;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RetryTaskKey {
     asset_id: Arc<str>,
@@ -2620,31 +2758,6 @@ struct RetryTaskKey {
 struct UrlRetrySource {
     asset_record_name: Arc<str>,
     pass_index: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PendingRetryTarget {
-    library: Arc<str>,
-    asset_id: Arc<str>,
-    version_size: VersionSizeKey,
-}
-
-impl PendingRetryTarget {
-    fn from_record(record: &crate::state::AssetRecord) -> Self {
-        Self {
-            library: Arc::clone(&record.library),
-            asset_id: Arc::from(record.id.as_ref()),
-            version_size: record.version_size,
-        }
-    }
-
-    fn from_task(task: &DownloadTask) -> Self {
-        Self {
-            library: Arc::clone(&task.library),
-            asset_id: Arc::clone(&task.asset_id),
-            version_size: task.version_size,
-        }
-    }
 }
 
 impl From<&DownloadTask> for RetryTaskKey {
@@ -2673,24 +2786,6 @@ fn retry_hydrator_pass_index(
         .or_else(|| (!passes.is_empty()).then_some(0))
 }
 
-fn take_matching_pending_retry_tasks<I>(
-    tasks: I,
-    pending_targets: &mut FxHashSet<PendingRetryTarget>,
-    out: &mut Vec<DownloadTask>,
-) where
-    I: IntoIterator<Item = DownloadTask>,
-{
-    for task in tasks {
-        let target = PendingRetryTarget::from_task(&task);
-        if pending_targets.remove(&target) {
-            out.push(task);
-            if pending_targets.is_empty() {
-                break;
-            }
-        }
-    }
-}
-
 fn take_matching_retry_tasks<I>(
     tasks: I,
     pending_keys: &mut FxHashSet<RetryTaskKey>,
@@ -2710,144 +2805,259 @@ fn take_matching_retry_tasks<I>(
 }
 
 #[derive(Debug, Default)]
-struct PendingRetryPlan {
-    tasks: Vec<DownloadTask>,
-    retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource>,
-    pass_configs: Vec<Arc<DownloadConfig>>,
-    unmatched_targets: Vec<PendingRetryTarget>,
-    requested: usize,
+pub(crate) struct PathReconciliationResult {
+    pub(crate) complete: bool,
+    pub(crate) stats: SyncStats,
 }
 
-async fn build_pending_retry_download_tasks(
+pub(crate) async fn reconcile_catalog_paths(
     passes: &[crate::commands::AlbumPass],
-    config: &DownloadConfig,
+    config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
-) -> Result<PendingRetryPlan> {
+) -> Result<PathReconciliationResult> {
     let Some(db) = &config.state_db else {
-        return Ok(PendingRetryPlan::default());
+        return Ok(PathReconciliationResult::default());
+    };
+    let Some(provider_pass) = passes.first() else {
+        return Ok(PathReconciliationResult::default());
     };
 
-    let pending = db.get_pending().await?;
-    let mut pending_targets: FxHashSet<PendingRetryTarget> = pending
-        .iter()
-        .filter(|record| record.library.as_ref() == config.library.as_ref())
-        .map(PendingRetryTarget::from_record)
-        .collect();
-    if pending_targets.is_empty() {
-        return Ok(PendingRetryPlan::default());
-    }
-
-    let requested = pending_targets.len();
-    let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
-    let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
-    let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
-    let mut task_planner = planner::TaskPlanner::new();
-
-    for (pass_index, pass) in passes.iter().enumerate() {
-        if pending_targets.is_empty() || shutdown_token.is_cancelled() {
+    let mut records = Vec::new();
+    let mut offset = 0u64;
+    const PAGE_SIZE: u32 = 1_000;
+    loop {
+        let page = db.get_downloaded_page(offset, PAGE_SIZE).await?;
+        let page_len = page.len();
+        records.extend(page.into_iter().filter(|record| {
+            record.library.as_ref() == config.library.as_ref() && !record.metadata.is_deleted
+        }));
+        if page_len < PAGE_SIZE as usize {
             break;
         }
+        offset = offset.saturating_add(u64::from(PAGE_SIZE));
+    }
+    if records.is_empty() {
+        return Ok(PathReconciliationResult {
+            complete: true,
+            stats: SyncStats::default(),
+        });
+    }
 
-        let assets = pass.album.photos(config.recent).await?;
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
-                      built 1:1 from the same slice"
-        )]
-        let pass_config = &pass_configs[pass_index];
-
-        for asset in &assets {
-            if pending_targets.is_empty() || shutdown_token.is_cancelled() {
-                break;
+    let mut targets: FxHashSet<PendingRetryTarget> = records
+        .iter()
+        .map(PendingRetryTarget::from_record)
+        .collect();
+    let mut requests = Vec::new();
+    let mut seen_requests = FxHashSet::default();
+    let mut master_by_state_id = FxHashMap::default();
+    for record in &records {
+        let mapped_master = db
+            .get_master_record_name_for_asset(&config.library, &record.id)
+            .await?;
+        let master = mapped_master
+            .as_deref()
+            .unwrap_or(record.id.as_ref())
+            .to_owned();
+        let asset_record_names = if mapped_master.is_some() {
+            vec![record.id.to_string()]
+        } else {
+            db.get_asset_record_names_for_master(&config.library, &master)
+                .await?
+        };
+        master_by_state_id.insert(record.id.to_string(), master.clone());
+        for asset_record_name in asset_record_names {
+            let key = (
+                record.id.to_string(),
+                master.clone(),
+                asset_record_name.clone(),
+            );
+            if seen_requests.insert(key.clone()) {
+                requests.push(RecordLookupRequest {
+                    state_id: ProviderRecordId::new(key.0),
+                    master_record_name: ProviderRecordId::new(key.1),
+                    asset_record_name: ProviderRecordId::new(key.2),
+                });
             }
-            let plan = task_planner.plan_asset(asset, pass_config).await;
-            if plan.filter_reason.is_some() {
+        }
+    }
+
+    let pass_configs: Vec<Arc<DownloadConfig>> = passes
+        .iter()
+        .map(|pass| Arc::new(config.with_pass(pass)))
+        .collect();
+    let mut albums_by_asset: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
+    for (asset_id, album_name) in db.get_all_asset_albums(&config.library).await? {
+        albums_by_asset
+            .entry(asset_id)
+            .or_default()
+            .insert(album_name);
+    }
+    let album_container_ids: Vec<String> = passes
+        .iter()
+        .filter(|pass| pass.kind == crate::commands::PassKind::Album)
+        .filter_map(|pass| pass.album.container_id().map(ToOwned::to_owned))
+        .collect();
+    let album_pass_count = passes
+        .iter()
+        .filter(|pass| pass.kind == crate::commands::PassKind::Album)
+        .count();
+    let album_container_refs: Vec<&str> = album_container_ids.iter().map(String::as_str).collect();
+    let album_membership_complete = album_container_ids.len() == album_pass_count
+        && (album_container_refs.is_empty()
+            || db
+                .selected_album_containers_have_complete_snapshots(
+                    &config.library,
+                    &album_container_refs,
+                )
+                .await?);
+    let selection_complete = album_membership_complete
+        && !passes
+            .iter()
+            .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
+    let batch = provider_pass.album.resolve_records(&requests).await;
+    let mut task_planner = planner::TaskPlanner::new();
+    let mut tasks = Vec::new();
+    let mut task_keys = FxHashSet::default();
+    for (state_id, resolution) in batch.results {
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        match resolution {
+            RecordResolution::Present(asset) => {
+                targets.retain(|target| target.asset_id.as_ref() != state_id.as_str());
+                let known_albums = albums_by_asset.get(state_id.as_str());
+                for (pass, pass_config) in passes.iter().zip(&pass_configs) {
+                    let selected = match pass.kind {
+                        crate::commands::PassKind::Album => known_albums
+                            .is_some_and(|albums| albums.contains(pass.album.name.as_ref())),
+                        crate::commands::PassKind::Unfiled => {
+                            known_albums.is_none_or(FxHashSet::is_empty)
+                        }
+                        crate::commands::PassKind::SmartFolder => false,
+                    };
+                    if !selected {
+                        continue;
+                    }
+                    let plan = task_planner.plan_asset(&asset, pass_config).await;
+                    if plan.filter_reason.is_some() {
+                        continue;
+                    }
+                    for task in plan.tasks {
+                        let key = RetryTaskKey::from(&task);
+                        if task_keys.insert(key) {
+                            tasks.push(task);
+                        }
+                    }
+                }
+            }
+            RecordResolution::Deleted {
+                deleted_at,
+                master_family,
+            } => {
+                let id = state_id.as_str();
+                if master_family {
+                    let master = master_by_state_id.get(id).map(String::as_str).unwrap_or(id);
+                    db.resolve_master_family_source_deleted_affected(
+                        &config.library,
+                        master,
+                        deleted_at,
+                    )
+                    .await?;
+                } else {
+                    db.resolve_source_deleted_affected(&config.library, id, deleted_at)
+                        .await?;
+                }
+                targets.retain(|target| target.asset_id.as_ref() != id);
+            }
+            RecordResolution::Unknown | RecordResolution::TransientFailure(_) => {}
+        }
+    }
+
+    let records_by_target: FxHashMap<PendingRetryTarget, &crate::state::AssetRecord> = records
+        .iter()
+        .map(|record| (PendingRetryTarget::from_record(record), record))
+        .collect();
+    let mut stats = SyncStats::default();
+    let mut deferred_to_pending_retry = false;
+    for task in tasks {
+        let target = PendingRetryTarget::from_task(&task);
+        let Some(record) = records_by_target.get(&target) else {
+            stats.failed += 1;
+            tracing::warn!(asset_id = %task.asset_id, "Path reconciliation task had no catalog row");
+            continue;
+        };
+        let Some(source_path) = record.local_path.as_deref() else {
+            deferred_to_pending_retry = true;
+            tracing::debug!(asset_id = %task.asset_id, "Path reconciliation deferred catalog row without a local file to targeted retry");
+            continue;
+        };
+        match tokio::fs::try_exists(source_path).await {
+            Ok(true) => {}
+            Ok(false) => {
+                deferred_to_pending_retry = true;
+                tracing::debug!(asset_id = %task.asset_id, path = %source_path.display(), "Path reconciliation deferred missing local file to targeted retry");
                 continue;
             }
-            let first_new_task = tasks.len();
-            take_matching_pending_retry_tasks(plan.tasks, &mut pending_targets, &mut tasks);
-            for task in tasks.iter().skip(first_new_task) {
-                retry_sources.insert(
-                    RetryTaskKey::from(task),
-                    UrlRetrySource {
-                        asset_record_name: asset.asset_record_name_arc(),
-                        pass_index,
-                    },
-                );
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(asset_id = %task.asset_id, path = %source_path.display(), %error, "Path reconciliation could not inspect the catalog file");
+                continue;
             }
         }
-    }
-
-    if !pending_targets.is_empty() {
-        tracing::warn!(
-            requested,
-            refreshed = tasks.len(),
-            missing = pending_targets.len(),
-            diagnostic = PENDING_RETRY_UNMATCHED_REASON,
-            "Targeted retry could not refresh every pending asset; blocking sync token advancement"
-        );
-    }
-
-    Ok(PendingRetryPlan {
-        tasks,
-        retry_sources,
-        pass_configs,
-        unmatched_targets: pending_targets.into_iter().collect(),
-        requested,
-    })
-}
-
-async fn prune_unmatched_pending_retry_targets(
-    config: &DownloadConfig,
-    shutdown_token: &CancellationToken,
-    unmatched_targets: &[PendingRetryTarget],
-) -> usize {
-    if unmatched_targets.is_empty()
-        || config.recent.is_some()
-        || config.skip_created_before.is_some()
-        || shutdown_token.is_cancelled()
-    {
-        return 0;
-    }
-
-    let Some(db) = &config.state_db else {
-        return 0;
-    };
-
-    let asset_versions: Vec<(String, String)> = unmatched_targets
-        .iter()
-        .map(|target| {
-            (
-                target.asset_id.to_string(),
-                target.version_size.as_str().to_string(),
-            )
-        })
-        .collect();
-    match db
-        .prune_pending_asset_versions(&config.library, &asset_versions)
+        match file::copy_local_file_no_replace(
+            source_path,
+            &task.download_path,
+            &config.temp_suffix,
+        )
         .await
-    {
-        Ok(pruned) => {
-            if pruned > 0 {
-                tracing::warn!(
-                    count = pruned,
-                    library = %config.library,
-                    diagnostic = "targeted_retry_stale_pending_pruned",
-                    "Pruned pending state rows absent from targeted retry enumeration"
-                );
+        {
+            Ok(Some(local_checksum)) => {
+                if let Err(error) = db
+                    .mark_downloaded(
+                        &task.library,
+                        &task.asset_id,
+                        task.version_size.as_str(),
+                        &task.download_path,
+                        &local_checksum,
+                        None,
+                    )
+                    .await
+                {
+                    stats.state_write_failures += 1;
+                    tracing::warn!(asset_id = %task.asset_id, %error, "Failed to persist reconciled local path");
+                } else {
+                    stats.downloaded += 1;
+                    if matches!(
+                        task.media_type,
+                        crate::state::MediaType::Photo | crate::state::MediaType::LivePhotoImage
+                    ) {
+                        stats.photos_downloaded += 1;
+                    } else {
+                        stats.videos_downloaded += 1;
+                    }
+                    stats.disk_bytes_written =
+                        stats.disk_bytes_written.saturating_add(record.size_bytes);
+                }
             }
-            usize::try_from(pruned).unwrap_or(usize::MAX)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                library = %config.library,
-                diagnostic = PENDING_RETRY_UNMATCHED_REASON,
-                "Failed to prune pending rows absent from targeted retry enumeration"
-            );
-            0
+            Ok(None) => {
+                stats.failed += 1;
+                tracing::warn!(asset_id = %task.asset_id, path = %task.download_path.display(), "Path reconciliation found conflicting destination bytes");
+            }
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(asset_id = %task.asset_id, %error, "Failed to copy existing media into reconciled path");
+            }
         }
     }
+    stats.interrupted = shutdown_token.is_cancelled();
+    let complete = batch.complete
+        && selection_complete
+        && targets.is_empty()
+        && !deferred_to_pending_retry
+        && stats.failed == 0
+        && stats.state_write_failures == 0
+        && !stats.interrupted;
+    Ok(PathReconciliationResult { complete, stats })
 }
 
 /// Re-enumerate iCloud and rebuild only the failed tasks with fresh CDN URLs.
@@ -3306,24 +3516,6 @@ async fn has_metadata_backfill_work(config: &DownloadConfig) -> bool {
             false
         }
     }
-}
-
-fn should_prune_stale_pending_after_full_enumeration(
-    sync_result: &SyncResult,
-    config: &DownloadConfig,
-    controls: DownloadControls,
-    shutdown_token: &CancellationToken,
-) -> bool {
-    sync_result.full_enumeration_ran
-        && matches!(sync_result.outcome, DownloadOutcome::Success)
-        && sync_result.stats.enumeration_errors == 0
-        && !sync_result.stats.enumeration_incomplete
-        && !sync_result.stats.interrupted
-        && config.recent.is_none()
-        && config.skip_created_before.is_none()
-        && !controls.run_mode.is_dry_run()
-        && !controls.run_mode.only_print_filenames()
-        && !shutdown_token.is_cancelled()
 }
 
 fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullEnumerationReason) {
@@ -3803,12 +3995,13 @@ async fn download_photos_incremental_with_smart_folder_refresh(
             Arc::clone(config)
         };
 
-    let mut smart_folder_result = download_photos_full_with_token(
+    let mut smart_folder_result = download_photos_full_with_token_policy(
         download_client,
         &smart_folder_passes,
         &smart_folder_config,
         controls,
         shutdown_token,
+        false,
     )
     .await?;
 
@@ -3879,7 +4072,6 @@ async fn run_pending_retry_pass(
             &shutdown_token,
             0,
             0,
-            0,
         ));
     }
 
@@ -3903,7 +4095,6 @@ async fn run_pending_retry_pass(
             &shutdown_token,
             unmatched,
             0,
-            0,
         ));
     }
 
@@ -3913,20 +4104,15 @@ async fn run_pending_retry_pass(
             &shutdown_token,
             unmatched,
             tasks.len(),
-            0,
         ));
     }
 
     if tasks.is_empty() {
-        let pruned =
-            prune_unmatched_pending_retry_targets(config, &shutdown_token, &unmatched_targets)
-                .await;
         return Ok(pending_retry_no_download_result(
             &started,
             &shutdown_token,
             unmatched,
             0,
-            pruned,
         ));
     }
 
@@ -4015,14 +4201,11 @@ async fn run_pending_retry_pass(
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Targeted retry failed");
         }
     }
-    let pruned =
-        prune_unmatched_pending_retry_targets(config, &shutdown_token, &unmatched_targets).await;
-    let remaining_unmatched = unmatched.saturating_sub(pruned);
+    let remaining_unmatched = unmatched;
 
-    let mut stats = SyncStats {
+    let stats = SyncStats {
         downloaded: pass_result.downloaded,
-        failed,
-        stale_pending_pruned: pruned as u64,
+        failed: failed.saturating_add(remaining_unmatched),
         bytes_downloaded: pass_result.bytes_downloaded,
         disk_bytes_written: pass_result.disk_bytes_written,
         exif_failures: pass_result.exif_failures,
@@ -4037,10 +4220,6 @@ async fn run_pending_retry_pass(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
-    if remaining_unmatched > 0 {
-        block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
-    }
-
     if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(SyncResult {
             outcome: DownloadOutcome::SessionExpired {
@@ -4071,19 +4250,15 @@ fn pending_retry_no_download_result(
     shutdown_token: &CancellationToken,
     unmatched: usize,
     downloaded: usize,
-    pruned: usize,
 ) -> SyncResult {
-    let remaining_unmatched = unmatched.saturating_sub(pruned);
-    let mut stats = SyncStats {
+    let remaining_unmatched = unmatched;
+    let stats = SyncStats {
         downloaded,
-        stale_pending_pruned: pruned as u64,
+        failed: remaining_unmatched,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled(),
         ..SyncStats::default()
     };
-    if remaining_unmatched > 0 {
-        block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
-    }
     SyncResult {
         outcome: if remaining_unmatched > 0 {
             DownloadOutcome::PartialFailure {
@@ -4126,15 +4301,15 @@ async fn append_pending_retry_to_incremental_result(
     {
         Ok(result) => result,
         Err(e) => {
-            let mut stats = SyncStats {
+            let stats = SyncStats {
+                failed: 1,
                 elapsed_secs: 0.0,
                 ..SyncStats::default()
             };
-            block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
             tracing::warn!(
                 error = %e,
                 diagnostic = PENDING_RETRY_UNMATCHED_REASON,
-                "Targeted pending retry failed before downloads; blocking sync token advancement"
+                "Targeted pending retry failed before downloads; retaining durable work for a later cycle"
             );
             SyncResult {
                 outcome: DownloadOutcome::PartialFailure { failed_count: 1 },
@@ -4153,8 +4328,7 @@ async fn append_pending_retry_to_incremental_result(
     } = incremental_result;
     let outcome = merge_download_outcomes(&incremental_outcome, &retry_result.outcome);
     combined_stats.accumulate(&retry_result.stats);
-    let sync_token = if matches!(outcome, DownloadOutcome::Success)
-        && !combined_stats.sync_token_blocked
+    let sync_token = if !combined_stats.sync_token_blocked
         && !combined_stats.interrupted
         && !controls.run_mode.is_dry_run()
         && !controls.run_mode.only_print_filenames()
@@ -4367,39 +4541,6 @@ pub async fn download_photos_with_sync(
         }
     };
 
-    let mut result = result;
-    if let (Ok(sync_result), Some(db)) = (&mut result, config.state_db.as_ref()) {
-        if should_prune_stale_pending_after_full_enumeration(
-            sync_result,
-            config.as_ref(),
-            controls,
-            &shutdown_token,
-        ) {
-            match db
-                .prune_stale_pending_not_seen_since(&config.library, sync_started_at)
-                .await
-            {
-                Ok(pruned) if pruned > 0 => {
-                    sync_result.stats.stale_pending_pruned = pruned;
-                    tracing::warn!(
-                        count = pruned,
-                        library = %config.library,
-                        diagnostic = "stale_pending_pruned",
-                        "Pruned stale pending state rows after clean full enumeration"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        library = %config.library,
-                        "Failed to prune stale pending rows"
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
     // Pending is transient — anything still pending after a complete sync either
     // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
     if let Some(db) = &config.state_db {
@@ -4570,25 +4711,6 @@ fn classify_pagination_shortfall(
 /// one. All passes for a zone must agree before the token can advance; picking
 /// the first completed pass would hide snapshot drift between album-scoped
 /// enumerations.
-fn unanimous_pass_sync_token(tokens: &[String]) -> Option<String> {
-    let first = tokens.first()?;
-    if tokens.iter().all(|token| token == first) {
-        return Some(first.clone());
-    }
-
-    let mut unique_tokens = FxHashSet::default();
-    for token in tokens {
-        unique_tokens.insert(token.as_str());
-    }
-    tracing::warn!(
-        token_count = tokens.len(),
-        unique_token_count = unique_tokens.len(),
-        "Full enumeration syncToken mismatch across passes; blocking sync \
-         token advancement"
-    );
-    None
-}
-
 /// Full enumeration with syncToken capture.
 ///
 /// Uses `photo_stream_with_token` to capture the zone-level syncToken
@@ -4600,6 +4722,25 @@ async fn download_photos_full_with_token(
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    download_photos_full_with_token_policy(
+        download_client,
+        passes,
+        config,
+        controls,
+        shutdown_token,
+        true,
+    )
+    .await
+}
+
+async fn download_photos_full_with_token_policy(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+    repair_token_gaps: bool,
 ) -> Result<SyncResult> {
     let started = Instant::now();
     let record_album_snapshots = should_record_album_snapshots(passes, config, controls);
@@ -4645,7 +4786,7 @@ async fn download_photos_full_with_token(
     // instead of serializing round trips across albums. Download workers are
     // divided across active pass pipelines so real downloads do not multiply
     // the user-selected `[download].threads` by the number of albums.
-    let (streaming_result, token_receivers) = if needs_per_pass {
+    let (mut streaming_result, token_receivers) = if needs_per_pass {
         let mut combined_result = StreamingResult {
             // Enumeration is "complete" only when every pass finished
             // its stream cleanly. Start optimistic; flip to false on the
@@ -4702,85 +4843,89 @@ async fn download_photos_full_with_token(
                     Some(*index) != deferred_unfiled
                 }),
         )
-        .map(|((((_index, pass), &count), total_count), pass_config)| {
-            let shutdown_token = shutdown_token.clone();
-            let download_client = download_client.clone();
-            let deferred_ids = deferred_ids.clone();
-            let recent_frontier = recent_frontier.as_ref();
-            let download_ctx = shared_download_ctx.clone();
-            let bounds_truncated = Arc::clone(&bounds_truncated);
-            async move {
-                let album_snapshot = if record_album_snapshots {
-                    AlbumSnapshotRecorder::start_for_pass(
-                        config.state_db.clone(),
-                        pass,
-                        config.enum_config_hash.as_deref(),
+        .map(
+            |((((pass_index, pass), &count), total_count), pass_config)| {
+                let shutdown_token = shutdown_token.clone();
+                let download_client = download_client.clone();
+                let deferred_ids = deferred_ids.clone();
+                let recent_frontier = recent_frontier.as_ref();
+                let download_ctx = shared_download_ctx.clone();
+                let bounds_truncated = Arc::clone(&bounds_truncated);
+                async move {
+                    let album_snapshot = if record_album_snapshots {
+                        AlbumSnapshotRecorder::start_for_pass(
+                            config.state_db.clone(),
+                            pass,
+                            config.enum_config_hash.as_deref(),
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    let (stream, token_rx) = open_photo_stream_for_controls(
+                        &pass.album,
+                        scope_frontier_limit(config, recent_frontier),
+                        *total_count,
+                        config.concurrent_downloads,
+                        pass_config.concurrent_downloads,
+                        controls,
+                        strict_empty_tail_errors,
+                    );
+                    let stream = filter_stream_to_enumeration_bounds(
+                        stream,
+                        config,
+                        recent_frontier,
+                        Arc::clone(&bounds_truncated),
+                    );
+
+                    if pass.kind == crate::commands::PassKind::Album {
+                        if let Some(deferred_ids) = deferred_ids {
+                            let stream = stream.map(move |item| {
+                                if let Ok(asset) = &item {
+                                    if let Ok(mut ids) = deferred_ids.lock() {
+                                        ids.insert(asset.asset_record_name().to_string());
+                                    }
+                                }
+                                item
+                            });
+                            return run_full_pass_stream(
+                                download_client,
+                                stream,
+                                token_rx,
+                                pass_config,
+                                FullPassStreamOptions {
+                                    pass_index,
+                                    controls,
+                                    count,
+                                    kind: pass.kind,
+                                    shutdown_token,
+                                    download_ctx: download_ctx.clone(),
+                                    album_snapshot,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+
+                    run_full_pass_stream(
+                        download_client,
+                        stream,
+                        token_rx,
+                        pass_config,
+                        FullPassStreamOptions {
+                            pass_index,
+                            controls,
+                            count,
+                            kind: pass.kind,
+                            shutdown_token,
+                            download_ctx,
+                            album_snapshot,
+                        },
                     )
                     .await
-                } else {
-                    None
-                };
-                let (stream, token_rx) = open_photo_stream_for_controls(
-                    &pass.album,
-                    scope_frontier_limit(config, recent_frontier),
-                    *total_count,
-                    config.concurrent_downloads,
-                    pass_config.concurrent_downloads,
-                    controls,
-                    strict_empty_tail_errors,
-                );
-                let stream = filter_stream_to_enumeration_bounds(
-                    stream,
-                    config,
-                    recent_frontier,
-                    Arc::clone(&bounds_truncated),
-                );
-
-                if pass.kind == crate::commands::PassKind::Album {
-                    if let Some(deferred_ids) = deferred_ids {
-                        let stream = stream.map(move |item| {
-                            if let Ok(asset) = &item {
-                                if let Ok(mut ids) = deferred_ids.lock() {
-                                    ids.insert(asset.asset_record_name().to_string());
-                                }
-                            }
-                            item
-                        });
-                        return run_full_pass_stream(
-                            download_client,
-                            stream,
-                            token_rx,
-                            pass_config,
-                            FullPassStreamOptions {
-                                controls,
-                                count,
-                                kind: pass.kind,
-                                shutdown_token,
-                                download_ctx: download_ctx.clone(),
-                                album_snapshot,
-                            },
-                        )
-                        .await;
-                    }
                 }
-
-                run_full_pass_stream(
-                    download_client,
-                    stream,
-                    token_rx,
-                    pass_config,
-                    FullPassStreamOptions {
-                        controls,
-                        count,
-                        kind: pass.kind,
-                        shutdown_token,
-                        download_ctx,
-                        album_snapshot,
-                    },
-                )
-                .await
-            }
-        })
+            },
+        )
         .buffer_unordered(pass_parallelism)
         .collect::<Vec<Result<PerPassStreamingResult>>>();
 
@@ -4790,6 +4935,7 @@ async fn download_photos_full_with_token(
         let mut deferred_exclusions_complete = true;
         for pass_result in pass_results {
             let PerPassStreamingResult {
+                pass_index,
                 kind,
                 label,
                 count,
@@ -4820,7 +4966,15 @@ async fn download_photos_full_with_token(
                 pagination_count_deduction = pagination_count_deduction.saturating_add(count);
             }
 
-            token_receivers.push(token_rx);
+            token_receivers.push(PassTokenReceiver {
+                pass: PassKey {
+                    index: pass_index,
+                    kind,
+                    label: label.clone(),
+                },
+                receiver: token_rx,
+                enumeration_complete: result.enumeration_complete && result.enumeration_errors == 0,
+            });
             let downloaded_u64 = u64::try_from(result.downloaded).unwrap_or(u64::MAX);
             divider.mark_done(&label, downloaded_u64, count, elapsed);
 
@@ -4867,6 +5021,7 @@ async fn download_photos_full_with_token(
                         token_rx,
                         pass_config,
                         FullPassStreamOptions {
+                            pass_index: index,
                             controls,
                             count: pass_counts.get(index).copied().unwrap_or(0),
                             kind: crate::commands::PassKind::Unfiled,
@@ -4888,7 +5043,16 @@ async fn download_photos_full_with_token(
                         pass_result.count,
                         pass_result.elapsed,
                     );
-                    token_receivers.push(pass_result.token_rx);
+                    token_receivers.push(PassTokenReceiver {
+                        pass: PassKey {
+                            index: pass_result.pass_index,
+                            kind: pass_result.kind,
+                            label: pass_result.label.clone(),
+                        },
+                        receiver: pass_result.token_rx,
+                        enumeration_complete: pass_result.result.enumeration_complete
+                            && pass_result.result.enumeration_errors == 0,
+                    });
                     merge_streaming_result(&mut combined_result, pass_result.result);
                 }
             } else {
@@ -4911,8 +5075,9 @@ async fn download_photos_full_with_token(
         let mut token_receivers = Vec::with_capacity(passes.len());
         let streams: Vec<_> = passes
             .iter()
+            .enumerate()
             .zip(&pass_stream_counts)
-            .map(|(pass, total_count)| {
+            .map(|((pass_index, pass), total_count)| {
                 let (stream, token_rx) = open_photo_stream_for_controls(
                     &pass.album,
                     scope_frontier_limit(config, recent_frontier.as_ref()),
@@ -4922,7 +5087,20 @@ async fn download_photos_full_with_token(
                     controls,
                     strict_empty_tail_errors,
                 );
-                token_receivers.push(token_rx);
+                let label = if pass.album.name.is_empty() {
+                    "unfiled".to_string()
+                } else {
+                    pass.album.name.to_string()
+                };
+                token_receivers.push(PassTokenReceiver {
+                    pass: PassKey {
+                        index: pass_index,
+                        kind: pass.kind,
+                        label,
+                    },
+                    receiver: token_rx,
+                    enumeration_complete: true,
+                });
                 filter_stream_to_enumeration_bounds(
                     stream,
                     config,
@@ -5031,10 +5209,8 @@ async fn download_photos_full_with_token(
     // stream suppresses its token when it hits the cap, and lower-date-bound /
     // global-recent filtering marks `bounds_truncated` when it stops before
     // natural EOF.
-    let token_eligible = !controls.run_mode.only_print_filenames()
-        && !controls.run_mode.is_dry_run()
-        && streaming_result.enumeration_complete
-        && streaming_result.enumeration_errors == 0;
+    let token_attempt_allowed =
+        !controls.run_mode.only_print_filenames() && !controls.run_mode.is_dry_run();
     let mut token_block_reason: Option<&'static str> = None;
     let mut token_expected_receivers: Option<usize> = None;
     let mut token_receivers_with_token: Option<usize> = None;
@@ -5042,73 +5218,292 @@ async fn download_photos_full_with_token(
     let mut token_receivers_blank: Option<usize> = None;
     let mut token_receivers_dropped: Option<usize> = None;
     let mut token_unique_values: Option<usize> = None;
-    let sync_token = if token_eligible {
+    let mut same_cycle_recovery_attempts = 0usize;
+    let mut same_cycle_recovery_successes = 0usize;
+    let sync_token = if token_attempt_allowed {
         let expected_token_count = token_receivers.len();
         token_expected_receivers = Some(expected_token_count);
-        let mut tokens = Vec::new();
-        let mut missing_tokens = 0usize;
-        let mut blank_tokens = 0usize;
-        let mut dropped_receivers = 0usize;
-        for rx in token_receivers {
-            match rx.await {
-                Ok(Some(token)) => {
-                    let trimmed = token.trim();
-                    if trimmed.is_empty() {
-                        blank_tokens += 1;
-                        continue;
-                    }
-                    tokens.push(trimmed.to_string());
+        let mut observations = Vec::with_capacity(expected_token_count);
+        for receiver in token_receivers {
+            let result = if !receiver.enumeration_complete {
+                let _ = receiver.receiver.await;
+                PassTokenResult::EnumerationIncomplete
+            } else {
+                match receiver.receiver.await {
+                    Ok(Some(token)) if token.trim().is_empty() => PassTokenResult::Blank,
+                    Ok(Some(token)) => PassTokenResult::Present(token.trim().to_string()),
+                    Ok(None) => PassTokenResult::Missing,
+                    Err(_) => PassTokenResult::ReceiverDropped,
                 }
-                Ok(None) => {
-                    missing_tokens += 1;
-                }
-                Err(_) => {
-                    dropped_receivers += 1;
-                }
-            }
+            };
+            observations.push(PassTokenObservation {
+                pass: receiver.pass,
+                result,
+            });
         }
+        let tokens: Vec<&str> = observations
+            .iter()
+            .filter_map(|observation| match &observation.result {
+                PassTokenResult::Present(token) => Some(token.as_str()),
+                _ => None,
+            })
+            .collect();
+        let missing_tokens = observations
+            .iter()
+            .filter(|observation| matches!(observation.result, PassTokenResult::Missing))
+            .count();
+        let blank_tokens = observations
+            .iter()
+            .filter(|observation| matches!(observation.result, PassTokenResult::Blank))
+            .count();
+        let dropped_receivers = observations
+            .iter()
+            .filter(|observation| matches!(observation.result, PassTokenResult::ReceiverDropped))
+            .count();
+        let unique_token_count = tokens.iter().copied().collect::<FxHashSet<_>>().len();
         token_receivers_with_token = Some(tokens.len());
         token_receivers_missing = Some(missing_tokens);
         token_receivers_blank = Some(blank_tokens);
         token_receivers_dropped = Some(dropped_receivers);
-        if blank_tokens > 0 {
-            tracing::warn!(
-                blank_tokens,
-                expected_token_count,
-                "Full enumeration returned blank syncToken values; blocking token advancement"
-            );
-        }
-        if dropped_receivers > 0 {
-            tracing::warn!(
-                dropped_receivers,
-                expected_token_count,
-                "Full enumeration syncToken receiver dropped before completion; blocking token advancement"
-            );
-        }
-        let unique_token_count = tokens
-            .iter()
-            .map(std::string::String::as_str)
-            .collect::<FxHashSet<_>>()
-            .len();
         token_unique_values = Some(unique_token_count);
-        let resolved = unanimous_pass_sync_token(&tokens);
-        if resolved.is_none() {
-            token_block_reason = Some(if dropped_receivers > 0 {
-                "kei_internal_token_receiver_dropped"
-            } else if blank_tokens > 0 {
-                "icloud_blank_sync_token"
-            } else if unique_token_count > 1 {
-                "icloud_sync_token_mismatch"
-            } else if missing_tokens > 0 {
-                "icloud_sync_token_missing"
-            } else {
-                "sync_token_unavailable"
-            });
+        let bounded_stream_truncated = bounds_truncated.load(Ordering::Relaxed);
+        let repair_entire_enumeration = (!streaming_result.enumeration_complete
+            || streaming_result.enumeration_errors > 0)
+            && !bounded_stream_truncated;
+        let initial_evidence = if bounded_stream_truncated {
+            ZoneTokenEvidence::Incomplete {
+                reason: TokenGap::EnumerationIncomplete,
+            }
+        } else if repair_entire_enumeration {
+            ZoneTokenEvidence::Recoverable {
+                passes: observations
+                    .iter()
+                    .map(|observation| observation.pass.clone())
+                    .collect(),
+                reason: TokenGap::EnumerationIncomplete,
+            }
+        } else {
+            classify_zone_token_evidence(&observations)
+        };
+        match initial_evidence {
+            ZoneTokenEvidence::Complete { token } => Some(token),
+            ZoneTokenEvidence::Recoverable { reason, .. } if !repair_token_gaps => {
+                token_block_reason = Some(match reason {
+                    TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
+                    TokenGap::Blank => "icloud_blank_sync_token",
+                    TokenGap::Mismatch => "icloud_sync_token_mismatch",
+                    TokenGap::Missing | TokenGap::EnumerationIncomplete => {
+                        "icloud_sync_token_missing"
+                    }
+                });
+                None
+            }
+            ZoneTokenEvidence::Recoverable {
+                reason,
+                passes: recovery_passes,
+            } => {
+                tracing::warn!(
+                    reason = ?reason,
+                    passes = ?recovery_passes,
+                    "Provider checkpoint preserved: pass proof is incomplete; retrying only affected passes now"
+                );
+                same_cycle_recovery_attempts = 1;
+                let recovery_configs =
+                    match build_pass_configs_resolving_deferred_excludes(passes, config).await {
+                        Ok(configs) => configs,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Same-cycle pass recovery could not rebuild pass exclusions"
+                            );
+                            Vec::new()
+                        }
+                    };
+                let mut recovery_enumeration_complete = true;
+                let mut recovery_enumeration_errors = 0usize;
+                let expected_recovery_passes = recovery_passes.len();
+                let mut completed_recovery_passes = 0usize;
+                for pass_key in recovery_passes {
+                    let Some(pass) = passes.get(pass_key.index) else {
+                        recovery_enumeration_complete = false;
+                        continue;
+                    };
+                    let Some(pass_config) = recovery_configs.get(pass_key.index).cloned() else {
+                        recovery_enumeration_complete = false;
+                        continue;
+                    };
+                    let total_count = pass_stream_counts.get(pass_key.index).copied().flatten();
+                    let (stream, token_rx) = open_photo_stream_for_controls(
+                        &pass.album,
+                        scope_frontier_limit(config, recent_frontier.as_ref()),
+                        total_count,
+                        config.concurrent_downloads,
+                        pass_config.concurrent_downloads,
+                        controls,
+                        strict_empty_tail_errors,
+                    );
+                    let stream = filter_stream_to_enumeration_bounds(
+                        stream,
+                        config,
+                        recent_frontier.as_ref(),
+                        Arc::clone(&bounds_truncated),
+                    );
+                    let recovered = run_full_pass_stream(
+                        download_client.clone(),
+                        stream,
+                        token_rx,
+                        pass_config,
+                        FullPassStreamOptions {
+                            pass_index: pass_key.index,
+                            controls,
+                            count: pass_counts.get(pass_key.index).copied().unwrap_or(0),
+                            kind: pass.kind,
+                            shutdown_token: shutdown_token.clone(),
+                            download_ctx: None,
+                            album_snapshot: None,
+                        },
+                    )
+                    .await;
+                    let recovered = match recovered {
+                        Ok(recovered) => recovered,
+                        Err(error) => {
+                            recovery_enumeration_complete = false;
+                            recovery_enumeration_errors =
+                                recovery_enumeration_errors.saturating_add(1);
+                            if let Some(observation) = observations
+                                .iter_mut()
+                                .find(|observation| observation.pass.index == pass_key.index)
+                            {
+                                observation.result = PassTokenResult::EnumerationIncomplete;
+                            }
+                            tracing::warn!(
+                                pass = ?pass_key,
+                                error = %error,
+                                "Same-cycle pass recovery did not complete"
+                            );
+                            continue;
+                        }
+                    };
+                    completed_recovery_passes += 1;
+                    let recovered_result = if !recovered.result.enumeration_complete
+                        || recovered.result.enumeration_errors > 0
+                    {
+                        let _ = recovered.token_rx.await;
+                        PassTokenResult::EnumerationIncomplete
+                    } else {
+                        match recovered.token_rx.await {
+                            Ok(Some(token)) if token.trim().is_empty() => PassTokenResult::Blank,
+                            Ok(Some(token)) => PassTokenResult::Present(token.trim().to_string()),
+                            Ok(None) => PassTokenResult::Missing,
+                            Err(_) => PassTokenResult::ReceiverDropped,
+                        }
+                    };
+                    recovery_enumeration_complete =
+                        recovery_enumeration_complete && recovered.result.enumeration_complete;
+                    recovery_enumeration_errors = recovery_enumeration_errors
+                        .saturating_add(recovered.result.enumeration_errors);
+                    if let Some(observation) = observations
+                        .iter_mut()
+                        .find(|observation| observation.pass.index == pass_key.index)
+                    {
+                        observation.result = recovered_result;
+                    }
+                    merge_token_recovery_result(&mut streaming_result, recovered.result);
+                }
+
+                if completed_recovery_passes != expected_recovery_passes {
+                    recovery_enumeration_complete = false;
+                    recovery_enumeration_errors = recovery_enumeration_errors.saturating_add(
+                        expected_recovery_passes.saturating_sub(completed_recovery_passes),
+                    );
+                }
+
+                if repair_entire_enumeration {
+                    streaming_result.enumeration_complete = recovery_enumeration_complete;
+                    streaming_result.enumeration_errors = recovery_enumeration_errors;
+                }
+
+                let final_tokens: Vec<&str> = observations
+                    .iter()
+                    .filter_map(|observation| match &observation.result {
+                        PassTokenResult::Present(token) => Some(token.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                token_receivers_with_token = Some(final_tokens.len());
+                token_receivers_missing = Some(
+                    observations
+                        .iter()
+                        .filter(|observation| {
+                            matches!(observation.result, PassTokenResult::Missing)
+                        })
+                        .count(),
+                );
+                token_receivers_blank = Some(
+                    observations
+                        .iter()
+                        .filter(|observation| matches!(observation.result, PassTokenResult::Blank))
+                        .count(),
+                );
+                token_receivers_dropped = Some(
+                    observations
+                        .iter()
+                        .filter(|observation| {
+                            matches!(observation.result, PassTokenResult::ReceiverDropped)
+                        })
+                        .count(),
+                );
+                token_unique_values =
+                    Some(final_tokens.iter().copied().collect::<FxHashSet<_>>().len());
+
+                match classify_zone_token_evidence(&observations) {
+                    ZoneTokenEvidence::Complete { token }
+                        if streaming_result.enumeration_complete
+                            && streaming_result.enumeration_errors == 0 =>
+                    {
+                        same_cycle_recovery_successes = 1;
+                        tracing::info!(
+                            passes = ?observations.iter().map(|observation| &observation.pass).collect::<Vec<_>>(),
+                            "Provider checkpoint proof repaired in the current cycle"
+                        );
+                        Some(token)
+                    }
+                    ZoneTokenEvidence::Complete { .. } => {
+                        token_block_reason = Some("icloud_sync_token_missing");
+                        None
+                    }
+                    ZoneTokenEvidence::Recoverable { reason, .. }
+                    | ZoneTokenEvidence::Incomplete { reason } => {
+                        token_block_reason = Some(match reason {
+                            TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
+                            TokenGap::Blank => "icloud_blank_sync_token",
+                            TokenGap::Mismatch => "icloud_sync_token_mismatch",
+                            TokenGap::Missing | TokenGap::EnumerationIncomplete => {
+                                "icloud_sync_token_missing"
+                            }
+                        });
+                        None
+                    }
+                }
+            }
+            ZoneTokenEvidence::Incomplete { reason } => {
+                token_block_reason = Some(match reason {
+                    TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
+                    TokenGap::Blank => "icloud_blank_sync_token",
+                    TokenGap::Mismatch => "icloud_sync_token_mismatch",
+                    TokenGap::Missing | TokenGap::EnumerationIncomplete => {
+                        "icloud_sync_token_missing"
+                    }
+                });
+                None
+            }
         }
-        resolved
     } else {
         None
     };
+    let token_eligible = token_attempt_allowed
+        && streaming_result.enumeration_complete
+        && streaming_result.enumeration_errors == 0;
 
     // Capture the enumeration-complete signal before
     // `build_download_outcome` consumes `streaming_result`. The marker
@@ -5116,6 +5511,17 @@ async fn download_photos_full_with_token(
     // whose enumeration phase finished still clears the marker.
     let enumeration_complete = streaming_result.enumeration_complete;
     let enumeration_errors = streaming_result.enumeration_errors;
+    let tail_probes = if config.recent.is_none() && config.skip_created_before.is_none() {
+        pass_stream_counts
+            .iter()
+            .filter(|count| count.is_some())
+            .count()
+    } else {
+        0
+    };
+    let count_undercount_assets = exact_total
+        .map(|count| streaming_result.assets_seen.saturating_sub(count))
+        .unwrap_or(0);
 
     // Build the outcome using the same logic as download_photos
     let (outcome, mut stats) = build_download_outcome(
@@ -5130,9 +5536,13 @@ async fn download_photos_full_with_token(
     .await?;
     stats.pagination_shortfall_warnings = pagination_shortfall_warnings;
     stats.pagination_shortfall_assets = pagination_shortfall_assets;
+    stats.tail_probes = tail_probes;
+    stats.count_undercount_assets = count_undercount_assets;
     stats.count_probe_failures = len_errors;
     stats.api_total_at_start = api_total_at_start;
-    if token_eligible {
+    stats.same_cycle_recovery_attempts = same_cycle_recovery_attempts;
+    stats.same_cycle_recovery_successes = same_cycle_recovery_successes;
+    if token_attempt_allowed {
         stats.sync_token_expected_receivers = token_expected_receivers;
         stats.sync_token_receivers_with_token = token_receivers_with_token;
         stats.sync_token_receivers_missing = token_receivers_missing;
@@ -6809,7 +7219,7 @@ mod tests {
                 }));
             }
 
-            if url.contains("/records/query?") {
+            if url.contains("/records/lookup?") || url.contains("/records/query?") {
                 self.records_query_calls.fetch_add(1, Ordering::SeqCst);
                 return Ok(self.query_page.clone());
             }
@@ -6874,11 +7284,17 @@ mod tests {
             }
 
             if url.contains("/records/query?") {
-                self.records_query_calls.fetch_add(1, Ordering::SeqCst);
+                let call = self.records_query_calls.fetch_add(1, Ordering::SeqCst);
                 if self.fail_records_query {
                     anyhow::bail!("smart folder refresh failed");
                 }
-                return Ok(self.page.clone());
+                if call == 0 {
+                    return Ok(self.page.clone());
+                }
+                return Ok(json!({
+                    "records": [],
+                    "syncToken": self.page.get("syncToken").cloned().unwrap_or(Value::Null)
+                }));
             }
 
             Ok(json!({"records": []}))
@@ -7428,6 +7844,91 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct RecoveringPassTokenSession {
+        query_calls: Arc<AtomicUsize>,
+        records: Arc<Vec<Value>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecoveringIncompletePassSession {
+        query_calls: Arc<AtomicUsize>,
+        records: Arc<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for RecoveringIncompletePassSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": 1}}}]}]
+                }));
+            }
+            if !url.contains("/records/query?") {
+                return Ok(json!({"records": []}));
+            }
+
+            let call = self.query_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(json!({"records": "malformed"}));
+            }
+            if call == 1 {
+                return Ok(json!({
+                    "records": self.records.as_ref().clone(),
+                    "syncToken": "zone-token-recovered"
+                }));
+            }
+            Ok(json!({"records": [], "syncToken": "zone-token-recovered"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for RecoveringPassTokenSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": 1}}}]}]
+                }));
+            }
+            if !url.contains("/records/query?") {
+                return Ok(json!({"records": []}));
+            }
+
+            let call = self.query_calls.fetch_add(1, Ordering::SeqCst);
+            let recovery_round = call >= 6;
+            let first_page = call.is_multiple_of(6);
+            Ok(match (first_page, recovery_round) {
+                (true, false) => json!({"records": self.records.as_ref().clone()}),
+                (false, false) => json!({"records": []}),
+                (true, true) => json!({
+                    "records": self.records.as_ref().clone(),
+                    "syncToken": "zone-token-recovered"
+                }),
+                (false, true) => {
+                    json!({"records": [], "syncToken": "zone-token-recovered"})
+                }
+            })
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Debug)]
     struct SplitChangesZoneSession {
         delta_responses: Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
         hydrate_responses: Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
@@ -7508,7 +8009,7 @@ mod tests {
                 return Ok(changes_zone_response(records, "zone-token-next"));
             }
 
-            if url.contains("/records/query?") {
+            if url.contains("/records/lookup?") || url.contains("/records/query?") {
                 let call = self.query_calls.fetch_add(1, Ordering::SeqCst);
                 return Ok(if call == 0 {
                     json!({
@@ -7521,6 +8022,33 @@ mod tests {
             }
 
             Ok(json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct PendingLookupSession {
+        records: Arc<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for PendingLookupSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                return Ok(changes_zone_response(Vec::new(), "zone-token-next"));
+            }
+            if url.contains("/records/lookup?") {
+                return Ok(json!({"records": self.records.as_ref().clone()}));
+            }
+            Ok(json!({"records": [], "syncToken": "ignored-query-token"}))
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -7937,7 +8465,10 @@ mod tests {
         .await
         .expect("dry-run full sync should succeed");
 
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "result: {result:?}"
+        );
         assert_eq!(
             session.max_in_flight(),
             1,
@@ -8566,7 +9097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_album_count_blocks_token_on_ambiguous_empty_tail() {
+    async fn malformed_album_count_is_diagnostic_when_tail_proves_eof() {
         let records = mock_photo_records_with_filename("MASTER_BEFORE_GAP", "before-gap.jpg");
         let later_records = mock_photo_records_with_filename("MASTER_AFTER_GAP", "after-gap.jpg");
         let session = MockPhotosFlow::new()
@@ -8606,28 +9137,22 @@ mod tests {
         .await
         .expect("malformed album count should produce a sync result");
 
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
-        ));
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(
             result.stats.assets_seen, 1,
-            "enumeration must not walk past the ambiguous empty-tail terminator"
+            "the finite empty-page ceiling is the natural EOF proof"
         );
-        assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(result.stats.enumeration_errors, 0);
         assert_eq!(result.stats.count_probe_failures, 1);
         assert_eq!(result.stats.pagination_shortfall_warnings, 0);
         assert_eq!(result.stats.pagination_shortfall_assets, 0);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
-        );
-        assert_eq!(result.sync_token, None);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_blocked_reason, None);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
     }
 
     #[tokio::test]
-    async fn missing_album_count_item_count_blocks_ambiguous_empty_tail() {
+    async fn missing_album_count_is_diagnostic_when_empty_inventory_proves_eof() {
         let session = MockPhotosFlow::new()
             .album_count_response(json!({
                 "batch": [{"records": [{"fields": {}}]}]
@@ -8655,19 +9180,13 @@ mod tests {
         .await
         .expect("missing album count should produce a sync result");
 
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
-        ));
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.stats.assets_seen, 0);
-        assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(result.stats.enumeration_errors, 0);
         assert_eq!(result.stats.count_probe_failures, 1);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
-        );
-        assert_eq!(result.sync_token, None);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_blocked_reason, None);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
     }
 
     #[tokio::test]
@@ -8799,9 +9318,9 @@ mod tests {
             "duplicate asset IDs should be treated as producer skips, not partial failure"
         );
         assert_eq!(result.stats.assets_seen, 1);
-        assert_eq!(result.stats.skipped.duplicates, 1);
-        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
-        assert_eq!(result.stats.pagination_shortfall_assets, 0);
+        assert_eq!(result.stats.skipped.duplicates, 0);
+        assert_eq!(result.stats.pagination_shortfall_warnings, 1);
+        assert_eq!(result.stats.pagination_shortfall_assets, 1);
         assert!(!result.stats.sync_token_blocked);
         assert_eq!(result.stats.sync_token_expected_receivers, Some(1));
         assert_eq!(result.stats.sync_token_receivers_with_token, Some(1));
@@ -8947,6 +9466,90 @@ mod tests {
         assert_eq!(result.stats.sync_token_receivers_dropped, Some(0));
         assert_eq!(result.stats.sync_token_unique_values, Some(0));
         assert_eq!(result.sync_token, None, "blank token must not be persisted");
+        assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+        assert_eq!(result.stats.same_cycle_recovery_successes, 0);
+    }
+
+    #[tokio::test]
+    async fn full_sync_repairs_missing_pass_token_in_same_cycle() {
+        let records = mock_photo_records_with_filename("MASTER_RECOVER", "recover.jpg");
+        let query_calls = Arc::new(AtomicUsize::new(0));
+        let session = RecoveringPassTokenSession {
+            query_calls: Arc::clone(&query_calls),
+            records: Arc::new(records.clone()),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session("PrimarySync", "Recovery", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("same-cycle token recovery should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-recovered"));
+        assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+        assert_eq!(result.stats.same_cycle_recovery_successes, 1);
+        assert_eq!(result.stats.sync_token_receivers_with_token, Some(1));
+        assert_eq!(result.stats.sync_token_receivers_missing, Some(0));
+        assert_eq!(query_calls.load(Ordering::SeqCst), 12);
+    }
+
+    #[tokio::test]
+    async fn full_sync_repairs_incomplete_pass_in_same_cycle() {
+        let records = mock_photo_records_with_filename("MASTER_REPAIR", "repair.jpg");
+        let query_calls = Arc::new(AtomicUsize::new(0));
+        let session = RecoveringIncompletePassSession {
+            query_calls: Arc::clone(&query_calls),
+            records: Arc::new(records.clone()),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session("PrimarySync", "Recovery", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("incomplete pass should repair once in-cycle");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-recovered"));
+        assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+        assert_eq!(result.stats.same_cycle_recovery_successes, 1);
+        assert_eq!(query_calls.load(Ordering::SeqCst), 7);
     }
 
     #[test]
@@ -10109,7 +10712,7 @@ mod tests {
         );
         assert_eq!(
             smart_session.records_query_count(),
-            1,
+            1 + crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize,
             "smart-folder refresh should enumerate the selected smart folder"
         );
         assert!(
@@ -10152,7 +10755,10 @@ mod tests {
             1,
             "unfiled incremental changes should still be checked"
         );
-        assert_eq!(smart_session.records_query_count(), 1);
+        assert_eq!(
+            smart_session.records_query_count(),
+            crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize
+        );
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
         assert!(
             !result.stats.sync_token_blocked,
@@ -10183,7 +10789,7 @@ mod tests {
         assert_eq!(changes_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             smart_session.records_query_count(),
-            1,
+            1 + crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize,
             "smart-folder refresh must enumerate only the selected smart-folder stream"
         );
     }
@@ -10433,21 +11039,24 @@ mod tests {
         )
         .await
         .expect("mark failed");
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-FAILED_BEFORE_SYNC",
+            "FAILED_BEFORE_SYNC",
+        )
+        .await
+        .expect("seed asset/master mapping");
 
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(Vec::new(), "zone-token-next", false)
-            .query_page(
-                mock_photo_records_for_zone_with_filename(
-                    "FAILED_BEFORE_SYNC",
-                    "PrimarySync",
-                    "failed-before-sync.jpg",
-                ),
-                Some("ignored-query-token"),
-            )
-            .build();
+        let session = PendingLookupSession {
+            records: Arc::new(mock_photo_records_for_zone_with_filename(
+                "FAILED_BEFORE_SYNC",
+                "PrimarySync",
+                "failed-before-sync.jpg",
+            )),
+        };
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
-            album: mock_album("", session),
+            album: album_with_session("PrimarySync", "", Box::new(session)),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
 
@@ -10474,11 +11083,123 @@ mod tests {
             "normal sync with failed rows should not force full enumeration"
         );
         assert_eq!(result.stats.full_enumeration_reason, None);
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "result: {result:?}"
+        );
         assert_eq!(
             result.sync_token, None,
             "print-only targeted retry must not advance the zone token"
         );
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
+        #[derive(Clone, Debug)]
+        struct LookupOnlySession {
+            records: Arc<Vec<Value>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for LookupOnlySession {
+            async fn post(
+                &self,
+                url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                if url.contains("/records/lookup?") {
+                    return Ok(json!({"records": self.records.as_ref().clone()}));
+                }
+                anyhow::bail!("path reconciliation made an unexpected provider request: {url}")
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let old_dir = TempDir::new().expect("old dir");
+        let new_dir = TempDir::new().expect("new dir");
+        let old_path = old_dir.path().join("reconcile.jpg");
+        tokio::fs::write(&old_path, b"catalog bytes").await.unwrap();
+        let local_checksum = file::compute_sha256(&old_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("RECONCILE")
+            .filename("reconcile.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "RECONCILE",
+            "original",
+            &old_path,
+            &local_checksum,
+            Some("provider-checksum"),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-RECONCILE", "RECONCILE")
+            .await
+            .unwrap();
+
+        let records =
+            mock_photo_records_for_zone_with_filename("RECONCILE", "PrimarySync", "reconcile.jpg");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(LookupOnlySession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(new_dir.path());
+        config.state_db = Some(db.clone());
+        let expected_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .unwrap()
+            .path;
+
+        let result = reconcile_catalog_paths(&passes, Arc::new(config), CancellationToken::new())
+            .await
+            .expect("path reconciliation");
+
+        assert!(result.complete);
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(tokio::fs::read(&old_path).await.unwrap(), b"catalog bytes");
+        assert_eq!(
+            tokio::fs::read(&expected_path).await.unwrap(),
+            b"catalog bytes"
+        );
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(expected_path.as_path())
+        );
+
+        tokio::fs::remove_file(&expected_path).await.unwrap();
+        let deferred = reconcile_catalog_paths(
+            &passes,
+            Arc::new({
+                let mut config = test_config();
+                config.directory = Arc::from(new_dir.path());
+                config.state_db = Some(db);
+                config
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("missing local file should defer to targeted retry");
+        assert!(!deferred.complete);
+        assert_eq!(deferred.stats.failed, 0);
     }
 
     #[tokio::test]
@@ -10490,21 +11211,20 @@ mod tests {
             .size(1024)
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
+        db.upsert_asset_master_mapping("PrimarySync", "asset-DRY_RUN_PENDING", "DRY_RUN_PENDING")
+            .await
+            .expect("seed asset/master mapping");
 
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(Vec::new(), "zone-token-next", false)
-            .query_page(
-                mock_photo_records_for_zone_with_filename(
-                    "DRY_RUN_PENDING",
-                    "PrimarySync",
-                    "dry-run-pending.jpg",
-                ),
-                Some("ignored-query-token"),
-            )
-            .build();
+        let session = PendingLookupSession {
+            records: Arc::new(mock_photo_records_for_zone_with_filename(
+                "DRY_RUN_PENDING",
+                "PrimarySync",
+                "dry-run-pending.jpg",
+            )),
+        };
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
-            album: mock_album("", session),
+            album: album_with_session("PrimarySync", "", Box::new(session)),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
 
@@ -10571,6 +11291,13 @@ mod tests {
         )
         .await
         .expect("mark failed");
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-FAILED_BEFORE_SYNC",
+            "FAILED_BEFORE_SYNC",
+        )
+        .await
+        .expect("seed asset/master mapping");
 
         let download_url = format!("{}/failed-before-sync.jpg", server.uri());
         let mut records = incremental_photo_records_with_url(
@@ -10580,13 +11307,12 @@ mod tests {
             8,
         );
         records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(Vec::new(), "zone-token-next", false)
-            .query_page(records, Some("ignored-query-token"))
-            .build();
+        let session = PendingLookupSession {
+            records: Arc::new(records),
+        };
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
-            album: mock_album("", session),
+            album: album_with_session("PrimarySync", "", Box::new(session)),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
 
@@ -10666,6 +11392,13 @@ mod tests {
             .size(1024)
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-PENDING_EXPIRED_URL",
+            "PENDING_EXPIRED_URL",
+        )
+        .await
+        .expect("seed asset/master mapping");
 
         let expired_url = format!("{}/expired-pending.jpg", server.uri());
         let fresh_url = format!("{}/fresh-pending.jpg", server.uri());
@@ -10722,7 +11455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_with_unmatched_pending_rows_blocks_token_without_full_enumeration() {
+    async fn incremental_with_unmatched_pending_rows_does_not_block_source_checkpoint() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("PENDING_BEFORE_SYNC")
             .filename("pending-before-sync.jpg")
@@ -10757,7 +11490,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await
-        .expect("pending rows should return a token-blocked result");
+        .expect("pending rows should remain durable without forcing provider recovery");
 
         assert!(
             !result.full_enumeration_ran,
@@ -10769,15 +11502,12 @@ mod tests {
         ));
         assert_eq!(result.sync_token, None);
         assert_eq!(result.stats.downloaded, 0);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(PENDING_RETRY_UNMATCHED_REASON)
-        );
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_blocked_reason, None);
     }
 
     #[tokio::test]
-    async fn incremental_with_unmatched_pending_rows_prunes_after_targeted_retry() {
+    async fn incremental_with_unmatched_pending_rows_retains_state_without_deletion_evidence() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = TestAssetRecord::new("PENDING_DELETED_UPSTREAM")
             .filename("pending-deleted-upstream.jpg")
@@ -10812,19 +11542,119 @@ mod tests {
             CancellationToken::new(),
         )
         .await
-        .expect("unmatched pending rows should be pruned after targeted retry");
+        .expect("unmatched pending rows should remain represented after targeted retry");
 
         assert!(
             !result.full_enumeration_ran,
-            "targeted retry pruning should not force full enumeration"
+            "retaining unresolved pending state should not force full enumeration"
         );
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
         assert!(!result.stats.sync_token_blocked);
-        assert_eq!(result.stats.stale_pending_pruned, 1);
+        assert_eq!(result.stats.sync_token_blocked_reason, None);
+        assert_eq!(result.stats.stale_pending_pruned, 0);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.awaiting_provider_verification, 1);
+        assert_eq!(db.get_pending().await.expect("pending page").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_enumeration_query_absence_never_deletes_pending_state() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("ABSENT_FROM_FULL_QUERY")
+            .filename("absent-from-full-query.jpg")
+            .checksum("ck_absent_from_full_query")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+
+        let session = MockPhotosFlow::new()
+            .empty_query_page(Some("zone-token-next"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Full;
+
+        download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("clean full enumeration");
+
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.total_assets, 1);
+        assert_eq!(summary.source_deleted, 0);
+        assert_eq!(summary.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn incremental_pending_retry_clears_only_explicit_provider_deletion() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("PENDING_CONFIRMED_DELETED")
+            .filename("confirmed-deleted.jpg")
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-PENDING_CONFIRMED_DELETED",
+            "PENDING_CONFIRMED_DELETED",
+        )
+        .await
+        .expect("seed identity mapping");
+
+        let session = PendingLookupSession {
+            records: Arc::new(vec![json!({
+                "recordName": "PENDING_CONFIRMED_DELETED",
+                "serverErrorCode": "UNKNOWN_ITEM",
+                "reason": "record not found"
+            })]),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("explicit provider deletion should resolve pending work");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.pending, 0);
-        assert!(db.get_pending().await.expect("pending page").is_empty());
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.awaiting_provider_verification, 0);
+        assert_eq!(summary.source_deleted, 1);
     }
 
     async fn run_bounded_incremental_sync(
@@ -13342,6 +14172,8 @@ mod tests {
             stale_pending_pruned: 5,
             pagination_shortfall_warnings: 1,
             pagination_shortfall_assets: 9,
+            tail_probes: 2,
+            count_undercount_assets: 3,
             enumeration_incomplete: false,
             inventory_drop_warnings: 1,
             inventory_drop_assets: 5,
@@ -13362,6 +14194,8 @@ mod tests {
             sync_token_receivers_blank: Some(0),
             sync_token_receivers_dropped: Some(0),
             sync_token_unique_values: Some(1),
+            same_cycle_recovery_attempts: 1,
+            same_cycle_recovery_successes: 1,
             full_enumeration_reason: Some(FullEnumerationReason::NoStoredToken),
             elapsed_secs: 1.5,
             interrupted: false,
@@ -13399,6 +14233,8 @@ mod tests {
             stale_pending_pruned: 8,
             pagination_shortfall_warnings: 2,
             pagination_shortfall_assets: 11,
+            tail_probes: 4,
+            count_undercount_assets: 5,
             enumeration_incomplete: true,
             inventory_drop_warnings: 2,
             inventory_drop_assets: 11,
@@ -13417,6 +14253,8 @@ mod tests {
             sync_token_receivers_blank: Some(0),
             sync_token_receivers_dropped: Some(0),
             sync_token_unique_values: Some(1),
+            same_cycle_recovery_attempts: 2,
+            same_cycle_recovery_successes: 1,
             full_enumeration_reason: Some(FullEnumerationReason::MetadataBackfill),
             elapsed_secs: 0.75,
             interrupted: true,
@@ -13463,6 +14301,11 @@ mod tests {
             acc.pagination_shortfall_assets, 20,
             "pagination shortfall assets must sum"
         );
+        assert_eq!(acc.tail_probes, 6, "tail probes must sum");
+        assert_eq!(
+            acc.count_undercount_assets, 8,
+            "count undercount assets must sum"
+        );
         assert!(acc.enumeration_incomplete, "enumeration_incomplete must OR");
         assert_eq!(
             acc.inventory_drop_warnings, 3,
@@ -13496,6 +14339,8 @@ mod tests {
         assert_eq!(acc.sync_token_receivers_blank, Some(0));
         assert_eq!(acc.sync_token_receivers_dropped, Some(0));
         assert_eq!(acc.sync_token_unique_values, Some(1));
+        assert_eq!(acc.same_cycle_recovery_attempts, 3);
+        assert_eq!(acc.same_cycle_recovery_successes, 2);
         assert_eq!(
             acc.full_enumeration_reason,
             Some(FullEnumerationReason::NoStoredToken)
@@ -14451,24 +15296,90 @@ mod tests {
     }
 
     #[test]
-    fn unanimous_pass_sync_token_returns_token_when_passes_agree() {
-        let tokens = vec!["zone-token".to_string(), "zone-token".to_string()];
+    fn zone_token_evidence_is_complete_when_all_passes_agree() {
+        let observations = [PassKind::Album, PassKind::Unfiled]
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| PassTokenObservation {
+                pass: PassKey {
+                    index,
+                    kind,
+                    label: format!("pass-{index}"),
+                },
+                result: PassTokenResult::Present("zone-token".to_string()),
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            unanimous_pass_sync_token(&tokens).as_deref(),
-            Some("zone-token")
+            classify_zone_token_evidence(&observations),
+            ZoneTokenEvidence::Complete {
+                token: "zone-token".to_string()
+            }
         );
     }
 
     #[test]
-    fn unanimous_pass_sync_token_suppresses_disagreement() {
-        let tokens = vec!["zone-token-a".to_string(), "zone-token-b".to_string()];
+    fn zone_token_evidence_retries_all_passes_after_mismatch() {
+        let observations = ["zone-token-a", "zone-token-b"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, token)| PassTokenObservation {
+                pass: PassKey {
+                    index,
+                    kind: PassKind::Album,
+                    label: format!("pass-{index}"),
+                },
+                result: PassTokenResult::Present(token.to_string()),
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            unanimous_pass_sync_token(&tokens),
-            None,
-            "mismatched full-enumeration pass tokens must block advancement"
-        );
+        let ZoneTokenEvidence::Recoverable { passes, reason } =
+            classify_zone_token_evidence(&observations)
+        else {
+            panic!("mismatched pass tokens must be recoverable once");
+        };
+        assert_eq!(reason, TokenGap::Mismatch);
+        assert_eq!(passes.len(), 2);
+    }
+
+    #[test]
+    fn zone_token_evidence_retries_only_passes_with_gaps() {
+        for (gap, expected_reason) in [
+            (PassTokenResult::Missing, TokenGap::Missing),
+            (PassTokenResult::Blank, TokenGap::Blank),
+            (PassTokenResult::ReceiverDropped, TokenGap::ReceiverDropped),
+            (
+                PassTokenResult::EnumerationIncomplete,
+                TokenGap::EnumerationIncomplete,
+            ),
+        ] {
+            let observations = vec![
+                PassTokenObservation {
+                    pass: PassKey {
+                        index: 0,
+                        kind: PassKind::Album,
+                        label: "complete".to_string(),
+                    },
+                    result: PassTokenResult::Present("zone-token".to_string()),
+                },
+                PassTokenObservation {
+                    pass: PassKey {
+                        index: 1,
+                        kind: PassKind::Unfiled,
+                        label: "gap".to_string(),
+                    },
+                    result: gap,
+                },
+            ];
+
+            let ZoneTokenEvidence::Recoverable { passes, reason } =
+                classify_zone_token_evidence(&observations)
+            else {
+                panic!("pass gap must receive one bounded recovery round");
+            };
+            assert_eq!(reason, expected_reason);
+            assert_eq!(passes, vec![observations[1].pass.clone()]);
+        }
     }
 
     /// Per-pass mode AND-folds `enumeration_complete` across passes.

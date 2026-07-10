@@ -33,7 +33,8 @@ use crate::sync_cycle::{run_cycle, sync_token_key as make_sync_token_key, Librar
 use crate::sync_cycle::{
     check_and_persist_enum_config_hash, check_download_config_hash_for_cycle, determine_sync_mode,
     should_store_sync_token, should_store_sync_token_for_cycle, CycleResult,
-    DownloadConfigHashOutcome, EnumConfigHashOutcome, ENUM_CONFIG_HASH_KEY, SYNC_TOKEN_PREFIX,
+    DownloadConfigHashOutcome, EnumConfigHashOutcome, ENUM_CONFIG_HASH_KEY,
+    PENDING_DOWNLOAD_CONFIG_HASH_KEY, PENDING_ENUM_CONFIG_HASH_KEY, SYNC_TOKEN_PREFIX,
 };
 
 #[cfg(all(test, feature = "xmp"))]
@@ -3272,6 +3273,58 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct ConfigBridgeSession {
+        zone: Arc<str>,
+        inventory_token: Arc<str>,
+        bridge_token: Arc<str>,
+    }
+
+    impl ConfigBridgeSession {
+        fn new(zone: &str, inventory_token: &str, bridge_token: &str) -> Self {
+            Self {
+                zone: Arc::from(zone),
+                inventory_token: Arc::from(inventory_token),
+                bridge_token: Arc::from(bridge_token),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(album_count_response(0));
+            }
+            if url.contains("/records/query?") {
+                return Ok(serde_json::json!({
+                    "records": [],
+                    "syncToken": self.inventory_token.as_ref()
+                }));
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(serde_json::json!({
+                    "zones": [{
+                        "zoneID": {"zoneName": self.zone.as_ref(), "ownerRecordName": "_defaultOwner"},
+                        "syncToken": self.bridge_token.as_ref(),
+                        "moreComing": false,
+                        "records": []
+                    }]
+                }));
+            }
+            Ok(serde_json::json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     fn make_one_photo_incremental_album_for_zone(
         zone: &str,
         zone_sync_token: &str,
@@ -3679,7 +3732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cycle_recent_full_download_does_not_store_zone_token() {
+    async fn run_cycle_recent_exact_inventory_stores_zone_token() {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let mut config = make_run_cycle_config();
         config.filters.recent = Some(40);
@@ -3722,20 +3775,15 @@ mod tests {
             db.get_metadata("sync_token:PrimarySync")
                 .await
                 .expect("read zone token"),
-            None,
-            "recent-limited full cycle must not persist a zone token"
+            Some("zone-tok-recent".to_owned()),
+            "an N+1 probe that proves exact EOF may persist the zone token"
         );
         let events = capture.events();
         assert!(
-            events.iter().any(|event| {
-                event.level == tracing::Level::INFO
-                    && event.field("reason") == Some("recent_limited_full_enumeration")
-                    && event.message().is_some_and(|message| {
-                        message.contains("--recent mode is bounded")
-                            && message.contains("does not persist a full enumeration sync token")
-                    })
-            }),
-            "recent-limited token suppression should log at info: {events:?}"
+            !events
+                .iter()
+                .any(|event| { event.field("reason") == Some("recent_limited_full_enumeration") }),
+            "an exact recent inventory must not report truncation: {events:?}"
         );
         assert!(
             !events.iter().any(|event| {
@@ -3767,17 +3815,17 @@ mod tests {
         assert!(
             events.iter().any(|event| {
                 event.level == tracing::Level::WARN
-                    && event.field("reason") == Some("icloud_blank_sync_token")
+                    && event.field("diagnostic") == Some("icloud_blank_sync_token")
                     && event
                         .message()
-                        .is_some_and(|message| message.contains("Sync token did not advance"))
+                        .is_some_and(|message| message.contains("Provider checkpoint preserved"))
             }),
             "true token-unsafe sync-token suppression should still warn: {events:?}"
         );
     }
 
     #[tokio::test]
-    async fn watch_recent_first_cycle_does_not_seed_incremental_token() {
+    async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         let mut config = make_run_cycle_config();
         config.filters.recent = Some(20);
         let db = make_state_db();
@@ -3818,7 +3866,7 @@ mod tests {
             db.get_metadata("sync_token:PrimarySync")
                 .await
                 .expect("read zone token"),
-            None
+            Some("zone-tok-watch".to_owned())
         );
         let next_mode = determine_sync_mode(
             false,
@@ -3829,13 +3877,13 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(next_mode, download::SyncMode::Full),
-            "a later watch cycle must not switch to incremental from a recent-limited token"
+            matches!(next_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "zone-tok-watch"),
+            "a later watch cycle should use the token from proved recent EOF"
         );
     }
 
     #[tokio::test]
-    async fn run_cycle_recent_multiple_libraries_downloads_each_zone_without_token_advance() {
+    async fn run_cycle_recent_exact_multiple_libraries_advance_each_zone() {
         let mut config = make_run_cycle_config();
         config.filters.recent = Some(20);
         let db = make_state_db();
@@ -3890,13 +3938,13 @@ mod tests {
             db.get_metadata("sync_token:PrimarySync")
                 .await
                 .expect("read primary token"),
-            None
+            Some("zone-tok-primary".to_owned())
         );
         assert_eq!(
             db.get_metadata("sync_token:SharedSync-TEST")
                 .await
                 .expect("read shared token"),
-            None
+            Some("zone-tok-shared".to_owned())
         );
     }
 
@@ -4124,11 +4172,6 @@ mod tests {
 
         fn with_get_failure(mut self, failure: MetadataSetFailure) -> Self {
             self.get_failure = Some(failure);
-            self
-        }
-
-        fn with_delete_prefix_failure(mut self, prefix: &'static str) -> Self {
-            self.delete_prefix_failure = Some(prefix);
             self
         }
 
@@ -4411,6 +4454,25 @@ mod tests {
             }
         }
 
+        async fn commit_checkpoint_transition(
+            &self,
+            transition: state::CheckpointTransition,
+        ) -> Result<(), state::error::StateError> {
+            if transition
+                .metadata_updates
+                .iter()
+                .any(|(key, _)| self.failure.matches(key))
+                || transition
+                    .metadata_deletes
+                    .iter()
+                    .any(|key| self.delete_prefix_failure == Some(key.as_str()))
+            {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner.commit_checkpoint_transition(transition).await
+            }
+        }
+
         async fn get_scoped_db_sync_token(
             &self,
             provider: &str,
@@ -4685,12 +4747,10 @@ mod tests {
         }
     }
 
-    /// `is_retry_failed=true` MUST force `SyncMode::Full` even when a
-    /// sync token is stored. A regression that picked Incremental during
-    /// retry-failed would silently skip the previously-failed assets the
-    /// user explicitly asked to retry — silent data loss.
+    /// Retry work is rehydrated independently from source enumeration, so a
+    /// stored provider checkpoint remains usable during `--retry-failed`.
     #[tokio::test]
-    async fn determine_sync_mode_retry_failed_with_token_returns_full() {
+    async fn determine_sync_mode_retry_failed_with_token_returns_incremental() {
         let db = make_state_db();
         let sync_token_key = "sync_token:PrimarySync";
         // Pre-populate a stored token so we can verify it is ignored.
@@ -4708,14 +4768,12 @@ mod tests {
         .await;
 
         assert!(
-            matches!(mode, download::SyncMode::Full),
-            "retry-failed must force Full, got {mode:?}"
+            matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
+            "retry-failed should keep source tracking incremental, got {mode:?}"
         );
     }
 
-    /// Retry-failed should ignore a stored token for its own run, but it must
-    /// not clear that token. A subsequent normal sync should still use
-    /// incremental mode from the previously stored token.
+    /// Retry-failed must neither consume nor clear the stored provider token.
     #[tokio::test]
     async fn determine_sync_mode_retry_failed_does_not_consume_or_clear_stored_token() {
         let db = make_state_db();
@@ -4727,8 +4785,8 @@ mod tests {
         let retry_mode =
             determine_sync_mode(true, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
         assert!(
-            matches!(retry_mode, download::SyncMode::Full),
-            "retry-failed must force Full, got {retry_mode:?}"
+            matches!(retry_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
+            "retry-failed should use the stored token, got {retry_mode:?}"
         );
 
         let normal_mode =
@@ -5863,7 +5921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cycle_config_hash_purge_failure_forces_full_without_persisting_hash() {
+    async fn run_cycle_config_hash_stage_failure_forces_full_without_replacing_checkpoint() {
         let config = make_run_cycle_config();
         let current_hash = download::compute_config_hash(&config);
         assert_ne!(current_hash, "old-hash");
@@ -5877,13 +5935,11 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn download::DownloadStore> = Arc::new(
-            FailingMetadataSetDb::without_set_failure(
-                Arc::clone(&inner),
-                "simulated token purge failure",
-            )
-            .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
-        );
+        let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
+            Arc::clone(&inner),
+            MetadataSetFailure::Exact(PENDING_ENUM_CONFIG_HASH_KEY),
+            "simulated pending hash write failure",
+        ));
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
@@ -5936,7 +5992,7 @@ mod tests {
                 .expect("read enum hash")
                 .as_deref(),
             Some("old-hash"),
-            "new hash must not be persisted when the stale-token purge failed"
+            "new hash must not become active when reconciliation could not be staged"
         );
         assert_eq!(
             inner
@@ -5944,13 +6000,205 @@ mod tests {
                 .await
                 .expect("read zone token")
                 .as_deref(),
-            Some("zone-tok-new"),
-            "the forced full pass should still refresh the selected zone token after success"
+            Some("zone-tok-prev"),
+            "failed reconciliation staging must preserve the last safe zone token"
         );
     }
 
     #[tokio::test]
-    async fn run_cycle_download_config_hash_drift_forces_full_reconciliation() {
+    async fn run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+            .await
+            .expect("seed active enum hash");
+        db.set_metadata("sync_token:PrimarySync", "prior-token")
+            .await
+            .expect("seed prior token");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(ConfigBridgeSession::new(
+                "PrimarySync",
+                "inventory-token",
+                "bridge-token",
+            )),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("inventory plus delta bridge should complete");
+
+        assert!(result.db_sync_token_advance_safe);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bridge-token")
+        );
+        let expected_hash = download::compute_config_hash(&config);
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_failed_token_repair_preserves_prior_sqlite_checkpoint() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "prior-token")
+            .await
+            .unwrap();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_empty_full_album(""),
+        );
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("failed token repair should preserve the active state");
+
+        assert!(!result.db_sync_token_advance_safe);
+        assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+        assert_eq!(result.stats.same_cycle_recovery_successes, 0);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("prior-token")
+        );
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("old-enum-hash")
+        );
+        assert!(db
+            .get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_partial_failure() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "primary-prior")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:SharedSync-TEST", "shared-prior")
+            .await
+            .unwrap();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let primary = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_full_album_with_boxed_session(
+                "PrimarySync",
+                Box::new(ConfigBridgeSession::new(
+                    "PrimarySync",
+                    "primary-inventory",
+                    "primary-bridge",
+                )),
+            ),
+        );
+        let shared = make_run_cycle_library_state_with_album(
+            "SharedSync-TEST",
+            "sync_token:SharedSync-TEST",
+            make_full_album_with_boxed_session(
+                "SharedSync-TEST",
+                Box::new(ConfigBridgeSession::new("SharedSync-TEST", "", "unused")),
+            ),
+        );
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&primary, &shared],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("partial multi-zone reconciliation should preserve active state");
+
+        assert!(!result.db_sync_token_advance_safe);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("primary-prior")
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:SharedSync-TEST")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("shared-prior")
+        );
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("old-enum-hash")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
         let config = make_run_cycle_config();
         let db = make_state_db();
         let old_download_dir = tempfile::tempdir().expect("old download tempdir");
@@ -5976,7 +6224,7 @@ mod tests {
         let lib_state = make_run_cycle_library_state_with_album(
             "PrimarySync",
             &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
-            make_empty_full_album("zone-tok-new"),
+            make_incremental_album("zone-tok-new"),
         );
         let states = vec![&lib_state];
         let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
@@ -5985,6 +6233,12 @@ mod tests {
             Arc::clone(&db),
             Arc::clone(&observed_modes),
         );
+        let new_hash = download::hash_download_config(&build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        ));
 
         let result = run_cycle(
             &states,
@@ -6000,16 +6254,15 @@ mod tests {
         .expect("run cycle");
 
         assert_eq!(result.failed_count, 0);
-        assert_eq!(
-            result.stats.full_enumeration_reason,
-            Some(download::FullEnumerationReason::DownloadConfigHashDrift)
-        );
+        assert_eq!(result.stats.full_enumeration_reason, None);
         let observed_modes = observed_modes.lock().expect("recorded modes lock").clone();
         assert!(
-            observed_modes
-                .iter()
-                .all(|mode| matches!(mode, download::SyncMode::Full)),
-            "path drift must not run an empty incremental pass against the old cursor: {observed_modes:?}"
+            matches!(
+                observed_modes.last(),
+                Some(download::SyncMode::Incremental { zone_sync_token })
+                    if zone_sync_token == "zone-tok-prev"
+            ),
+            "path-only drift must preserve incremental source tracking: {observed_modes:?}"
         );
         assert_eq!(
             db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
@@ -6017,7 +6270,21 @@ mod tests {
                 .expect("read zone token")
                 .as_deref(),
             Some("zone-tok-new"),
-            "the forced full pass should refresh the selected zone token after success"
+            "the incremental source pass should refresh the selected zone token after success"
+        );
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read active download hash")
+                .as_deref(),
+            Some(new_hash.as_str()),
+            "an empty catalog completes local path reconciliation immediately"
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read pending download hash"),
+            None
         );
     }
 
@@ -6314,15 +6581,15 @@ mod tests {
         assert_eq!(result.stats.failed, 1);
         assert_eq!(result.stats.downloaded, 0);
         assert!(
-            !result.db_sync_token_advance_safe,
-            "database precheck token must not advance after a download failure"
+            result.db_sync_token_advance_safe,
+            "durably queued transfer failure must not replay the provider delta"
         );
         assert_eq!(
             db.get_metadata("sync_token:PrimarySync")
                 .await
                 .expect("read zone token"),
-            None,
-            "partial sync must not store the post-fault zone token"
+            Some("zone-tok-after-fault".to_string()),
+            "source checkpoint may advance once failed transfer work is durable"
         );
 
         let failed = db.get_failed().await.expect("read failed assets");
@@ -6389,7 +6656,7 @@ mod tests {
         assert_eq!(result.stats.assets_seen, 0);
         assert_eq!(
             result.stats.full_enumeration_reason,
-            Some(download::FullEnumerationReason::ExplicitRetryFailed)
+            Some(download::FullEnumerationReason::NoStoredToken)
         );
         assert!(
             !logs_contain(ZERO_ASSET_WARNING_PREFIX),
@@ -6798,7 +7065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enum_config_hash_drift_clears_tokens_and_persists() {
+    async fn enum_config_hash_drift_stages_reconciliation_and_preserves_tokens() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-hash")
             .await
@@ -6821,23 +7088,33 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("new-hash"),
+            Some("old-hash"),
         );
-        // Every sync_token:* row must clear, including shared zones.
-        assert!(db
-            .get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
-            .await
-            .unwrap()
-            .is_none());
-        assert!(db
-            .get_metadata(&format!("{SYNC_TOKEN_PREFIX}SharedSync-AAAA1111"))
-            .await
-            .unwrap()
-            .is_none());
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-hash")
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-primary")
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}SharedSync-AAAA1111"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-shared")
+        );
     }
 
     #[tokio::test]
-    async fn enum_config_hash_purge_failure_keeps_old_hash_and_tokens() {
+    async fn enum_config_hash_stage_failure_keeps_old_hash_and_tokens() {
         let inner = make_state_db();
         inner
             .set_metadata(ENUM_CONFIG_HASH_KEY, "old-hash")
@@ -6847,13 +7124,11 @@ mod tests {
             .set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "old-zone-token")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn download::DownloadStore> = Arc::new(
-            FailingMetadataSetDb::without_set_failure(
-                Arc::clone(&inner),
-                "simulated token purge failure",
-            )
-            .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
-        );
+        let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
+            Arc::clone(&inner),
+            MetadataSetFailure::Exact(PENDING_ENUM_CONFIG_HASH_KEY),
+            "simulated pending hash write failure",
+        ));
 
         let outcome = check_and_persist_enum_config_hash(db.as_ref(), "new-hash").await;
 
@@ -6865,7 +7140,7 @@ mod tests {
                 .expect("read enum hash")
                 .as_deref(),
             Some("old-hash"),
-            "new hash must not be persisted while old sync tokens may still exist"
+            "new hash must not become active before reconciliation"
         );
         assert_eq!(
             inner
@@ -6874,7 +7149,7 @@ mod tests {
                 .expect("read zone token")
                 .as_deref(),
             Some("old-zone-token"),
-            "the test must prove the stale token survived the failed purge"
+            "the last safe token must survive a failed reconciliation-stage write"
         );
     }
 
@@ -6901,7 +7176,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_config_hash_drift_clears_token() {
+    async fn enum_config_revert_clears_pending_reconciliation() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "active-hash")
+            .await
+            .unwrap();
+        db.set_metadata(PENDING_ENUM_CONFIG_HASH_KEY, "abandoned-hash")
+            .await
+            .unwrap();
+
+        let outcome = check_and_persist_enum_config_hash(&db, "active-hash").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Unchanged);
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_hash_drift_stages_reconciliation_without_clearing_token() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "old-download-hash")
             .await
@@ -6917,15 +7211,22 @@ mod tests {
             db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
                 .await
                 .unwrap(),
-            None,
-            "path hash drift cannot leave an old incremental cursor in place"
+            Some("tok-keep".to_string()),
+            "path drift must preserve the active provider cursor"
         );
         assert_eq!(
             db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
                 .await
                 .unwrap(),
+            Some("old-download-hash".to_string()),
+            "the active path hash changes only after reconciliation"
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap(),
             Some("current-download-hash".to_string()),
-            "the cycle owner must persist the stable run-level path hash"
+            "the candidate path hash must be durable while reconciliation runs"
         );
     }
 
@@ -6954,6 +7255,27 @@ mod tests {
                 .as_deref(),
             Some("tok-keep"),
             "initial hash persistence must not purge existing tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_revert_clears_pending_reconciliation() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "active-hash")
+            .await
+            .unwrap();
+        db.set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, "abandoned-hash")
+            .await
+            .unwrap();
+
+        let outcome = check_download_config_hash_for_cycle(&db, "active-hash").await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap(),
+            None
         );
     }
 

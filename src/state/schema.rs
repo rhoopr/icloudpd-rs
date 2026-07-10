@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 15;
+pub(crate) const SCHEMA_VERSION: i32 = 16;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -447,6 +447,23 @@ GROUP BY membership.library, membership.asset_record_name
 HAVING COUNT(DISTINCT membership.master_record_name) = 1;
 ";
 
+/// V16 durable provider-verification state for unresolved retry rows.
+const SCHEMA_V16: &str = r"
+CREATE TABLE IF NOT EXISTS asset_verifications (
+    library TEXT NOT NULL,
+    id TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('unknown', 'transient_failure')),
+    reason TEXT NOT NULL,
+    checked_at INTEGER NOT NULL,
+    PRIMARY KEY (library, id, version_size),
+    FOREIGN KEY (library, id, version_size)
+        REFERENCES assets (library, id, version_size) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_asset_verifications_state
+    ON asset_verifications (state, checked_at);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -599,6 +616,7 @@ fn migrate_to_version(
         }
         14 => conn.execute_batch(SCHEMA_V14)?,
         15 => conn.execute_batch(SCHEMA_V15)?,
+        16 => conn.execute_batch(SCHEMA_V16)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1806,6 +1824,32 @@ mod tests {
             exists, 1,
             "v15 must create idx_asset_master_mappings_master"
         );
+    }
+
+    #[test]
+    fn test_v16_creates_asset_verifications_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'asset_verifications'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        for column in [
+            "library",
+            "id",
+            "version_size",
+            "state",
+            "reason",
+            "checked_at",
+        ] {
+            assert!(column_exists(&conn, "asset_verifications", column).unwrap());
+        }
     }
 
     #[test]

@@ -489,6 +489,18 @@ pub struct SyncSummary {
     pub pending: u64,
     /// Number of assets that failed to download.
     pub failed: u64,
+    /// Pending or failed rows whose targeted provider lookup was inconclusive.
+    pub awaiting_provider_verification: u64,
+    /// Provider-confirmed deletions retained as catalog history.
+    pub source_deleted: u64,
+    /// Oldest unresolved targeted provider verification.
+    pub oldest_provider_verification_at: Option<DateTime<Utc>>,
+    /// Last provider checkpoint decision recorded by the cycle owner.
+    pub provider_checkpoint_status: Option<String>,
+    /// Last bounded recovery action selected by the cycle owner.
+    pub last_recovery_action: Option<String>,
+    /// Last reason that selected full provider enumeration.
+    pub last_full_enumeration_reason: Option<String>,
     /// Total size in bytes of downloaded assets.
     pub downloaded_bytes: u64,
     /// Time of the newest sync run that is still marked running.

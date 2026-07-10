@@ -96,6 +96,27 @@ pub(crate) struct ScopedDbSyncToken {
     pub(crate) token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckpointTransition {
+    pub(crate) metadata_updates: Vec<(String, String)>,
+    pub(crate) metadata_deletes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetVerificationState {
+    Unknown,
+    TransientFailure,
+}
+
+impl AssetVerificationState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::TransientFailure => "transient_failure",
+        }
+    }
+}
+
 /// State operations used by the download producer and finalizer.
 #[allow(
     dead_code,
@@ -192,6 +213,31 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<Option<String>, StateError> {
         Ok(None)
     }
+    async fn get_asset_record_names_for_master(
+        &self,
+        _library: &str,
+        _master_record_name: &str,
+    ) -> Result<Vec<String>, StateError> {
+        Ok(Vec::new())
+    }
+    async fn set_asset_verification(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version_size: &str,
+        _state: AssetVerificationState,
+        _reason: &str,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
+    async fn clear_asset_verification(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version_size: &str,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
     async fn backfill_asset_master_mappings_from_album_memberships(
         &self,
     ) -> Result<u64, StateError> {
@@ -221,10 +267,9 @@ pub trait DownloadStateStore: Send + Sync {
     }
     /// Resolve a provider delete while respecting local download state.
     ///
-    /// Downloaded rows stay in the catalog with a source tombstone so kei can
-    /// keep reporting locally protected files. Pending/failed rows are removed:
-    /// there is no source left to retry, and keeping them would create stale
-    /// unresolved work.
+    /// Every row stays in the catalog with a source tombstone so kei retains
+    /// provider history and local-file evidence. Actionable retry and status
+    /// readers exclude tombstoned pending/failed rows.
     async fn resolve_source_deleted_affected(
         &self,
         library: &str,
@@ -322,6 +367,15 @@ pub trait SyncTokenStore: Send + Sync {
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
+    async fn commit_checkpoint_transition(
+        &self,
+        _transition: CheckpointTransition,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "commit_checkpoint_transition",
+            detail: "atomic checkpoint transitions are not implemented by this state store".into(),
+        })
+    }
     async fn get_scoped_db_sync_token(
         &self,
         _provider: &str,
@@ -852,7 +906,7 @@ fn update_status_to_downloaded(
     let mut stmt = conn
         .prepare_cached(
             "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-             local_checksum = ?3, download_checksum = ?4, last_error = NULL \
+             local_checksum = ?3, download_checksum = COALESCE(?4, download_checksum), last_error = NULL \
              WHERE library = ?5 AND id = ?6 AND version_size = ?7",
         )
         .map_err(|e| StateError::query("mark_downloaded::prepare", e))?;
@@ -1202,7 +1256,7 @@ impl SqliteStateDb {
     pub(crate) async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
         self.with_conn("get_failed", move |conn| {
             let sql = format!(
-                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' AND is_deleted = 0 \
                  ORDER BY last_seen_at DESC",
             );
             let mut stmt = conn
@@ -1227,14 +1281,14 @@ impl SqliteStateDb {
         self.with_conn("get_failed_sample", move |conn| {
             let total: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM assets WHERE status = 'failed'",
+                    "SELECT COUNT(*) FROM assets WHERE status = 'failed' AND is_deleted = 0",
                     [],
                     |row| row.get(0),
                 )
                 .map_err(|e| StateError::query("get_failed_sample", e))?;
 
             let sql = format!(
-                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' AND is_deleted = 0 \
                  ORDER BY last_seen_at DESC LIMIT ?1",
             );
             let mut stmt = conn
@@ -1261,7 +1315,7 @@ impl SqliteStateDb {
     pub(crate) async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
         self.with_conn("get_pending", move |conn| {
             let sql = format!(
-                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' AND is_deleted = 0 \
                  ORDER BY last_seen_at DESC",
             );
             let mut stmt = conn
@@ -1286,7 +1340,7 @@ impl SqliteStateDb {
     ) -> Result<Vec<AssetRecord>, StateError> {
         self.with_conn("get_failed_page", move |conn| {
             let sql = format!(
-                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' AND is_deleted = 0 \
                  ORDER BY last_seen_at DESC LIMIT ?1 OFFSET ?2",
             );
             let mut stmt = conn
@@ -1319,7 +1373,7 @@ impl SqliteStateDb {
     ) -> Result<Vec<AssetRecord>, StateError> {
         self.with_conn("get_pending_page", move |conn| {
             let sql = format!(
-                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' AND is_deleted = 0 \
                  ORDER BY last_seen_at DESC LIMIT ?1 OFFSET ?2",
             );
             let mut stmt = conn
@@ -1347,13 +1401,14 @@ impl SqliteStateDb {
 
     pub(crate) async fn get_summary(&self) -> Result<SyncSummary, StateError> {
         self.with_conn("get_summary", move |conn| {
-            let (total_assets, downloaded, pending, failed, downloaded_bytes) = conn
+            let (total_assets, downloaded, pending, failed, source_deleted, downloaded_bytes) = conn
                 .query_row(
                     "SELECT \
                          COUNT(*), \
                          COUNT(CASE WHEN status = 'downloaded' THEN 1 END), \
-                         COUNT(CASE WHEN status = 'pending' THEN 1 END), \
-                         COUNT(CASE WHEN status = 'failed' THEN 1 END), \
+                         COUNT(CASE WHEN status = 'pending' AND is_deleted = 0 THEN 1 END), \
+                         COUNT(CASE WHEN status = 'failed' AND is_deleted = 0 THEN 1 END), \
+                         COUNT(CASE WHEN is_deleted = 1 THEN 1 END), \
                          COALESCE(SUM(CASE WHEN status = 'downloaded' THEN size_bytes ELSE 0 END), 0) \
                      FROM assets",
                     [],
@@ -1364,19 +1419,66 @@ impl SqliteStateDb {
                             row.get::<_, i64>(2)?,
                             row.get::<_, i64>(3)?,
                             row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
                         ))
                     },
                 )
-                .map(|(t, d, p, f, b)| {
+                .map(|(t, d, p, f, s, b)| {
                     (
                         u64::try_from(t).unwrap_or(0),
                         u64::try_from(d).unwrap_or(0),
                         u64::try_from(p).unwrap_or(0),
                         u64::try_from(f).unwrap_or(0),
+                        u64::try_from(s).unwrap_or(0),
                         u64::try_from(b).unwrap_or(0),
                     )
                 })
                 .map_err(|e| StateError::query("get_summary", e))?;
+            let awaiting_provider_verification: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM asset_verifications AS verification \
+                     JOIN assets \
+                       ON assets.library = verification.library \
+                      AND assets.id = verification.id \
+                      AND assets.version_size = verification.version_size \
+                     WHERE assets.status IN ('pending', 'failed') AND assets.is_deleted = 0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| u64::try_from(count).unwrap_or(0))
+                .map_err(|e| StateError::query("get_summary::provider_verification", e))?;
+            let oldest_provider_verification_at = conn
+                .query_row(
+                    "SELECT MIN(verification.checked_at) FROM asset_verifications AS verification \
+                     JOIN assets \
+                       ON assets.library = verification.library \
+                      AND assets.id = verification.id \
+                      AND assets.version_size = verification.version_size \
+                     WHERE assets.status IN ('pending', 'failed') AND assets.is_deleted = 0",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(|e| StateError::query("get_summary::oldest_provider_verification", e))?
+                .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
+            let metadata_value = |key: &str| {
+                conn.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+            };
+            let mut provider_checkpoint_status = metadata_value("last_checkpoint_status")
+                .map_err(|e| StateError::query("get_summary::checkpoint_status", e))?;
+            if provider_checkpoint_status.is_none() {
+                let token_exists = conn
+                    .prepare("SELECT 1 FROM metadata WHERE key LIKE 'sync_token:%' LIMIT 1")
+                    .and_then(|mut stmt| stmt.exists([]))
+                    .map_err(|e| StateError::query("get_summary::checkpoint_exists", e))?;
+                provider_checkpoint_status = token_exists.then(|| "current".to_owned());
+            }
+            let last_recovery_action = metadata_value("last_recovery_action")
+                .map_err(|e| StateError::query("get_summary::recovery_action", e))?;
+            let last_full_enumeration_reason = metadata_value("last_full_enumeration_reason")
+                .map_err(|e| StateError::query("get_summary::full_enumeration_reason", e))?;
 
             type LastSyncRow = (
                 Option<i64>,
@@ -1498,6 +1600,12 @@ impl SqliteStateDb {
                 downloaded,
                 pending,
                 failed,
+                awaiting_provider_verification,
+                source_deleted,
+                oldest_provider_verification_at,
+                provider_checkpoint_status,
+                last_recovery_action,
+                last_full_enumeration_reason,
                 downloaded_bytes,
                 active_sync_started,
                 active_enumeration_zones,
@@ -1785,13 +1893,13 @@ impl SqliteStateDb {
             let failed = if let Some(library) = library.as_deref() {
                 conn.execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
-                     WHERE status = 'failed' AND library = ?1",
+                     WHERE status = 'failed' AND is_deleted = 0 AND library = ?1",
                     rusqlite::params![library],
                 )
             } else {
                 conn.execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
-                     WHERE status = 'failed'",
+                     WHERE status = 'failed' AND is_deleted = 0",
                     [],
                 )
             }
@@ -1801,13 +1909,13 @@ impl SqliteStateDb {
             let pending = if let Some(library) = library.as_deref() {
                 conn.execute(
                     "UPDATE assets SET download_attempts = 0, last_error = NULL \
-                     WHERE status = 'pending' AND download_attempts > 0 AND library = ?1",
+                     WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0 AND library = ?1",
                     rusqlite::params![library],
                 )
             } else {
                 conn.execute(
                     "UPDATE assets SET download_attempts = 0, last_error = NULL \
-                     WHERE status = 'pending' AND download_attempts > 0",
+                     WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0",
                     [],
                 )
             }
@@ -1816,13 +1924,13 @@ impl SqliteStateDb {
 
             let total_pending: i64 = if let Some(library) = library.as_deref() {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM assets WHERE status = 'pending' AND library = ?1",
+                    "SELECT COUNT(*) FROM assets WHERE status = 'pending' AND is_deleted = 0 AND library = ?1",
                     rusqlite::params![library],
                     |row| row.get(0),
                 )
             } else {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
+                    "SELECT COUNT(*) FROM assets WHERE status = 'pending' AND is_deleted = 0",
                     [],
                     |row| row.get(0),
                 )
@@ -1838,29 +1946,9 @@ impl SqliteStateDb {
 
     pub(crate) async fn prune_source_deleted_retries(
         &self,
-        library: Option<&str>,
+        _library: Option<&str>,
     ) -> Result<u64, StateError> {
-        let library = library.map(ToOwned::to_owned);
-        self.with_conn("prune_source_deleted_retries", move |conn| {
-            let pruned = if let Some(library) = library.as_deref() {
-                conn.execute(
-                    "DELETE FROM assets \
-                     WHERE library = ?1 AND is_deleted = 1 AND status IN ('pending', 'failed')",
-                    rusqlite::params![library],
-                )
-            } else {
-                conn.execute(
-                    "DELETE FROM assets \
-                     WHERE is_deleted = 1 AND status IN ('pending', 'failed')",
-                    [],
-                )
-            }
-            .map_err(|e| StateError::query("prune_source_deleted_retries", e))?
-                as u64;
-
-            Ok(pruned)
-        })
-        .await
+        Ok(0)
     }
 
     pub(crate) async fn promote_pending_to_failed(
@@ -1875,7 +1963,13 @@ impl SqliteStateDb {
             let promoted = conn
                 .execute(
                     "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
-                     WHERE status = 'pending' AND last_seen_at >= ?1",
+                     WHERE status = 'pending' AND last_seen_at >= ?1 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM asset_verifications AS verification \
+                         WHERE verification.library = assets.library \
+                           AND verification.id = assets.id \
+                           AND verification.version_size = assets.version_size \
+                       )",
                     rusqlite::params![seen_since],
                 )
                 .map_err(|e| StateError::query("promote_pending_to_failed", e))?
@@ -2161,6 +2255,33 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
 
             Ok(deleted as u64)
+        })
+        .await
+    }
+
+    pub(crate) async fn commit_checkpoint_transition(
+        &self,
+        transition: CheckpointTransition,
+    ) -> Result<(), StateError> {
+        self.with_conn_mut("commit_checkpoint_transition", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("commit_checkpoint_transition::begin", e))?;
+            for (key, value) in transition.metadata_updates {
+                tx.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![key, value],
+                )
+                .map_err(|e| StateError::query("commit_checkpoint_transition::update", e))?;
+            }
+            for key in transition.metadata_deletes {
+                tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
+                    .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("commit_checkpoint_transition::commit", e))?;
+            Ok(())
         })
         .await
     }
@@ -2790,6 +2911,89 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_asset_record_names_for_master(
+        &self,
+        library: &str,
+        master_record_name: &str,
+    ) -> Result<Vec<String>, StateError> {
+        let library = library.to_owned();
+        let master_record_name = master_record_name.to_owned();
+        self.with_conn("get_asset_record_names_for_master", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT asset_record_name FROM asset_master_mappings \
+                     WHERE library = ?1 AND master_record_name = ?2 \
+                     ORDER BY asset_record_name",
+                )
+                .map_err(|e| StateError::query("get_asset_record_names_for_master::prepare", e))?;
+            let rows = stmt
+                .query_map(rusqlite::params![library, master_record_name], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| StateError::query("get_asset_record_names_for_master::query", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_asset_record_names_for_master::row", e))?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub(crate) async fn set_asset_verification(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        state: AssetVerificationState,
+        reason: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let id = id.to_owned();
+        let version_size = version_size.to_owned();
+        let reason = reason.to_owned();
+        self.with_conn("set_asset_verification", move |conn| {
+            conn.execute(
+                "INSERT INTO asset_verifications \
+                    (library, id, version_size, state, reason, checked_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(library, id, version_size) DO UPDATE SET \
+                    state = excluded.state, reason = excluded.reason, \
+                    checked_at = excluded.checked_at",
+                rusqlite::params![
+                    library,
+                    id,
+                    version_size,
+                    state.as_str(),
+                    reason,
+                    Utc::now().timestamp()
+                ],
+            )
+            .map_err(|e| StateError::query("set_asset_verification", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn clear_asset_verification(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let id = id.to_owned();
+        let version_size = version_size.to_owned();
+        self.with_conn("clear_asset_verification", move |conn| {
+            conn.execute(
+                "DELETE FROM asset_verifications \
+                 WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+                rusqlite::params![library, id, version_size],
+            )
+            .map_err(|e| StateError::query("clear_asset_verification", e))?;
+            Ok(())
+        })
+        .await
+    }
+
     pub(crate) async fn backfill_asset_master_mappings_from_album_memberships(
         &self,
     ) -> Result<u64, StateError> {
@@ -2868,20 +3072,18 @@ impl SqliteStateDb {
             let marked = tx
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-                     WHERE library = ?2 AND id = ?3 AND status = 'downloaded'",
+                     WHERE library = ?2 AND id = ?3",
                     rusqlite::params![deleted_at.map(|dt| dt.timestamp()), library, asset_id],
                 )
                 .map_err(|e| StateError::query("resolve_source_deleted::mark", e))?;
-            let pruned = tx
-                .execute(
-                    "DELETE FROM assets \
-                     WHERE library = ?1 AND id = ?2 AND status IN ('pending', 'failed')",
-                    rusqlite::params![&library, &asset_id],
-                )
-                .map_err(|e| StateError::query("resolve_source_deleted::prune", e))?;
+            tx.execute(
+                "DELETE FROM asset_verifications WHERE library = ?1 AND id = ?2",
+                rusqlite::params![&library, &asset_id],
+            )
+            .map_err(|e| StateError::query("resolve_source_deleted::clear_verification", e))?;
             tx.commit()
                 .map_err(|e| StateError::query("resolve_source_deleted::commit", e))?;
-            Ok(marked + pruned)
+            Ok(marked)
         })
         .await
     }
@@ -2929,7 +3131,7 @@ impl SqliteStateDb {
             let marked = tx
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
-                     WHERE library = ?2 AND status = 'downloaded' AND (id = ?3 OR id IN ( \
+                     WHERE library = ?2 AND (id = ?3 OR id IN ( \
                         SELECT asset_record_name FROM asset_master_mappings \
                         WHERE library = ?2 AND master_record_name = ?3 \
                      ))",
@@ -2940,19 +3142,24 @@ impl SqliteStateDb {
                     ],
                 )
                 .map_err(|e| StateError::query("resolve_master_family_source_deleted::mark", e))?;
-            let pruned = tx
-                .execute(
-                    "DELETE FROM assets \
-                     WHERE library = ?1 AND status IN ('pending', 'failed') AND (id = ?2 OR id IN ( \
-                        SELECT asset_record_name FROM asset_master_mappings \
-                        WHERE library = ?1 AND master_record_name = ?2 \
-                     ))",
-                    rusqlite::params![&library, &master_record_name],
+            tx.execute(
+                "DELETE FROM asset_verifications \
+                 WHERE library = ?1 AND (id = ?2 OR id IN ( \
+                    SELECT asset_record_name FROM asset_master_mappings \
+                    WHERE library = ?1 AND master_record_name = ?2 \
+                 ))",
+                rusqlite::params![&library, &master_record_name],
+            )
+            .map_err(|e| {
+                StateError::query(
+                    "resolve_master_family_source_deleted::clear_verification",
+                    e,
                 )
-                .map_err(|e| StateError::query("resolve_master_family_source_deleted::prune", e))?;
-            tx.commit()
-                .map_err(|e| StateError::query("resolve_master_family_source_deleted::commit", e))?;
-            Ok(marked + pruned)
+            })?;
+            tx.commit().map_err(|e| {
+                StateError::query("resolve_master_family_source_deleted::commit", e)
+            })?;
+            Ok(marked)
         })
         .await
     }
@@ -3291,6 +3498,34 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::get_master_record_name_for_asset(self, library, asset_record_name).await
     }
 
+    async fn get_asset_record_names_for_master(
+        &self,
+        library: &str,
+        master_record_name: &str,
+    ) -> Result<Vec<String>, StateError> {
+        SqliteStateDb::get_asset_record_names_for_master(self, library, master_record_name).await
+    }
+
+    async fn set_asset_verification(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        state: AssetVerificationState,
+        reason: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::set_asset_verification(self, library, id, version_size, state, reason).await
+    }
+
+    async fn clear_asset_verification(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::clear_asset_verification(self, library, id, version_size).await
+    }
+
     async fn backfill_asset_master_mappings_from_album_memberships(
         &self,
     ) -> Result<u64, StateError> {
@@ -3467,6 +3702,13 @@ impl SyncTokenStore for SqliteStateDb {
 
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
+    }
+
+    async fn commit_checkpoint_transition(
+        &self,
+        transition: CheckpointTransition,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::commit_checkpoint_transition(self, transition).await
     }
 
     async fn get_scoped_db_sync_token(
@@ -5660,6 +5902,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_transition_is_atomic() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.set_metadata("sync_token:zone", "old-token")
+            .await
+            .unwrap();
+        db.set_metadata("enum_config_hash", "old-hash")
+            .await
+            .unwrap();
+        db.set_metadata("pending_enum_config_hash", "new-hash")
+            .await
+            .unwrap();
+
+        db.with_conn("install_test_trigger", |conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_enum_hash_update \
+                 BEFORE UPDATE ON metadata \
+                 WHEN NEW.key = 'enum_config_hash' \
+                 BEGIN SELECT RAISE(ABORT, 'simulated promotion failure'); END;",
+            )
+            .map_err(|e| StateError::query("install_test_trigger", e))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let result = db
+            .commit_checkpoint_transition(CheckpointTransition {
+                metadata_updates: vec![
+                    ("sync_token:zone".into(), "new-token".into()),
+                    ("enum_config_hash".into(), "new-hash".into()),
+                ],
+                metadata_deletes: vec!["pending_enum_config_hash".into()],
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            db.get_metadata("sync_token:zone").await.unwrap().as_deref(),
+            Some("old-token")
+        );
+        assert_eq!(
+            db.get_metadata("enum_config_hash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("old-hash")
+        );
+        assert_eq!(
+            db.get_metadata("pending_enum_config_hash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-hash")
+        );
+    }
+
+    #[tokio::test]
     async fn test_delete_metadata_by_prefix() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -6487,6 +6786,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_verification_marker_keeps_inconclusive_row_pending() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("VERIFY_UNKNOWN").build();
+        db.upsert_seen(&record).await.unwrap();
+        db.set_asset_verification(
+            "PrimarySync",
+            "VERIFY_UNKNOWN",
+            "original",
+            AssetVerificationState::Unknown,
+            "lookup omitted record",
+        )
+        .await
+        .unwrap();
+
+        let promoted = db.promote_pending_to_failed(0).await.unwrap();
+        assert_eq!(promoted, 0);
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.awaiting_provider_verification, 1);
+
+        db.clear_asset_verification("PrimarySync", "VERIFY_UNKNOWN", "original")
+            .await
+            .unwrap();
+        assert_eq!(db.promote_pending_to_failed(0).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn open_corrupt_db_returns_error() {
         let dir = test_dir();
         let path = dir.path().join("corrupt.db");
@@ -7195,6 +7521,16 @@ mod tests {
         )
         .await
         .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DL_CK",
+            "original",
+            Path::new("/photos/reconciled/photo.jpg"),
+            "reconciled_local_sha256",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Verify via get_downloaded_page that the asset is downloaded
         let page = db.get_downloaded_page(0, 10).await.unwrap();
@@ -7202,8 +7538,8 @@ mod tests {
         assert_eq!(&*page[0].id, "DL_CK");
         assert_eq!(
             page[0].local_checksum.as_deref(),
-            Some("local_sha256"),
-            "local_checksum should be stored"
+            Some("reconciled_local_sha256"),
+            "the latest local checksum should be stored"
         );
         let conn = db.acquire_lock("verify download checksum").unwrap();
         let download_checksum: Option<String> = conn
@@ -7217,7 +7553,7 @@ mod tests {
         assert_eq!(
             download_checksum.as_deref(),
             Some("pre_exif_sha256"),
-            "download_checksum should preserve the pre-EXIF downloaded bytes hash"
+            "path reconciliation without downloaded-byte evidence must preserve the prior hash"
         );
     }
 
@@ -7830,19 +8166,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated, 2);
-        let pending = db.get_pending().await.unwrap();
-        assert_eq!(pending.len(), 2);
-        for rec in &pending {
-            assert!(
-                rec.metadata.is_deleted,
-                "is_deleted should be set for all versions"
-            );
-            assert_eq!(rec.metadata.deleted_at, Some(when));
-        }
+        assert!(db.get_pending().await.unwrap().is_empty());
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 2);
+        assert_eq!(summary.source_deleted, 2);
     }
 
     #[tokio::test]
-    async fn resolve_source_deleted_prunes_pending_and_failed_but_preserves_downloaded() {
+    async fn resolve_source_deleted_retains_history_and_preserves_downloaded() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let pending = TestAssetRecord::new("SRC_DEL")
             .version_size(VersionSizeKey::Original)
@@ -7896,10 +8227,13 @@ mod tests {
         assert!(downloaded[0].metadata.is_deleted);
         assert_eq!(downloaded[0].metadata.deleted_at, Some(deleted_at));
         assert_eq!(downloaded[0].local_path.as_deref(), Some(path.as_path()));
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 3);
+        assert_eq!(summary.source_deleted, 3);
     }
 
     #[tokio::test]
-    async fn resolve_master_family_source_deleted_prunes_pending_siblings() {
+    async fn resolve_master_family_source_deleted_excludes_pending_siblings() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         db.upsert_seen(&TestAssetRecord::new("MASTER_FAMILY").build())
             .await
@@ -7923,10 +8257,11 @@ mod tests {
         let pending = db.get_pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id.as_ref(), "OTHER_MASTER");
+        assert_eq!(db.get_summary().await.unwrap().source_deleted, 2);
     }
 
     #[tokio::test]
-    async fn prune_source_deleted_retries_removes_only_retry_tombstones() {
+    async fn source_deleted_retries_are_retained_but_not_actionable() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         db.upsert_seen(&TestAssetRecord::new("PENDING_DELETED").build())
             .await
@@ -7987,21 +8322,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(pruned, 2);
+        assert_eq!(pruned, 0);
         assert!(db.get_failed().await.unwrap().is_empty());
         let pending = db.get_pending().await.unwrap();
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 1);
         assert!(pending.iter().any(|record| {
             record.library.as_ref() == "PrimarySync" && record.id.as_ref() == "PENDING_LIVE"
-        }));
-        assert!(pending.iter().any(|record| {
-            record.library.as_ref() == "SharedSync-AAAA" && record.id.as_ref() == "SHARED_DELETED"
         }));
         let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(downloaded.len(), 1);
         assert_eq!(downloaded[0].id.as_ref(), "DOWNLOADED_DELETED");
         assert!(downloaded[0].metadata.is_deleted);
         assert_eq!(downloaded[0].local_path.as_deref(), Some(path.as_path()));
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 5);
+        assert_eq!(summary.source_deleted, 4);
     }
 
     #[tokio::test]

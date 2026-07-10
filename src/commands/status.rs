@@ -37,7 +37,29 @@ pub(crate) async fn run_status(
     println!("  Downloaded: {}", summary.downloaded);
     println!("  Pending:    {}", summary.pending);
     println!("  Failed:     {}", summary.failed);
+    println!("  Source deleted: {}", summary.source_deleted);
+    println!(
+        "  Awaiting provider verification: {}",
+        summary.awaiting_provider_verification
+    );
     println!();
+    println!(
+        "Provider checkpoint: {}",
+        summary
+            .provider_checkpoint_status
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
+    if let Some(reason) = &summary.last_full_enumeration_reason {
+        println!("Last full-enumeration reason: {reason}");
+    }
+    if let Some(action) = summary
+        .last_recovery_action
+        .as_deref()
+        .filter(|action| *action != "none")
+    {
+        println!("Last recovery action: {action}");
+    }
     println!("{}", backup_status_line(&summary));
     println!();
 
@@ -168,6 +190,12 @@ fn backup_status_line(summary: &state::types::SyncSummary) -> String {
             "{} {}",
             count_phrase(summary.pending, "pending asset"),
             remain_verb(summary.pending)
+        ));
+    }
+    if summary.awaiting_provider_verification > 0 {
+        reasons.push(format!(
+            "{} awaiting provider verification",
+            count_phrase(summary.awaiting_provider_verification, "asset")
         ));
     }
     if summary.last_inventory_drop_detected {

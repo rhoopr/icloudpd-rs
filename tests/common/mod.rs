@@ -1,6 +1,7 @@
 // Shared test utilities -- not all functions are used by every test file.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -14,6 +15,57 @@ const CLOUDKIT_STALE_SESSION_MARKER: &str = "HTTP 401 for https://";
 
 /// Cached auth credentials for reactive session refresh mid-run.
 static AUTH_CREDS: OnceLock<(String, String, PathBuf)> = OnceLock::new();
+
+thread_local! {
+    /// Keep each live test's isolated state directory alive for the lifetime
+    /// of its test thread. Auth material is copied in, while the SQLite state
+    /// DB starts empty so one test's download/config choices cannot leave
+    /// durable pending work that changes another test's result.
+    static ISOLATED_DATA_DIR: RefCell<Option<tempfile::TempDir>> = const { RefCell::new(None) };
+}
+
+fn copy_auth_material(username: &str, source: &Path, destination: &Path) {
+    let sanitized: String = username
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    for name in [
+        sanitized.clone(),
+        format!("{sanitized}.session"),
+        format!("{sanitized}.cache"),
+    ] {
+        let source_path = source.join(&name);
+        if source_path.is_file() {
+            std::fs::copy(&source_path, destination.join(&name)).unwrap_or_else(|error| {
+                panic!(
+                    "copy live-test auth material {}: {error}",
+                    source_path.display()
+                )
+            });
+        }
+    }
+}
+
+fn isolated_data_dir(username: &str, shared_cookie_dir: &Path) -> PathBuf {
+    ISOLATED_DATA_DIR.with(|slot| {
+        let dir = tempfile::Builder::new()
+            .prefix("kei-live-state-")
+            .tempdir()
+            .expect("create isolated live-test data dir");
+        copy_auth_material(username, shared_cookie_dir, dir.path());
+        let path = dir.path().to_path_buf();
+        *slot.borrow_mut() = Some(dir);
+        path
+    })
+}
+
+fn refresh_isolated_auth_material(username: &str, shared_cookie_dir: &Path) {
+    ISOLATED_DATA_DIR.with(|slot| {
+        if let Some(dir) = slot.borrow().as_ref() {
+            copy_auth_material(username, shared_cookie_dir, dir.path());
+        }
+    });
+}
 
 /// Load `.env` exactly once across all test functions.
 fn init_env() {
@@ -230,6 +282,7 @@ fn refresh_auth() {
         .expect("failed to run login");
 
     if output.status.success() {
+        refresh_isolated_auth_material(username, cookie_dir);
         eprintln!("Session refreshed OK.");
         return;
     }
@@ -304,8 +357,9 @@ pub(crate) fn is_retryable_auth_failure(msg: &str) -> bool {
 
 /// Require a pre-authenticated session. Returns `(username, password, cookie_dir)`.
 ///
-/// All tests share the same cookie directory so only one Apple API session
-/// is used per test run. **Auth-requiring tests must run single-threaded:**
+/// All tests share one pre-authenticated session source, then copy its auth
+/// material into an isolated data directory so SQLite state does not leak
+/// between tests. **Auth-requiring tests must run single-threaded:**
 ///
 /// ```sh
 /// cargo test --test sync -- --ignored --test-threads=1
@@ -326,7 +380,8 @@ pub fn require_preauth() -> (String, String, PathBuf) {
     let dir = cookie_dir();
     AUTH_CREDS.get_or_init(|| (username.clone(), password.clone(), dir.clone()));
     ensure_session(&username, &password, &dir);
-    (username, password, dir)
+    let isolated_dir = isolated_data_dir(&username, &dir);
+    (username, password, isolated_dir)
 }
 
 /// Strip ANSI escape sequences from a string (for log assertions).

@@ -378,6 +378,23 @@ pub async fn retry_post(
     .await
 }
 
+/// Retry transport and HTTP failures while leaving record-level CloudKit
+/// errors in the response for a batch-aware caller to classify. This is used
+/// by `/records/lookup`, where one explicit `UNKNOWN_ITEM` is a successful
+/// deletion result and must not fail unrelated records in the same batch.
+pub(crate) async fn retry_post_allowing_record_errors(
+    session: &dyn PhotosSession,
+    url: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+    retry_config: &RetryConfig,
+) -> anyhow::Result<Value> {
+    retry::retry_with_backoff(retry_config, classify_api_error, || async {
+        session.post(url, body.to_owned(), headers).await
+    })
+    .await
+}
+
 /// Errors from `changes/zone` when syncToken is invalid.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncTokenError {

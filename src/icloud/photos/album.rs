@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -28,7 +28,7 @@ use crate::retry::RetryConfig;
 /// Set conservatively so a multi-page run of fully-deleted records does
 /// not silently truncate enumeration; the cost on true EOF is at most
 /// `MAX_EMPTY_PAGE_PROBES - 1` extra empty requests per fetcher.
-const MAX_EMPTY_PAGE_PROBES: u32 = 5;
+pub(crate) const MAX_EMPTY_PAGE_PROBES: u32 = 5;
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
 pub(crate) const QUERY_ALL_LIST: &str = "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted";
 pub(crate) const QUERY_ALL_OBJ: &str = "CPLAssetByAssetDateWithoutHiddenOrDeleted";
@@ -36,6 +36,75 @@ pub(crate) const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate"
 
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
+
+const RECORD_LOOKUP_BATCH_SIZE: usize = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProviderRecordId(Arc<str>);
+
+impl ProviderRecordId {
+    pub(crate) fn new(value: impl Into<Arc<str>>) -> Self {
+        Self(value.into())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordLookupRequest {
+    pub(crate) state_id: ProviderRecordId,
+    pub(crate) master_record_name: ProviderRecordId,
+    pub(crate) asset_record_name: ProviderRecordId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ProviderLookupError {
+    #[error("provider authentication failed with HTTP {status}: {message}")]
+    Authentication { status: u16, message: String },
+    #[error("provider record lookup was rate limited with HTTP {status}: {message}")]
+    RateLimited { status: u16, message: String },
+    #[error("provider record lookup request failed: {0}")]
+    Request(String),
+    #[error("provider record lookup response was malformed: {0}")]
+    Malformed(String),
+}
+
+fn classify_provider_lookup_error(error: &anyhow::Error) -> ProviderLookupError {
+    let message = error.to_string();
+    let Some(http) = error.downcast_ref::<super::session::HttpStatusError>() else {
+        return ProviderLookupError::Request(message);
+    };
+    match http.status {
+        401 | 403 | 421 => ProviderLookupError::Authentication {
+            status: http.status,
+            message,
+        },
+        429 | 503 => ProviderLookupError::RateLimited {
+            status: http.status,
+            message,
+        },
+        _ => ProviderLookupError::Request(message),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RecordResolution {
+    Present(PhotoAsset),
+    Deleted {
+        deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        master_family: bool,
+    },
+    Unknown,
+    TransientFailure(ProviderLookupError),
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordResolutionBatch {
+    pub(crate) results: Vec<(ProviderRecordId, RecordResolution)>,
+    pub(crate) complete: bool,
+}
 
 fn prune_paired_master_cache(
     paired_masters: &mut FxHashMap<String, super::cloudkit::Record>,
@@ -120,10 +189,31 @@ impl PhotoStreamProfile {
             Self::BackpressuredDownload { .. } => 1,
         }
     }
+}
 
-    fn allow_initial_boundary_probe(self) -> bool {
-        matches!(self, Self::FastEnumeration { .. })
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetcherRangeRole {
+    /// Count-partitioned work that covers a known rank interval.
+    Data,
+    /// The single owner that scans past the count hint until natural EOF.
+    TailProof,
+    /// A bounded stream that must inspect one more eligible asset to prove
+    /// whether the caller's limit truncated the inventory.
+    LimitProbe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumerationFailure {
+    FetcherError,
+    ConsumerDropped,
+    UnpairedRecords,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumerationCompletion {
+    ProvenEof,
+    UserBoundReached,
+    Incomplete(EnumerationFailure),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +221,7 @@ struct FetcherRange {
     start: u64,
     end: u64,
     limit: Option<u32>,
-    suppress_token_on_limit: bool,
+    role: FetcherRangeRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,13 +287,7 @@ fn range_limit(limit: Option<u32>, start: u64, end: u64) -> Option<u32> {
     })
 }
 
-fn push_fetcher_range(
-    ranges: &mut Vec<FetcherRange>,
-    limit: Option<u32>,
-    start: u64,
-    end: u64,
-    suppress_token_on_limit: bool,
-) {
+fn push_fetcher_range(ranges: &mut Vec<FetcherRange>, limit: Option<u32>, start: u64, end: u64) {
     if start >= end {
         return;
     }
@@ -211,7 +295,7 @@ fn push_fetcher_range(
         start,
         end,
         limit: range_limit(limit, start, end),
-        suppress_token_on_limit,
+        role: FetcherRangeRole::Data,
     });
 }
 
@@ -222,76 +306,83 @@ fn build_enumeration_plan(
     profile: PhotoStreamProfile,
 ) -> EnumerationPlan {
     let page_size = profile.request_page_size(default_page_size);
-    let Some(total) = effective_total(limit, total_count).map(|total| total.max(1)) else {
+    // A caller limit needs an ordered N+1 probe. Running count-partitioned
+    // ranges in parallel cannot prove which asset is the first item beyond
+    // the bound, and historically `limit == count` was incorrectly treated
+    // as EOF. Keep bounded streams sequential and use the count only as a
+    // scheduling hint for unbounded inventories.
+    if let Some(limit) = limit {
         return EnumerationPlan {
             page_size,
             ranges: vec![FetcherRange {
                 start: 0,
                 end: u64::MAX,
-                limit,
-                suppress_token_on_limit: limit.is_some(),
+                limit: Some(limit),
+                role: FetcherRangeRole::LimitProbe,
+            }],
+        };
+    }
+
+    let Some(total) = total_count else {
+        return EnumerationPlan {
+            page_size,
+            ranges: vec![FetcherRange {
+                start: 0,
+                end: u64::MAX,
+                limit: None,
+                role: FetcherRangeRole::TailProof,
             }],
         };
     };
 
+    // Download streams deliberately keep one ordered fetcher so signed URLs
+    // stay near their consumers. Let that fetcher own EOF proof directly
+    // rather than stopping at the count hint and starting a concurrent tail.
+    if matches!(profile, PhotoStreamProfile::BackpressuredDownload { .. })
+        || profile.fetcher_concurrency() == 1
+    {
+        return EnumerationPlan {
+            page_size,
+            ranges: vec![FetcherRange {
+                start: 0,
+                end: u64::MAX,
+                limit: None,
+                role: FetcherRangeRole::TailProof,
+            }],
+        };
+    }
+
     let concurrency = profile.fetcher_concurrency();
-    let num_fetchers = if concurrency > 1 {
+    let num_fetchers = if concurrency > 1 && total > 0 {
         determine_fetcher_count(total, page_size, concurrency * 2)
     } else {
         1
     };
-    let suppress_token_on_limit = match (limit, total_count) {
-        (Some(lim), Some(total_count)) => u64::from(lim) < total_count,
-        (Some(_), None) => true,
-        (None, _) => false,
-    };
-    let initial_boundary_probe = profile.allow_initial_boundary_probe()
-        && concurrency > 1
-        && total >= page_size as u64
-        && page_size > 1
-        && limit.is_some();
     let chunk_size_items = {
         let raw = total.div_ceil(num_fetchers as u64);
         let ps = page_size as u64;
         raw.div_ceil(ps) * ps
     };
 
-    let mut ranges = Vec::with_capacity(num_fetchers + usize::from(initial_boundary_probe) * 2);
+    let mut ranges = Vec::with_capacity(num_fetchers + 1);
     for i in 0..num_fetchers {
-        let mut start = i as u64 * chunk_size_items;
+        let start = i as u64 * chunk_size_items;
         let end = ((i as u64 + 1) * chunk_size_items).min(total);
         if start >= total {
             break;
         }
-        if initial_boundary_probe && i == 0 {
-            let boundary_start = page_size as u64 - 1;
-            let boundary_end = (page_size as u64).min(total);
-            ranges.push(FetcherRange {
-                start: boundary_start,
-                end: boundary_end,
-                limit: Some(1),
-                suppress_token_on_limit,
-            });
-            push_fetcher_range(
-                &mut ranges,
-                limit,
-                start,
-                end.min(boundary_start),
-                suppress_token_on_limit,
-            );
-            push_fetcher_range(
-                &mut ranges,
-                limit,
-                boundary_end,
-                end,
-                suppress_token_on_limit,
-            );
-            continue;
-        } else if initial_boundary_probe && i > 0 {
-            start = start.max(page_size as u64);
-        }
-        push_fetcher_range(&mut ranges, limit, start, end, suppress_token_on_limit);
+        push_fetcher_range(&mut ranges, None, start, end);
     }
+
+    // Counts are hints, not EOF proof. The final owner starts exactly where
+    // the count-partitioned ranges stop and continues until the provider's
+    // consecutive-empty-page policy proves natural EOF.
+    ranges.push(FetcherRange {
+        start: total,
+        end: u64::MAX,
+        limit: None,
+        role: FetcherRangeRole::TailProof,
+    });
 
     EnumerationPlan { page_size, ranges }
 }
@@ -306,6 +397,31 @@ fn log_fetcher_response(album: &str, response: &Value) {
         response = %response,
         "Fetcher response body",
     );
+}
+
+fn should_emit_asset_record(
+    record_name: &str,
+    range_start: u64,
+    range_role: FetcherRangeRole,
+    emitted_in_range: &mut FxHashSet<String>,
+    range_record_owners: &std::sync::Mutex<FxHashMap<String, u64>>,
+) -> bool {
+    if !matches!(range_role, FetcherRangeRole::Data)
+        && !emitted_in_range.insert(record_name.to_owned())
+    {
+        return false;
+    }
+
+    let Ok(mut owners) = range_record_owners.lock() else {
+        return true;
+    };
+    match owners.get(record_name) {
+        Some(owner) => *owner == range_start,
+        None => {
+            owners.insert(record_name.to_owned(), range_start);
+            true
+        }
+    }
 }
 
 /// Return a full-enumeration sync token only when every fetcher that reported
@@ -334,13 +450,20 @@ fn unanimous_fetcher_sync_token(album: &str, tokens: &[String]) -> Option<String
 
 #[derive(Debug, Default)]
 struct FetcherSyncTokenCapture {
-    tokens: tokio::sync::Mutex<Vec<String>>,
+    observations: tokio::sync::Mutex<Vec<(Option<String>, EnumerationCompletion)>>,
+    expected_fetchers: AtomicUsize,
+    completed_fetchers: AtomicUsize,
     suppressed: AtomicBool,
 }
 
 impl FetcherSyncTokenCapture {
-    async fn push(&self, token: String) {
-        self.tokens.lock().await.push(token);
+    fn expect(&self, fetchers: usize) {
+        self.expected_fetchers.store(fetchers, Ordering::Relaxed);
+    }
+
+    async fn complete(&self, token: Option<String>, completion: EnumerationCompletion) {
+        self.observations.lock().await.push((token, completion));
+        self.completed_fetchers.fetch_add(1, Ordering::Relaxed);
     }
 
     fn suppress(&self) {
@@ -356,8 +479,50 @@ impl FetcherSyncTokenCapture {
             return None;
         }
 
-        let tokens = self.tokens.lock().await;
-        unanimous_fetcher_sync_token(album, &tokens)
+        let expected = self.expected_fetchers.load(Ordering::Relaxed);
+        let completed = self.completed_fetchers.load(Ordering::Relaxed);
+        if completed != expected {
+            tracing::warn!(
+                album,
+                expected_fetchers = expected,
+                completed_fetchers = completed,
+                "Full enumeration did not receive completion evidence from every fetcher; blocking sync token advancement"
+            );
+            return None;
+        }
+
+        let observations = self.observations.lock().await;
+        if let Some(failure) = observations
+            .iter()
+            .find_map(|(_, completion)| match completion {
+                EnumerationCompletion::Incomplete(failure) => Some(*failure),
+                _ => None,
+            })
+        {
+            tracing::warn!(
+                album,
+                ?failure,
+                "Full enumeration was incomplete in a fetcher"
+            );
+            return None;
+        }
+        if observations
+            .iter()
+            .any(|(_, completion)| matches!(completion, EnumerationCompletion::UserBoundReached))
+        {
+            tracing::debug!(album, "Full enumeration stopped at a user bound");
+            return None;
+        }
+        let present = observations
+            .iter()
+            .filter_map(|(token, _)| token.as_ref())
+            .cloned()
+            .collect::<Vec<_>>();
+        // Completion is required from every fetcher, but CloudKit may omit a
+        // syncToken on an empty tail page. In that case the unanimous token
+        // observed by the completed data fetchers is still the pass token;
+        // an incomplete fetcher is rejected by the count above.
+        unanimous_fetcher_sync_token(album, &present)
     }
 }
 
@@ -649,6 +814,155 @@ impl PhotoAlbum {
             );
         }
         Ok(items)
+    }
+
+    /// Resolve durable pending identities without scanning the surrounding
+    /// album or library. Missing response members are inconclusive; only an
+    /// explicit CloudKit not-found result or tombstone is deletion evidence.
+    pub(crate) async fn resolve_records(
+        &self,
+        requests: &[RecordLookupRequest],
+    ) -> RecordResolutionBatch {
+        let mut results = Vec::with_capacity(requests.len());
+        let mut complete = true;
+        let url = format!(
+            "{}/records/lookup?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+
+        for batch in requests.chunks(RECORD_LOOKUP_BATCH_SIZE) {
+            let mut record_names = FxHashSet::default();
+            let mut records = Vec::with_capacity(batch.len().saturating_mul(2));
+            for request in batch {
+                for record_id in [&request.master_record_name, &request.asset_record_name] {
+                    if record_names.insert(record_id.as_str().to_string()) {
+                        records.push(json!({
+                            "recordName": record_id.as_str(),
+                        }));
+                    }
+                }
+            }
+            let body = json!({
+                "records": records,
+                "zoneID": self.zone_id.as_ref(),
+                "desiredKeys": &*DESIRED_KEYS_VALUES,
+            });
+            let response = match super::session::retry_post_allowing_record_errors(
+                self.session.as_ref(),
+                &url,
+                &body.to_string(),
+                &[("Content-type", "text/plain")],
+                &self.retry_config,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    complete = false;
+                    let error = classify_provider_lookup_error(&error);
+                    crate::metrics::record_targeted_lookup("transient_failure", batch.len());
+                    results.extend(batch.iter().map(|request| {
+                        (
+                            request.state_id.clone(),
+                            RecordResolution::TransientFailure(error.clone()),
+                        )
+                    }));
+                    continue;
+                }
+            };
+
+            let Some(response_records) = response.get("records").and_then(Value::as_array) else {
+                complete = false;
+                crate::metrics::record_targeted_lookup("transient_failure", batch.len());
+                results.extend(batch.iter().map(|request| {
+                    (
+                        request.state_id.clone(),
+                        RecordResolution::TransientFailure(ProviderLookupError::Malformed(
+                            "missing records array".to_string(),
+                        )),
+                    )
+                }));
+                continue;
+            };
+            let by_name: FxHashMap<&str, &Value> = response_records
+                .iter()
+                .filter_map(|record| {
+                    record
+                        .get("recordName")
+                        .and_then(Value::as_str)
+                        .map(|name| (name, record))
+                })
+                .collect();
+
+            for request in batch {
+                let master = by_name.get(request.master_record_name.as_str()).copied();
+                let asset = by_name.get(request.asset_record_name.as_str()).copied();
+                let explicit_not_found = |record: Option<&Value>| {
+                    record
+                        .and_then(|record| record.get("serverErrorCode"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|code| matches!(code, "UNKNOWN_ITEM" | "NOT_FOUND"))
+                };
+                let tombstoned = |record: Option<&Value>| {
+                    record
+                        .and_then(|record| record.get("deleted"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                };
+                let deleted_at = master.into_iter().chain(asset).find_map(|record| {
+                    record
+                        .get("fields")
+                        .and_then(|fields| fields.get("deletedDate"))
+                        .and_then(|field| field.get("value"))
+                        .and_then(Value::as_i64)
+                        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                });
+
+                let master_deleted = explicit_not_found(master) || tombstoned(master);
+                let asset_deleted = explicit_not_found(asset) || tombstoned(asset);
+                let resolution = if master_deleted || asset_deleted {
+                    RecordResolution::Deleted {
+                        deleted_at,
+                        master_family: master_deleted,
+                    }
+                } else if let (Some(master), Some(asset)) = (master, asset) {
+                    match (
+                        serde_json::from_value::<super::cloudkit::Record>(master.clone()),
+                        serde_json::from_value::<super::cloudkit::Record>(asset.clone()),
+                    ) {
+                        (Ok(master), Ok(asset))
+                            if master.record_type == "CPLMaster"
+                                && asset.record_type == "CPLAsset" =>
+                        {
+                            let mut photo = PhotoAsset::from_records(master, &asset);
+                            if request.state_id.as_str() != request.master_record_name.as_str() {
+                                photo = photo
+                                    .with_state_record_name(Arc::from(request.state_id.as_str()));
+                            }
+                            RecordResolution::Present(photo)
+                        }
+                        _ => {
+                            complete = false;
+                            RecordResolution::Unknown
+                        }
+                    }
+                } else {
+                    complete = false;
+                    RecordResolution::Unknown
+                };
+                let outcome = match &resolution {
+                    RecordResolution::Present(_) => "present",
+                    RecordResolution::Deleted { .. } => "deleted",
+                    RecordResolution::Unknown => "unknown",
+                    RecordResolution::TransientFailure(_) => "transient_failure",
+                };
+                crate::metrics::record_targeted_lookup(outcome, 1);
+                results.push((request.state_id.clone(), resolution));
+            }
+        }
+
+        RecordResolutionBatch { results, complete }
     }
 
     /// Stream photos page-by-page without buffering the full album in memory.
@@ -1287,9 +1601,18 @@ impl PhotoAlbum {
         treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
         let plan = build_enumeration_plan(limit, total_count, self.page_size, profile);
+        if let Some(capture) = &fetcher_sync_tokens {
+            capture.expect(plan.ranges.len());
+            if matches!((limit, total_count), (Some(limit), Some(total)) if total > u64::from(limit))
+            {
+                capture.suppress();
+            }
+        }
         let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(
             (plan.page_size * plan.channel_fetchers()).min(500),
         );
+        let range_record_owners =
+            Arc::new(std::sync::Mutex::new(FxHashMap::<String, u64>::default()));
         let mut handles = Vec::with_capacity(plan.ranges.len());
 
         if effective_total(limit, total_count).is_none() {
@@ -1306,10 +1629,8 @@ impl PhotoAlbum {
         for range in plan.ranges {
             handles.push(self.spawn_fetcher(
                 tx.clone(),
-                range.start,
-                range.end,
-                range.limit,
-                range.suppress_token_on_limit,
+                range,
+                Arc::clone(&range_record_owners),
                 fetcher_sync_tokens.clone(),
                 behavior,
             ));
@@ -1337,10 +1658,8 @@ impl PhotoAlbum {
     fn spawn_fetcher(
         &self,
         tx: mpsc::Sender<anyhow::Result<PhotoAsset>>,
-        start_offset: u64,
-        end_offset: u64,
-        limit: Option<u32>,
-        suppress_token_on_limit: bool,
+        range: FetcherRange,
+        range_record_owners: Arc<std::sync::Mutex<FxHashMap<String, u64>>>,
         fetcher_sync_tokens: Option<Arc<FetcherSyncTokenCapture>>,
         behavior: FetcherBehavior,
     ) -> JoinHandle<()> {
@@ -1354,6 +1673,12 @@ impl PhotoAlbum {
         let zone_id = Arc::clone(&self.zone_id);
 
         tokio::spawn(async move {
+            let FetcherRange {
+                start: start_offset,
+                end: end_offset,
+                limit,
+                role: range_role,
+            } = range;
             let mut offset = start_offset;
             let mut total_sent: u64 = 0;
             let mut last_sync_token: Option<String> = None;
@@ -1364,6 +1689,7 @@ impl PhotoAlbum {
                 FxHashMap::default();
             let mut paired_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
+            let mut emitted_asset_records: FxHashSet<String> = FxHashSet::default();
             let mut consecutive_empty_pages: u32 = 0;
             let mut enumeration_incomplete = false;
             let mut stopped_for_limit = false;
@@ -1375,6 +1701,22 @@ impl PhotoAlbum {
             let max_pending_records = behavior.page_size.saturating_mul(4).max(1);
 
             loop {
+                // Dropping the stream is the caller's cancellation signal.
+                // Do not continue probing the provider or report checkpoint
+                // evidence after the consumer has stopped observing assets.
+                if tx.is_closed() {
+                    if let Some(shared) = &fetcher_sync_tokens {
+                        shared
+                            .complete(
+                                None,
+                                EnumerationCompletion::Incomplete(
+                                    EnumerationFailure::ConsumerDropped,
+                                ),
+                            )
+                            .await;
+                    }
+                    return;
+                }
                 if offset >= end_offset {
                     break;
                 }
@@ -1406,6 +1748,16 @@ impl PhotoAlbum {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
+                        if let Some(shared) = &fetcher_sync_tokens {
+                            shared
+                                .complete(
+                                    None,
+                                    EnumerationCompletion::Incomplete(
+                                        EnumerationFailure::FetcherError,
+                                    ),
+                                )
+                                .await;
+                        }
                         return;
                     }
                 };
@@ -1420,6 +1772,16 @@ impl PhotoAlbum {
                             "Failed to deserialize fetcher response (body logged above at DEBUG)",
                         );
                         let _ = tx.send(Err(e.into())).await;
+                        if let Some(shared) = &fetcher_sync_tokens {
+                            shared
+                                .complete(
+                                    None,
+                                    EnumerationCompletion::Incomplete(
+                                        EnumerationFailure::FetcherError,
+                                    ),
+                                )
+                                .await;
+                        }
                         return;
                     }
                 };
@@ -1474,6 +1836,7 @@ impl PhotoAlbum {
                             "End of album (consecutive empty pages)"
                         );
                         if behavior.treat_empty_tail_as_error
+                            && matches!(range_role, FetcherRangeRole::Data)
                             && limit.is_none()
                             && end_offset == u64::MAX
                             && fetcher_sync_tokens.is_some()
@@ -1497,8 +1860,6 @@ impl PhotoAlbum {
                     offset += behavior.page_size as u64;
                     continue;
                 }
-                consecutive_empty_pages = 0;
-
                 // Collect current page's records, trying to pair with
                 // buffered unpaired records from previous pages.
                 let mut page_assets: FxHashMap<String, Vec<super::cloudkit::Record>> =
@@ -1506,6 +1867,7 @@ impl PhotoAlbum {
                 let mut page_masters: Vec<super::cloudkit::Record> = Vec::new();
                 let mut masters_seen_on_page = false;
                 let mut limit_reached = false;
+                let mut page_emitted = 0u64;
 
                 for rec in records {
                     tracing::debug!(record_type = %rec.record_type, "  record");
@@ -1527,7 +1889,7 @@ impl PhotoAlbum {
                 }
 
                 if limit_reached {
-                    stopped_for_limit = suppress_token_on_limit;
+                    stopped_for_limit = matches!(range_role, FetcherRangeRole::LimitProbe);
                     break;
                 }
 
@@ -1549,12 +1911,6 @@ impl PhotoAlbum {
                 }
 
                 for master in page_masters {
-                    if let Some(n) = limit {
-                        if total_sent >= u64::from(n) {
-                            limit_reached = true;
-                            break;
-                        }
-                    }
                     let mut asset_records = pending_assets.remove(&master.record_name);
                     if let Some(page_records) = page_assets.remove(&master.record_name) {
                         asset_records
@@ -1564,6 +1920,15 @@ impl PhotoAlbum {
                     if let Some(asset_records) = asset_records {
                         let sibling_count = asset_records.len();
                         for (index, asset_rec) in asset_records.into_iter().enumerate() {
+                            if !should_emit_asset_record(
+                                &asset_rec.record_name,
+                                start_offset,
+                                range_role,
+                                &mut emitted_asset_records,
+                                &range_record_owners,
+                            ) {
+                                continue;
+                            }
                             if let Some(n) = limit {
                                 if total_sent >= u64::from(n) {
                                     limit_reached = true;
@@ -1580,6 +1945,7 @@ impl PhotoAlbum {
                                 return;
                             }
                             total_sent += 1;
+                            page_emitted += 1;
                         }
                         paired_masters.insert(master.record_name.clone(), master);
                         prune_paired_master_cache(&mut paired_masters, max_pending_records);
@@ -1598,7 +1964,7 @@ impl PhotoAlbum {
                 );
 
                 if limit_reached {
-                    stopped_for_limit = suppress_token_on_limit;
+                    stopped_for_limit = matches!(range_role, FetcherRangeRole::LimitProbe);
                     break;
                 }
 
@@ -1606,6 +1972,15 @@ impl PhotoAlbum {
                     if let Some(master) = pending_masters.remove(&master_id) {
                         let sibling_count = records.len();
                         for (index, asset_rec) in records.into_iter().enumerate() {
+                            if !should_emit_asset_record(
+                                &asset_rec.record_name,
+                                start_offset,
+                                range_role,
+                                &mut emitted_asset_records,
+                                &range_record_owners,
+                            ) {
+                                continue;
+                            }
                             if let Some(n) = limit {
                                 if total_sent >= u64::from(n) {
                                     limit_reached = true;
@@ -1622,11 +1997,21 @@ impl PhotoAlbum {
                                 return;
                             }
                             total_sent += 1;
+                            page_emitted += 1;
                         }
                         paired_masters.insert(master.record_name.clone(), master);
                         prune_paired_master_cache(&mut paired_masters, max_pending_records);
                     } else if let Some(master) = paired_masters.get(&master_id) {
                         for asset_rec in records {
+                            if !should_emit_asset_record(
+                                &asset_rec.record_name,
+                                start_offset,
+                                range_role,
+                                &mut emitted_asset_records,
+                                &range_record_owners,
+                            ) {
+                                continue;
+                            }
                             if let Some(n) = limit {
                                 if total_sent >= u64::from(n) {
                                     limit_reached = true;
@@ -1639,13 +2024,14 @@ impl PhotoAlbum {
                                 return;
                             }
                             total_sent += 1;
+                            page_emitted += 1;
                         }
                     } else {
                         pending_assets.entry(master_id).or_default().extend(records);
                     }
                 }
                 if limit_reached {
-                    stopped_for_limit = suppress_token_on_limit;
+                    stopped_for_limit = matches!(range_role, FetcherRangeRole::LimitProbe);
                     break;
                 }
                 let pending_record_count =
@@ -1660,10 +2046,21 @@ impl PhotoAlbum {
                         .await;
                     break;
                 }
-            }
-
-            if suppress_token_on_limit && limit.is_some_and(|n| total_sent >= u64::from(n)) {
-                stopped_for_limit = true;
+                if page_emitted == 0 {
+                    consecutive_empty_pages += 1;
+                    if consecutive_empty_pages >= MAX_EMPTY_PAGE_PROBES {
+                        tracing::info!(
+                            album = %name,
+                            offset,
+                            probes = consecutive_empty_pages,
+                            total_sent,
+                            "End of album (consecutive pages without new assets)"
+                        );
+                        break;
+                    }
+                } else {
+                    consecutive_empty_pages = 0;
+                }
             }
 
             // Surface any remaining unpaired records that couldn't be paired.
@@ -1695,18 +2092,22 @@ impl PhotoAlbum {
                     .await;
             }
 
-            if !enumeration_incomplete {
-                if let Some(shared) = &fetcher_sync_tokens {
-                    if stopped_for_limit {
-                        shared.suppress();
-                    } else if let Some(token) = last_sync_token {
-                        shared.push(token).await;
-                    } else if saw_blank_sync_token
-                        && behavior.preserve_blank_sync_tokens_for_diagnostics
-                    {
-                        shared.push(String::new()).await;
-                    }
+            if let Some(shared) = &fetcher_sync_tokens {
+                if stopped_for_limit {
+                    shared.suppress();
                 }
+                let token = last_sync_token.or_else(|| {
+                    (saw_blank_sync_token && behavior.preserve_blank_sync_tokens_for_diagnostics)
+                        .then(String::new)
+                });
+                let completion = if enumeration_incomplete {
+                    EnumerationCompletion::Incomplete(EnumerationFailure::UnpairedRecords)
+                } else if stopped_for_limit {
+                    EnumerationCompletion::UserBoundReached
+                } else {
+                    EnumerationCompletion::ProvenEof
+                };
+                shared.complete(token, completion).await;
             }
         })
     }
@@ -2102,9 +2503,9 @@ mod tests {
             plan.ranges,
             vec![FetcherRange {
                 start: 0,
-                end: 1000,
+                end: u64::MAX,
                 limit: Some(1000),
-                suppress_token_on_limit: true,
+                role: FetcherRangeRole::LimitProbe,
             }]
         );
         assert!(
@@ -2114,7 +2515,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_profile_parallel_plan_covers_recent_window_with_partitioned_ranges() {
+    fn fast_profile_uses_ordered_limit_probe_for_recent_window() {
         let plan = build_enumeration_plan(
             Some(1000),
             Some(5000),
@@ -2123,10 +2524,8 @@ mod tests {
         );
 
         assert_eq!(plan.page_size, 100);
-        assert!(
-            plan.ranges.len() > 1,
-            "fast profile should keep parallel fetcher ranges"
-        );
+        assert_eq!(plan.ranges.len(), 1);
+        assert_eq!(plan.ranges[0].role, FetcherRangeRole::LimitProbe);
         assert!(
             plan.covers_prefix(1000),
             "parallel fast profile must cover the same recent window"
@@ -2134,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_probe_is_disabled_for_single_fetcher_plans() {
+    fn limit_probe_does_not_trust_equal_count_as_eof() {
         let plan = build_enumeration_plan(
             Some(100),
             Some(100),
@@ -2146,15 +2545,15 @@ mod tests {
             plan.ranges,
             vec![FetcherRange {
                 start: 0,
-                end: 100,
+                end: u64::MAX,
                 limit: Some(100),
-                suppress_token_on_limit: false,
+                role: FetcherRangeRole::LimitProbe,
             }]
         );
     }
 
     #[test]
-    fn boundary_probe_is_explicit_in_parallel_plans_without_losing_coverage() {
+    fn parallel_recent_plan_still_uses_one_ordered_limit_probe() {
         let plan = build_enumeration_plan(
             Some(100),
             Some(100),
@@ -2162,16 +2561,17 @@ mod tests {
             PhotoStreamProfile::FastEnumeration { concurrency: 10 },
         );
 
-        let mut offsets: Vec<u64> = plan.ranges.iter().map(|range| range.start).collect();
-        offsets.sort_unstable();
-        assert_eq!(offsets, vec![0, 99]);
+        assert_eq!(plan.ranges.len(), 1);
+        assert_eq!(plan.ranges[0].start, 0);
+        assert_eq!(plan.ranges[0].end, u64::MAX);
+        assert_eq!(plan.ranges[0].role, FetcherRangeRole::LimitProbe);
         assert!(plan.covers_prefix(100));
     }
 
     #[test]
-    fn boundary_probe_keeps_rest_of_first_parallel_chunk() {
+    fn unbounded_parallel_plan_partitions_data_and_appends_tail_owner() {
         let plan = build_enumeration_plan(
-            Some(5000),
+            None,
             Some(5000),
             100,
             PhotoStreamProfile::FastEnumeration { concurrency: 10 },
@@ -2180,8 +2580,17 @@ mod tests {
         assert!(
             plan.ranges
                 .iter()
-                .any(|range| range.start == 100 && range.end == 300),
-            "the boundary probe must not drop ranks between the first page and second fetcher"
+                .any(|range| range.start == 0 && range.role == FetcherRangeRole::Data),
+            "the count prefix must keep count-partitioned data work"
+        );
+        assert_eq!(
+            plan.ranges.last(),
+            Some(&FetcherRange {
+                start: 5000,
+                end: u64::MAX,
+                limit: None,
+                role: FetcherRangeRole::TailProof,
+            })
         );
         assert!(plan.covers_prefix(5000));
     }
@@ -2261,6 +2670,139 @@ mod tests {
             },
             session,
         )
+    }
+
+    fn lookup_request(state_id: &str, master: &str, asset: &str) -> RecordLookupRequest {
+        RecordLookupRequest {
+            state_id: ProviderRecordId::new(state_id),
+            master_record_name: ProviderRecordId::new(master),
+            asset_record_name: ProviderRecordId::new(asset),
+        }
+    }
+
+    #[tokio::test]
+    async fn targeted_record_lookup_scopes_zone_at_request_level() {
+        #[derive(Clone)]
+        struct CaptureLookupSession {
+            body: Arc<Mutex<Option<Value>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for CaptureLookupSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                assert!(url.contains("/records/lookup?"));
+                *self.body.lock().unwrap() = Some(serde_json::from_str(&body)?);
+                Ok(json!({"records": []}))
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let album = make_album_with_session(
+            100,
+            Box::new(CaptureLookupSession {
+                body: Arc::clone(&captured),
+            }),
+        );
+        album
+            .resolve_records(&[lookup_request("master", "master", "asset")])
+            .await;
+
+        let body = captured.lock().unwrap().clone().expect("lookup body");
+        assert_eq!(body["zoneID"], default_zone());
+        let records = body["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.get("zoneID").is_none()));
+    }
+
+    #[tokio::test]
+    async fn targeted_record_lookup_distinguishes_present_deleted_and_omitted() {
+        let response = json!({
+            "records": [
+                test_master_record("master-present"),
+                test_asset_record_for("asset-present", "master-present"),
+                test_master_record("master-deleted"),
+                {
+                    "recordName": "asset-deleted",
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                }
+            ]
+        });
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(response)));
+        let batch = album
+            .resolve_records(&[
+                lookup_request("master-present", "master-present", "asset-present"),
+                lookup_request("master-deleted", "master-deleted", "asset-deleted"),
+                lookup_request("master-unknown", "master-unknown", "asset-unknown"),
+            ])
+            .await;
+
+        assert!(!batch.complete, "an omitted batch member is inconclusive");
+        assert!(
+            matches!(batch.results[0].1, RecordResolution::Present(_)),
+            "unexpected lookup results: {:?}",
+            batch.results
+        );
+        assert!(matches!(
+            batch.results[1].1,
+            RecordResolution::Deleted { .. }
+        ));
+        assert!(matches!(batch.results[2].1, RecordResolution::Unknown));
+    }
+
+    #[tokio::test]
+    async fn targeted_record_lookup_retains_transient_failure() {
+        let mut session = MockPhotosSession::new();
+        for _ in 0..8 {
+            session = session.err("temporary lookup failure");
+        }
+        let album = make_album_with_session(100, Box::new(session));
+
+        let batch = album
+            .resolve_records(&[lookup_request("master", "master", "asset")])
+            .await;
+
+        assert!(!batch.complete);
+        assert!(matches!(
+            batch.results[0].1,
+            RecordResolution::TransientFailure(ProviderLookupError::Request(_))
+        ));
+    }
+
+    #[test]
+    fn targeted_record_lookup_preserves_typed_http_failures() {
+        let error: anyhow::Error = super::super::session::HttpStatusError {
+            status: 429,
+            url: "https://example.com/records/lookup".to_string(),
+            retry_after: None,
+            body: None,
+        }
+        .into();
+        assert!(matches!(
+            classify_provider_lookup_error(&error),
+            ProviderLookupError::RateLimited { status: 429, .. }
+        ));
+
+        let error: anyhow::Error = super::super::session::HttpStatusError {
+            status: 421,
+            url: "https://example.com/records/lookup".to_string(),
+            retry_after: None,
+            body: None,
+        }
+        .into();
+        assert!(matches!(
+            classify_provider_lookup_error(&error),
+            ProviderLookupError::Authentication { status: 421, .. }
+        ));
     }
 
     #[tokio::test]
@@ -2398,6 +2940,105 @@ mod tests {
             }
         }
         (ids, errors)
+    }
+
+    #[tokio::test]
+    async fn underreported_count_tail_proof_emits_every_asset() {
+        let session = DynamicRecentPhotosSession::new(2);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) =
+            album.photo_stream_with_token_for_download_policy(None, Some(1), 1, true);
+
+        assert_eq!(
+            drain_photo_stream_ids(stream).await,
+            vec!["master-0000", "master-0001"]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("zone-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_limit_probe_suppresses_token_only_when_extra_asset_exists() {
+        let session = DynamicRecentPhotosSession::new(2);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) =
+            album.photo_stream_with_token_for_download_policy(Some(1), Some(1), 1, true);
+
+        assert_eq!(drain_photo_stream_ids(stream).await, vec!["master-0000"]);
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            None,
+            "the N+1 asset proves that the user bound truncated enumeration"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_limit_probe_keeps_token_when_natural_eof_is_proved() {
+        let session = DynamicRecentPhotosSession::new(1);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) =
+            album.photo_stream_with_token_for_download_policy(Some(1), Some(1), 1, true);
+
+        assert_eq!(drain_photo_stream_ids(stream).await, vec!["master-0000"]);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("zone-token"),
+            "equal count and limit are eligible only after the N+1 probe proves EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn overreported_count_still_finishes_at_proved_eof() {
+        let session = DynamicRecentPhotosSession::new(1);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) =
+            album.photo_stream_with_token_for_download_policy(None, Some(10_000), 1, true);
+
+        assert_eq!(drain_photo_stream_ids(stream).await, vec!["master-0000"]);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("zone-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_request_failure_blocks_token_after_prefix_was_observed() {
+        let session = DynamicRecentPhotosSession::new(2).with_error_at_offset(2);
+        let album = make_album_with_session(100, Box::new(session));
+
+        let (stream, token_rx) =
+            album.photo_stream_with_token_for_download_policy(None, Some(1), 1, true);
+        let (ids, errors) = drain_photo_stream(stream).await;
+
+        assert_eq!(ids, vec!["master-0000", "master-0001"]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(token_rx.await.expect("sync token sender"), None);
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_during_tail_proof_blocks_token() {
+        use tokio_stream::StreamExt;
+
+        let session = DynamicRecentPhotosSession::new(100);
+        let album = make_album_with_session(100, Box::new(session));
+        let (mut stream, token_rx) =
+            album.photo_stream_with_token_for_download_policy(None, Some(1), 1, true);
+
+        assert!(stream
+            .next()
+            .await
+            .transpose()
+            .expect("first asset")
+            .is_some());
+        drop(stream);
+
+        assert_eq!(token_rx.await.expect("sync token sender"), None);
     }
 
     #[tokio::test]
@@ -2666,7 +3307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_query_empty_page_stop_blocks_token() {
+    async fn full_query_consecutive_empty_pages_prove_eof() {
         let mock = MockPhotosFlow::new()
             .query_photo_page("master-before-empty-tail", Some("token-full"))
             .build();
@@ -2676,16 +3317,11 @@ mod tests {
         let (ids, errors) = drain_photo_stream(stream).await;
 
         assert_eq!(ids, vec!["master-before-empty-tail"]);
-        assert_eq!(errors.len(), 1);
-        assert!(
-            errors[0].contains("without confirming the end of the stream"),
-            "unexpected error: {}",
-            errors[0]
-        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(
-            token_rx.await.expect("sync token sender"),
-            None,
-            "ambiguous empty-page termination must suppress the sync token"
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full"),
+            "the finite consecutive-empty-page policy is positive EOF proof"
         );
     }
 
@@ -2809,7 +3445,7 @@ mod tests {
                     Some("st-known"),
                 ))
             } else {
-                Ok(json!({"records": []}))
+                Ok(json!({"records": [], "syncToken": "st-known"}))
             }
         }
 
@@ -2819,7 +3455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn photo_stream_with_known_single_page_total_skips_empty_tail_probes() {
+    async fn photo_stream_with_known_single_page_total_proves_empty_tail() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let album = make_album_with_session(
             100,
@@ -2837,8 +3473,8 @@ mod tests {
         );
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "known single-page totals should not spend extra requests probing the empty tail"
+            6,
+            "the count is only a hint, so the final owner must prove the empty tail"
         );
     }
 
@@ -2902,8 +3538,10 @@ mod tests {
                 }
                 records.push(test_asset_record("master-99"));
                 records
-            } else {
+            } else if offset == 99 {
                 test_records("master-99")
+            } else {
+                Vec::new()
             };
             Ok(json!({"records": records, "syncToken": "st-boundary"}))
         }
@@ -3176,8 +3814,8 @@ mod tests {
         );
         assert_eq!(
             owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "base enumeration should stop after the owner page plus empty tail"
+            6,
+            "base enumeration should stop after the owner page plus finite empty-tail proof"
         );
         assert_eq!(
             owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3252,8 +3890,8 @@ mod tests {
         );
         assert_eq!(
             owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "recent limit should stop at the requested owner-zone item"
+            6,
+            "recent limit should stop after the requested item and finite owner-zone probe"
         );
         assert_eq!(
             owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3268,7 +3906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn photo_stream_initial_boundary_probe_runs_in_parallel() {
+    async fn photo_stream_limit_probe_is_ordered_and_proves_eof() {
         let session = InitialBoundarySession {
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3283,16 +3921,16 @@ mod tests {
             token_rx.await.expect("sync token sender").as_deref(),
             Some("st-boundary")
         );
-        assert!(
+        assert_eq!(
             session
                 .max_in_flight
-                .load(std::sync::atomic::Ordering::SeqCst)
-                >= 2,
-            "boundary probe should overlap the first page fetch"
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the N+1 proof must remain ordered"
         );
         let mut offsets = session.offsets.lock().expect("offsets lock").clone();
         offsets.sort_unstable();
-        assert_eq!(offsets, vec![0, 99]);
+        assert_eq!(offsets, vec![0, 99, 100, 200, 300, 400, 500]);
     }
 
     #[tokio::test]
@@ -3314,8 +3952,8 @@ mod tests {
         );
         assert_eq!(
             session.offsets().as_slice(),
-            &[0, 20, 40, 60, 80],
-            "download-mode pagination should advance through every reduced page"
+            &[0, 20, 40, 60, 80, 100, 120, 140, 160, 180],
+            "download-mode pagination should advance through the data and finite EOF proof"
         );
         assert!(
             session.results_limits().iter().all(|limit| *limit == 40),
@@ -3336,14 +3974,14 @@ mod tests {
         assert_eq!(ids.first().map(String::as_str), Some("master-0000"));
         assert_eq!(ids.last().map(String::as_str), Some("master-0099"));
         assert_eq!(
-            token_rx.await.expect("sync token sender"),
-            None,
-            "unknown-total recent streams stop at the caller's cap, not a confirmed EOF"
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("zone-token"),
+            "the N+1 probe can prove EOF even when the count side-channel is unavailable"
         );
         assert_eq!(
             session.offsets().as_slice(),
-            &[0, 20, 40, 60, 80],
-            "unknown-total download-mode --recent should keep paging until the limit"
+            &[0, 20, 40, 60, 80, 100, 120, 140, 160, 180],
+            "unknown-total download-mode --recent should keep paging through the finite EOF proof"
         );
         assert!(
             session.results_limits().iter().all(|limit| *limit == 40),
