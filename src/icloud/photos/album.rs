@@ -106,6 +106,40 @@ pub(crate) struct RecordResolutionBatch {
     pub(crate) complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResolutionEvidence {
+    ChildDeleted,
+    Inconclusive,
+    MasterDeleted,
+    Present,
+}
+
+fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
+    match resolution {
+        RecordResolution::Present(_) => ResolutionEvidence::Present,
+        RecordResolution::Deleted {
+            master_family: true,
+            ..
+        } => ResolutionEvidence::MasterDeleted,
+        RecordResolution::Unknown | RecordResolution::TransientFailure(_) => {
+            ResolutionEvidence::Inconclusive
+        }
+        RecordResolution::Deleted {
+            master_family: false,
+            ..
+        } => ResolutionEvidence::ChildDeleted,
+    }
+}
+
+// Multiple provider records can map to one durable state identity. Merge them
+// conservatively: a present sibling resolves the work, a missing master proves
+// family deletion, and any inconclusive sibling blocks child-only deletion.
+fn merge_record_resolution(existing: &mut RecordResolution, incoming: RecordResolution) {
+    if resolution_evidence(&incoming) > resolution_evidence(existing) {
+        *existing = incoming;
+    }
+}
+
 fn prune_paired_master_cache(
     paired_masters: &mut FxHashMap<String, super::cloudkit::Record>,
     max_records: usize,
@@ -824,7 +858,6 @@ impl PhotoAlbum {
         requests: &[RecordLookupRequest],
     ) -> RecordResolutionBatch {
         let mut results = Vec::with_capacity(requests.len());
-        let mut complete = true;
         let url = format!(
             "{}/records/lookup?{}",
             self.service_endpoint,
@@ -859,7 +892,6 @@ impl PhotoAlbum {
             {
                 Ok(response) => response,
                 Err(error) => {
-                    complete = false;
                     let error = classify_provider_lookup_error(&error);
                     crate::metrics::record_targeted_lookup("transient_failure", batch.len());
                     results.extend(batch.iter().map(|request| {
@@ -873,7 +905,6 @@ impl PhotoAlbum {
             };
 
             let Some(response_records) = response.get("records").and_then(Value::as_array) else {
-                complete = false;
                 crate::metrics::record_targeted_lookup("transient_failure", batch.len());
                 results.extend(batch.iter().map(|request| {
                     (
@@ -942,13 +973,9 @@ impl PhotoAlbum {
                             }
                             RecordResolution::Present(photo)
                         }
-                        _ => {
-                            complete = false;
-                            RecordResolution::Unknown
-                        }
+                        _ => RecordResolution::Unknown,
                     }
                 } else {
-                    complete = false;
                     RecordResolution::Unknown
                 };
                 let outcome = match &resolution {
@@ -962,7 +989,32 @@ impl PhotoAlbum {
             }
         }
 
-        RecordResolutionBatch { results, complete }
+        let mut grouped: Vec<(ProviderRecordId, RecordResolution)> =
+            Vec::with_capacity(results.len());
+        let mut positions: FxHashMap<ProviderRecordId, usize> = FxHashMap::default();
+        for (state_id, resolution) in results {
+            if let Some(existing) = positions
+                .get(&state_id)
+                .and_then(|index| grouped.get_mut(*index))
+                .map(|(_, resolution)| resolution)
+            {
+                merge_record_resolution(existing, resolution);
+            } else {
+                positions.insert(state_id.clone(), grouped.len());
+                grouped.push((state_id, resolution));
+            }
+        }
+        let complete = grouped.iter().all(|(_, resolution)| {
+            matches!(
+                resolution,
+                RecordResolution::Present(_) | RecordResolution::Deleted { .. }
+            )
+        });
+
+        RecordResolutionBatch {
+            results: grouped,
+            complete,
+        }
     }
 
     /// Stream photos page-by-page without buffering the full album in memory.
@@ -2757,6 +2809,59 @@ mod tests {
             RecordResolution::Deleted { .. }
         ));
         assert!(matches!(batch.results[2].1, RecordResolution::Unknown));
+    }
+
+    #[tokio::test]
+    async fn targeted_record_lookup_present_sibling_keeps_shared_master_state() {
+        let response = json!({
+            "records": [
+                test_master_record("master-shared"),
+                {
+                    "recordName": "asset-a-deleted",
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                },
+                test_asset_record_for("asset-b-present", "master-shared")
+            ]
+        });
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(response)));
+
+        let batch = album
+            .resolve_records(&[
+                lookup_request("master-shared", "master-shared", "asset-a-deleted"),
+                lookup_request("master-shared", "master-shared", "asset-b-present"),
+            ])
+            .await;
+
+        assert!(batch.complete);
+        assert_eq!(batch.results.len(), 1);
+        assert!(matches!(batch.results[0].1, RecordResolution::Present(_)));
+    }
+
+    #[tokio::test]
+    async fn targeted_record_lookup_omitted_sibling_keeps_shared_master_state_unknown() {
+        let response = json!({
+            "records": [
+                test_master_record("master-shared"),
+                {
+                    "recordName": "asset-a-deleted",
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                }
+            ]
+        });
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(response)));
+
+        let batch = album
+            .resolve_records(&[
+                lookup_request("master-shared", "master-shared", "asset-a-deleted"),
+                lookup_request("master-shared", "master-shared", "asset-b-omitted"),
+            ])
+            .await;
+
+        assert!(!batch.complete);
+        assert_eq!(batch.results.len(), 1);
+        assert!(matches!(batch.results[0].1, RecordResolution::Unknown));
     }
 
     #[tokio::test]

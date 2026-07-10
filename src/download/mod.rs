@@ -2810,6 +2810,25 @@ pub(crate) struct PathReconciliationResult {
     pub(crate) stats: SyncStats,
 }
 
+async fn requeue_missing_catalog_file(
+    db: &dyn DownloadStore,
+    task: &DownloadTask,
+    stats: &mut SyncStats,
+) {
+    if let Err(error) = db
+        .mark_failed(
+            &task.library,
+            &task.asset_id,
+            task.version_size.as_str(),
+            crate::commands::reconcile::FILE_MISSING_REASON,
+        )
+        .await
+    {
+        stats.state_write_failures += 1;
+        tracing::warn!(asset_id = %task.asset_id, %error, "Path reconciliation could not requeue a missing catalog file");
+    }
+}
+
 pub(crate) async fn reconcile_catalog_paths(
     passes: &[crate::commands::AlbumPass],
     config: Arc<DownloadConfig>,
@@ -2988,6 +3007,7 @@ pub(crate) async fn reconcile_catalog_paths(
         };
         let Some(source_path) = record.local_path.as_deref() else {
             deferred_to_pending_retry = true;
+            requeue_missing_catalog_file(db.as_ref(), &task, &mut stats).await;
             tracing::debug!(asset_id = %task.asset_id, "Path reconciliation deferred catalog row without a local file to targeted retry");
             continue;
         };
@@ -2995,6 +3015,7 @@ pub(crate) async fn reconcile_catalog_paths(
             Ok(true) => {}
             Ok(false) => {
                 deferred_to_pending_retry = true;
+                requeue_missing_catalog_file(db.as_ref(), &task, &mut stats).await;
                 tracing::debug!(asset_id = %task.asset_id, path = %source_path.display(), "Path reconciliation deferred missing local file to targeted retry");
                 continue;
             }
@@ -11191,7 +11212,7 @@ mod tests {
             Arc::new({
                 let mut config = test_config();
                 config.directory = Arc::from(new_dir.path());
-                config.state_db = Some(db);
+                config.state_db = Some(db.clone());
                 config
             }),
             CancellationToken::new(),
@@ -11200,6 +11221,9 @@ mod tests {
         .expect("missing local file should defer to targeted retry");
         assert!(!deferred.complete);
         assert_eq!(deferred.stats.failed, 0);
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 1);
     }
 
     #[tokio::test]
@@ -11655,6 +11679,54 @@ mod tests {
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.awaiting_provider_verification, 0);
         assert_eq!(summary.source_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_retry_deleted_sibling_does_not_tombstone_present_master_state() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("MASTER_WITH_SIBLINGS")
+            .filename("master-with-siblings.jpg")
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        db.upsert_asset_master_mapping("PrimarySync", "asset-a-deleted", "MASTER_WITH_SIBLINGS")
+            .await
+            .expect("seed deleted sibling mapping");
+        db.upsert_asset_master_mapping("PrimarySync", "asset-b-present", "MASTER_WITH_SIBLINGS")
+            .await
+            .expect("seed present sibling mapping");
+
+        let session = PendingLookupSession {
+            records: Arc::new(vec![
+                json!({
+                    "recordName": "asset-a-deleted",
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                }),
+                mock_master_record_with_filename(
+                    "MASTER_WITH_SIBLINGS",
+                    "master-with-siblings.jpg",
+                ),
+                mock_asset_record_for("asset-b-present", "MASTER_WITH_SIBLINGS"),
+            ]),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("build pending retry plan");
+
+        assert_eq!(plan.unmatched_targets.len(), 0);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.source_deleted, 0);
+        assert_eq!(summary.pending, 1);
     }
 
     async fn run_bounded_incremental_sync(

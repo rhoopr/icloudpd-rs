@@ -6198,6 +6198,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_multi_zone_status_preserves_an_earlier_checkpoint_hold() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let held = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_empty_full_album(""),
+        );
+        let advanced = make_run_cycle_library_state_with_album(
+            "SharedSync-TEST",
+            "sync_token:SharedSync-TEST",
+            make_empty_full_album("shared-token"),
+        );
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&held, &advanced],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert!(!result.db_sync_token_advance_safe);
+        assert_eq!(
+            db.get_metadata("last_checkpoint_status")
+                .await
+                .expect("read checkpoint status")
+                .as_deref(),
+            Some("preserved")
+        );
+        assert_eq!(
+            db.get_metadata("last_recovery_action")
+                .await
+                .expect("read recovery action")
+                .as_deref(),
+            Some("retry_passes")
+        );
+    }
+
+    #[tokio::test]
     async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
         let config = make_run_cycle_config();
         let db = make_state_db();

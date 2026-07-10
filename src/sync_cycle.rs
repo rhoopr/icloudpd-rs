@@ -634,6 +634,7 @@ pub(crate) async fn run_cycle(
     let mut pending_download_config_hash = None;
     let mut path_reconciliation_complete = true;
     let mut candidate_zone_tokens = Vec::new();
+    let mut checkpoint_hold_action: Option<&'static str> = None;
     let enum_config_hash = download::compute_config_hash(config);
 
     // Check if token-unsafe eligibility config changed since last sync. If
@@ -963,37 +964,55 @@ pub(crate) async fn run_cycle(
                     let reconciliation_active = force_full_for_config_hash;
                     if reconciliation_active {
                         candidate_zone_tokens.push((lib_state.sync_token_key.clone(), token));
-                    } else if let Err(e) = db
-                        .commit_checkpoint_transition(state::CheckpointTransition {
-                            metadata_updates: vec![
-                                (lib_state.sync_token_key.clone(), token),
-                                (LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()),
-                                (LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()),
-                            ],
-                            metadata_deletes: Vec::new(),
-                        })
-                        .await
-                    {
-                        db_sync_token_advance_safe = false;
-                        tracing::warn!(error = %e, "Failed to store provider checkpoint");
                     } else {
-                        if cycle_has_stale_plan && !lib_state.plan_is_stale {
-                            tracing::warn!(
-                                zone = %lib_state.zone_name,
-                                diagnostic = "stale_plan_unaffected_zone",
-                                "Stored clean zone checkpoint despite another selected zone's stale plan"
-                            );
-                        }
-                        if sync_result.stats.failed > 0 || sync_result.stats.exif_failures > 0 {
-                            tracing::info!(
-                                zone = %lib_state.zone_name,
-                                basis = ?basis,
-                                deferred_transfers = sync_result.stats.failed,
-                                metadata_failures = sync_result.stats.exif_failures,
-                                "Provider checkpoint advanced: incomplete local work is durably queued for targeted retry"
-                            );
+                        let mut metadata_updates = vec![(lib_state.sync_token_key.clone(), token)];
+                        if let Some(recovery_action) = checkpoint_hold_action {
+                            metadata_updates.push((
+                                LAST_CHECKPOINT_STATUS_KEY.to_owned(),
+                                "preserved".to_owned(),
+                            ));
+                            metadata_updates.push((
+                                LAST_RECOVERY_ACTION_KEY.to_owned(),
+                                recovery_action.to_owned(),
+                            ));
                         } else {
-                            tracing::debug!(zone = %lib_state.zone_name, basis = ?basis, "Stored provider checkpoint for next incremental sync");
+                            metadata_updates.push((
+                                LAST_CHECKPOINT_STATUS_KEY.to_owned(),
+                                "current".to_owned(),
+                            ));
+                            metadata_updates
+                                .push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
+                        }
+                        if let Err(e) = db
+                            .commit_checkpoint_transition(state::CheckpointTransition {
+                                metadata_updates,
+                                metadata_deletes: Vec::new(),
+                            })
+                            .await
+                        {
+                            checkpoint_hold_action =
+                                Some(RecoveryAction::ReplayFromPriorToken.as_str());
+                            db_sync_token_advance_safe = false;
+                            tracing::warn!(error = %e, "Failed to store provider checkpoint");
+                        } else {
+                            if cycle_has_stale_plan && !lib_state.plan_is_stale {
+                                tracing::warn!(
+                                    zone = %lib_state.zone_name,
+                                    diagnostic = "stale_plan_unaffected_zone",
+                                    "Stored clean zone checkpoint despite another selected zone's stale plan"
+                                );
+                            }
+                            if sync_result.stats.failed > 0 || sync_result.stats.exif_failures > 0 {
+                                tracing::info!(
+                                    zone = %lib_state.zone_name,
+                                    basis = ?basis,
+                                    deferred_transfers = sync_result.stats.failed,
+                                    metadata_failures = sync_result.stats.exif_failures,
+                                    "Provider checkpoint advanced: incomplete local work is durably queued for targeted retry"
+                                );
+                            } else {
+                                tracing::debug!(zone = %lib_state.zone_name, basis = ?basis, "Stored provider checkpoint for next incremental sync");
+                            }
                         }
                     }
                 } else {
@@ -1005,6 +1024,7 @@ pub(crate) async fn run_cycle(
                 }
             }
             SourceCheckpointDecision::Preserve { reason, recovery } => {
+                checkpoint_hold_action = Some(recovery.as_str());
                 crate::metrics::record_checkpoint_decision("preserved", reason.as_str());
                 db_sync_token_advance_safe = false;
                 if let Some(db) = state_db {
