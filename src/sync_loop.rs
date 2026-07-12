@@ -32,8 +32,8 @@ use crate::sync_cycle::{run_cycle, sync_token_key as make_sync_token_key, Librar
 #[cfg(test)]
 use crate::sync_cycle::{
     check_and_persist_enum_config_hash, check_download_config_hash_for_cycle, determine_sync_mode,
-    should_store_sync_token, should_store_sync_token_for_cycle, CycleResult,
-    DownloadConfigHashOutcome, EnumConfigHashOutcome, ENUM_CONFIG_HASH_KEY,
+    pending_zone_token_key, should_store_sync_token, should_store_sync_token_for_cycle,
+    CycleResult, DownloadConfigHashOutcome, EnumConfigHashOutcome, ENUM_CONFIG_HASH_KEY,
     PENDING_DOWNLOAD_CONFIG_HASH_KEY, PENDING_ENUM_CONFIG_HASH_KEY, SYNC_TOKEN_PREFIX,
 };
 
@@ -3325,12 +3325,75 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct LegacyPendingDeleteSession {
+        master_record_name: Arc<str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for LegacyPendingDeleteSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/changes/zone?") {
+                return Ok(serde_json::json!({
+                    "zones": [{
+                        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                        "syncToken": "zone-token-after-legacy-cleanup",
+                        "moreComing": false,
+                        "records": []
+                    }]
+                }));
+            }
+            if url.contains("/records/lookup?") {
+                return Ok(serde_json::json!({
+                    "records": [{
+                        "recordName": self.master_record_name.as_ref(),
+                        "serverErrorCode": "UNKNOWN_ITEM",
+                        "reason": "record not found"
+                    }]
+                }));
+            }
+            Ok(serde_json::json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     fn make_one_photo_incremental_album_for_zone(
         zone: &str,
         zone_sync_token: &str,
     ) -> crate::icloud::photos::PhotoAlbum {
+        make_one_photo_incremental_album_with_download(
+            zone,
+            zone_sync_token,
+            "https://p01.icloud-content.com/photo.jpg",
+            1024,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+    }
+
+    fn make_one_photo_incremental_album_with_download(
+        zone: &str,
+        zone_sync_token: &str,
+        download_url: &str,
+        size: u64,
+        checksum: &str,
+    ) -> crate::icloud::photos::PhotoAlbum {
         use serde_json::json;
-        let page = full_album_page(zone, &format!("master-{zone}"), zone_sync_token);
+        let page = full_album_page_with_download(
+            zone,
+            &format!("master-{zone}"),
+            zone_sync_token,
+            download_url,
+            size,
+            checksum,
+        );
         let records = page
             .get("records")
             .expect("full album page records")
@@ -5921,6 +5984,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let body = b"expired-body";
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        let album = make_one_photo_incremental_album_with_download(
+            "PrimarySync",
+            "zone-tok-next",
+            &format!("{}/expired.jpg", server.uri()),
+            body.len() as u64,
+            &checksum,
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("expired URL cycle");
+
+        assert_eq!(result.failed_count, 1);
+        assert!(!result.stats.interrupted);
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-next")
+        );
+        let summary = db.get_summary().await.expect("state summary");
+        assert_eq!(summary.pending + summary.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_durable_retry_survives_checkpoint_commit_failure() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
+            Arc::clone(&inner),
+            MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
+            "simulated checkpoint commit failure",
+        ));
+        let body = b"expired-body";
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        let album = make_one_photo_incremental_album_with_download(
+            "PrimarySync",
+            "zone-tok-next",
+            &format!("{}/expired.jpg", server.uri()),
+            body.len() as u64,
+            &checksum,
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("expired URL cycle with checkpoint failure");
+
+        assert_eq!(result.failed_count, 1);
+        assert!(!result.db_sync_token_advance_safe);
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "a failed checkpoint commit must retain the replay token"
+        );
+        let summary = inner.get_summary().await.expect("state summary");
+        assert_eq!(
+            summary.pending + summary.failed,
+            1,
+            "durable retry work must survive a failed checkpoint commit"
+        );
+    }
+
+    #[tokio::test]
     async fn run_cycle_config_hash_stage_failure_forces_full_without_replacing_checkpoint() {
         let config = make_run_cycle_config();
         let current_hash = download::compute_config_hash(&config);
@@ -6123,6 +6323,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_legacy_pending_delete_self_heals_without_full_inventory() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-token-before-legacy-cleanup")
+            .await
+            .expect("seed zone token");
+        let master_record_name = "LEGACY_PENDING_MASTER";
+        db.upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new(master_record_name)
+                .filename("legacy-deleted.jpg")
+                .build(),
+        )
+        .await
+        .expect("seed legacy pending row");
+        let album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(LegacyPendingDeleteSession {
+                master_record_name: Arc::from(master_record_name),
+            }),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let observed_modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let build_download_config = make_recording_run_cycle_download_config_builder(
+            download_dir.path(),
+            Arc::clone(&db),
+            Arc::clone(&observed_modes),
+        );
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("legacy cleanup cycle");
+
+        assert!(result.db_sync_token_advance_safe);
+        assert!(observed_modes
+            .lock()
+            .expect("observed modes lock")
+            .iter()
+            .any(|mode| matches!(mode, download::SyncMode::Incremental { .. })));
+        assert!(result.stats.full_enumeration_reason.is_none());
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-token-after-legacy-cleanup")
+        );
+        let summary = db.get_summary().await.expect("state summary");
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.source_deleted, 1);
+        assert_eq!(summary.awaiting_provider_verification, 0);
+    }
+
+    #[tokio::test]
     async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_partial_failure() {
         let config = make_run_cycle_config();
         let db = make_state_db();
@@ -6194,6 +6460,88 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("old-enum-hash")
+        );
+        let expected_hash = download::compute_config_hash(&config);
+        assert_eq!(
+            db.get_metadata(&pending_zone_token_key(&expected_hash, "PrimarySync",))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("primary-bridge"),
+            "the completed zone must retain its reconciliation checkpoint"
+        );
+        assert_eq!(
+            db.get_metadata(&pending_zone_token_key(&expected_hash, "SharedSync-TEST",))
+                .await
+                .unwrap(),
+            None
+        );
+
+        let primary_resume = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_full_album_with_boxed_session(
+                "PrimarySync",
+                Box::new(ConfigBridgeSession::new(
+                    "PrimarySync",
+                    "unused-inventory",
+                    "primary-after-resume",
+                )),
+            ),
+        );
+        let shared_retry = make_run_cycle_library_state_with_album(
+            "SharedSync-TEST",
+            "sync_token:SharedSync-TEST",
+            make_full_album_with_boxed_session(
+                "SharedSync-TEST",
+                Box::new(ConfigBridgeSession::new(
+                    "SharedSync-TEST",
+                    "shared-inventory",
+                    "shared-bridge",
+                )),
+            ),
+        );
+
+        let resumed = run_cycle(
+            &[&primary_resume, &shared_retry],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("unfinished zone reconciliation should resume");
+
+        assert!(resumed.db_sync_token_advance_safe);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("primary-after-resume")
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:SharedSync-TEST")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("shared-bridge")
+        );
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(&pending_zone_token_key(&expected_hash, "PrimarySync",))
+                .await
+                .unwrap(),
+            None
         );
     }
 
@@ -7233,12 +7581,58 @@ mod tests {
         db.set_metadata(PENDING_ENUM_CONFIG_HASH_KEY, "abandoned-hash")
             .await
             .unwrap();
+        db.set_metadata(
+            &pending_zone_token_key("abandoned-hash", "PrimarySync"),
+            "candidate-token",
+        )
+        .await
+        .unwrap();
 
         let outcome = check_and_persist_enum_config_hash(&db, "active-hash").await;
 
         assert_eq!(outcome, EnumConfigHashOutcome::Unchanged);
         assert_eq!(
             db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_metadata(&pending_zone_token_key("abandoned-hash", "PrimarySync"))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn enum_config_new_drift_discards_superseded_zone_candidates() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "active-hash")
+            .await
+            .unwrap();
+        db.set_metadata(PENDING_ENUM_CONFIG_HASH_KEY, "superseded-hash")
+            .await
+            .unwrap();
+        db.set_metadata(
+            &pending_zone_token_key("superseded-hash", "PrimarySync"),
+            "candidate-token",
+        )
+        .await
+        .unwrap();
+
+        let outcome = check_and_persist_enum_config_hash(&db, "replacement-hash").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Changed);
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("replacement-hash")
+        );
+        assert_eq!(
+            db.get_metadata(&pending_zone_token_key("superseded-hash", "PrimarySync"))
+                .await
+                .unwrap(),
             None
         );
     }

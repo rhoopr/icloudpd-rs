@@ -376,6 +376,10 @@ pub struct SyncStats {
     pub same_cycle_recovery_attempts: usize,
     /// Pass-token recovery rounds that completed checkpoint proof.
     pub same_cycle_recovery_successes: usize,
+    #[serde(skip)]
+    pub(crate) checkpoint_retry_passes: Vec<PassKey>,
+    #[serde(skip)]
+    pub(crate) checkpoint_revalidate_records: Vec<ProviderRecordId>,
     pub elapsed_secs: f64,
     pub interrupted: bool,
     /// Number of tasks that observed at least one HTTP 429 / 503 response
@@ -484,6 +488,10 @@ impl SyncStats {
         }
         self.same_cycle_recovery_attempts += other.same_cycle_recovery_attempts;
         self.same_cycle_recovery_successes += other.same_cycle_recovery_successes;
+        self.checkpoint_retry_passes
+            .extend(other.checkpoint_retry_passes.iter().cloned());
+        self.checkpoint_revalidate_records
+            .extend(other.checkpoint_revalidate_records.iter().cloned());
         self.elapsed_secs += other.elapsed_secs;
         self.interrupted = self.interrupted || other.interrupted;
         self.rate_limited += other.rate_limited;
@@ -516,6 +524,7 @@ const PENDING_RETRY_UNMATCHED_REASON: &str = "pending_retry_unmatched";
 const PAGINATION_SHORTFALL_REASON: &str = "pagination_shortfall";
 const ICLOUD_ALBUM_COUNT_ERROR_REASON: &str = "icloud_album_count_error";
 const INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
+const MAX_SAME_CYCLE_CHECKPOINT_RECOVERY_ROUNDS: usize = 1;
 pub(super) const PRODUCER_ENUMERATION_INCOMPLETE_REASON: &str = "producer_enumeration_incomplete";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
@@ -2112,9 +2121,41 @@ struct PerPassStreamingResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassKey {
-    index: usize,
-    kind: crate::commands::PassKind,
-    label: String,
+    pub(crate) index: usize,
+    pub(crate) kind: crate::commands::PassKind,
+    pub(crate) label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryAction {
+    ContinueTail,
+    RetryPasses(Vec<PassKey>),
+    RevalidateRecords(Vec<ProviderRecordId>),
+    ReplayFromPriorToken,
+    ReconcileInventory(FullEnumerationReason),
+    Reauthenticate,
+    Stop,
+}
+
+impl RecoveryAction {
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ContinueTail => "continue_tail",
+            Self::RetryPasses(_) => "retry_passes",
+            Self::RevalidateRecords(_) => "revalidate_records",
+            Self::ReplayFromPriorToken => "replay_from_prior_token",
+            Self::ReconcileInventory(_) => "reconcile_inventory",
+            Self::Reauthenticate => "reauthenticate",
+            Self::Stop => "stop",
+        }
+    }
+
+    fn retry_passes(&self) -> &[PassKey] {
+        match self {
+            Self::RetryPasses(passes) => passes,
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2891,11 +2932,11 @@ pub(crate) async fn reconcile_catalog_paths(
                 asset_record_name.clone(),
             );
             if seen_requests.insert(key.clone()) {
-                requests.push(RecordLookupRequest {
-                    state_id: ProviderRecordId::new(key.0),
-                    master_record_name: ProviderRecordId::new(key.1),
-                    asset_record_name: ProviderRecordId::new(key.2),
-                });
+                requests.push(RecordLookupRequest::paired(
+                    ProviderRecordId::new(key.0),
+                    ProviderRecordId::new(key.1),
+                    ProviderRecordId::new(key.2),
+                ));
             }
         }
     }
@@ -4223,6 +4264,10 @@ async fn run_pending_retry_pass(
         }
     }
     let remaining_unmatched = unmatched;
+    let checkpoint_revalidate_records = unmatched_targets
+        .iter()
+        .map(|target| ProviderRecordId::new(target.asset_id.to_string()))
+        .collect();
 
     let stats = SyncStats {
         downloaded: pass_result.downloaded,
@@ -4233,12 +4278,12 @@ async fn run_pending_retry_pass(
         state_write_failures: pass_result.state_write_failures,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled()
-            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD
-            || pass_result.url_expired_abort,
+            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
         rate_limited: pass_result.rate_limit_observations,
         photos_downloaded: pass_result.photos_downloaded,
         videos_downloaded: pass_result.videos_downloaded,
         recap: pass_result.recap.clone(),
+        checkpoint_revalidate_records,
         ..SyncStats::default()
     };
     if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
@@ -5241,6 +5286,7 @@ async fn download_photos_full_with_token_policy(
     let mut token_unique_values: Option<usize> = None;
     let mut same_cycle_recovery_attempts = 0usize;
     let mut same_cycle_recovery_successes = 0usize;
+    let mut checkpoint_retry_passes = Vec::new();
     let sync_token = if token_attempt_allowed {
         let expected_token_count = token_receivers.len();
         token_expected_receivers = Some(expected_token_count);
@@ -5308,7 +5354,8 @@ async fn download_photos_full_with_token_policy(
         };
         match initial_evidence {
             ZoneTokenEvidence::Complete { token } => Some(token),
-            ZoneTokenEvidence::Recoverable { reason, .. } if !repair_token_gaps => {
+            ZoneTokenEvidence::Recoverable { passes, reason } if !repair_token_gaps => {
+                checkpoint_retry_passes = passes;
                 token_block_reason = Some(match reason {
                     TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
                     TokenGap::Blank => "icloud_blank_sync_token",
@@ -5323,12 +5370,13 @@ async fn download_photos_full_with_token_policy(
                 reason,
                 passes: recovery_passes,
             } => {
+                let recovery_action = RecoveryAction::RetryPasses(recovery_passes);
                 tracing::warn!(
                     reason = ?reason,
-                    passes = ?recovery_passes,
+                    passes = ?recovery_action.retry_passes(),
                     "Provider checkpoint preserved: pass proof is incomplete; retrying only affected passes now"
                 );
-                same_cycle_recovery_attempts = 1;
+                same_cycle_recovery_attempts = MAX_SAME_CYCLE_CHECKPOINT_RECOVERY_ROUNDS;
                 let recovery_configs =
                     match build_pass_configs_resolving_deferred_excludes(passes, config).await {
                         Ok(configs) => configs,
@@ -5342,9 +5390,9 @@ async fn download_photos_full_with_token_policy(
                     };
                 let mut recovery_enumeration_complete = true;
                 let mut recovery_enumeration_errors = 0usize;
-                let expected_recovery_passes = recovery_passes.len();
+                let expected_recovery_passes = recovery_action.retry_passes().len();
                 let mut completed_recovery_passes = 0usize;
-                for pass_key in recovery_passes {
+                for pass_key in recovery_action.retry_passes().iter().cloned() {
                     let Some(pass) = passes.get(pass_key.index) else {
                         recovery_enumeration_complete = false;
                         continue;
@@ -5493,8 +5541,23 @@ async fn download_photos_full_with_token_policy(
                         token_block_reason = Some("icloud_sync_token_missing");
                         None
                     }
-                    ZoneTokenEvidence::Recoverable { reason, .. }
-                    | ZoneTokenEvidence::Incomplete { reason } => {
+                    ZoneTokenEvidence::Recoverable { passes, reason } => {
+                        checkpoint_retry_passes = passes;
+                        token_block_reason = Some(match reason {
+                            TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
+                            TokenGap::Blank => "icloud_blank_sync_token",
+                            TokenGap::Mismatch => "icloud_sync_token_mismatch",
+                            TokenGap::Missing | TokenGap::EnumerationIncomplete => {
+                                "icloud_sync_token_missing"
+                            }
+                        });
+                        None
+                    }
+                    ZoneTokenEvidence::Incomplete { reason } => {
+                        checkpoint_retry_passes = observations
+                            .iter()
+                            .map(|observation| observation.pass.clone())
+                            .collect();
                         token_block_reason = Some(match reason {
                             TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
                             TokenGap::Blank => "icloud_blank_sync_token",
@@ -5508,6 +5571,10 @@ async fn download_photos_full_with_token_policy(
                 }
             }
             ZoneTokenEvidence::Incomplete { reason } => {
+                checkpoint_retry_passes = observations
+                    .iter()
+                    .map(|observation| observation.pass.clone())
+                    .collect();
                 token_block_reason = Some(match reason {
                     TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
                     TokenGap::Blank => "icloud_blank_sync_token",
@@ -5563,6 +5630,7 @@ async fn download_photos_full_with_token_policy(
     stats.api_total_at_start = api_total_at_start;
     stats.same_cycle_recovery_attempts = same_cycle_recovery_attempts;
     stats.same_cycle_recovery_successes = same_cycle_recovery_successes;
+    stats.checkpoint_retry_passes = checkpoint_retry_passes;
     if token_attempt_allowed {
         stats.sync_token_expected_receivers = token_expected_receivers;
         stats.sync_token_receivers_with_token = token_receivers_with_token;
@@ -6876,8 +6944,7 @@ async fn download_photos_incremental_collecting_inner(
         sync_token_blocked_reason: None,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled()
-            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD
-            || pass_result.url_expired_abort,
+            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
         rate_limited: pass_result.rate_limit_observations,
         photos_downloaded: pass_result.photos_downloaded,
         videos_downloaded: pass_result.videos_downloaded,
@@ -11623,24 +11690,16 @@ mod tests {
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.total_assets, 1);
         assert_eq!(summary.source_deleted, 0);
-        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.pending + summary.failed, 1);
     }
 
     #[tokio::test]
-    async fn incremental_pending_retry_clears_only_explicit_provider_deletion() {
+    async fn incremental_legacy_pending_master_lookup_clears_explicit_provider_deletion() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = TestAssetRecord::new("PENDING_CONFIRMED_DELETED")
             .filename("confirmed-deleted.jpg")
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
-        db.upsert_asset_master_mapping(
-            "PrimarySync",
-            "asset-PENDING_CONFIRMED_DELETED",
-            "PENDING_CONFIRMED_DELETED",
-        )
-        .await
-        .expect("seed identity mapping");
-
         let session = PendingLookupSession {
             records: Arc::new(vec![json!({
                 "recordName": "PENDING_CONFIRMED_DELETED",
@@ -14268,6 +14327,12 @@ mod tests {
             sync_token_unique_values: Some(1),
             same_cycle_recovery_attempts: 1,
             same_cycle_recovery_successes: 1,
+            checkpoint_retry_passes: vec![PassKey {
+                index: 0,
+                kind: PassKind::Album,
+                label: "album".to_string(),
+            }],
+            checkpoint_revalidate_records: vec![ProviderRecordId::new("master-a")],
             full_enumeration_reason: Some(FullEnumerationReason::NoStoredToken),
             elapsed_secs: 1.5,
             interrupted: false,
@@ -14327,6 +14392,12 @@ mod tests {
             sync_token_unique_values: Some(1),
             same_cycle_recovery_attempts: 2,
             same_cycle_recovery_successes: 1,
+            checkpoint_retry_passes: vec![PassKey {
+                index: 1,
+                kind: PassKind::Unfiled,
+                label: "unfiled".to_string(),
+            }],
+            checkpoint_revalidate_records: vec![ProviderRecordId::new("master-b")],
             full_enumeration_reason: Some(FullEnumerationReason::MetadataBackfill),
             elapsed_secs: 0.75,
             interrupted: true,
@@ -14413,6 +14484,8 @@ mod tests {
         assert_eq!(acc.sync_token_unique_values, Some(1));
         assert_eq!(acc.same_cycle_recovery_attempts, 3);
         assert_eq!(acc.same_cycle_recovery_successes, 2);
+        assert_eq!(acc.checkpoint_retry_passes.len(), 2);
+        assert_eq!(acc.checkpoint_revalidate_records.len(), 2);
         assert_eq!(
             acc.full_enumeration_reason,
             Some(FullEnumerationReason::NoStoredToken)

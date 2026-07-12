@@ -56,7 +56,32 @@ impl ProviderRecordId {
 pub(crate) struct RecordLookupRequest {
     pub(crate) state_id: ProviderRecordId,
     pub(crate) master_record_name: ProviderRecordId,
-    pub(crate) asset_record_name: ProviderRecordId,
+    pub(crate) asset_record_name: Option<ProviderRecordId>,
+}
+
+impl RecordLookupRequest {
+    pub(crate) fn paired(
+        state_id: ProviderRecordId,
+        master_record_name: ProviderRecordId,
+        asset_record_name: ProviderRecordId,
+    ) -> Self {
+        Self {
+            state_id,
+            master_record_name,
+            asset_record_name: Some(asset_record_name),
+        }
+    }
+
+    pub(crate) fn master_only(
+        state_id: ProviderRecordId,
+        master_record_name: ProviderRecordId,
+    ) -> Self {
+        Self {
+            state_id,
+            master_record_name,
+            asset_record_name: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -868,7 +893,9 @@ impl PhotoAlbum {
             let mut record_names = FxHashSet::default();
             let mut records = Vec::with_capacity(batch.len().saturating_mul(2));
             for request in batch {
-                for record_id in [&request.master_record_name, &request.asset_record_name] {
+                for record_id in std::iter::once(&request.master_record_name)
+                    .chain(request.asset_record_name.as_ref())
+                {
                     if record_names.insert(record_id.as_str().to_string()) {
                         records.push(json!({
                             "recordName": record_id.as_str(),
@@ -928,7 +955,10 @@ impl PhotoAlbum {
 
             for request in batch {
                 let master = by_name.get(request.master_record_name.as_str()).copied();
-                let asset = by_name.get(request.asset_record_name.as_str()).copied();
+                let asset = request
+                    .asset_record_name
+                    .as_ref()
+                    .and_then(|record_name| by_name.get(record_name.as_str()).copied());
                 let explicit_not_found = |record: Option<&Value>| {
                     record
                         .and_then(|record| record.get("serverErrorCode"))
@@ -2725,11 +2755,90 @@ mod tests {
     }
 
     fn lookup_request(state_id: &str, master: &str, asset: &str) -> RecordLookupRequest {
-        RecordLookupRequest {
-            state_id: ProviderRecordId::new(state_id),
-            master_record_name: ProviderRecordId::new(master),
-            asset_record_name: ProviderRecordId::new(asset),
-        }
+        RecordLookupRequest::paired(
+            ProviderRecordId::new(state_id),
+            ProviderRecordId::new(master),
+            ProviderRecordId::new(asset),
+        )
+    }
+
+    /// Live Phase 0 capability probe for the private CloudKit database.
+    ///
+    /// Run single-threaded with the maintainer test account:
+    /// `cargo test live_targeted_record_lookup_distinguishes_present_and_missing -- --ignored --test-threads=1`
+    #[tokio::test]
+    #[ignore = "requires live iCloud credentials and a trusted session"]
+    async fn live_targeted_record_lookup_distinguishes_present_and_missing() {
+        let _ = dotenvy::from_filename(".env");
+        let username = std::env::var("ICLOUD_USERNAME").expect("ICLOUD_USERNAME must be set");
+        let password = std::env::var("ICLOUD_PASSWORD").expect("ICLOUD_PASSWORD must be set");
+        let cookie_dir = std::env::var_os("ICLOUD_TEST_COOKIE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(".test-cookies"));
+        let password_provider: crate::password::PasswordProvider =
+            Arc::new(move || Some(crate::password::SecretString::from(password.clone())));
+        let auth = crate::auth::authenticate(
+            &cookie_dir,
+            &username,
+            &password_provider,
+            "com",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("authenticate live lookup probe");
+        let (_session, mut service) = crate::commands::init_photos_service(
+            auth,
+            RetryConfig::default(),
+            crate::personality::Mode::Off,
+        )
+        .await
+        .expect("initialize live Photos service");
+        let album = service
+            .get_library(crate::icloud::photos::PRIMARY_ZONE_NAME)
+            .await
+            .expect("resolve primary library")
+            .all();
+        let asset = album
+            .photos(Some(1))
+            .await
+            .expect("enumerate one live asset")
+            .into_iter()
+            .next()
+            .expect("live account must contain at least one photo");
+        let missing_id = "kei-phase0-record-that-does-not-exist";
+        let requests = [
+            lookup_request(asset.id(), asset.id(), asset.asset_record_name()),
+            RecordLookupRequest::master_only(
+                ProviderRecordId::new(missing_id),
+                ProviderRecordId::new(missing_id),
+            ),
+        ];
+
+        let result = album.resolve_records(&requests).await;
+
+        assert!(result.complete, "live lookup batch must be complete");
+        assert!(matches!(
+            result
+                .results
+                .iter()
+                .find(|(id, _)| id.as_str() == asset.id()),
+            Some((_, RecordResolution::Present(_)))
+        ));
+        assert!(matches!(
+            result
+                .results
+                .iter()
+                .find(|(id, _)| id.as_str() == missing_id),
+            Some((
+                _,
+                RecordResolution::Deleted {
+                    deleted_at: None,
+                    master_family: true,
+                }
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -2773,6 +2882,37 @@ mod tests {
         let records = body["records"].as_array().expect("records array");
         assert_eq!(records.len(), 2);
         assert!(records.iter().all(|record| record.get("zoneID").is_none()));
+    }
+
+    #[tokio::test]
+    async fn targeted_master_only_lookup_resolves_explicit_legacy_deletion() {
+        let response = json!({
+            "records": [{
+                "recordName": "legacy-master",
+                "serverErrorCode": "UNKNOWN_ITEM",
+                "reason": "record not found"
+            }]
+        });
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(response)));
+
+        let batch = album
+            .resolve_records(&[RecordLookupRequest::master_only(
+                ProviderRecordId::new("legacy-master"),
+                ProviderRecordId::new("legacy-master"),
+            )])
+            .await;
+
+        assert!(batch.complete);
+        assert!(matches!(
+            batch.results.as_slice(),
+            [(
+                _,
+                RecordResolution::Deleted {
+                    master_family: true,
+                    ..
+                }
+            )]
+        ));
     }
 
     #[tokio::test]

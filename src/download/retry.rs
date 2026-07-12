@@ -110,18 +110,28 @@ pub(super) async fn build_pending_retry_download_tasks(
                 .await?
         };
         master_by_state_id.insert(record.id.to_string(), master.clone());
+        if asset_record_names.is_empty() {
+            let request_key = (record.id.to_string(), master.clone(), None);
+            if seen_requests.insert(request_key.clone()) {
+                lookup_requests.push(RecordLookupRequest::master_only(
+                    ProviderRecordId::new(request_key.0),
+                    ProviderRecordId::new(request_key.1),
+                ));
+            }
+            continue;
+        }
         for asset_record_name in asset_record_names {
             let request_key = (
                 record.id.to_string(),
                 master.clone(),
-                asset_record_name.clone(),
+                Some(asset_record_name.clone()),
             );
             if seen_requests.insert(request_key.clone()) {
-                lookup_requests.push(RecordLookupRequest {
-                    state_id: ProviderRecordId::new(request_key.0),
-                    master_record_name: ProviderRecordId::new(request_key.1),
-                    asset_record_name: ProviderRecordId::new(request_key.2),
-                });
+                lookup_requests.push(RecordLookupRequest::paired(
+                    ProviderRecordId::new(request_key.0),
+                    ProviderRecordId::new(request_key.1),
+                    ProviderRecordId::new(asset_record_name),
+                ));
             }
         }
     }

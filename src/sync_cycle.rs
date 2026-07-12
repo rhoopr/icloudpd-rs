@@ -47,6 +47,7 @@ pub(crate) struct LibraryState {
 pub(crate) const ENUM_CONFIG_HASH_KEY: &str = "enum_config_hash";
 pub(crate) const PENDING_ENUM_CONFIG_HASH_KEY: &str = "pending_enum_config_hash";
 pub(crate) const PENDING_DOWNLOAD_CONFIG_HASH_KEY: &str = "pending_download_config_hash";
+const PENDING_ZONE_TOKEN_PREFIX: &str = "pending_sync_token:";
 const LAST_CHECKPOINT_STATUS_KEY: &str = "last_checkpoint_status";
 const LAST_RECOVERY_ACTION_KEY: &str = "last_recovery_action";
 const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
@@ -78,6 +79,10 @@ pub(crate) fn sync_token_key(zone_name: &str) -> String {
 
 fn inventory_anchor_key(enum_config_hash: &str, zone_name: &str) -> String {
     format!("{INVENTORY_ANCHOR_PREFIX}{enum_config_hash}:{zone_name}")
+}
+
+pub(crate) fn pending_zone_token_key(enum_config_hash: &str, zone_name: &str) -> String {
+    format!("{PENDING_ZONE_TOKEN_PREFIX}{enum_config_hash}:{zone_name}")
 }
 
 #[allow(
@@ -154,34 +159,7 @@ impl CheckpointHoldReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RecoveryAction {
-    ContinueTail,
-    RetryPasses(Vec<download::PassKey>),
-    RevalidateRecords(Vec<crate::icloud::photos::ProviderRecordId>),
-    ReplayFromPriorToken,
-    #[allow(
-        dead_code,
-        reason = "typed recovery vocabulary includes the final fallback even when current branches select narrower actions"
-    )]
-    ReconcileInventory(download::FullEnumerationReason),
-    Reauthenticate,
-    Stop,
-}
-
-impl RecoveryAction {
-    const fn as_str(&self) -> &'static str {
-        match self {
-            Self::ContinueTail => "continue_tail",
-            Self::RetryPasses(_) => "retry_passes",
-            Self::RevalidateRecords(_) => "revalidate_records",
-            Self::ReplayFromPriorToken => "replay_from_prior_token",
-            Self::ReconcileInventory(_) => "reconcile_inventory",
-            Self::Reauthenticate => "reauthenticate",
-            Self::Stop => "stop",
-        }
-    }
-}
+pub(crate) use download::RecoveryAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SourceCheckpointDecision {
@@ -243,19 +221,22 @@ fn source_checkpoint_decision(
         .as_ref()
         .filter(|token| !token.trim().is_empty())
     else {
-        let recovery = if result.stats.sync_token_blocked_reason == Some("pending_retry_unmatched")
-        {
-            RecoveryAction::RevalidateRecords(Vec::new())
+        let recovery = if !result.stats.checkpoint_retry_passes.is_empty() {
+            RecoveryAction::RetryPasses(result.stats.checkpoint_retry_passes.clone())
+        } else if !result.stats.checkpoint_revalidate_records.is_empty() {
+            RecoveryAction::RevalidateRecords(result.stats.checkpoint_revalidate_records.clone())
         } else {
-            RecoveryAction::RetryPasses(Vec::new())
+            RecoveryAction::ReplayFromPriorToken
         };
         return preserve(CheckpointHoldReason::TokenProofIncomplete, recovery);
     };
     if result.stats.sync_token_blocked {
-        return preserve(
-            CheckpointHoldReason::TokenProofIncomplete,
-            RecoveryAction::RetryPasses(Vec::new()),
-        );
+        let recovery = if result.stats.checkpoint_retry_passes.is_empty() {
+            RecoveryAction::ReplayFromPriorToken
+        } else {
+            RecoveryAction::RetryPasses(result.stats.checkpoint_retry_passes.clone())
+        };
+        return preserve(CheckpointHoldReason::TokenProofIncomplete, recovery);
     }
     SourceCheckpointDecision::Advance {
         token: token.clone(),
@@ -520,6 +501,12 @@ where
             {
                 tracing::debug!(error = %e, "Failed to clear reverted pending enum config hash");
             }
+            if let Err(e) = db
+                .delete_metadata_by_prefix(PENDING_ZONE_TOKEN_PREFIX)
+                .await
+            {
+                tracing::debug!(error = %e, "Failed to clear reverted pending zone checkpoints");
+            }
             return EnumConfigHashOutcome::Unchanged;
         }
         Some(_) => EnumConfigHashOutcome::Changed,
@@ -530,6 +517,22 @@ where
         tracing::info!(
             "Enumeration config changed since last sync; preserving active checkpoints and staging reconciliation"
         );
+        match db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await {
+            Ok(Some(pending_hash)) if pending_hash == current_hash => {}
+            Ok(_) => {
+                if let Err(e) = db
+                    .delete_metadata_by_prefix(PENDING_ZONE_TOKEN_PREFIX)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Failed to clear checkpoints from superseded config reconciliation");
+                    return EnumConfigHashOutcome::ChangedTokenPurgeFailed;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to read pending enum config hash");
+                return EnumConfigHashOutcome::ReadFailed;
+            }
+        }
         PENDING_ENUM_CONFIG_HASH_KEY
     } else {
         ENUM_CONFIG_HASH_KEY
@@ -633,7 +636,6 @@ pub(crate) async fn run_cycle(
     let mut enum_config_hash_outcome = EnumConfigHashOutcome::Unchanged;
     let mut pending_download_config_hash = None;
     let mut path_reconciliation_complete = true;
-    let mut candidate_zone_tokens = Vec::new();
     let mut checkpoint_hold_action: Option<&'static str> = None;
     let enum_config_hash = download::compute_config_hash(config);
 
@@ -654,6 +656,17 @@ pub(crate) async fn run_cycle(
             enum_config_hash_outcome =
                 check_and_persist_enum_config_hash(db, &enum_config_hash).await;
             force_full_for_config_hash = enum_config_hash_outcome.must_force_full_sync();
+            if matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed) {
+                let recovery = RecoveryAction::ReconcileInventory(
+                    download::FullEnumerationReason::EnumConfigHashDrift,
+                );
+                if let Err(e) = db
+                    .set_metadata(LAST_RECOVERY_ACTION_KEY, recovery.as_str())
+                    .await
+                {
+                    tracing::debug!(error = %e, "Failed to persist inventory reconciliation action");
+                }
+            }
             if matches!(
                 enum_config_hash_outcome,
                 EnumConfigHashOutcome::ChangedTokenPurgeFailed | EnumConfigHashOutcome::ReadFailed
@@ -703,7 +716,31 @@ pub(crate) async fn run_cycle(
         // Determine source-enumeration mode per library. Failed transfers are
         // rehydrated from durable pending state by the download engine and do
         // not require replaying the provider inventory.
-        let sync_mode_decision = if force_full_for_config_hash {
+        let pending_zone_token =
+            if matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed) {
+                if let Some(db) = state_db {
+                    db.get_metadata(&pending_zone_token_key(
+                        &enum_config_hash,
+                        &lib_state.zone_name,
+                    ))
+                    .await?
+                    .filter(|token| !token.trim().is_empty())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let sync_mode_decision = if let Some(zone_sync_token) = pending_zone_token {
+            tracing::debug!(
+                zone = %lib_state.zone_name,
+                "Continuing config reconciliation from the completed zone checkpoint"
+            );
+            SyncModeDecision {
+                mode: download::SyncMode::Incremental { zone_sync_token },
+                full_enumeration_reason: None,
+            }
+        } else if force_full_for_config_hash {
             let reason = download::FullEnumerationReason::EnumConfigHashDrift;
             tracing::debug!(
                 zone = %lib_state.zone_name,
@@ -963,7 +1000,18 @@ pub(crate) async fn run_cycle(
                 if let Some(db) = state_db {
                     let reconciliation_active = force_full_for_config_hash;
                     if reconciliation_active {
-                        candidate_zone_tokens.push((lib_state.sync_token_key.clone(), token));
+                        let candidate_key =
+                            pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
+                        if let Err(e) = db.set_metadata(&candidate_key, &token).await {
+                            checkpoint_hold_action =
+                                Some(RecoveryAction::ReplayFromPriorToken.as_str());
+                            db_sync_token_advance_safe = false;
+                            tracing::warn!(
+                                zone = %lib_state.zone_name,
+                                error = %e,
+                                "Failed to retain completed zone reconciliation checkpoint"
+                            );
+                        }
                     } else {
                         let mut metadata_updates = vec![(lib_state.sync_token_key.clone(), token)];
                         if let Some(recovery_action) = checkpoint_hold_action {
@@ -1099,23 +1147,50 @@ pub(crate) async fn run_cycle(
         && !shutdown_token.is_cancelled()
     {
         if let Some(db) = state_db {
-            let mut metadata_updates = candidate_zone_tokens;
+            let mut metadata_updates = Vec::new();
             let mut metadata_deletes = Vec::new();
             if force_full_for_config_hash {
-                metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));
-                metadata_deletes.push(PENDING_ENUM_CONFIG_HASH_KEY.to_owned());
+                for lib_state in library_states
+                    .iter()
+                    .copied()
+                    .filter(|state| has_active_passes(state))
+                {
+                    let candidate_key =
+                        pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
+                    let Some(token) = db
+                        .get_metadata(&candidate_key)
+                        .await?
+                        .filter(|token| !token.trim().is_empty())
+                    else {
+                        db_sync_token_advance_safe = false;
+                        tracing::warn!(
+                            zone = %lib_state.zone_name,
+                            "Config reconciliation has no completed checkpoint for selected zone"
+                        );
+                        break;
+                    };
+                    metadata_updates.push((lib_state.sync_token_key.clone(), token));
+                    metadata_deletes.push(candidate_key);
+                }
+                if db_sync_token_advance_safe {
+                    metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));
+                    metadata_deletes.push(PENDING_ENUM_CONFIG_HASH_KEY.to_owned());
+                }
             }
-            metadata_updates.push((LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()));
-            metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
-            if let Err(e) = db
-                .commit_checkpoint_transition(state::CheckpointTransition {
-                    metadata_updates,
-                    metadata_deletes,
-                })
-                .await
-            {
-                db_sync_token_advance_safe = false;
-                tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
+            if db_sync_token_advance_safe {
+                metadata_updates
+                    .push((LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()));
+                metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
+                if let Err(e) = db
+                    .commit_checkpoint_transition(state::CheckpointTransition {
+                        metadata_updates,
+                        metadata_deletes,
+                    })
+                    .await
+                {
+                    db_sync_token_advance_safe = false;
+                    tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
+                }
             }
         }
     }
@@ -1376,6 +1451,33 @@ mod tests {
             SourceCheckpointDecision::Preserve {
                 reason: CheckpointHoldReason::StateNotDurable,
                 recovery: RecoveryAction::ReplayFromPriorToken,
+            }
+        );
+    }
+
+    #[test]
+    fn incomplete_token_proof_preserves_concrete_retry_passes() {
+        let pass = download::PassKey {
+            index: 2,
+            kind: PassKind::Unfiled,
+            label: "unfiled".to_string(),
+        };
+        let result = download::SyncResult {
+            outcome: download::DownloadOutcome::Success,
+            sync_token: None,
+            stats: download::SyncStats {
+                sync_token_blocked: true,
+                checkpoint_retry_passes: vec![pass.clone()],
+                ..download::SyncStats::default()
+            },
+            full_enumeration_ran: true,
+        };
+
+        assert_eq!(
+            source_checkpoint_decision(&result, false, false, CheckpointBasis::CompleteInventory),
+            SourceCheckpointDecision::Preserve {
+                reason: CheckpointHoldReason::TokenProofIncomplete,
+                recovery: RecoveryAction::RetryPasses(vec![pass]),
             }
         );
     }
