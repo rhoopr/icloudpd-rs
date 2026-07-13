@@ -4190,6 +4190,7 @@ mod tests {
         message: &'static str,
         cancel_on_upsert: Option<CancellationToken>,
         replace_download_dir_on_upsert: Option<std::path::PathBuf>,
+        fail_upsert_seen: bool,
         fail_mark_downloaded: bool,
     }
 
@@ -4218,6 +4219,7 @@ mod tests {
                 message,
                 cancel_on_upsert: None,
                 replace_download_dir_on_upsert: None,
+                fail_upsert_seen: false,
                 fail_mark_downloaded: false,
             }
         }
@@ -4252,6 +4254,11 @@ mod tests {
             self.fail_mark_downloaded = true;
             self
         }
+
+        fn with_upsert_seen_failure(mut self) -> Self {
+            self.fail_upsert_seen = true;
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -4274,6 +4281,9 @@ mod tests {
             &self,
             record: &state::types::AssetRecord,
         ) -> Result<(), state::error::StateError> {
+            if self.fail_upsert_seen {
+                return Err(state::error::StateError::LockPoisoned(self.message.into()));
+            }
             let result = self.inner.upsert_seen(record).await;
             if result.is_ok() {
                 if let Some(path) = &self.replace_download_dir_on_upsert {
@@ -6044,6 +6054,79 @@ mod tests {
         );
         let summary = db.get_summary().await.expect("state summary");
         assert_eq!(summary.pending + summary.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_expired_url_without_durable_retry_preserves_zone_checkpoint() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(
+                Arc::clone(&inner),
+                "simulated pending-row write failure",
+            )
+            .with_upsert_seen_failure(),
+        );
+        let body = b"expired-body";
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        let album = make_one_photo_incremental_album_with_download(
+            "PrimarySync",
+            "zone-tok-next",
+            &format!("{}/expired.jpg", server.uri()),
+            body.len() as u64,
+            &checksum,
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("expired URL cycle with failed pending-row write");
+
+        assert_eq!(result.failed_count, 2);
+        assert_eq!(result.stats.state_write_failures, 1);
+        assert!(!result.db_sync_token_advance_safe);
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "the provider checkpoint must not advance without a durable retry row"
+        );
+        let summary = inner.get_summary().await.expect("state summary");
+        assert_eq!(summary.pending + summary.failed, 0);
     }
 
     #[tokio::test]

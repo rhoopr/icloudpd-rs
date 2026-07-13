@@ -674,14 +674,16 @@ async fn record_seen_for_forwarded_task(
     config: &DownloadConfig,
     asset: &PhotoAsset,
     task: &DownloadTask,
-) {
-    if let Err(e) = planner::upsert_seen_for_task(db, config, asset, task).await {
+) -> Result<(), crate::state::error::StateError> {
+    let result = planner::upsert_seen_for_task(db, config, asset, task).await;
+    if let Err(e) = &result {
         tracing::warn!(
             asset_id = %task.asset_id,
             error = %e,
             "Failed to record asset"
         );
     }
+    result
 }
 
 async fn backfill_downloaded_metadata_for_on_disk_skip(
@@ -1503,13 +1505,18 @@ where
                                 ) {
                                     Some(true) => {
                                         disposition = disposition.max(AssetDisposition::Forwarded);
-                                        record_seen_for_forwarded_task(
+                                        if record_seen_for_forwarded_task(
                                             db.as_ref(),
                                             config,
                                             &asset,
                                             &task,
                                         )
-                                        .await;
+                                        .await
+                                        .is_err()
+                                        {
+                                            state_write_failures_producer
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                         let size = task.size;
                                         if task_tx.send(task).await.is_err() {
                                             return skips;
@@ -1579,13 +1586,20 @@ where
                                                 );
                                                 disposition =
                                                     disposition.max(AssetDisposition::Forwarded);
-                                                record_seen_for_forwarded_task(
+                                                if record_seen_for_forwarded_task(
                                                     db.as_ref(),
                                                     config,
                                                     &asset,
                                                     &task,
                                                 )
-                                                .await;
+                                                .await
+                                                .is_err()
+                                                {
+                                                    state_write_failures_producer.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                }
                                                 let size = task.size;
                                                 if task_tx.send(task).await.is_err() {
                                                     return skips;

@@ -6649,6 +6649,7 @@ async fn download_photos_incremental_collecting_inner(
     let mut task_planner = planner::TaskPlanner::new();
     let mut skip_breakdown = SkipBreakdown::default();
     let mut enumeration_errors = 0usize;
+    let mut planning_state_write_failures = 0usize;
     // Incremental routing already decides whether a changed asset belongs to
     // a selected album pass or the unfiled pass from trusted membership
     // state. Re-enumerating every album here to rebuild unfiled excludes
@@ -6701,6 +6702,7 @@ async fn download_photos_incremental_collecting_inner(
                 if let Err(e) =
                     planner::upsert_seen_for_task(db.as_ref(), effective_config, asset, task).await
                 {
+                    planning_state_write_failures = planning_state_write_failures.saturating_add(1);
                     tracing::warn!(
                         asset_id = %task.asset_id,
                         error = %e,
@@ -6750,7 +6752,9 @@ async fn download_photos_incremental_collecting_inner(
         let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
-            state_write_failures: delta_summary.state_transition_failures,
+            state_write_failures: delta_summary
+                .state_transition_failures
+                .saturating_add(planning_state_write_failures),
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
@@ -6793,7 +6797,9 @@ async fn download_photos_incremental_collecting_inner(
         let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
-            state_write_failures: delta_summary.state_transition_failures,
+            state_write_failures: delta_summary
+                .state_transition_failures
+                .saturating_add(planning_state_write_failures),
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
@@ -6935,8 +6941,10 @@ async fn download_photos_incremental_collecting_inner(
         bytes_downloaded: pass_result.bytes_downloaded,
         disk_bytes_written: pass_result.disk_bytes_written,
         exif_failures: pass_result.exif_failures,
-        state_write_failures: pass_result.state_write_failures
-            + delta_summary.state_transition_failures,
+        state_write_failures: pass_result
+            .state_write_failures
+            .saturating_add(delta_summary.state_transition_failures)
+            .saturating_add(planning_state_write_failures),
         enumeration_errors,
         pagination_shortfall_warnings: 0,
         pagination_shortfall_assets: 0,
