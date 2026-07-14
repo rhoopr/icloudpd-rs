@@ -4339,21 +4339,21 @@ fn pending_retry_no_download_result(
     }
 }
 
-async fn append_pending_retry_to_incremental_result(
+async fn append_pending_retry_to_sync_result(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     shutdown_token: CancellationToken,
     pending_at_start: u64,
-    incremental_result: SyncResult,
+    sync_result: SyncResult,
 ) -> Result<SyncResult> {
     if pending_at_start == 0
-        || !matches!(incremental_result.outcome, DownloadOutcome::Success)
-        || incremental_result.stats.interrupted
+        || !matches!(sync_result.outcome, DownloadOutcome::Success)
+        || sync_result.stats.interrupted
         || shutdown_token.is_cancelled()
     {
-        return Ok(incremental_result);
+        return Ok(sync_result);
     }
 
     let retry_result = match run_pending_retry_pass(
@@ -4387,19 +4387,19 @@ async fn append_pending_retry_to_incremental_result(
     };
 
     let SyncResult {
-        outcome: incremental_outcome,
-        sync_token: incremental_sync_token,
+        outcome: source_outcome,
+        sync_token: source_sync_token,
         stats: mut combined_stats,
-        full_enumeration_ran: incremental_full_enumeration_ran,
-    } = incremental_result;
-    let outcome = merge_download_outcomes(&incremental_outcome, &retry_result.outcome);
+        full_enumeration_ran: source_full_enumeration_ran,
+    } = sync_result;
+    let outcome = merge_download_outcomes(&source_outcome, &retry_result.outcome);
     combined_stats.accumulate(&retry_result.stats);
     let sync_token = if !combined_stats.sync_token_blocked
         && !combined_stats.interrupted
         && !controls.run_mode.is_dry_run()
         && !controls.run_mode.only_print_filenames()
     {
-        incremental_sync_token
+        source_sync_token
     } else {
         None
     };
@@ -4408,7 +4408,7 @@ async fn append_pending_retry_to_incremental_result(
         outcome,
         sync_token,
         stats: combined_stats,
-        full_enumeration_ran: incremental_full_enumeration_ran || retry_result.full_enumeration_ran,
+        full_enumeration_ran: source_full_enumeration_ran || retry_result.full_enumeration_ran,
     })
 }
 
@@ -4518,26 +4518,15 @@ pub async fn download_photos_with_sync(
                         backfill_passes = pass_indices.len(),
                         "Backfilling missing album snapshots before incremental routing"
                     );
-                    let incremental_result =
-                        download_photos_incremental_with_targeted_album_backfill(
-                            download_client,
-                            passes,
-                            &config,
-                            zone_sync_token,
-                            controls,
-                            shutdown_token.clone(),
-                            &pass_indices,
-                            reason,
-                        )
-                        .await?;
-                    append_pending_retry_to_incremental_result(
+                    download_photos_incremental_with_targeted_album_backfill(
                         download_client,
                         passes,
                         &config,
+                        zone_sync_token,
                         controls,
                         shutdown_token.clone(),
-                        total_pending,
-                        incremental_result,
+                        &pass_indices,
+                        reason,
                     )
                     .await
                 }
@@ -4568,18 +4557,7 @@ pub async fn download_photos_with_sync(
                         .await
                     };
                     match incremental_result {
-                        Ok(result) => {
-                            append_pending_retry_to_incremental_result(
-                                download_client,
-                                passes,
-                                &config,
-                                controls,
-                                shutdown_token.clone(),
-                                total_pending,
-                                result,
-                            )
-                            .await
-                        }
+                        Ok(result) => Ok(result),
                         Err(e) => match classify_incremental_error(&e) {
                             IncrementalErrorClass::TokenFallback
                             | IncrementalErrorClass::StaticFallback => {
@@ -4605,7 +4583,18 @@ pub async fn download_photos_with_sync(
                 }
             }
         }
-    };
+    }?;
+
+    let result = append_pending_retry_to_sync_result(
+        download_client,
+        passes,
+        &config,
+        controls,
+        shutdown_token.clone(),
+        total_pending,
+        result,
+    )
+    .await;
 
     // Pending is transient — anything still pending after a complete sync either
     // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
@@ -11699,6 +11688,7 @@ mod tests {
         assert_eq!(summary.total_assets, 1);
         assert_eq!(summary.source_deleted, 0);
         assert_eq!(summary.pending + summary.failed, 1);
+        assert_eq!(summary.awaiting_provider_verification, 1);
     }
 
     #[tokio::test]
@@ -11741,6 +11731,52 @@ mod tests {
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.awaiting_provider_verification, 0);
+        assert_eq!(summary.source_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_full_sync_revalidates_explicit_provider_deletion() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("BOUNDED_FULL_PENDING_DELETED")
+            .filename("bounded-full-pending-deleted.jpg")
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        let session = PendingLookupSession {
+            records: Arc::new(vec![json!({
+                "recordName": "BOUNDED_FULL_PENDING_DELETED",
+                "serverErrorCode": "UNKNOWN_ITEM",
+                "reason": "record not found"
+            })]),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Full;
+        config.recent = Some(300);
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("bounded full sync should revalidate pending work");
+
+        assert!(result.full_enumeration_ran);
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 0);
