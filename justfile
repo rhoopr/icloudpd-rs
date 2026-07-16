@@ -110,6 +110,62 @@ full-test:
 full-test-history N="10":
     scripts/full-test/history.sh "{{N}}"
 
+# Compact agent preflight: branch, worktree, diff size, and latest full-test record.
+agent-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "repo: $(pwd)"
+    echo
+    git status --short --branch
+    echo
+    echo "diff stat:"
+    if git diff --quiet -- . && git diff --cached --quiet -- .; then
+        echo "(clean)"
+    else
+        git diff --stat
+        git diff --cached --stat
+    fi
+    echo
+    runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
+    latest=$(find "$runs_dir" -maxdepth 1 -name '*.json' -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)
+    echo "latest full-test:"
+    if [[ -n "$latest" ]]; then
+        echo "$latest"
+        if rg -q '"status": "fail"' "$latest"; then
+            result=fail
+        else
+            result=pass
+        fi
+        scripts/full-test/render_summary.py "$latest" --result "$result" | sed -n '1,80p'
+    else
+        echo "(no run records found)"
+    fi
+    echo
+    echo "recent full-test history:"
+    scripts/full-test/history.sh 3 2>/dev/null || true
+
+# Summarize the latest full-test phase log, or pass LOG=/path/to/log.
+agent-failure-summary LOG="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    log="{{LOG}}"
+    log="${log#LOG=}"
+    if [[ -z "$log" ]]; then
+        log_dir="${KEI_FULLTEST_LOG_DIR:-/tmp/codex/kei/full-test/logs}"
+        log=$(find "$log_dir" -maxdepth 1 -type f \( -name 'full-test-*.log' -o -name 'kei-full-test-*.log' \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)
+    fi
+    if [[ -z "$log" || ! -f "$log" ]]; then
+        echo "agent-failure-summary: no log found" >&2
+        exit 1
+    fi
+    echo "log: $log"
+    echo
+    echo "failure markers:"
+    rg -n "FAILED|failures:|error:|panicked|PermissionDenied|Operation not permitted|Failed to bind|Could not resolve|timed out|timeout|rc=[1-9]" "$log" | tail -n 80 || echo "(no common failure markers found)"
+    echo
+    echo "tail:"
+    tail -n 80 "$log"
+
 # Check lightweight source CONTRACT markers against their contract_ tests.
 check-contracts:
     scripts/check-contracts
