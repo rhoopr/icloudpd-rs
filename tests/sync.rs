@@ -1100,10 +1100,9 @@ fn first_jpeg(dir: &&std::path::Path) -> std::path::PathBuf {
 #[test]
 #[ignore]
 fn sync_raw_policy_controls_raw_naming() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
     common::with_auth_retry(|| {
         for variant in ["as-is", "prefer-raw", "prefer-jpeg"] {
+            let (username, password, cookie_dir) = common::require_preauth();
             let dir = tempdir().expect("tempdir");
             album_cmd_with_toml(
                 &username,
@@ -1137,10 +1136,9 @@ fn sync_raw_policy_controls_raw_naming() {
 #[test]
 #[ignore]
 fn sync_live_photo_mov_policy_controls_naming() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
     common::with_auth_retry(|| {
         for policy in ["suffix", "original"] {
+            let (username, password, cookie_dir) = common::require_preauth();
             let dir = tempdir().expect("tempdir");
             album_cmd_with_toml(
                 &username,

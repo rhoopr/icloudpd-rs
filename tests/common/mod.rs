@@ -17,11 +17,10 @@ const CLOUDKIT_STALE_SESSION_MARKER: &str = "HTTP 401 for https://";
 static AUTH_CREDS: OnceLock<(String, String, PathBuf)> = OnceLock::new();
 
 thread_local! {
-    /// Keep each live test's isolated state directory alive for the lifetime
-    /// of its test thread. Auth material is copied in, while the SQLite state
-    /// DB starts empty so one test's download/config choices cannot leave
-    /// durable pending work that changes another test's result.
-    static ISOLATED_DATA_DIR: RefCell<Option<tempfile::TempDir>> = const { RefCell::new(None) };
+    /// Keep every live test state directory alive for the lifetime of its test
+    /// thread. A test may call `require_preauth` more than once; retaining all
+    /// directories prevents a later call from deleting an earlier auth source.
+    static ISOLATED_DATA_DIRS: RefCell<Vec<tempfile::TempDir>> = const { RefCell::new(Vec::new()) };
 }
 
 fn copy_auth_material(username: &str, source: &Path, destination: &Path) {
@@ -47,24 +46,44 @@ fn copy_auth_material(username: &str, source: &Path, destination: &Path) {
 }
 
 fn isolated_data_dir(username: &str, shared_cookie_dir: &Path) -> PathBuf {
-    ISOLATED_DATA_DIR.with(|slot| {
+    ISOLATED_DATA_DIRS.with(|dirs| {
         let dir = tempfile::Builder::new()
             .prefix("kei-live-state-")
             .tempdir()
             .expect("create isolated live-test data dir");
         copy_auth_material(username, shared_cookie_dir, dir.path());
         let path = dir.path().to_path_buf();
-        *slot.borrow_mut() = Some(dir);
+        dirs.borrow_mut().push(dir);
         path
     })
 }
 
 fn refresh_isolated_auth_material(username: &str, shared_cookie_dir: &Path) {
-    ISOLATED_DATA_DIR.with(|slot| {
-        if let Some(dir) = slot.borrow().as_ref() {
+    ISOLATED_DATA_DIRS.with(|dirs| {
+        for dir in dirs.borrow().iter() {
             copy_auth_material(username, shared_cookie_dir, dir.path());
         }
     });
+}
+
+#[test]
+fn repeated_isolated_data_dirs_remain_available() {
+    let source = tempfile::tempdir().expect("create auth source");
+    std::fs::write(source.path().join("userexamplecom.session"), b"session")
+        .expect("write auth source");
+
+    let first = isolated_data_dir("user@example.com", source.path());
+    let second = isolated_data_dir("user@example.com", source.path());
+
+    assert_ne!(first, second);
+    assert_eq!(
+        std::fs::read(first.join("userexamplecom.session")).expect("read first auth copy"),
+        b"session"
+    );
+    assert_eq!(
+        std::fs::read(second.join("userexamplecom.session")).expect("read second auth copy"),
+        b"session"
+    );
 }
 
 /// Load `.env` exactly once across all test functions.

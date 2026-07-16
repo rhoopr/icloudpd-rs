@@ -41,6 +41,14 @@ kei_sync() {
         --log-level info "$@" 2>&1
 }
 
+# Each scenario uses a different download root. Clear provider checkpoints and
+# path/config hashes with the asset rows so the next scenario starts with a
+# full inventory instead of treating the new root as deferred reconciliation.
+reset_sync_state() {
+    kei_db_exec "DELETE FROM metadata WHERE key LIKE '%token%' OR key IN ('config_hash', 'enum_config_hash', 'pending_download_config_hash', 'pending_enum_config_hash')"
+    kei_db_exec "DELETE FROM assets"
+}
+
 kei_suite_banner "CONCURRENCY / RESUME / PARTIAL-FAILURE"
 
 echo ""
@@ -53,7 +61,7 @@ kei_preflight_session
 echo ""
 echo "=== 1. Concurrent downloads (threads=5) ==="
 DIR1=$(kei_scratch_dir concurrent)
-kei_db_exec "DELETE FROM assets"
+reset_sync_state
 
 OUT=$(KEI_SYNC_DOWNLOAD_TOML=$'threads = 5\n' kei_sync "$DIR1")
 echo "$OUT" | grep -E "concurrency|downloaded|failed|completed"
@@ -88,7 +96,7 @@ rm -rf "$DIR1"
 echo ""
 echo "=== 2. Interrupted download + resume ==="
 DIR2=$(kei_scratch_dir resume)
-kei_db_exec "DELETE FROM assets"
+reset_sync_state
 
 # Session reuse puts auth at ~3s; kill at 4s so we interrupt mid- or
 # just-post-download. Even if all files complete before the kill the
@@ -120,7 +128,7 @@ rm -rf "$DIR2"
 echo ""
 echo "=== 3. Exit code 2 (partial failure) ==="
 DIR3=$(kei_scratch_dir partial-fail)
-kei_db_exec "DELETE FROM assets"
+reset_sync_state
 
 # Force one of the test album's files to land in a read-only directory.
 # Album passes default to `{album}/` since the per-category template

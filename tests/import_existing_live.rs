@@ -1191,10 +1191,14 @@ fn default_used_when_no_toml_no_cli_flag() {
             .success()
             .get_output()
             .clone();
-        let summary = parse_summary(&String::from_utf8_lossy(&out.stdout));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let summary = parse_summary(&stdout);
         assert!(
             summary.matched > 0,
-            "no-toml/no-flag default did not match the fixture: {summary:?}"
+            "no-toml/no-flag default did not match the fixture: {summary:?}\n\
+             stdout:\n{stdout}\n\
+             stderr:\n{stderr}"
         );
     });
 }
