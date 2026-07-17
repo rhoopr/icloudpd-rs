@@ -24,7 +24,7 @@ run_scenario_test() {
     echo "scenario runner: could not list target=$target filter=$filter" >&2
     return 1
   fi
-  if ! rg -q ': test$' <<<"$listed"; then
+  if ! grep -q ': test$' <<<"$listed"; then
     echo "scenario runner: no tests matched target=$target filter=$filter" >&2
     return 2
   fi
