@@ -7,10 +7,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    DownloadConfig, DownloadTask, PENDING_RETRY_UNMATCHED_REASON, RetryTaskKey, UrlRetrySource,
-    build_pass_configs_resolving_deferred_excludes, planner,
+    DownloadConfig, DownloadStore, DownloadTask, PENDING_RETRY_UNMATCHED_REASON, RetryTaskKey,
+    UrlRetrySource, build_pass_configs_resolving_deferred_excludes, planner,
 };
-use crate::icloud::photos::{ProviderRecordId, RecordLookupRequest, RecordResolution};
+use crate::icloud::photos::{PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::state::{AssetVerificationState, VersionSizeKey};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -38,6 +38,76 @@ impl PendingRetryTarget {
     }
 }
 
+#[derive(Debug)]
+struct PendingRetryEvidence {
+    checksum: Arc<str>,
+    size_bytes: u64,
+}
+
+impl PendingRetryEvidence {
+    fn from_record(record: &crate::state::AssetRecord) -> Self {
+        Self {
+            checksum: Arc::from(record.checksum.as_ref()),
+            size_bytes: record.size_bytes,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LegacyCandidateSelection {
+    Selected(PhotoAsset),
+    Missing,
+    Ambiguous { candidates: usize },
+}
+
+fn candidate_matches_durable_evidence(
+    asset: &PhotoAsset,
+    target: &PendingRetryTarget,
+    evidence: &PendingRetryEvidence,
+) -> bool {
+    asset.versions().iter().any(|(version_size, version)| {
+        VersionSizeKey::from(*version_size) == target.version_size
+            && version.size == evidence.size_bytes
+            && version.checksum.as_ref() == evidence.checksum.as_ref()
+    })
+}
+
+fn select_legacy_candidate(
+    candidates: Vec<PhotoAsset>,
+    targets: &[&PendingRetryTarget],
+    evidence: &FxHashMap<PendingRetryTarget, PendingRetryEvidence>,
+) -> LegacyCandidateSelection {
+    if candidates.is_empty() {
+        return LegacyCandidateSelection::Missing;
+    }
+    if candidates.len() == 1 {
+        return candidates.into_iter().next().map_or(
+            LegacyCandidateSelection::Missing,
+            LegacyCandidateSelection::Selected,
+        );
+    }
+
+    let candidate_count = candidates.len();
+    let mut matching = candidates.into_iter().filter(|asset| {
+        targets.iter().any(|target| {
+            evidence
+                .get(*target)
+                .is_some_and(|evidence| candidate_matches_durable_evidence(asset, target, evidence))
+        })
+    });
+    let Some(selected) = matching.next() else {
+        return LegacyCandidateSelection::Ambiguous {
+            candidates: candidate_count,
+        };
+    };
+    if matching.next().is_some() {
+        return LegacyCandidateSelection::Ambiguous {
+            candidates: candidate_count,
+        };
+    }
+    LegacyCandidateSelection::Selected(selected)
+}
+
 pub(super) fn take_matching_pending_retry_tasks<I>(
     tasks: I,
     pending_targets: &mut FxHashSet<PendingRetryTarget>,
@@ -54,6 +124,70 @@ pub(super) fn take_matching_pending_retry_tasks<I>(
             }
         }
     }
+}
+
+async fn plan_resolved_pending_asset(
+    asset: &PhotoAsset,
+    state_id: &str,
+    db: &dyn DownloadStore,
+    pass_configs: &[Arc<DownloadConfig>],
+    pending_targets: &mut FxHashSet<PendingRetryTarget>,
+    task_planner: &mut planner::TaskPlanner,
+    tasks: &mut Vec<DownloadTask>,
+    retry_sources: &mut FxHashMap<RetryTaskKey, UrlRetrySource>,
+) -> Result<()> {
+    for target in pending_targets
+        .iter()
+        .filter(|target| target.asset_id.as_ref() == state_id)
+    {
+        db.clear_asset_verification(
+            &target.library,
+            &target.asset_id,
+            target.version_size.as_str(),
+        )
+        .await?;
+    }
+    for (pass_index, pass_config) in pass_configs.iter().enumerate() {
+        let plan = task_planner.plan_asset(asset, pass_config).await;
+        if plan.filter_reason.is_some() {
+            continue;
+        }
+        let first_new_task = tasks.len();
+        take_matching_pending_retry_tasks(plan.tasks, pending_targets, tasks);
+        for task in tasks.iter().skip(first_new_task) {
+            retry_sources.insert(
+                RetryTaskKey::from(task),
+                UrlRetrySource {
+                    asset_record_name: asset.asset_record_name_arc(),
+                    pass_index,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn set_verification_for_state_id(
+    db: &dyn DownloadStore,
+    pending_targets: &FxHashSet<PendingRetryTarget>,
+    state_id: &str,
+    state: AssetVerificationState,
+    reason: &str,
+) -> Result<()> {
+    for target in pending_targets
+        .iter()
+        .filter(|target| target.asset_id.as_ref() == state_id)
+    {
+        db.set_asset_verification(
+            &target.library,
+            &target.asset_id,
+            target.version_size.as_str(),
+            state,
+            reason,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +216,27 @@ pub(super) async fn build_pending_retry_download_tasks(
         .collect();
     if pending_targets.is_empty() {
         return Ok(PendingRetryPlan::default());
+    }
+    let pending_evidence: FxHashMap<PendingRetryTarget, PendingRetryEvidence> = pending
+        .iter()
+        .filter(|record| record.library.as_ref() == config.library.as_ref())
+        .map(|record| {
+            (
+                PendingRetryTarget::from_record(record),
+                PendingRetryEvidence::from_record(record),
+            )
+        })
+        .collect();
+
+    let backfilled = db
+        .backfill_asset_master_mappings_from_album_memberships()
+        .await?;
+    if backfilled > 0 {
+        tracing::info!(
+            inserted = backfilled,
+            library = %config.library,
+            "Backfilled asset/master mappings before pending retry"
+        );
     }
 
     let requested = pending_targets.len();
@@ -166,40 +321,27 @@ pub(super) async fn build_pending_retry_download_tasks(
     } else {
         Vec::new()
     };
+    let mut legacy_present_state_ids = FxHashSet::default();
     for (state_id, resolution) in resolutions {
         if pending_targets.is_empty() || shutdown_token.is_cancelled() {
             break;
         }
         match resolution {
             RecordResolution::Present(asset) => {
-                for target in pending_targets
-                    .iter()
-                    .filter(|target| target.asset_id.as_ref() == state_id.as_str())
-                {
-                    db.clear_asset_verification(
-                        &target.library,
-                        &target.asset_id,
-                        target.version_size.as_str(),
-                    )
-                    .await?;
-                }
-                for (pass_index, pass_config) in pass_configs.iter().enumerate() {
-                    let plan = task_planner.plan_asset(&asset, pass_config).await;
-                    if plan.filter_reason.is_some() {
-                        continue;
-                    }
-                    let first_new_task = tasks.len();
-                    take_matching_pending_retry_tasks(plan.tasks, &mut pending_targets, &mut tasks);
-                    for task in tasks.iter().skip(first_new_task) {
-                        retry_sources.insert(
-                            RetryTaskKey::from(task),
-                            UrlRetrySource {
-                                asset_record_name: asset.asset_record_name_arc(),
-                                pass_index,
-                            },
-                        );
-                    }
-                }
+                plan_resolved_pending_asset(
+                    &asset,
+                    state_id.as_str(),
+                    db.as_ref(),
+                    &pass_configs,
+                    &mut pending_targets,
+                    &mut task_planner,
+                    &mut tasks,
+                    &mut retry_sources,
+                )
+                .await?;
+            }
+            RecordResolution::MasterPresent => {
+                legacy_present_state_ids.insert(state_id.as_str().to_string());
             }
             RecordResolution::Deleted {
                 deleted_at,
@@ -230,19 +372,14 @@ pub(super) async fn build_pending_retry_download_tasks(
                 );
             }
             RecordResolution::Unknown => {
-                for target in pending_targets
-                    .iter()
-                    .filter(|target| target.asset_id.as_ref() == state_id.as_str())
-                {
-                    db.set_asset_verification(
-                        &target.library,
-                        &target.asset_id,
-                        target.version_size.as_str(),
-                        AssetVerificationState::Unknown,
-                        "provider lookup omitted or could not parse the requested record",
-                    )
-                    .await?;
-                }
+                set_verification_for_state_id(
+                    db.as_ref(),
+                    &pending_targets,
+                    state_id.as_str(),
+                    AssetVerificationState::Unknown,
+                    "provider lookup omitted or could not parse the requested record",
+                )
+                .await?;
                 tracing::warn!(
                     library = %config.library,
                     state_id = state_id.as_str(),
@@ -250,25 +387,146 @@ pub(super) async fn build_pending_retry_download_tasks(
                 );
             }
             RecordResolution::TransientFailure(error) => {
-                for target in pending_targets
-                    .iter()
-                    .filter(|target| target.asset_id.as_ref() == state_id.as_str())
-                {
-                    db.set_asset_verification(
-                        &target.library,
-                        &target.asset_id,
-                        target.version_size.as_str(),
-                        AssetVerificationState::TransientFailure,
-                        &error.to_string(),
-                    )
-                    .await?;
-                }
+                set_verification_for_state_id(
+                    db.as_ref(),
+                    &pending_targets,
+                    state_id.as_str(),
+                    AssetVerificationState::TransientFailure,
+                    &error.to_string(),
+                )
+                .await?;
                 tracing::warn!(
                     library = %config.library,
                     state_id = state_id.as_str(),
                     error = %error,
                     "Pending asset retained: provider lookup failed transiently"
                 );
+            }
+        }
+    }
+
+    if !legacy_present_state_ids.is_empty() && !shutdown_token.is_cancelled() {
+        tracing::info!(
+            library = %config.library,
+            masters = legacy_present_state_ids.len(),
+            "Hydrating missing CPLAsset identities for live legacy pending masters"
+        );
+        let (hydrated, hydration_failed) = match passes.first() {
+            Some(pass) => match pass
+                .album
+                .hydrate_matching_master_assets_from_changes(
+                    &legacy_present_state_ids,
+                    &shutdown_token,
+                    |asset| {
+                        pending_evidence.iter().any(|(target, evidence)| {
+                            target.asset_id.as_ref() == asset.id()
+                                && candidate_matches_durable_evidence(asset, target, evidence)
+                        })
+                    },
+                )
+                .await
+            {
+                Ok(assets) => (assets, false),
+                Err(error) => {
+                    let reason = error.to_string();
+                    for state_id in &legacy_present_state_ids {
+                        set_verification_for_state_id(
+                            db.as_ref(),
+                            &pending_targets,
+                            state_id,
+                            AssetVerificationState::TransientFailure,
+                            &reason,
+                        )
+                        .await?;
+                    }
+                    tracing::warn!(
+                        library = %config.library,
+                        error = %error,
+                        "Pending legacy asset hydration failed transiently"
+                    );
+                    (Vec::new(), true)
+                }
+            },
+            None => (Vec::new(), false),
+        };
+        let mut candidates_by_master: FxHashMap<String, Vec<PhotoAsset>> = FxHashMap::default();
+        for asset in hydrated {
+            candidates_by_master
+                .entry(asset.id().to_string())
+                .or_default()
+                .push(asset);
+        }
+
+        for state_id in legacy_present_state_ids {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            if hydration_failed {
+                continue;
+            }
+            let matching_targets: Vec<&PendingRetryTarget> = pending_targets
+                .iter()
+                .filter(|target| target.asset_id.as_ref() == state_id)
+                .collect();
+            let candidates = candidates_by_master.remove(&state_id).unwrap_or_default();
+            match select_legacy_candidate(candidates, &matching_targets, &pending_evidence) {
+                LegacyCandidateSelection::Selected(asset) => {
+                    db.upsert_asset_master_mapping(
+                        &config.library,
+                        asset.asset_record_name(),
+                        asset.id(),
+                    )
+                    .await?;
+                    tracing::info!(
+                        library = %config.library,
+                        state_id,
+                        asset_record_name = %asset.asset_record_name(),
+                        "Recovered legacy pending asset/master mapping"
+                    );
+                    let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
+                    plan_resolved_pending_asset(
+                        &asset,
+                        &state_id,
+                        db.as_ref(),
+                        &pass_configs,
+                        &mut pending_targets,
+                        &mut task_planner,
+                        &mut tasks,
+                        &mut retry_sources,
+                    )
+                    .await?;
+                }
+                LegacyCandidateSelection::Missing => {
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        &state_id,
+                        AssetVerificationState::Unknown,
+                        "provider confirmed the master exists but no current CPLAsset pair was found",
+                    )
+                    .await?;
+                    tracing::warn!(
+                        library = %config.library,
+                        state_id,
+                        "Pending asset retained: live master had no current CPLAsset pair"
+                    );
+                }
+                LegacyCandidateSelection::Ambiguous { candidates } => {
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        &state_id,
+                        AssetVerificationState::Unknown,
+                        "multiple provider asset records matched the legacy master",
+                    )
+                    .await?;
+                    tracing::warn!(
+                        library = %config.library,
+                        state_id,
+                        candidates,
+                        "Pending asset retained: legacy master resolved to ambiguous CPLAsset siblings"
+                    );
+                }
             }
         }
     }
@@ -302,4 +560,87 @@ pub(super) async fn build_pending_retry_download_tasks(
         unmatched_targets: pending_targets.into_iter().collect(),
         requested,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::test_helpers::TestAssetRecord;
+
+    fn candidate(master: &str, asset: &str, checksum: &str, size: u64) -> PhotoAsset {
+        PhotoAsset::new(
+            json!({
+                "recordName": master,
+                "recordType": "CPLMaster",
+                "fields": {
+                    "filenameEnc": {"value": "legacy.jpg", "type": "STRING"},
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalFileType": {"value": "public.jpeg"},
+                    "resOriginalRes": {"value": {
+                        "downloadURL": "https://p01.icloud-content.com/legacy.jpg",
+                        "fileChecksum": checksum,
+                        "size": size,
+                    }},
+                },
+            }),
+            json!({
+                "recordName": asset,
+                "recordType": "CPLAsset",
+                "fields": {
+                    "masterRef": {"value": {"recordName": master}},
+                    "assetDate": {"value": 1700000000000i64},
+                },
+            }),
+        )
+    }
+
+    #[test]
+    fn legacy_candidate_selection_uses_unique_durable_fingerprint() {
+        let record = TestAssetRecord::new("legacy-master")
+            .checksum("checksum-b")
+            .size(200)
+            .build();
+        let target = PendingRetryTarget::from_record(&record);
+        let evidence =
+            FxHashMap::from_iter([(target.clone(), PendingRetryEvidence::from_record(&record))]);
+        let selection = select_legacy_candidate(
+            vec![
+                candidate("legacy-master", "asset-a", "checksum-a", 100),
+                candidate("legacy-master", "asset-b", "checksum-b", 200),
+            ],
+            &[&target],
+            &evidence,
+        );
+
+        let LegacyCandidateSelection::Selected(selected) = selection else {
+            panic!("unique durable fingerprint should select one sibling");
+        };
+        assert_eq!(selected.asset_record_name(), "asset-b");
+    }
+
+    #[test]
+    fn legacy_candidate_selection_retains_ambiguous_siblings() {
+        let record = TestAssetRecord::new("legacy-master")
+            .checksum("missing-checksum")
+            .size(300)
+            .build();
+        let target = PendingRetryTarget::from_record(&record);
+        let evidence =
+            FxHashMap::from_iter([(target.clone(), PendingRetryEvidence::from_record(&record))]);
+        let selection = select_legacy_candidate(
+            vec![
+                candidate("legacy-master", "asset-a", "checksum-a", 100),
+                candidate("legacy-master", "asset-b", "checksum-b", 200),
+            ],
+            &[&target],
+            &evidence,
+        );
+
+        assert!(matches!(
+            selection,
+            LegacyCandidateSelection::Ambiguous { candidates: 2 }
+        ));
+    }
 }

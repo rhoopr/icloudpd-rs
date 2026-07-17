@@ -3025,7 +3025,9 @@ pub(crate) async fn reconcile_catalog_paths(
                 }
                 targets.retain(|target| target.asset_id.as_ref() != id);
             }
-            RecordResolution::Unknown | RecordResolution::TransientFailure(_) => {}
+            RecordResolution::MasterPresent
+            | RecordResolution::Unknown
+            | RecordResolution::TransientFailure(_) => {}
         }
     }
 
@@ -8130,6 +8132,49 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct LegacyPendingHydrationSession {
+        lookup_records: Arc<Vec<Value>>,
+        hydration_records: Arc<Vec<Value>>,
+        hydration_error: Option<Arc<str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for LegacyPendingHydrationSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                return Ok(json!({"records": self.lookup_records.as_ref().clone()}));
+            }
+            if url.contains("/changes/zone?") {
+                let request: Value = serde_json::from_str(&body)?;
+                let has_sync_token = request["zones"]
+                    .as_array()
+                    .and_then(|zones| zones.first())
+                    .and_then(|zone| zone.get("syncToken"))
+                    .is_some();
+                let records = if has_sync_token {
+                    Vec::new()
+                } else {
+                    if let Some(error) = &self.hydration_error {
+                        anyhow::bail!(error.to_string());
+                    }
+                    self.hydration_records.as_ref().clone()
+                };
+                return Ok(changes_zone_response(records, "zone-token-next"));
+            }
+            Ok(json!({"records": [], "syncToken": "ignored-query-token"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     fn changes_zone_response(records: Vec<Value>, sync_token: &str) -> Value {
         json!({
             "zones": [{
@@ -11771,6 +11816,175 @@ mod tests {
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.awaiting_provider_verification, 0);
         assert_eq!(summary.source_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_full_sync_hydrates_live_legacy_pending_master() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/legacy-pending.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("LEGACY_PENDING_PRESENT")
+            .filename("legacy-pending.jpg")
+            .checksum(&checksum)
+            .size(8)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+
+        let download_url = format!("{}/legacy-pending.jpg", server.uri());
+        let mut records = incremental_photo_records_with_url(
+            "LEGACY_PENDING_PRESENT",
+            "legacy-pending.jpg",
+            &download_url,
+            8,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        let session = LegacyPendingHydrationSession {
+            lookup_records: Arc::new(vec![records[0].clone()]),
+            hydration_records: Arc::new(records),
+            hydration_error: None,
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Full;
+        config.recent = Some(300);
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live legacy pending master should hydrate and download");
+
+        assert!(result.full_enumeration_ran);
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.awaiting_provider_verification, 0);
+        assert_eq!(summary.source_deleted, 0);
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-LEGACY_PENDING_PRESENT")
+                .await
+                .expect("mapping lookup")
+                .as_deref(),
+            Some("LEGACY_PENDING_PRESENT")
+        );
+        let downloaded = db
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("downloaded page");
+        let local_path = downloaded[0]
+            .local_path
+            .as_ref()
+            .expect("downloaded row has local path");
+        assert!(tokio::fs::metadata(local_path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pending_retry_retains_ambiguous_legacy_siblings() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("LEGACY_AMBIGUOUS")
+            .checksum("no-sibling-matches")
+            .size(999)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+
+        let master = mock_master_record_with_filename("LEGACY_AMBIGUOUS", "ambiguous.jpg");
+        let hydration_records = vec![
+            master.clone(),
+            mock_asset_record_for("asset-ambiguous-a", "LEGACY_AMBIGUOUS"),
+            mock_asset_record_for("asset-ambiguous-b", "LEGACY_AMBIGUOUS"),
+        ];
+        let session = LegacyPendingHydrationSession {
+            lookup_records: Arc::new(vec![master]),
+            hydration_records: Arc::new(hydration_records),
+            hydration_error: None,
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("ambiguous siblings should remain safely unresolved");
+
+        assert!(plan.tasks.is_empty());
+        assert_eq!(plan.unmatched_targets.len(), 1);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.awaiting_provider_verification, 1);
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-ambiguous-a")
+                .await
+                .expect("mapping lookup"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_retry_retains_transient_legacy_hydration_failure() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("LEGACY_TRANSIENT").build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        let session = LegacyPendingHydrationSession {
+            lookup_records: Arc::new(vec![mock_master_record_with_filename(
+                "LEGACY_TRANSIENT",
+                "transient.jpg",
+            )]),
+            hydration_records: Arc::new(Vec::new()),
+            hydration_error: Some(Arc::from("temporary changes failure")),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.state_db = Some(db.clone());
+
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("transient hydration failure should retain durable work");
+
+        assert!(plan.tasks.is_empty());
+        assert_eq!(plan.unmatched_targets.len(), 1);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.awaiting_provider_verification, 1);
     }
 
     #[tokio::test]

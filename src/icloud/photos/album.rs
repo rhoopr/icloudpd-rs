@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
+use tokio_util::sync::CancellationToken;
 
 use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use super::cloudkit::ChangesZoneResponse;
@@ -117,6 +118,7 @@ fn classify_provider_lookup_error(error: &anyhow::Error) -> ProviderLookupError 
 #[derive(Debug)]
 pub(crate) enum RecordResolution {
     Present(PhotoAsset),
+    MasterPresent,
     Deleted {
         deleted_at: Option<chrono::DateTime<chrono::Utc>>,
         master_family: bool,
@@ -135,6 +137,7 @@ pub(crate) struct RecordResolutionBatch {
 enum ResolutionEvidence {
     ChildDeleted,
     Inconclusive,
+    MasterPresent,
     MasterDeleted,
     Present,
 }
@@ -142,6 +145,7 @@ enum ResolutionEvidence {
 fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
     match resolution {
         RecordResolution::Present(_) => ResolutionEvidence::Present,
+        RecordResolution::MasterPresent => ResolutionEvidence::MasterPresent,
         RecordResolution::Deleted {
             master_family: true,
             ..
@@ -987,12 +991,14 @@ impl PhotoAlbum {
                         deleted_at,
                         master_family: master_deleted,
                     }
-                } else if let (Some(master), Some(asset)) = (master, asset) {
+                } else if let Some(master) = master {
                     match (
                         serde_json::from_value::<super::cloudkit::Record>(master.clone()),
-                        serde_json::from_value::<super::cloudkit::Record>(asset.clone()),
+                        asset.map(|asset| {
+                            serde_json::from_value::<super::cloudkit::Record>(asset.clone())
+                        }),
                     ) {
-                        (Ok(master), Ok(asset))
+                        (Ok(master), Some(Ok(asset)))
                             if master.record_type == "CPLMaster"
                                 && asset.record_type == "CPLAsset" =>
                         {
@@ -1003,6 +1009,12 @@ impl PhotoAlbum {
                             }
                             RecordResolution::Present(photo)
                         }
+                        (Ok(master), None)
+                            if request.asset_record_name.is_none()
+                                && master.record_type == "CPLMaster" =>
+                        {
+                            RecordResolution::MasterPresent
+                        }
                         _ => RecordResolution::Unknown,
                     }
                 } else {
@@ -1010,6 +1022,7 @@ impl PhotoAlbum {
                 };
                 let outcome = match &resolution {
                     RecordResolution::Present(_) => "present",
+                    RecordResolution::MasterPresent => "master_present_unpaired",
                     RecordResolution::Deleted { .. } => "deleted",
                     RecordResolution::Unknown => "unknown",
                     RecordResolution::TransientFailure(_) => "transient_failure",
@@ -1452,6 +1465,89 @@ impl PhotoAlbum {
                 source
                     .matching_assets_from_changes(missing_asset_record_names)
                     .await?,
+            );
+        }
+        Ok(matched)
+    }
+
+    /// Recover current `CPLAsset` records for legacy state keyed only by a
+    /// `CPLMaster` record name.
+    ///
+    /// The caller supplies the proof that a candidate resolves its durable
+    /// target. Scanning stops once every requested master has such a candidate;
+    /// otherwise it continues to EOF so the caller can assess missing or
+    /// ambiguous siblings conservatively.
+    pub(crate) async fn hydrate_matching_master_assets_from_changes<F>(
+        &self,
+        master_record_names: &FxHashSet<String>,
+        shutdown_token: &CancellationToken,
+        mut candidate_resolves_target: F,
+    ) -> anyhow::Result<Vec<PhotoAsset>>
+    where
+        F: FnMut(&PhotoAsset) -> bool,
+    {
+        if master_record_names.is_empty() || shutdown_token.is_cancelled() {
+            return Ok(Vec::new());
+        }
+
+        fn collect_event<F>(
+            event: ChangeEvent,
+            source_zone: &Arc<str>,
+            master_record_names: &FxHashSet<String>,
+            unresolved_master_names: &mut FxHashSet<String>,
+            seen_asset_record_names: &mut FxHashSet<String>,
+            matched: &mut Vec<PhotoAsset>,
+            candidate_resolves_target: &mut F,
+        ) where
+            F: FnMut(&PhotoAsset) -> bool,
+        {
+            if event.reason != crate::types::ChangeReason::Created {
+                return;
+            }
+            let Some(asset) = event.asset else {
+                return;
+            };
+            let asset = asset.with_source_zone(Arc::clone(source_zone));
+            if master_record_names.contains(asset.id())
+                && seen_asset_record_names.insert(asset.asset_record_name().to_string())
+            {
+                if candidate_resolves_target(&asset) {
+                    unresolved_master_names.remove(asset.id());
+                }
+                matched.push(asset);
+            }
+        }
+
+        let mut buffer = DeltaRecordBuffer::new();
+        let source_zone: Arc<str> = Arc::from(self.zone_name());
+        let mut unresolved_master_names = master_record_names.clone();
+        let mut seen_asset_record_names = FxHashSet::default();
+        let mut matched = Vec::new();
+        self.scan_changes_zone(|record| {
+            for event in buffer.process_records(vec![record]) {
+                collect_event(
+                    event,
+                    &source_zone,
+                    master_record_names,
+                    &mut unresolved_master_names,
+                    &mut seen_asset_record_names,
+                    &mut matched,
+                    &mut candidate_resolves_target,
+                );
+            }
+            !shutdown_token.is_cancelled() && !unresolved_master_names.is_empty()
+        })
+        .await?;
+
+        for event in buffer.flush() {
+            collect_event(
+                event,
+                &source_zone,
+                master_record_names,
+                &mut unresolved_master_names,
+                &mut seen_asset_record_names,
+                &mut matched,
+                &mut candidate_resolves_target,
             );
         }
         Ok(matched)
@@ -2808,8 +2904,13 @@ mod tests {
             .next()
             .expect("live account must contain at least one photo");
         let missing_id = "kei-phase0-record-that-does-not-exist";
+        let master_only_state_id = "live-master-only";
         let requests = [
             lookup_request(asset.id(), asset.id(), asset.asset_record_name()),
+            RecordLookupRequest::master_only(
+                ProviderRecordId::new(master_only_state_id),
+                ProviderRecordId::new(asset.id()),
+            ),
             RecordLookupRequest::master_only(
                 ProviderRecordId::new(missing_id),
                 ProviderRecordId::new(missing_id),
@@ -2818,13 +2919,23 @@ mod tests {
 
         let result = album.resolve_records(&requests).await;
 
-        assert!(result.complete, "live lookup batch must be complete");
+        assert!(
+            !result.complete,
+            "a live master-only lookup still needs its CPLAsset pair"
+        );
         assert!(matches!(
             result
                 .results
                 .iter()
                 .find(|(id, _)| id.as_str() == asset.id()),
             Some((_, RecordResolution::Present(_)))
+        ));
+        assert!(matches!(
+            result
+                .results
+                .iter()
+                .find(|(id, _)| id.as_str() == master_only_state_id),
+            Some((_, RecordResolution::MasterPresent))
         ));
         assert!(matches!(
             result
@@ -2912,6 +3023,27 @@ mod tests {
                     ..
                 }
             )]
+        ));
+    }
+
+    #[tokio::test]
+    async fn targeted_master_only_lookup_distinguishes_live_legacy_master() {
+        let response = json!({
+            "records": [test_master_record("legacy-master")]
+        });
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(response)));
+
+        let batch = album
+            .resolve_records(&[RecordLookupRequest::master_only(
+                ProviderRecordId::new("legacy-state"),
+                ProviderRecordId::new("legacy-master"),
+            )])
+            .await;
+
+        assert!(!batch.complete);
+        assert!(matches!(
+            batch.results.as_slice(),
+            [(_, RecordResolution::MasterPresent)]
         ));
     }
 
@@ -4649,6 +4781,43 @@ mod tests {
         assert!(missing.is_empty());
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].asset_record_name(), "asset-1");
+    }
+
+    #[tokio::test]
+    async fn hydrate_matching_master_assets_collects_every_live_sibling() {
+        let records = vec![
+            changes_master("master-target"),
+            changes_asset("asset-target-a", "master-target"),
+            changes_asset("asset-target-b", "master-target"),
+            changes_master("master-other"),
+            changes_asset("asset-other", "master-other"),
+        ];
+        let mock = MockPhotosSession::new().ok(canned_changes_page(&records, "token-final", false));
+        let album = make_album_with_session(100, Box::new(mock));
+        let masters = FxHashSet::from_iter(["master-target".to_string()]);
+
+        let matched = album
+            .hydrate_matching_master_assets_from_changes(
+                &masters,
+                &CancellationToken::new(),
+                |_| false,
+            )
+            .await
+            .expect("master hydration");
+
+        assert_eq!(matched.len(), 2);
+        assert!(matched.iter().all(|asset| asset.id() == "master-target"));
+        assert!(
+            matched
+                .iter()
+                .all(|asset| asset.source_zone() == Some("PrimarySync"))
+        );
+        let asset_record_names: FxHashSet<&str> =
+            matched.iter().map(PhotoAsset::asset_record_name).collect();
+        assert_eq!(
+            asset_record_names,
+            FxHashSet::from_iter(["asset-target-a", "asset-target-b"])
+        );
     }
 
     #[tokio::test]
