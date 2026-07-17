@@ -213,9 +213,10 @@ happens:
   match cleanly.
 - **`scripts/test-scenarios/`** - focused offline behavior slices named by
   risk class, not release history. Current slices cover URL refresh,
-  identity/tombstone deltas, path-family collisions, auth/session flows,
-  service health, config docs, and full-test harness reachability. Use these
-  before a broad gate when touching the matching owner path.
+  identity/tombstone deltas, pending recovery, path-family collisions,
+  auth/session flows, service health, config docs, and full-test harness
+  reachability. Each named filter must resolve to at least one current test.
+  Use these before a broad gate when touching the matching owner path.
 - **`shell/concurrency.sh`** - things that need `kill -9` mid-process,
   `chmod 555` on a target dir, direct sqlite3 assertions on the state
   DB mid-test. Hard to do cleanly from Rust.

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+source "$script_dir/lib.sh"
+
+run_scenario_test lib incremental_source_delete_prunes_pending_row_in_bounded_sync
+run_scenario_test lib incremental_prunes_existing_source_deleted_pending_row_without_wide_sync
+run_scenario_test lib bounded_full_sync_hydrates_live_legacy_pending_master
+run_scenario_test lib pending_retry_retains_ambiguous_legacy_siblings
+run_scenario_test lib pending_retry_retains_transient_legacy_hydration_failure
+run_scenario_test lib pending_retry_deleted_sibling_does_not_tombstone_present_master_state
+run_scenario_test lib targeted_master_only_lookup_distinguishes_live_legacy_master
+run_scenario_test lib hydrate_matching_master_assets_collects_every_live_sibling

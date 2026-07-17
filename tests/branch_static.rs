@@ -9,6 +9,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Output};
+
 fn repo_file(path: &str) -> String {
     let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     full.push(path);
@@ -22,6 +27,49 @@ fn repo_path(path: &str) -> PathBuf {
     let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     full.push(path);
     full
+}
+
+#[cfg(target_os = "linux")]
+fn write_executable(path: &Path, contents: &str) {
+    std::fs::write(path, contents).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    let mut permissions = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+}
+
+#[cfg(target_os = "linux")]
+fn command_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_text_order(output: &str, names: &[&str]) {
+    let mut previous = None;
+    for name in names {
+        let position = output
+            .find(name)
+            .unwrap_or_else(|| panic!("output missing {name}:\n{output}"));
+        if let Some((previous_name, previous_position)) = previous {
+            assert!(
+                previous_position < position,
+                "expected {previous_name} before {name}:\n{output}"
+            );
+        }
+        previous = Some((name, position));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_json(path: &Path, value: &serde_json::Value) {
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(value)
+            .unwrap_or_else(|e| panic!("serialize fixture for {}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 fn rust_files_under(path: &Path, out: &mut Vec<PathBuf>) {
@@ -291,6 +339,212 @@ fn full_test_reports_include_newer_phase_metadata() {
         assert!(
             diff.contains(phase),
             "diff_runs.sh must assign phase number/test metadata for {phase}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scenario_runner_rejects_filters_that_match_no_tests() {
+    let temp = tempfile::tempdir().expect("scenario runner tempdir");
+    let cargo_stub = temp.path().join("cargo-stub");
+    write_executable(
+        &cargo_stub,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *" --list "* && " $* " == *" known_filter "* ]]; then
+  echo "module::known_filter: test"
+fi
+"#,
+    );
+
+    let runner = repo_path("scripts/test-scenarios/lib.sh");
+    let run_filter = |filter: &str| {
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; run_scenario_test lib "$2""#,
+                "scenario-runner-test",
+            ])
+            .arg(&runner)
+            .arg(filter)
+            .env("CARGO", &cargo_stub)
+            .output()
+            .expect("run scenario helper")
+    };
+
+    let known = run_filter("known_filter");
+    assert!(
+        known.status.success(),
+        "known scenario filter should execute: {}",
+        String::from_utf8_lossy(&known.stderr)
+    );
+
+    let missing = run_filter("missing_filter");
+    assert_eq!(missing.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("no tests matched target=lib filter=missing_filter"),
+        "zero-match failure should identify the target and filter: {stderr}"
+    );
+
+    let list = Command::new("bash")
+        .arg(repo_path("scripts/test-scenarios/list.sh"))
+        .output()
+        .expect("list scenarios");
+    assert!(list.status.success());
+    let listed = command_text(&list);
+    assert!(listed.lines().any(|line| line == "pending-recovery"));
+    assert!(!listed.lines().any(|line| line == "lib"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_reporting_executes_grouped_and_legacy_fixtures() {
+    let temp = tempfile::tempdir().expect("report fixture tempdir");
+    let grouped_phases = serde_json::json!({
+        "service": {"status": "pass", "wall_s": 1.0},
+        "scenarios": {"status": "pass", "wall_s": 2.0, "tests": 3},
+        "offline_core": {"status": "pass", "wall_s": 3.0, "tests": 4},
+        "static_checks": {"status": "pass", "wall_s": 4.0}
+    });
+    let legacy_phases = serde_json::json!({
+        "service_smoke": {"status": "pass", "wall_s": 1.0},
+        "offline_all": {"status": "pass", "wall_s": 2.0, "tests": 5},
+        "nodefault": {"status": "pass", "wall_s": 3.0},
+        "gate": {"status": "pass", "wall_s": 4.0}
+    });
+
+    let grouped_record = temp.path().join("grouped.json");
+    let legacy_record = temp.path().join("legacy.json");
+    write_json(
+        &grouped_record,
+        &serde_json::json!({"phases": grouped_phases.clone(), "metrics": {}}),
+    );
+    write_json(
+        &legacy_record,
+        &serde_json::json!({"phases": legacy_phases.clone(), "metrics": {}}),
+    );
+
+    let render = repo_path("scripts/full-test/render_summary.py");
+    let grouped_render = Command::new("python3")
+        .arg(&render)
+        .arg(&grouped_record)
+        .args(["--result", "pass"])
+        .output()
+        .expect("render grouped fixture");
+    assert!(grouped_render.status.success());
+    assert_text_order(
+        &command_text(&grouped_render),
+        &["static_checks", "offline_core", "scenarios", "service"],
+    );
+
+    let legacy_render = Command::new("python3")
+        .arg(&render)
+        .arg(&legacy_record)
+        .args(["--result", "pass"])
+        .output()
+        .expect("render legacy fixture");
+    assert!(legacy_render.status.success());
+    assert_text_order(
+        &command_text(&legacy_render),
+        &["gate", "nodefault", "offline_all", "service_smoke"],
+    );
+
+    let diff = repo_path("scripts/full-test/diff_runs.sh");
+    for (name, phases, order) in [
+        (
+            "grouped",
+            grouped_phases,
+            vec!["static_checks", "offline_core", "scenarios", "service"],
+        ),
+        (
+            "legacy",
+            legacy_phases,
+            vec!["gate", "nodefault", "offline_all", "service_smoke"],
+        ),
+    ] {
+        let runs = temp.path().join(name);
+        std::fs::create_dir(&runs).expect("create report runs dir");
+        for (timestamp, head) in [("20260716T000000", "old"), ("20260717T000000", "new")] {
+            write_json(
+                &runs.join(format!("{timestamp}.json")),
+                &serde_json::json!({
+                    "started_at": timestamp,
+                    "branch": "fixture",
+                    "head": head,
+                    "phases": phases.clone(),
+                    "metrics": {}
+                }),
+            );
+        }
+        let output = Command::new("bash")
+            .arg(&diff)
+            .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+            .output()
+            .expect("diff run fixtures");
+        assert!(
+            output.status.success(),
+            "diff fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_text_order(&command_text(&output), &order);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_finalize_emits_metrics_and_cleans_staging() {
+    let temp = tempfile::tempdir().expect("finalize fixture tempdir");
+    let runs = temp.path().join("runs");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&runs).expect("create finalize runs dir");
+    std::fs::create_dir(&bin).expect("create stub bin dir");
+
+    std::fs::write(
+        runs.join(".current.jsonl"),
+        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.25,\"tests\":3}\n",
+    )
+    .expect("write phase fixture");
+    std::fs::write(runs.join(".run-started-at"), "2026-07-17T12:34:56\n")
+        .expect("write start fixture");
+    std::fs::write(runs.join(".run-marker"), "fixture\n").expect("write marker fixture");
+
+    write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(&bin.join("docker"), "#!/usr/bin/env bash\nexit 1\n");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
+
+    let output = Command::new("bash")
+        .arg(repo_path("scripts/full-test/finalize_run.sh"))
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .env("PATH", path)
+        .output()
+        .expect("finalize fixture run");
+    assert!(
+        output.status.success(),
+        "finalize fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record_path = PathBuf::from(command_text(&output).trim());
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&record_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", record_path.display())),
+    )
+    .expect("parse finalized record");
+    assert_eq!(record["started_at"], "2026-07-17T12:34:56");
+    assert_eq!(record["phases"]["static_checks"]["status"], "pass");
+    assert_eq!(record["phases"]["static_checks"]["tests"], 3);
+    assert!(record["metrics"].is_object());
+    assert!(record["metrics"]["deps_count"].is_number());
+    for staging in [".current.jsonl", ".run-started-at", ".run-marker"] {
+        assert!(
+            !runs.join(staging).exists(),
+            "finalize must remove {staging}"
         );
     }
 }
