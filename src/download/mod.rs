@@ -11909,7 +11909,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_retry_retains_ambiguous_legacy_siblings() {
+    async fn bounded_full_sync_adopts_filtered_legacy_pending_file() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        let mut records = incremental_photo_records_with_url(
+            "LEGACY_FILTERED_ON_DISK",
+            "IMG_8905.HEIC",
+            "https://p01.icloud-content.com/IMG_8905.HEIC",
+            16,
+        );
+        records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/IMG_8905.MOV",
+            "fileChecksum": checksum,
+            "size": 8,
+        }});
+        records[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value": "com.apple.quicktime-movie"});
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let session = LegacyPendingHydrationSession {
+            lookup_records: Arc::new(vec![records[0].clone()]),
+            hydration_records: Arc::new(records.clone()),
+            hydration_error: None,
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Full;
+        config.recent = Some(300);
+        config.skip_created_before = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let expected_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .expect("legacy live photo should derive its MOV path")
+            .path;
+        let pending_filename = expected_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("expected MOV path should have a filename");
+        let record = TestAssetRecord::new("LEGACY_FILTERED_ON_DISK")
+            .version_size(VersionSizeKey::LiveOriginal)
+            .filename(pending_filename)
+            .checksum(&checksum)
+            .size(8)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        tokio::fs::create_dir_all(expected_path.parent().expect("expected path parent"))
+            .await
+            .expect("create expected path parent");
+        tokio::fs::write(&expected_path, &body)
+            .await
+            .expect("seed existing media");
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("filtered legacy pending file should be adopted");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.awaiting_provider_verification, 0);
+        let downloaded = db
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("downloaded page");
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(expected_path.as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_full_sync_defers_filtered_live_pending_without_failure() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("LEGACY_FILTERED_MISSING")
+            .filename("legacy-filtered-missing.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        db.backdate_last_seen(
+            "LEGACY_FILTERED_MISSING",
+            Utc::now().timestamp().saturating_sub(86_400),
+        );
+
+        let records = mock_photo_records_with_filename(
+            "LEGACY_FILTERED_MISSING",
+            "legacy-filtered-missing.jpg",
+        );
+        let session = LegacyPendingHydrationSession {
+            lookup_records: Arc::new(vec![records[0].clone()]),
+            hydration_records: Arc::new(records),
+            hydration_error: None,
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Full;
+        config.recent = Some(300);
+        config.skip_created_before = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("filtered live pending asset should be deferred");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.awaiting_provider_verification, 0);
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-LEGACY_FILTERED_MISSING")
+                .await
+                .expect("mapping lookup")
+                .as_deref(),
+            Some("LEGACY_FILTERED_MISSING")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_retry_retains_legacy_siblings_without_durable_match() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = TestAssetRecord::new("LEGACY_AMBIGUOUS")
             .checksum("no-sibling-matches")
@@ -11940,7 +12090,7 @@ mod tests {
 
         let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
             .await
-            .expect("ambiguous siblings should remain safely unresolved");
+            .expect("non-matching siblings should remain safely unresolved");
 
         assert!(plan.tasks.is_empty());
         assert_eq!(plan.unmatched_targets.len(), 1);

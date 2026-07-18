@@ -346,6 +346,73 @@ enum PendingOnDiskAdoption {
     StateWriteFailed(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingRetryAdoption {
+    NotFound,
+    Adopted,
+    StateWriteFailed,
+}
+
+impl From<PendingOnDiskAdoption> for PendingRetryAdoption {
+    fn from(adoption: PendingOnDiskAdoption) -> Self {
+        match adoption {
+            PendingOnDiskAdoption::Adopted(_) => Self::Adopted,
+            PendingOnDiskAdoption::StateWriteFailed(_) => Self::StateWriteFailed,
+        }
+    }
+}
+
+pub(super) struct PendingRetryFileEvidence<'a> {
+    pub(super) version_size: VersionSizeKey,
+    pub(super) filename: &'a str,
+    pub(super) checksum: &'a str,
+    pub(super) size: u64,
+}
+
+pub(super) async fn adopt_pending_on_disk_for_retry(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task_planner: &mut TaskPlanner,
+    planned_tasks: &[DownloadTask],
+    evidence: PendingRetryFileEvidence<'_>,
+) -> PendingRetryAdoption {
+    for task in planned_tasks.iter().filter(|task| {
+        task.version_size == evidence.version_size
+            && task.checksum.as_ref() == evidence.checksum
+            && task.size == evidence.size
+    }) {
+        if let Some(adoption) = adopt_pending_task_path(db, config, asset, task_planner, task).await
+        {
+            return adoption.into();
+        }
+    }
+
+    for derived in derive_expected_paths(asset, config)
+        .into_iter()
+        .filter(|derived| {
+            derived.version_size == evidence.version_size
+                && derived.checksum.as_ref() == evidence.checksum
+                && derived.size == evidence.size
+                && pending_filename_matches_derived(evidence.filename, &derived.filename)
+        })
+    {
+        if let Some(adoption) = adopt_pending_derived_path(
+            db,
+            effective_asset_library(asset, config),
+            asset,
+            task_planner,
+            &derived,
+        )
+        .await
+        {
+            return adoption.into();
+        }
+    }
+
+    PendingRetryAdoption::NotFound
+}
+
 async fn adopt_pending_on_disk_task(
     state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bounded and fallback full syncs now run targeted pending-asset revalidation after source enumeration, so provider-confirmed deletions clear stale pending rows without requiring an incremental checkpoint. ([#663])
 - Legacy pending rows with a live iCloud master now recover their missing asset identity and retry, so bounded syncs can finish old downloads without a wide photo enumeration. ([#663])
+- Targeted pending retries now adopt verified on-disk files before applying current filters, validate recovered child records against saved version, size, and checksum evidence, and defer policy-excluded live rows without reporting a failed sync. ([#663])
 
 ## [0.22.12] - 2026-07-13
 

@@ -1473,34 +1473,24 @@ impl PhotoAlbum {
     /// Recover current `CPLAsset` records for legacy state keyed only by a
     /// `CPLMaster` record name.
     ///
-    /// The caller supplies the proof that a candidate resolves its durable
-    /// target. Scanning stops once every requested master has such a candidate;
-    /// otherwise it continues to EOF so the caller can assess missing or
-    /// ambiguous siblings conservatively.
-    pub(crate) async fn hydrate_matching_master_assets_from_changes<F>(
+    /// Scans to EOF so the caller sees every current sibling before choosing
+    /// one from durable version, size, and checksum evidence.
+    pub(crate) async fn hydrate_matching_master_assets_from_changes(
         &self,
         master_record_names: &FxHashSet<String>,
         shutdown_token: &CancellationToken,
-        mut candidate_resolves_target: F,
-    ) -> anyhow::Result<Vec<PhotoAsset>>
-    where
-        F: FnMut(&PhotoAsset) -> bool,
-    {
+    ) -> anyhow::Result<Vec<PhotoAsset>> {
         if master_record_names.is_empty() || shutdown_token.is_cancelled() {
             return Ok(Vec::new());
         }
 
-        fn collect_event<F>(
+        fn collect_event(
             event: ChangeEvent,
             source_zone: &Arc<str>,
             master_record_names: &FxHashSet<String>,
-            unresolved_master_names: &mut FxHashSet<String>,
             seen_asset_record_names: &mut FxHashSet<String>,
             matched: &mut Vec<PhotoAsset>,
-            candidate_resolves_target: &mut F,
-        ) where
-            F: FnMut(&PhotoAsset) -> bool,
-        {
+        ) {
             if event.reason != crate::types::ChangeReason::Created {
                 return;
             }
@@ -1511,16 +1501,12 @@ impl PhotoAlbum {
             if master_record_names.contains(asset.id())
                 && seen_asset_record_names.insert(asset.asset_record_name().to_string())
             {
-                if candidate_resolves_target(&asset) {
-                    unresolved_master_names.remove(asset.id());
-                }
                 matched.push(asset);
             }
         }
 
         let mut buffer = DeltaRecordBuffer::new();
         let source_zone: Arc<str> = Arc::from(self.zone_name());
-        let mut unresolved_master_names = master_record_names.clone();
         let mut seen_asset_record_names = FxHashSet::default();
         let mut matched = Vec::new();
         self.scan_changes_zone(|record| {
@@ -1529,13 +1515,11 @@ impl PhotoAlbum {
                     event,
                     &source_zone,
                     master_record_names,
-                    &mut unresolved_master_names,
                     &mut seen_asset_record_names,
                     &mut matched,
-                    &mut candidate_resolves_target,
                 );
             }
-            !shutdown_token.is_cancelled() && !unresolved_master_names.is_empty()
+            !shutdown_token.is_cancelled()
         })
         .await?;
 
@@ -1544,10 +1528,8 @@ impl PhotoAlbum {
                 event,
                 &source_zone,
                 master_record_names,
-                &mut unresolved_master_names,
                 &mut seen_asset_record_names,
                 &mut matched,
-                &mut candidate_resolves_target,
             );
         }
         Ok(matched)
@@ -4797,11 +4779,7 @@ mod tests {
         let masters = FxHashSet::from_iter(["master-target".to_string()]);
 
         let matched = album
-            .hydrate_matching_master_assets_from_changes(
-                &masters,
-                &CancellationToken::new(),
-                |_| false,
-            )
+            .hydrate_matching_master_assets_from_changes(&masters, &CancellationToken::new())
             .await
             .expect("master hydration");
 
@@ -4812,6 +4790,32 @@ mod tests {
                 .iter()
                 .all(|asset| asset.source_zone() == Some("PrimarySync"))
         );
+        let asset_record_names: FxHashSet<&str> =
+            matched.iter().map(PhotoAsset::asset_record_name).collect();
+        assert_eq!(
+            asset_record_names,
+            FxHashSet::from_iter(["asset-target-a", "asset-target-b"])
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_matching_master_assets_scans_later_sibling_pages() {
+        let page1 = vec![
+            changes_master("master-target"),
+            changes_asset("asset-target-a", "master-target"),
+        ];
+        let page2 = vec![changes_asset("asset-target-b", "master-target")];
+        let mock = MockPhotosSession::new()
+            .ok(canned_changes_page(&page1, "token-page1", true))
+            .ok(canned_changes_page(&page2, "token-final", false));
+        let album = make_album_with_session(100, Box::new(mock));
+        let masters = FxHashSet::from_iter(["master-target".to_string()]);
+
+        let matched = album
+            .hydrate_matching_master_assets_from_changes(&masters, &CancellationToken::new())
+            .await
+            .expect("master hydration should scan every page");
+
         let asset_record_names: FxHashSet<&str> =
             matched.iter().map(PhotoAsset::asset_record_name).collect();
         assert_eq!(
