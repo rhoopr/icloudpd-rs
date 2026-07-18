@@ -183,6 +183,11 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check live wiki command documentation
+        run: |
+          git clone --depth=1 https://github.com/rhoopr/kei.wiki.git /tmp/kei-wiki
+          cargo build --bin kei
+          scripts/check-wiki-commands.sh target/debug/kei /tmp/kei-wiki
       - run: cargo doc --no-deps --all-features
 
   # Detects dependencies declared in Cargo.toml but not actually used

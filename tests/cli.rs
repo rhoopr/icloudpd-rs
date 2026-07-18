@@ -55,7 +55,42 @@ fn help_flag_succeeds() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("kei: photo sync engine"));
+        .stdout(predicate::str::contains("kei: photo sync engine"))
+        .stdout(predicate::str::contains(
+            "https://github.com/rhoopr/kei/wiki",
+        ))
+        .stdout(predicate::str::contains(
+            "https://github.com/rhoopr/kei/issues",
+        ));
+}
+
+#[test]
+fn subcommand_help_links_to_relevant_documentation() {
+    for (command, page) in [
+        ("sync", "Sync"),
+        ("login", "Login"),
+        ("list", "List"),
+        ("password", "Password"),
+        ("reset", "Reset"),
+        ("config", "Config"),
+        ("status", "Status"),
+        ("doctor", "Doctor"),
+        ("manifest", "Manifest"),
+        ("import-existing", "Import-Existing"),
+        ("verify", "Verify"),
+        ("reconcile", "Reconcile"),
+        ("install", "Install"),
+        ("uninstall", "Service"),
+        ("service", "Service"),
+    ] {
+        common::cmd()
+            .args([command, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "https://github.com/rhoopr/kei/wiki/{page}"
+            )));
+    }
 }
 
 #[test]
@@ -887,6 +922,14 @@ fn config_explicit_nonexistent_path_fails_at_runtime() {
         stderr.contains("config") || stderr.contains("nonexistent"),
         "error should mention the config file, stderr:\n{stderr}"
     );
+    assert!(
+        stderr.contains("kei doctor --json"),
+        "generic runtime errors should suggest diagnostics, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("https://github.com/rhoopr/kei/issues"),
+        "generic runtime errors should link to issue reporting, stderr:\n{stderr}"
+    );
 }
 
 // ── Auth flags on non-sync subcommands ──────────────────────────────────
@@ -1088,7 +1131,8 @@ fn exit_code_3_on_empty_password_file() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .code(3)
-        .stderr(predicate::str::contains("No password was available"));
+        .stderr(predicate::str::contains("No password was available"))
+        .stderr(predicate::str::contains("kei doctor --json").not());
 }
 
 /// Exit code 3 (auth failure) when password file contains only a newline.

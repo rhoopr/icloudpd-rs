@@ -550,6 +550,7 @@ pub enum ServiceAction {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Download photos from iCloud
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Sync")]
     Sync {
         #[command(flatten)]
         friendly: FriendlyArgs,
@@ -562,6 +563,7 @@ pub enum Command {
     },
 
     /// Authenticate interactively (creates/refreshes session tokens)
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Login")]
     Login {
         #[command(flatten)]
         password: PasswordArgs,
@@ -571,6 +573,7 @@ pub enum Command {
     },
 
     /// List available albums or libraries
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/List")]
     List {
         #[command(flatten)]
         password: PasswordArgs,
@@ -591,6 +594,7 @@ pub enum Command {
     },
 
     /// Manage stored credentials (OS keyring or encrypted file)
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Password")]
     Password {
         #[command(flatten)]
         password: PasswordArgs,
@@ -600,50 +604,61 @@ pub enum Command {
     },
 
     /// Reset state database or sync tokens
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Reset")]
     Reset {
         #[command(subcommand)]
         what: ResetCommand,
     },
 
     /// Config management
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Config")]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
 
     /// Show sync status and database summary
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Status")]
     Status(StatusArgs),
 
     /// Run redacted local diagnostics for support
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Doctor")]
     Doctor(DoctorArgs),
 
     /// Export the local state catalog without contacting iCloud
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Manifest")]
     Manifest(ManifestArgs),
 
     /// Import existing local files into the state database
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Import-Existing")]
     ImportExisting(ImportArgs),
 
     /// Verify downloaded files exist and optionally check checksums
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Verify")]
     Verify(VerifyArgs),
 
     /// Reconcile state database with files on disk: mark assets as
     /// failed when their local file is missing or truncated, so the
     /// next sync re-downloads them.
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Reconcile")]
     Reconcile(ReconcileArgs),
 
     /// Register kei as a system service (launchd on macOS, systemd on
     /// Linux, Service Control Manager on Windows). Inside a Docker
     /// container the command logs that compose-managed deployments are
     /// already supervised and exits without writing anything.
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Install")]
     Install(InstallArgs),
 
     /// Remove the kei service registered by `kei install`. Pass `--purge`
     /// to also delete the state database, configuration, and stored
     /// credentials.
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Service")]
     Uninstall(UninstallArgs),
 
     /// Service-mode operations: run the long-lived worker, or query
     /// service registration status.
+    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Service")]
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -667,7 +682,9 @@ pub enum Command {
         Advanced:\n  \
         kei install         Register as a background service\n  \
         kei verify          Verify downloaded files\n  \
-        kei import-existing  Adopt an existing local photo tree"
+        kei import-existing  Adopt an existing local photo tree\n\n  \
+        Documentation: https://github.com/rhoopr/kei/wiki\n  \
+        Support and issues: https://github.com/rhoopr/kei/issues"
 )]
 pub struct Cli {
     // ── Global options ──────────────────────────────────────────────

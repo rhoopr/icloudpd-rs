@@ -322,6 +322,10 @@ impl ExitClassification {
     const fn should_log(self) -> bool {
         !matches!(self, Self::TwoFactorRequired)
     }
+
+    const fn should_suggest_diagnostics(self) -> bool {
+        matches!(self, Self::Other)
+    }
 }
 
 fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
@@ -654,6 +658,11 @@ pub fn main_inner() -> ExitCode {
                 )]
                 {
                     eprintln!("Error: {e:#}");
+                    if classification.should_suggest_diagnostics() {
+                        eprintln!();
+                        eprintln!("Run `kei doctor --json` for a redacted diagnostic report.");
+                        eprintln!("Report bugs: https://github.com/rhoopr/kei/issues");
+                    }
                 }
             }
             ExitCode::from(classification.exit_code())
