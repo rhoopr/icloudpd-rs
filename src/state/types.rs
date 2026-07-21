@@ -92,6 +92,8 @@ impl From<AssetVersionSize> for VersionSizeKey {
 pub enum AssetStatus {
     /// Asset has been seen but not yet downloaded.
     Pending,
+    /// Asset is live at the provider but excluded by the active download policy.
+    PolicyExcluded,
     /// Asset has been successfully downloaded.
     Downloaded,
     /// Asset download failed (will be retried).
@@ -104,6 +106,7 @@ impl AssetStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::PolicyExcluded => "policy_excluded",
             Self::Downloaded => "downloaded",
             Self::Failed => "failed",
         }
@@ -113,6 +116,7 @@ impl AssetStatus {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
+            "policy_excluded" => Some(Self::PolicyExcluded),
             "downloaded" => Some(Self::Downloaded),
             "failed" => Some(Self::Failed),
             _ => None,
@@ -487,6 +491,8 @@ pub struct SyncSummary {
     pub downloaded: u64,
     /// Number of assets pending download.
     pub pending: u64,
+    /// Number of live assets intentionally excluded by the active download policy.
+    pub policy_excluded: u64,
     /// Number of assets that failed to download.
     pub failed: u64,
     /// Pending or failed rows whose targeted provider lookup was inconclusive.
@@ -604,6 +610,7 @@ mod tests {
     fn test_asset_status_round_trip() {
         for status in [
             AssetStatus::Pending,
+            AssetStatus::PolicyExcluded,
             AssetStatus::Downloaded,
             AssetStatus::Failed,
         ] {

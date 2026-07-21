@@ -438,6 +438,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planner_redispatch_reactivates_policy_excluded_asset() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let asset = TestPhotoAsset::new("POLICY_RESELECTED")
+            .filename("reselected.mov")
+            .build();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut task_planner = TaskPlanner::new();
+        let plan = task_planner.plan_asset(&asset, &config).await;
+        let task = plan
+            .tasks
+            .first()
+            .expect("selected asset should plan a task");
+        upsert_seen_for_task(&db, &config, &asset, task)
+            .await
+            .unwrap();
+        assert!(
+            db.mark_policy_excluded(
+                task.library.as_ref(),
+                task.asset_id.as_ref(),
+                task.version_size.as_str(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(db.get_summary().await.unwrap().policy_excluded, 1);
+
+        upsert_seen_for_task(&db, &config, &asset, task)
+            .await
+            .unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.policy_excluded, 0);
+        assert_eq!(summary.pending, 1);
+    }
+
+    #[tokio::test]
     async fn planner_uses_cross_zone_asset_library_for_state_and_membership() {
         let tmp = TempDir::new().unwrap();
         let base = test_config(tmp.path());

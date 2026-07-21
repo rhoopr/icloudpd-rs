@@ -238,6 +238,16 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<(), StateError> {
         Ok(())
     }
+    /// Mark a live asset as intentionally outside the active download policy.
+    ///
+    /// Returns `true` when a pending row was transitioned. A later
+    /// producer-dispatched `upsert_seen` reactivates the row to pending.
+    async fn mark_policy_excluded(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<bool, StateError>;
     async fn backfill_asset_master_mappings_from_album_memberships(
         &self,
     ) -> Result<u64, StateError> {
@@ -818,6 +828,10 @@ fn upsert_asset_row(
                         ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                         ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
                 ON CONFLICT(library, id, version_size) DO UPDATE SET
+                    status = CASE
+                        WHEN assets.status = 'policy_excluded' THEN 'pending'
+                        ELSE assets.status
+                    END,
                     checksum = excluded.checksum,
                     filename = excluded.filename,
                     created_at = excluded.created_at,
@@ -1049,7 +1063,9 @@ impl SqliteStateDb {
                             }
                         }
                     }
-                    AssetStatus::Pending | AssetStatus::Failed => Ok(true),
+                    AssetStatus::Pending | AssetStatus::PolicyExcluded | AssetStatus::Failed => {
+                        Ok(true)
+                    }
                 }
             }
         }
@@ -1401,12 +1417,20 @@ impl SqliteStateDb {
 
     pub(crate) async fn get_summary(&self) -> Result<SyncSummary, StateError> {
         self.with_conn("get_summary", move |conn| {
-            let (total_assets, downloaded, pending, failed, source_deleted, downloaded_bytes) = conn
-                .query_row(
+            let (
+                total_assets,
+                downloaded,
+                pending,
+                policy_excluded,
+                failed,
+                source_deleted,
+                downloaded_bytes,
+            ) = conn.query_row(
                     "SELECT \
                          COUNT(*), \
                          COUNT(CASE WHEN status = 'downloaded' THEN 1 END), \
                          COUNT(CASE WHEN status = 'pending' AND is_deleted = 0 THEN 1 END), \
+                         COUNT(CASE WHEN status = 'policy_excluded' AND is_deleted = 0 THEN 1 END), \
                          COUNT(CASE WHEN status = 'failed' AND is_deleted = 0 THEN 1 END), \
                          COUNT(CASE WHEN is_deleted = 1 THEN 1 END), \
                          COALESCE(SUM(CASE WHEN status = 'downloaded' THEN size_bytes ELSE 0 END), 0) \
@@ -1420,14 +1444,16 @@ impl SqliteStateDb {
                             row.get::<_, i64>(3)?,
                             row.get::<_, i64>(4)?,
                             row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
                         ))
                     },
                 )
-                .map(|(t, d, p, f, s, b)| {
+                .map(|(t, d, p, e, f, s, b)| {
                     (
                         u64::try_from(t).unwrap_or(0),
                         u64::try_from(d).unwrap_or(0),
                         u64::try_from(p).unwrap_or(0),
+                        u64::try_from(e).unwrap_or(0),
                         u64::try_from(f).unwrap_or(0),
                         u64::try_from(s).unwrap_or(0),
                         u64::try_from(b).unwrap_or(0),
@@ -1599,6 +1625,7 @@ impl SqliteStateDb {
                 total_assets,
                 downloaded,
                 pending,
+                policy_excluded,
                 failed,
                 awaiting_provider_verification,
                 source_deleted,
@@ -2994,6 +3021,42 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn mark_policy_excluded(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<bool, StateError> {
+        let library = library.to_owned();
+        let id = id.to_owned();
+        let version_size = version_size.to_owned();
+        self.with_conn_mut("mark_policy_excluded", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("mark_policy_excluded::begin", e))?;
+            let affected = tx
+                .execute(
+                    "UPDATE assets SET status = 'policy_excluded', last_error = NULL \
+                     WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                       AND status = 'pending' AND is_deleted = 0",
+                    rusqlite::params![library, id, version_size],
+                )
+                .map_err(|e| StateError::query("mark_policy_excluded::update", e))?;
+            if affected > 0 {
+                tx.execute(
+                    "DELETE FROM asset_verifications \
+                     WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+                    rusqlite::params![library, id, version_size],
+                )
+                .map_err(|e| StateError::query("mark_policy_excluded::verification", e))?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("mark_policy_excluded::commit", e))?;
+            Ok(affected > 0)
+        })
+        .await
+    }
+
     pub(crate) async fn backfill_asset_master_mappings_from_album_memberships(
         &self,
     ) -> Result<u64, StateError> {
@@ -3524,6 +3587,15 @@ impl DownloadStateStore for SqliteStateDb {
         version_size: &str,
     ) -> Result<(), StateError> {
         SqliteStateDb::clear_asset_verification(self, library, id, version_size).await
+    }
+
+    async fn mark_policy_excluded(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::mark_policy_excluded(self, library, id, version_size).await
     }
 
     async fn backfill_asset_master_mappings_from_album_memberships(
@@ -4910,6 +4982,78 @@ mod tests {
         assert_eq!(summary.pending, 3);
         assert_eq!(summary.downloaded, 2);
         assert_eq!(summary.failed, 1);
+        assert_eq!(summary.policy_excluded, 0);
+    }
+
+    #[tokio::test]
+    async fn policy_excluded_asset_is_non_actionable_until_redispatched() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("POLICY_EXCLUDED")
+            .checksum("excluded-checksum")
+            .filename("old.mov")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.set_asset_verification(
+            "PrimarySync",
+            "POLICY_EXCLUDED",
+            "original",
+            AssetVerificationState::Unknown,
+            "before policy decision",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.mark_policy_excluded("PrimarySync", "POLICY_EXCLUDED", "original")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.mark_policy_excluded("PrimarySync", "POLICY_EXCLUDED", "original")
+                .await
+                .unwrap()
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.policy_excluded, 1);
+        assert_eq!(summary.awaiting_provider_verification, 0);
+        assert!(db.get_pending().await.unwrap().is_empty());
+
+        db.upsert_seen(&record).await.unwrap();
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, AssetStatus::Pending);
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.policy_excluded, 0);
+    }
+
+    #[tokio::test]
+    async fn source_deletion_supersedes_policy_exclusion() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("EXCLUDED_DELETED")
+            .checksum("excluded-deleted-checksum")
+            .filename("deleted.mov")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        assert!(
+            db.mark_policy_excluded("PrimarySync", "EXCLUDED_DELETED", "original")
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            db.resolve_source_deleted("PrimarySync", "EXCLUDED_DELETED", None)
+                .await
+                .unwrap(),
+            1
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.policy_excluded, 0);
+        assert_eq!(summary.source_deleted, 1);
     }
 
     #[tokio::test]

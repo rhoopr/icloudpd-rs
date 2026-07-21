@@ -1552,6 +1552,49 @@ fn status_shows_safe_backup_summary_after_clean_sync() {
 }
 
 #[test]
+fn status_treats_policy_excluded_assets_as_safe_and_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "excluded",
+        "policy_excluded",
+        "old.mov",
+        None,
+        None,
+        None,
+    );
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, assets_seen, assets_downloaded,
+            assets_failed, interrupted, enumeration_errors
+         ) VALUES (?1, ?2, 'complete', 1, 0, 0, 0, 0)",
+        rusqlite::params![1_700_000_000_i64, 1_700_000_010_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Pending:    0"), "stdout: {stdout}");
+    assert!(stdout.contains("Policy excluded: 1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains(
+            "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
 fn status_shows_unsafe_backup_summary_with_last_run_reasons() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";

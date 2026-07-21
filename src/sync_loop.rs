@@ -4396,6 +4396,17 @@ mod tests {
             self.inner.touch_last_seen_many(library, asset_ids).await
         }
 
+        async fn mark_policy_excluded(
+            &self,
+            library: &str,
+            id: &str,
+            version_size: &str,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .mark_policy_excluded(library, id, version_size)
+                .await
+        }
+
         async fn mark_soft_deleted(
             &self,
             library: &str,

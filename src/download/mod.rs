@@ -11998,7 +11998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_full_sync_defers_filtered_live_pending_without_failure() {
+    async fn bounded_full_sync_excludes_filtered_live_pending_without_failure() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = TestAssetRecord::new("LEGACY_FILTERED_MISSING")
             .filename("legacy-filtered-missing.jpg")
@@ -12042,11 +12042,12 @@ mod tests {
             CancellationToken::new(),
         )
         .await
-        .expect("filtered live pending asset should be deferred");
+        .expect("filtered live pending asset should be policy-excluded");
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         let summary = db.get_summary().await.expect("summary");
-        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.policy_excluded, 1);
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.awaiting_provider_verification, 0);
         assert_eq!(

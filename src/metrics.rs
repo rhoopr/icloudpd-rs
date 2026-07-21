@@ -517,6 +517,11 @@ impl MetricsHandle {
             .get_or_create(&StatusLabels { status: "pending" })
             .set(i64::try_from(summary.pending).unwrap_or(i64::MAX));
         self.db_assets_total
+            .get_or_create(&StatusLabels {
+                status: "policy_excluded",
+            })
+            .set(i64::try_from(summary.policy_excluded).unwrap_or(i64::MAX));
+        self.db_assets_total
             .get_or_create(&StatusLabels { status: "failed" })
             .set(i64::try_from(summary.failed).unwrap_or(i64::MAX));
         self.db_assets_total
@@ -1294,6 +1299,7 @@ mod tests {
             total_assets: downloaded + pending + failed,
             downloaded,
             pending,
+            policy_excluded: 0,
             failed,
             awaiting_provider_verification: 0,
             source_deleted: 0,
@@ -1322,8 +1328,10 @@ mod tests {
     #[tokio::test]
     async fn update_db_stats_sets_asset_count_gauges() {
         let handle = MetricsHandle::new(None);
-        let summary = make_summary(100, 5, 2, 1_000_000);
-        handle.update_db_stats(&summary, 107);
+        let mut summary = make_summary(100, 5, 2, 1_000_000);
+        summary.policy_excluded = 3;
+        summary.total_assets += 3;
+        handle.update_db_stats(&summary, 110);
 
         let output = render_metrics(&handle).await;
         assert!(
@@ -1333,6 +1341,10 @@ mod tests {
         assert!(
             output.contains(r#"kei_db_assets_total{status="pending"} 5"#),
             "pending count missing or wrong:\n{output}"
+        );
+        assert!(
+            output.contains(r#"kei_db_assets_total{status="policy_excluded"} 3"#),
+            "policy-excluded count missing or wrong:\n{output}"
         );
         assert!(
             output.contains(r#"kei_db_assets_total{status="failed"} 2"#),

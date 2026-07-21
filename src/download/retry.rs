@@ -242,20 +242,24 @@ impl PendingRetryPlanning<'_> {
             .cloned()
             .collect();
         for target in deferred_targets {
-            self.db
-                .clear_asset_verification(
+            let transitioned = self
+                .db
+                .mark_policy_excluded(
                     &target.library,
                     &target.asset_id,
                     target.version_size.as_str(),
                 )
                 .await?;
-            self.pending_targets.remove(&target);
+            if transitioned {
+                self.pending_targets.remove(&target);
+            }
             tracing::info!(
                 library = %target.library,
                 asset_id = %target.asset_id,
                 version_size = target.version_size.as_str(),
                 filter_reasons = ?filter_reasons,
-                "Pending asset deferred: current sync policy did not produce a retry task"
+                transitioned,
+                "Pending asset excluded: current sync policy did not produce a retry task"
             );
         }
         for target in state_write_failed_targets {

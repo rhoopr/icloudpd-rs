@@ -36,6 +36,7 @@ pub(crate) async fn run_status(
     println!("  Total:      {}", summary.total_assets);
     println!("  Downloaded: {}", summary.downloaded);
     println!("  Pending:    {}", summary.pending);
+    println!("  Policy excluded: {}", summary.policy_excluded);
     println!("  Failed:     {}", summary.failed);
     println!("  Source deleted: {}", summary.source_deleted);
     println!(

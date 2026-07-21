@@ -4163,6 +4163,15 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_policy_excluded(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<bool, StateError> {
+            unimplemented!()
+        }
+
         async fn mark_soft_deleted(
             &self,
             _: &str,
