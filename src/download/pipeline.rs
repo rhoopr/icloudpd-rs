@@ -1267,6 +1267,8 @@ where
 
     let handle = tokio::spawn(async move {
         let config = &producer_config;
+        let mark_refreshed_metadata_for_rewrite =
+            config.refresh_metadata && MetadataFlags::from(config.as_ref()).has_any_write();
         let mut task_planner = TaskPlanner::new();
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
         // Skipped-asset IDs accumulated across the producer run and
@@ -1391,6 +1393,25 @@ where
                                 library,
                                 error = %e,
                                 "Failed to record asset/master mapping"
+                            );
+                        }
+                        if config.refresh_metadata
+                            && let Err(e) = db
+                                .refresh_downloaded_asset_metadata(
+                                    library,
+                                    asset.state_id(),
+                                    asset.metadata(),
+                                    mark_refreshed_metadata_for_rewrite,
+                                )
+                                .await
+                        {
+                            state_write_failures_producer
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                asset_id = %asset.id(),
+                                library,
+                                error = %e,
+                                "Failed to refresh downloaded asset metadata"
                             );
                         }
                     }
@@ -1607,6 +1628,16 @@ where
                                                 path = %existing_path.display(),
                                                 "Skipping (state path exists on disk)"
                                             );
+                                            let candidates =
+                                                extract_skip_candidates(&asset, config.as_ref());
+                                            metadata_rewrite::tag_if_needed(
+                                                producer_state_db.as_deref(),
+                                                config,
+                                                &asset,
+                                                &candidates,
+                                                &download_ctx,
+                                            )
+                                            .await;
                                             backfill_downloaded_metadata_for_on_disk_skip(
                                                 producer_state_db.as_deref(),
                                                 config,
@@ -2143,6 +2174,7 @@ async fn finalize_streaming_download(
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
     if consumer.state_write_circuit_error.is_none()
+        && !config.refresh_metadata
         && let Some(db) = &state_db
     {
         let metadata_flags = MetadataFlags::from(config.as_ref());
@@ -2153,7 +2185,8 @@ async fn finalize_streaming_download(
                 Arc::clone(&config.temp_suffix),
                 &pipeline_shutdown,
             )
-            .await;
+            .await
+            .failed;
         }
     }
 
@@ -4334,6 +4367,16 @@ mod tests {
             Ok(())
         }
 
+        async fn refresh_downloaded_asset_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::state::AssetMetadata,
+            _: bool,
+        ) -> Result<usize, StateError> {
+            Ok(0)
+        }
+
         async fn clear_metadata_write_failure(
             &self,
             _: &str,
@@ -4359,8 +4402,10 @@ mod tests {
             Ok(HashSet::new())
         }
 
-        async fn get_pending_metadata_rewrites(
+        async fn get_pending_metadata_rewrites_page(
             &self,
+            _: Option<&[&str]>,
+            _: usize,
             _: usize,
         ) -> Result<Vec<AssetRecord>, StateError> {
             Ok(Vec::new())
@@ -4884,14 +4929,8 @@ mod tests {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            set_exif_datetime: false,
-            set_exif_rating: false,
-            set_exif_gps: false,
-            set_exif_description: false,
-            #[cfg(feature = "xmp")]
-            embed_xmp: false,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: false,
+            metadata: crate::config::MetadataConfig::default(),
+            refresh_metadata: false,
             concurrent_downloads: 10,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -4972,14 +5011,8 @@ mod tests {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            set_exif_datetime: false,
-            set_exif_rating: false,
-            set_exif_gps: false,
-            set_exif_description: false,
-            #[cfg(feature = "xmp")]
-            embed_xmp: false,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: false,
+            metadata: crate::config::MetadataConfig::default(),
+            refresh_metadata: false,
             concurrent_downloads: 1,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -5541,6 +5574,100 @@ mod tests {
             !db.has_downloaded_without_metadata_hash().await.unwrap(),
             "on-disk skip must backfill metadata_hash for existing downloaded rows"
         );
+    }
+
+    /// Explicit metadata refresh updates historical versions before current
+    /// resolution and filename filters are applied.
+    #[tokio::test]
+    async fn refresh_metadata_updates_historical_version_before_filename_filter() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn existing_asset() -> PhotoAsset {
+            TestPhotoAsset::new("REFRESH_FILTERED")
+                .filename("filtered.jpg")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                .orig_url("https://p01.icloud-content.com/filtered.jpg")
+                .orig_checksum("ck_filtered")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.refresh_metadata = true;
+        config.metadata.set_exif_datetime = true;
+        config.filename_exclude =
+            Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
+        let config = Arc::new(config);
+
+        let historical_path = dir.path().join("historical-medium.jpg");
+        fs::write(
+            &historical_path,
+            [
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+            ],
+        )
+        .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("REFRESH_FILTERED")
+            .version_size(crate::state::VersionSizeKey::Medium)
+            .checksum("historical-medium")
+            .filename("historical-medium.jpg")
+            .size(1234)
+            .metadata(AssetMetadata {
+                title: Some("stale".to_string()),
+                metadata_hash: Some("stale-hash".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "REFRESH_FILTERED",
+            "medium",
+            &historical_path,
+            "sha256",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.downloaded, 0,
+            "filename-filtered asset should not be downloaded"
+        );
+        let rewrites = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(rewrites.len(), 1);
+        assert_eq!(
+            rewrites[0].version_size,
+            crate::state::VersionSizeKey::Medium
+        );
+        assert_ne!(
+            rewrites[0].metadata.metadata_hash.as_deref(),
+            Some("stale-hash")
+        );
+        assert_eq!(rewrites[0].metadata.title, None);
     }
 
     /// Data-sacred regression for the trust-state fast-skip removal.

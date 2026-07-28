@@ -555,15 +555,23 @@ pub trait MetadataRewriteStore: Send + Sync {
         asset_id: &str,
         version_size: &str,
     ) -> Result<(), StateError>;
+    async fn refresh_downloaded_asset_metadata(
+        &self,
+        library: &str,
+        asset_id: &str,
+        metadata: &AssetMetadata,
+        mark_for_rewrite: bool,
+    ) -> Result<usize, StateError>;
     async fn get_downloaded_metadata_hashes(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError>;
     async fn get_metadata_retry_markers(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError>;
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn get_pending_metadata_rewrites(
+    async fn get_pending_metadata_rewrites_page(
         &self,
+        library_scope: Option<&[&str]>,
+        offset: usize,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError>;
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
@@ -3268,6 +3276,89 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn refresh_downloaded_asset_metadata(
+        &self,
+        library: &str,
+        asset_id: &str,
+        metadata: &AssetMetadata,
+        mark_for_rewrite: bool,
+    ) -> Result<usize, StateError> {
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let mut metadata = metadata.clone();
+        if metadata.metadata_hash.is_none() {
+            metadata.refresh_hash();
+        }
+        let rewrite_at = Utc::now().timestamp();
+        self.with_conn("refresh_downloaded_asset_metadata", move |conn| {
+            let updated = conn
+                .execute(
+                    r"
+                    UPDATE assets SET
+                        source = COALESCE(?1, source),
+                        is_favorite = ?2,
+                        rating = ?3,
+                        latitude = ?4,
+                        longitude = ?5,
+                        altitude = ?6,
+                        orientation = ?7,
+                        duration_secs = ?8,
+                        timezone_offset = ?9,
+                        width = ?10,
+                        height = ?11,
+                        title = ?12,
+                        keywords = ?13,
+                        description = ?14,
+                        media_subtype = ?15,
+                        burst_id = ?16,
+                        is_hidden = ?17,
+                        is_archived = ?18,
+                        modified_at = ?19,
+                        is_deleted = ?20,
+                        deleted_at = ?21,
+                        provider_data = ?22,
+                        metadata_hash = ?23,
+                        metadata_write_failed_at =
+                            CASE WHEN ?24 = 1 THEN ?25 ELSE metadata_write_failed_at END
+                    WHERE library = ?26 AND id = ?27
+                      AND status = 'downloaded' AND is_deleted = 0
+                    ",
+                    rusqlite::params![
+                        metadata.source.as_deref(),
+                        i64::from(metadata.is_favorite),
+                        metadata.rating.map(i64::from),
+                        metadata.latitude,
+                        metadata.longitude,
+                        metadata.altitude,
+                        metadata.orientation.map(i64::from),
+                        metadata.duration_secs,
+                        metadata.timezone_offset.map(i64::from),
+                        metadata.width.map(i64::from),
+                        metadata.height.map(i64::from),
+                        metadata.title.as_deref(),
+                        metadata.keywords.as_deref(),
+                        metadata.description.as_deref(),
+                        metadata.media_subtype.as_deref(),
+                        metadata.burst_id.as_deref(),
+                        i64::from(metadata.is_hidden),
+                        i64::from(metadata.is_archived),
+                        metadata.modified_at.map(|dt| dt.timestamp()),
+                        i64::from(metadata.is_deleted),
+                        metadata.deleted_at.map(|dt| dt.timestamp()),
+                        metadata.provider_data.as_deref(),
+                        metadata.metadata_hash.as_deref(),
+                        i64::from(mark_for_rewrite),
+                        rewrite_at,
+                        library,
+                        asset_id,
+                    ],
+                )
+                .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
+            Ok(updated)
+        })
+        .await
+    }
+
     pub(crate) async fn clear_metadata_write_failure(
         &self,
         library: &str,
@@ -3322,25 +3413,78 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_pending_metadata_rewrites(
         &self,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError> {
+        self.get_pending_metadata_rewrites_page(None, 0, limit)
+            .await
+    }
+
+    pub(crate) async fn get_pending_metadata_rewrites_page(
+        &self,
+        library_scope: Option<&[&str]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        if let Some(libraries) = library_scope {
+            let libraries = unique_sorted_strings(libraries);
+            if libraries.is_empty() {
+                return Ok(Vec::new());
+            }
+            let placeholders = sqlite_placeholders(libraries.len());
+            return self
+                .with_conn("get_pending_metadata_rewrites", move |conn| {
+                    let sql = format!(
+                        "SELECT {ASSET_COLUMNS} FROM assets \
+                         WHERE metadata_write_failed_at IS NOT NULL \
+                           AND status = 'downloaded' \
+                           AND is_deleted = 0 \
+                           AND local_path IS NOT NULL \
+                           AND library IN ({placeholders}) \
+                         ORDER BY metadata_write_failed_at ASC, library, id, version_size \
+                         LIMIT ? OFFSET ?"
+                    );
+                    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+                    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+                    let mut params: Vec<&dyn rusqlite::ToSql> =
+                        Vec::with_capacity(libraries.len() + 2);
+                    for library in &libraries {
+                        params.push(library);
+                    }
+                    params.push(&limit);
+                    params.push(&offset);
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(params), row_to_asset_record)
+                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
+                })
+                .await;
+        }
+
         self.with_conn("get_pending_metadata_rewrites", move |conn| {
             let sql = format!(
                 "SELECT {ASSET_COLUMNS} FROM assets \
                  WHERE metadata_write_failed_at IS NOT NULL \
                    AND status = 'downloaded' \
                    AND local_path IS NOT NULL \
-                 ORDER BY metadata_write_failed_at ASC \
-                 LIMIT ?1"
+                 ORDER BY metadata_write_failed_at ASC, library, id, version_size \
+                 LIMIT ?1 OFFSET ?2"
             );
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
             let rows = stmt
                 .query_map(
-                    [i64::try_from(limit).unwrap_or(i64::MAX)],
+                    [
+                        i64::try_from(limit).unwrap_or(i64::MAX),
+                        i64::try_from(offset).unwrap_or(i64::MAX),
+                    ],
                     row_to_asset_record,
                 )
                 .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
@@ -3407,7 +3551,7 @@ impl SqliteStateDb {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
-                     AND metadata_hash IS NULL)",
+                     AND is_deleted = 0 AND metadata_hash IS NULL)",
                     [],
                     |row| row.get(0),
                 )
@@ -3986,6 +4130,23 @@ impl MetadataRewriteStore for SqliteStateDb {
         SqliteStateDb::record_metadata_write_failure(self, library, asset_id, version_size).await
     }
 
+    async fn refresh_downloaded_asset_metadata(
+        &self,
+        library: &str,
+        asset_id: &str,
+        metadata: &AssetMetadata,
+        mark_for_rewrite: bool,
+    ) -> Result<usize, StateError> {
+        SqliteStateDb::refresh_downloaded_asset_metadata(
+            self,
+            library,
+            asset_id,
+            metadata,
+            mark_for_rewrite,
+        )
+        .await
+    }
+
     async fn get_downloaded_metadata_hashes(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError> {
@@ -3998,11 +4159,13 @@ impl MetadataRewriteStore for SqliteStateDb {
         SqliteStateDb::get_metadata_retry_markers(self).await
     }
 
-    async fn get_pending_metadata_rewrites(
+    async fn get_pending_metadata_rewrites_page(
         &self,
+        library_scope: Option<&[&str]>,
+        offset: usize,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError> {
-        SqliteStateDb::get_pending_metadata_rewrites(self, limit).await
+        SqliteStateDb::get_pending_metadata_rewrites_page(self, library_scope, offset, limit).await
     }
 
     async fn update_metadata_hash(
@@ -4032,6 +4195,20 @@ impl MetadataRewriteStore for SqliteStateDb {
 
 #[cfg(test)]
 impl SqliteStateDb {
+    #[cfg(feature = "xmp")]
+    pub(crate) fn fail_metadata_marker_clear_for_test(&self) {
+        let conn = self
+            .acquire_lock("test_fail_metadata_marker_clear")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_metadata_marker_clear \
+             BEFORE UPDATE OF metadata_write_failed_at ON assets \
+             WHEN NEW.metadata_write_failed_at IS NULL \
+             BEGIN SELECT RAISE(FAIL, 'simulated metadata marker clear failure'); END;",
+        )
+        .unwrap();
+    }
+
     /// Overwrite `last_seen_at` for a specific asset in `PrimarySync`. Used
     /// by tests that need to simulate a pending row carried over from a
     /// prior sync. Callable from any test module in the crate so
@@ -8668,6 +8845,86 @@ mod tests {
                 .unwrap();
         }
         assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_downloaded_without_metadata_hash_skips_soft_deleted() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("D1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "D1",
+            "original",
+            Path::new("/a.jpg"),
+            "h",
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
+                .unwrap();
+        }
+        db.mark_soft_deleted("PrimarySync", "D1", None)
+            .await
+            .unwrap();
+        // A soft-deleted row is never re-enumerated, so its NULL hash must not drive full enumeration.
+        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn refresh_downloaded_asset_metadata_updates_every_live_downloaded_version() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for version in [VersionSizeKey::Original, VersionSizeKey::Medium] {
+            let record = TestAssetRecord::new("PHOTO")
+                .version_size(version)
+                .metadata(AssetMetadata {
+                    metadata_hash: Some("stale-hash".to_string()),
+                    ..AssetMetadata::default()
+                })
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "PHOTO",
+                version.as_str(),
+                Path::new("/photo.jpg"),
+                "checksum",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let metadata = AssetMetadata {
+            rating: Some(4),
+            ..AssetMetadata::default()
+        };
+        let expected_hash = metadata.compute_hash();
+        let updated = db
+            .refresh_downloaded_asset_metadata("PrimarySync", "PHOTO", &metadata, true)
+            .await
+            .unwrap();
+        assert_eq!(updated, 2);
+
+        let rewrites = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(rewrites.len(), 2);
+        for record in rewrites {
+            assert_eq!(record.library.as_ref(), "PrimarySync");
+            assert_eq!(record.id.as_ref(), "PHOTO");
+            assert!(matches!(
+                record.version_size,
+                VersionSizeKey::Original | VersionSizeKey::Medium
+            ));
+            assert_eq!(record.metadata.rating, Some(4));
+            assert_eq!(
+                record.metadata.metadata_hash.as_deref(),
+                Some(expected_hash.as_str())
+            );
+        }
     }
 
     #[test]

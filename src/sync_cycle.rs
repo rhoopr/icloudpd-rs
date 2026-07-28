@@ -477,6 +477,13 @@ pub(crate) struct SyncModeDecision {
     pub(crate) full_enumeration_reason: Option<download::FullEnumerationReason>,
 }
 
+fn metadata_refresh_mode_decision(refresh_metadata: bool) -> Option<SyncModeDecision> {
+    refresh_metadata.then_some(SyncModeDecision {
+        mode: download::SyncMode::Full,
+        full_enumeration_reason: Some(download::FullEnumerationReason::MetadataBackfill),
+    })
+}
+
 /// Compare the current enumeration-config hash against the active value.
 /// Drift is staged without deleting the last safe provider checkpoint.
 pub(crate) async fn check_and_persist_enum_config_hash<D>(
@@ -730,7 +737,11 @@ pub(crate) async fn run_cycle(
             } else {
                 None
             };
-        let sync_mode_decision = if let Some(zone_sync_token) = pending_zone_token {
+        let sync_mode_decision = if let Some(refresh_decision) =
+            metadata_refresh_mode_decision(config.runtime.refresh_metadata)
+        {
+            refresh_decision
+        } else if let Some(zone_sync_token) = pending_zone_token {
             tracing::debug!(
                 zone = %lib_state.zone_name,
                 "Continuing config reconciliation from the completed zone checkpoint"
@@ -1580,6 +1591,18 @@ mod tests {
             Some("stored-token-abc".to_string()),
             "mode selection must not consume or clear the stored token"
         );
+    }
+
+    #[test]
+    fn metadata_refresh_forces_full_enumeration() {
+        assert_eq!(
+            metadata_refresh_mode_decision(true),
+            Some(SyncModeDecision {
+                mode: download::SyncMode::Full,
+                full_enumeration_reason: Some(download::FullEnumerationReason::MetadataBackfill),
+            })
+        );
+        assert_eq!(metadata_refresh_mode_decision(false), None);
     }
 
     #[tokio::test]

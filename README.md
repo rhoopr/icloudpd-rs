@@ -141,6 +141,23 @@ kei import-existing
 kei sync
 ```
 
+### Refresh metadata after a fix
+
+If a kei upgrade fixes a metadata decode or capture bug, re-apply the corrected
+metadata to media you already downloaded, without downloading it again:
+
+```sh
+kei sync --refresh-metadata
+```
+
+This one-shot repair re-enumerates the selected libraries from the provider and
+refreshes every downloaded version it encounters before current resolution,
+filename, or live-photo download policy is applied. Embedded and sidecar tags
+follow your configured metadata outputs. The repair requires a complete library
+sweep, cannot use album, smart-folder, media, or date/recent filters, and does
+not run under `kei service run`. It is a manual recovery step; the permanent
+automatic fix is tracked in [#687](https://github.com/rhoopr/kei/issues/687).
+
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
 ## Docs

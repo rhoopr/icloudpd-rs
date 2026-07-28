@@ -310,6 +310,21 @@ pub struct FilterConfig {
     pub skip_photos: bool,
 }
 
+impl FilterConfig {
+    /// True when the resolved filters narrow a sync below a full sweep of the
+    /// selected libraries, so a `--refresh-metadata` repair cannot revisit
+    /// every downloaded asset in scope.
+    pub(crate) fn narrows_enumeration(&self) -> bool {
+        self.recent.is_some()
+            || self.skip_created_before.is_some()
+            || self.skip_created_after.is_some()
+            || !self.media.is_all()
+            || self.selection.albums_explicit
+            || self.selection.smart_folders_explicit
+            || !self.selection.unfiled
+    }
+}
+
 #[derive(Debug)]
 pub struct PhotoConfig {
     pub resolution: PhotoResolution,
@@ -361,14 +376,16 @@ pub struct UiConfig {
     pub friendly_request: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MetadataConfig {
     pub set_exif_datetime: bool,
     pub set_exif_rating: bool,
     pub set_exif_gps: bool,
     pub set_exif_description: bool,
+    /// Embed the full XMP packet into the file bytes on supported formats.
     #[cfg(feature = "xmp")]
     pub embed_xmp: bool,
+    /// Write a `.xmp` sidecar file next to each downloaded media file.
     #[cfg(feature = "xmp")]
     pub xmp_sidecar: bool,
 }
@@ -382,6 +399,7 @@ pub struct ImportConfig {
 pub struct RuntimeConfig {
     pub dry_run: bool,
     pub only_print_filenames: bool,
+    pub refresh_metadata: bool,
 }
 
 /// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
@@ -1567,6 +1585,7 @@ impl Config {
             runtime: RuntimeConfig {
                 dry_run: sync.dry_run,
                 only_print_filenames: sync.only_print_filenames,
+                refresh_metadata: sync.refresh_metadata,
             },
         })
     }
@@ -4072,6 +4091,7 @@ mod tests {
         // Misc
         assert!(!cfg.runtime.dry_run);
         assert!(!cfg.runtime.only_print_filenames);
+        assert!(!cfg.runtime.refresh_metadata);
         // Notifications
         assert!(cfg.notifications.script.is_none());
     }
@@ -4967,6 +4987,98 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.filters.recent, Some(500));
         assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::Global);
+    }
+
+    #[test]
+    fn narrows_enumeration_false_for_default_full_sweep() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert!(!cfg.filters.narrows_enumeration());
+    }
+
+    #[test]
+    fn narrows_enumeration_true_for_recent() {
+        let toml: TomlConfig = toml::from_str("[filters]\nrecent = 500\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(cfg.filters.narrows_enumeration());
+    }
+
+    #[test]
+    fn narrows_enumeration_true_for_date_window() {
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nskip_created_before = \"2024-01-01\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(cfg.filters.narrows_enumeration());
+    }
+
+    #[test]
+    fn narrows_enumeration_true_for_media_subset() {
+        let toml: TomlConfig = toml::from_str("[filters]\nmedia = [\"photos\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(cfg.filters.narrows_enumeration());
+    }
+
+    #[test]
+    fn narrows_enumeration_true_for_album_selection() {
+        let toml: TomlConfig = toml::from_str("[filters]\nalbums = [\"Vacation\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(cfg.filters.narrows_enumeration());
+    }
+
+    #[test]
+    fn narrows_enumeration_true_without_unfiled_pass() {
+        let toml: TomlConfig = toml::from_str("[filters]\nunfiled = false\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(cfg.filters.narrows_enumeration());
+    }
+
+    #[test]
+    fn narrows_enumeration_true_for_smart_folder_selection() {
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nsmart_folders = [\"Favorites\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(cfg.filters.narrows_enumeration());
     }
 
     #[test]

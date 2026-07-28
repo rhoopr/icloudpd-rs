@@ -56,15 +56,21 @@ impl MetadataFlags {
 
 impl From<&DownloadConfig> for MetadataFlags {
     fn from(config: &DownloadConfig) -> Self {
+        Self::from(&config.metadata)
+    }
+}
+
+impl From<&crate::config::MetadataConfig> for MetadataFlags {
+    fn from(metadata: &crate::config::MetadataConfig) -> Self {
         let mut flags = Self::empty();
-        flags.set(Self::DATETIME, config.set_exif_datetime);
-        flags.set(Self::RATING, config.set_exif_rating);
-        flags.set(Self::GPS, config.set_exif_gps);
-        flags.set(Self::DESCRIPTION, config.set_exif_description);
+        flags.set(Self::DATETIME, metadata.set_exif_datetime);
+        flags.set(Self::RATING, metadata.set_exif_rating);
+        flags.set(Self::GPS, metadata.set_exif_gps);
+        flags.set(Self::DESCRIPTION, metadata.set_exif_description);
         #[cfg(feature = "xmp")]
         {
-            flags.set(Self::EMBED_XMP, config.embed_xmp);
-            flags.set(Self::XMP_SIDECAR, config.xmp_sidecar);
+            flags.set(Self::EMBED_XMP, metadata.embed_xmp);
+            flags.set(Self::XMP_SIDECAR, metadata.xmp_sidecar);
         }
         flags
     }
@@ -331,32 +337,57 @@ pub(super) async fn tag_if_needed<D>(
 /// tail work at sync end; anything beyond this rolls into the next sync.
 const METADATA_REWRITE_BATCH: usize = 500;
 
-/// Drain persisted metadata-rewrite markers: for each asset whose
-/// `metadata_write_failed_at` is set and whose local file is still on disk,
-/// re-apply EXIF/XMP using the stored metadata. On success clears the marker
-/// and refreshes `metadata_hash`; on failure leaves the marker so the next
-/// sync retries.
+/// Per-batch outcome of [`run_pending`]: fetched, applied, and still-failing counts.
+#[derive(Default)]
+pub(super) struct RewritePass {
+    pub(super) fetched: usize,
+    pub(super) applied: usize,
+    pub(super) failed: usize,
+}
+
+/// Process one bounded batch of persisted metadata-rewrite markers: for each
+/// asset whose `metadata_write_failed_at` is set and whose local file is still
+/// on disk, re-apply EXIF/XMP using the stored metadata. On success clears the
+/// marker and refreshes `metadata_hash`; on failure leaves the marker so the
+/// next pass retries. Returns the per-batch counts.
 pub(super) async fn run_pending<D>(
     db: &D,
     metadata_flags: MetadataFlags,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
-) -> usize
+) -> RewritePass
+where
+    D: MetadataRewriteStore + ?Sized,
+{
+    run_pending_page(db, metadata_flags, temp_suffix, shutdown_token, None, 0).await
+}
+
+pub(super) async fn run_pending_page<D>(
+    db: &D,
+    metadata_flags: MetadataFlags,
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+    library_scope: Option<&[&str]>,
+    offset: usize,
+) -> RewritePass
 where
     D: MetadataRewriteStore + ?Sized,
 {
     let pending = match db
-        .get_pending_metadata_rewrites(METADATA_REWRITE_BATCH)
+        .get_pending_metadata_rewrites_page(library_scope, offset, METADATA_REWRITE_BATCH)
         .await
     {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to load pending metadata rewrites");
-            return 1;
+            return RewritePass {
+                failed: 1,
+                ..RewritePass::default()
+            };
         }
     };
     if pending.is_empty() {
-        return 0;
+        return RewritePass::default();
     }
     let pending_count = pending.len();
     tracing::info!(
@@ -424,12 +455,16 @@ where
                     .await
             {
                 tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
+                errored += 1;
+                continue;
             }
             if let Err(e) = db
                 .clear_metadata_write_failure(&record.library, &record.id, version_size.as_str())
                 .await
             {
                 tracing::warn!(asset_id = %record.id, error = %e, "Failed to clear metadata rewrite marker");
+                errored += 1;
+                continue;
             }
             applied += 1;
         } else {
@@ -450,7 +485,11 @@ where
         deferred,
         "Metadata rewrite pass complete"
     );
-    errored + deferred
+    RewritePass {
+        fetched: pending_count,
+        applied,
+        failed: errored + deferred,
+    }
 }
 
 #[cfg(test)]
@@ -773,7 +812,9 @@ mod tests {
         let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
         token.cancel();
-        let deferred = run_pending(&db, flags, Arc::from(".meta-tmp"), &token).await;
+        let deferred = run_pending(&db, flags, Arc::from(".meta-tmp"), &token)
+            .await
+            .failed;
 
         assert_eq!(
             deferred, 1,
@@ -784,6 +825,302 @@ mod tests {
             still_pending.len(),
             1,
             "cancelled metadata rewrite must keep marker for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_pending_batch_is_bounded() {
+        use crate::state::SqliteStateDb;
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for i in 0..(METADATA_REWRITE_BATCH + 100) {
+            let id = format!("A{i}");
+            let record = crate::test_helpers::TestAssetRecord::new(&id).build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &id,
+                "original",
+                std::path::Path::new("/nonexistent/missing.jpg"),
+                "ck",
+                None,
+            )
+            .await
+            .unwrap();
+            db.record_metadata_write_failure("PrimarySync", &id, "original")
+                .await
+                .unwrap();
+        }
+
+        let token = CancellationToken::new();
+        let pass = run_pending(
+            &db,
+            MetadataFlags::RATING,
+            std::sync::Arc::from(".meta-tmp"),
+            &token,
+        )
+        .await;
+        assert_eq!(
+            pass.fetched, METADATA_REWRITE_BATCH,
+            "one pass fetches at most a bounded batch, never the whole queue"
+        );
+        assert_eq!(pass.applied, 0, "missing files apply nothing");
+    }
+
+    #[tokio::test]
+    async fn drain_scope_skips_unselected_and_soft_deleted_failures() {
+        use crate::config::MetadataConfig;
+        use crate::download::DownloadStore;
+        use crate::state::SqliteStateDb;
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for i in 0..3 {
+            let id = format!("M{i}");
+            let record = crate::test_helpers::TestAssetRecord::new(&id).build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &id,
+                "original",
+                std::path::Path::new("/nonexistent/missing.jpg"),
+                "ck",
+                None,
+            )
+            .await
+            .unwrap();
+            db.record_metadata_write_failure("PrimarySync", &id, "original")
+                .await
+                .unwrap();
+        }
+
+        let invalid_dir = tempfile::tempdir().unwrap();
+        let invalid_path = invalid_dir.path().join("invalid.jpg");
+        std::fs::write(&invalid_path, b"not an image").unwrap();
+        for (library, id, soft_deleted) in [
+            ("SharedSync-OTHER", "UNSELECTED", false),
+            ("PrimarySync", "SOFT_DELETED", true),
+        ] {
+            let record = crate::test_helpers::TestAssetRecord::new(id)
+                .library(library)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(library, id, "original", &invalid_path, "ck", None)
+                .await
+                .unwrap();
+            db.record_metadata_write_failure(library, id, "original")
+                .await
+                .unwrap();
+            if soft_deleted {
+                db.mark_soft_deleted(library, id, None).await.unwrap();
+            }
+        }
+
+        let cfg = MetadataConfig {
+            set_exif_rating: true,
+            ..MetadataConfig::default()
+        };
+        let token = CancellationToken::new();
+        let residual = crate::download::drain_pending_metadata_rewrites(
+            &db as &dyn DownloadStore,
+            &cfg,
+            &["PrimarySync"],
+            std::sync::Arc::from(".meta-tmp"),
+            &token,
+        )
+        .await;
+        assert_eq!(
+            residual, 0,
+            "unselected and soft-deleted failures must not fail the selected repair"
+        );
+        let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert_eq!(pending.len(), 5);
+        assert!(
+            pending
+                .iter()
+                .any(|record| record.id.as_ref() == "UNSELECTED"),
+            "unselected library marker must remain untouched"
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|record| record.id.as_ref() == "SOFT_DELETED"),
+            "soft-deleted marker must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_reports_residual_on_cancellation() {
+        use crate::config::MetadataConfig;
+        use crate::download::DownloadStore;
+        use crate::state::SqliteStateDb;
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("C1").build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "C1",
+            "original",
+            std::path::Path::new("/x/c1.jpg"),
+            "ck",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "C1", "original")
+            .await
+            .unwrap();
+
+        let cfg = MetadataConfig {
+            set_exif_rating: true,
+            ..MetadataConfig::default()
+        };
+        let token = CancellationToken::new();
+        token.cancel();
+        let residual = crate::download::drain_pending_metadata_rewrites(
+            &db as &dyn DownloadStore,
+            &cfg,
+            &["PrimarySync"],
+            std::sync::Arc::from(".meta-tmp"),
+            &token,
+        )
+        .await;
+        assert!(
+            residual >= 1,
+            "a cancelled drain must report a non-zero residual so the sync exits non-zero"
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_stops_when_rewrite_marker_cannot_be_cleared() {
+        use crate::config::MetadataConfig;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clear-failure.jpg");
+        std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+        let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("CLEAR_FAIL")
+            .filename("clear-failure.jpg")
+            .metadata(AssetMetadata {
+                rating: Some(3),
+                metadata_hash: Some("fresh-hash".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "CLEAR_FAIL",
+            "original",
+            &path,
+            "checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "CLEAR_FAIL", "original")
+            .await
+            .unwrap();
+        db.fail_metadata_marker_clear_for_test();
+
+        let residual = crate::download::drain_pending_metadata_rewrites(
+            &db,
+            &MetadataConfig {
+                set_exif_rating: true,
+                embed_xmp: true,
+                ..MetadataConfig::default()
+            },
+            &["PrimarySync"],
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(residual, 1);
+        assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_reaches_newer_marker_after_retained_batch() {
+        use crate::config::MetadataConfig;
+        use crate::download::DownloadStore;
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let invalid_path = dir.path().join("invalid.jpg");
+        std::fs::write(&invalid_path, b"not a jpeg").unwrap();
+        for i in 0..METADATA_REWRITE_BATCH {
+            let id = format!("A{i:04}");
+            let metadata = AssetMetadata {
+                rating: Some(3),
+                metadata_hash: Some(format!("h{i}")),
+                ..AssetMetadata::default()
+            };
+            let record = crate::test_helpers::TestAssetRecord::new(&id)
+                .filename(&format!("{id}.jpg"))
+                .metadata(metadata)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded("PrimarySync", &id, "original", &invalid_path, "ck", None)
+                .await
+                .unwrap();
+            db.record_metadata_write_failure("PrimarySync", &id, "original")
+                .await
+                .unwrap();
+        }
+        let valid_path = dir.path().join("valid.jpg");
+        std::fs::write(&valid_path, minimal_jpeg_bytes()).unwrap();
+        let valid = crate::test_helpers::TestAssetRecord::new("Z_VALID")
+            .filename("valid.jpg")
+            .metadata(AssetMetadata {
+                rating: Some(3),
+                metadata_hash: Some("valid-hash".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&valid).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "Z_VALID",
+            "original",
+            &valid_path,
+            "ck",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "Z_VALID", "original")
+            .await
+            .unwrap();
+
+        let cfg = MetadataConfig {
+            set_exif_rating: true,
+            embed_xmp: true,
+            ..MetadataConfig::default()
+        };
+        let token = CancellationToken::new();
+        let residual = crate::download::drain_pending_metadata_rewrites(
+            &db as &dyn DownloadStore,
+            &cfg,
+            &["PrimarySync"],
+            std::sync::Arc::from(".meta-tmp"),
+            &token,
+        )
+        .await;
+        assert_eq!(residual, METADATA_REWRITE_BATCH);
+        let pending = db
+            .get_pending_metadata_rewrites(METADATA_REWRITE_BATCH + 1)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), METADATA_REWRITE_BATCH);
+        assert!(
+            pending.iter().all(|record| record.id.as_ref() != "Z_VALID"),
+            "retained older markers must not prevent newer work from completing"
         );
     }
 }

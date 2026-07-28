@@ -262,6 +262,14 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "dry_run")]
     pub retry_failed: bool,
 
+    /// One-shot full-library repair that refreshes metadata for every downloaded version without re-downloading media.
+    /// Requires a complete selected-library sweep and rewrites EXIF/XMP per the configured metadata outputs.
+    #[arg(
+        long,
+        conflicts_with_all = ["dry_run", "retry_failed", "only_print_filenames", "recent"]
+    )]
+    pub refresh_metadata: bool,
+
     /// Test-only durable config overrides used by unit tests that exercise
     /// resolver internals without rebuilding TOML snippets.
     #[cfg(test)]
@@ -1486,6 +1494,17 @@ mod tests {
             "echo pw",
         ]);
         assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn sync_refresh_metadata_parses_to_struct_field() {
+        let Command::Sync { sync, .. } = Cli::try_parse_from(["kei", "sync", "--refresh-metadata"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected Sync command");
+        };
+        assert!(sync.refresh_metadata);
     }
 
     #[test]

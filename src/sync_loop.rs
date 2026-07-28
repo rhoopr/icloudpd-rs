@@ -407,6 +407,57 @@ pub(crate) fn service_mode_default_interval(
     }
 }
 
+/// Precondition and watch adjustment for `--refresh-metadata`. It is a one-shot
+/// recovery pass, so it is rejected under `service run` and with any narrowing
+/// filter that would strand out-of-scope rows. Returns `true` when the caller
+/// must force a single one-shot cycle (clear the watch interval).
+fn refresh_metadata_forces_one_shot(
+    refresh_metadata: bool,
+    service_mode: bool,
+    narrows_enumeration: bool,
+) -> anyhow::Result<bool> {
+    if !refresh_metadata {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        !service_mode,
+        "--refresh-metadata is a one-shot repair and is not supported under `kei service run`. Run `kei sync --refresh-metadata` instead."
+    );
+    anyhow::ensure!(
+        !narrows_enumeration,
+        "--refresh-metadata repairs every downloaded asset in the selected libraries and requires a complete library sweep. Enable the unfiled pass and remove album, smart-folder, media, or date/recent filters before retrying."
+    );
+    Ok(true)
+}
+
+fn merge_refresh_tail_outcome(
+    cycle_result: &mut crate::sync_cycle::CycleResult,
+    failed: usize,
+    interrupted: bool,
+) {
+    cycle_result.failed_count = cycle_result.failed_count.saturating_add(failed);
+    cycle_result.stats.failed = cycle_result.stats.failed.saturating_add(failed);
+    cycle_result.stats.interrupted |= interrupted;
+}
+
+fn sync_run_stats_from_cycle(cycle_result: &crate::sync_cycle::CycleResult) -> state::SyncRunStats {
+    state::SyncRunStats {
+        assets_seen: cycle_result.stats.assets_seen,
+        assets_downloaded: u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX),
+        assets_failed: u64::try_from(cycle_result.stats.failed).unwrap_or(u64::MAX),
+        enumeration_errors: u64::try_from(cycle_result.stats.enumeration_errors)
+            .unwrap_or(u64::MAX),
+        interrupted: cycle_result.stats.interrupted,
+        api_total_at_start: cycle_result.stats.api_total_at_start,
+        api_total_at_start_partial: cycle_result.stats.api_total_at_start_partial,
+        inventory_drop_warnings: u64::try_from(cycle_result.stats.inventory_drop_warnings)
+            .unwrap_or(u64::MAX),
+        inventory_drop_previous_total: cycle_result.stats.inventory_drop_previous_total,
+        inventory_drop_current_total: cycle_result.stats.inventory_drop_current_total,
+        inventory_drop_library: cycle_result.stats.inventory_drop_library.clone(),
+    }
+}
+
 /// Arguments that [`run_sync`] needs from the CLI dispatch layer.
 #[derive(Clone)]
 pub(crate) struct SyncArgs {
@@ -477,6 +528,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // retry-failed: one-shot by definition.
     // setup → "sync now": initial test sync, not a daemon.
     if is_one_shot {
+        config.watch.interval = None;
+    }
+
+    // --refresh-metadata is a one-shot recovery pass; reject watch/service and incomplete library sweeps, then force a single cycle.
+    if refresh_metadata_forces_one_shot(
+        config.runtime.refresh_metadata,
+        service_mode,
+        config.filters.narrows_enumeration(),
+    )? {
         config.watch.interval = None;
     }
 
@@ -873,14 +933,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             media: config.filters.media,
             skip_created_before,
             skip_created_after,
-            set_exif_datetime: config.metadata.set_exif_datetime,
-            set_exif_rating: config.metadata.set_exif_rating,
-            set_exif_gps: config.metadata.set_exif_gps,
-            set_exif_description: config.metadata.set_exif_description,
-            #[cfg(feature = "xmp")]
-            embed_xmp: config.metadata.embed_xmp,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: config.metadata.xmp_sidecar,
+            metadata: config.metadata,
+            refresh_metadata: config.runtime.refresh_metadata,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
             recent_scope: config.filters.recent_scope,
@@ -1137,7 +1191,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             let cycle_started_at = std::time::Instant::now();
             let cycle_wall_started_at = chrono::Utc::now();
-            let cycle_result = run_cycle(
+            let mut cycle_result = run_cycle(
                 &cycle_library_states,
                 &config,
                 state_db.as_deref(),
@@ -1148,25 +1202,42 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
             )
             .await?;
-            if let Some(db) = state_db.as_deref() {
-                let stats = state::SyncRunStats {
-                    assets_seen: cycle_result.stats.assets_seen,
-                    assets_downloaded: u64::try_from(cycle_result.stats.downloaded)
-                        .unwrap_or(u64::MAX),
-                    assets_failed: u64::try_from(cycle_result.stats.failed).unwrap_or(u64::MAX),
-                    enumeration_errors: u64::try_from(cycle_result.stats.enumeration_errors)
-                        .unwrap_or(u64::MAX),
-                    interrupted: cycle_result.stats.interrupted,
-                    api_total_at_start: cycle_result.stats.api_total_at_start,
-                    api_total_at_start_partial: cycle_result.stats.api_total_at_start_partial,
-                    inventory_drop_warnings: u64::try_from(
-                        cycle_result.stats.inventory_drop_warnings,
+            // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
+            let refresh_tail_failures = if config.runtime.refresh_metadata {
+                if let Some(db) = state_db.as_deref() {
+                    let library_scope: Vec<&str> = libraries
+                        .iter()
+                        .map(|library| library.zone_name())
+                        .collect();
+                    download::drain_pending_metadata_rewrites(
+                        db,
+                        &config.metadata,
+                        &library_scope,
+                        Arc::clone(&cfg_temp_suffix),
+                        &shutdown_token,
                     )
-                    .unwrap_or(u64::MAX),
-                    inventory_drop_previous_total: cycle_result.stats.inventory_drop_previous_total,
-                    inventory_drop_current_total: cycle_result.stats.inventory_drop_current_total,
-                    inventory_drop_library: cycle_result.stats.inventory_drop_library.clone(),
-                };
+                    .await
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if config.runtime.refresh_metadata {
+                merge_refresh_tail_outcome(
+                    &mut cycle_result,
+                    refresh_tail_failures,
+                    shutdown_token.is_cancelled(),
+                );
+            }
+            if refresh_tail_failures > 0 {
+                tracing::warn!(
+                    failed = refresh_tail_failures,
+                    "Some --refresh-metadata rewrites did not complete; sync will exit non-zero"
+                );
+            }
+            if let Some(db) = state_db.as_deref() {
+                let stats = sync_run_stats_from_cycle(&cycle_result);
                 match db.start_sync_run_at(cycle_wall_started_at).await {
                     Ok(run_id) => {
                         if let Err(e) = db.complete_sync_run(run_id, &stats).await {
@@ -3421,6 +3492,20 @@ mod tests {
         )
     }
 
+    /// The `assetDate`/`addedDate` embedded by [`full_album_page_with_download`].
+    const RUN_CYCLE_ASSET_DATE_MS: i64 = 1_700_000_000_000;
+
+    /// The local-time `%Y/%m/%d` folder the pipeline derives for [`RUN_CYCLE_ASSET_DATE_MS`].
+    fn run_cycle_expected_date_dir() -> String {
+        use chrono::TimeZone;
+        chrono::Local
+            .timestamp_millis_opt(RUN_CYCLE_ASSET_DATE_MS)
+            .single()
+            .expect("valid asset timestamp")
+            .format("%Y/%m/%d")
+            .to_string()
+    }
+
     fn full_album_page_with_download(
         zone: &str,
         record_name: &str,
@@ -3459,8 +3544,8 @@ mod tests {
                             "value": {"recordName": record_name, "zoneID": {"zoneName": zone}},
                             "type": "REFERENCE"
                         },
-                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
-                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                        "assetDate": {"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"},
+                        "addedDate": {"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"}
                     },
                     "recordChangeTag": "ct-asset"
                 }
@@ -4770,6 +4855,18 @@ mod tests {
                 .await
         }
 
+        async fn refresh_downloaded_asset_metadata(
+            &self,
+            library: &str,
+            asset_id: &str,
+            metadata: &state::AssetMetadata,
+            mark_for_rewrite: bool,
+        ) -> Result<usize, state::error::StateError> {
+            self.inner
+                .refresh_downloaded_asset_metadata(library, asset_id, metadata, mark_for_rewrite)
+                .await
+        }
+
         async fn get_downloaded_metadata_hashes(
             &self,
         ) -> Result<
@@ -4786,11 +4883,15 @@ mod tests {
             self.inner.get_metadata_retry_markers().await
         }
 
-        async fn get_pending_metadata_rewrites(
+        async fn get_pending_metadata_rewrites_page(
             &self,
+            library_scope: Option<&[&str]>,
+            offset: usize,
             limit: usize,
         ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
-            self.inner.get_pending_metadata_rewrites(limit).await
+            self.inner
+                .get_pending_metadata_rewrites_page(library_scope, offset, limit)
+                .await
         }
 
         async fn update_metadata_hash(
@@ -5952,7 +6053,7 @@ mod tests {
         .await
         .expect("run cycle");
 
-        let final_dir = download_dir.path().join("2023/11/14");
+        let final_dir = download_dir.path().join(run_cycle_expected_date_dir());
         let final_paths = std::fs::read_dir(&final_dir)
             .expect("final directory exists")
             .map(|entry| entry.expect("final file entry").path())
@@ -7010,7 +7111,11 @@ mod tests {
             "interrupted cycle must leave the old zone token in place for replay"
         );
         assert!(
-            !download_dir.path().join("2023/11/14/photo.jpg").exists(),
+            !download_dir
+                .path()
+                .join(run_cycle_expected_date_dir())
+                .join("photo.jpg")
+                .exists(),
             "test must not pass by completing the download before cancellation"
         );
     }
@@ -7519,6 +7624,56 @@ mod tests {
         let err: anyhow::Error = anyhow::anyhow!("network unreachable");
         assert!(!should_wait_for_2fa(false, &err));
         assert!(!should_wait_for_2fa(true, &err));
+    }
+
+    #[test]
+    fn refresh_metadata_off_never_forces_one_shot() {
+        // Not requested: no gating even under service mode or with filters.
+        assert!(!refresh_metadata_forces_one_shot(false, true, true).unwrap());
+    }
+
+    #[test]
+    fn refresh_metadata_forces_one_shot_for_plain_sync() {
+        assert!(refresh_metadata_forces_one_shot(true, false, false).unwrap());
+    }
+
+    #[test]
+    fn refresh_metadata_rejected_under_service_run() {
+        let err = refresh_metadata_forces_one_shot(true, true, false).unwrap_err();
+        assert!(err.to_string().contains("service run"), "{err}");
+    }
+
+    #[test]
+    fn refresh_metadata_rejected_with_narrowing_filter() {
+        let err = refresh_metadata_forces_one_shot(true, false, true).unwrap_err();
+        assert!(err.to_string().contains("filters"), "{err}");
+    }
+
+    #[test]
+    fn refresh_tail_outcome_feeds_ledger_and_cycle_reporting() {
+        let mut cycle_result = CycleResult {
+            failed_count: 1,
+            session_expired: false,
+            stats: download::SyncStats {
+                failed: 1,
+                ..download::SyncStats::default()
+            },
+            db_sync_token_advance_safe: true,
+        };
+
+        merge_refresh_tail_outcome(&mut cycle_result, 2, false);
+
+        assert_eq!(cycle_result.failed_count, 3);
+        assert_eq!(cycle_result.stats.failed, 3);
+        let ledger = sync_run_stats_from_cycle(&cycle_result);
+        assert_eq!(ledger.assets_failed, 3);
+        let facts = crate::cycle_reporter::CycleFacts::new(
+            &cycle_result.stats,
+            cycle_result.failed_count,
+            cycle_result.session_expired,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(facts.status, crate::cycle_reporter::CycleStatus::Failed);
     }
 
     // ── check_and_persist_enum_config_hash ─────────────────────────────

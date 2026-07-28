@@ -1086,18 +1086,8 @@ pub(crate) struct DownloadConfig {
     pub(crate) media: crate::config::MediaSelection,
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
-    pub(crate) set_exif_datetime: bool,
-    pub(crate) set_exif_rating: bool,
-    pub(crate) set_exif_gps: bool,
-    pub(crate) set_exif_description: bool,
-    /// Embed the full XMP packet (title, keywords, people, hidden/archived,
-    /// media subtype, burst id) into the file bytes on supported formats.
-    #[cfg(feature = "xmp")]
-    pub(crate) embed_xmp: bool,
-    /// Write a `.xmp` sidecar file next to each downloaded media file with
-    /// the same composed XMP packet.
-    #[cfg(feature = "xmp")]
-    pub(crate) xmp_sidecar: bool,
+    pub(crate) metadata: crate::config::MetadataConfig,
+    pub(crate) refresh_metadata: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
     pub(crate) recent_scope: crate::cli::RecentScope,
@@ -1246,14 +1236,9 @@ impl std::fmt::Debug for DownloadConfig {
             .field("media", &self.media)
             .field("skip_created_before", &self.skip_created_before)
             .field("skip_created_after", &self.skip_created_after);
-        s.field("set_exif_datetime", &self.set_exif_datetime)
-            .field("set_exif_rating", &self.set_exif_rating)
-            .field("set_exif_gps", &self.set_exif_gps)
-            .field("set_exif_description", &self.set_exif_description);
-        #[cfg(feature = "xmp")]
-        s.field("embed_xmp", &self.embed_xmp)
-            .field("xmp_sidecar", &self.xmp_sidecar);
-        s.field("concurrent_downloads", &self.concurrent_downloads)
+        s.field("metadata", &self.metadata)
+            .field("refresh_metadata", &self.refresh_metadata)
+            .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
             .field("recent_scope", &self.recent_scope)
             .field("retry", &self.retry)
@@ -1299,14 +1284,8 @@ impl DownloadConfig {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            set_exif_datetime: false,
-            set_exif_rating: false,
-            set_exif_gps: false,
-            set_exif_description: false,
-            #[cfg(feature = "xmp")]
-            embed_xmp: false,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: false,
+            metadata: crate::config::MetadataConfig::default(),
+            refresh_metadata: false,
             concurrent_downloads: 1,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -3559,6 +3538,43 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
 
     if cleaned > 0 {
         tracing::info!(count = cleaned, "Cleaned up orphaned .part files");
+    }
+}
+
+/// Drain pending metadata-rewrite markers in bounded batches so a
+/// `--refresh-metadata` migration finishes in its own run. Returns the number
+/// of markers left failing when the drain stops.
+pub(crate) async fn drain_pending_metadata_rewrites(
+    db: &dyn DownloadStore,
+    metadata: &crate::config::MetadataConfig,
+    library_scope: &[&str],
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+) -> usize {
+    let flags = MetadataFlags::from(metadata);
+    if !flags.has_any_write() {
+        return 0;
+    }
+    let mut offset = 0usize;
+    let mut failed = 0usize;
+    loop {
+        let pass = metadata_rewrite::run_pending_page(
+            db,
+            flags,
+            Arc::clone(&temp_suffix),
+            shutdown_token,
+            Some(library_scope),
+            offset,
+        )
+        .await;
+        failed = failed.saturating_add(pass.failed);
+        if pass.fetched == 0 {
+            return failed;
+        }
+        if shutdown_token.is_cancelled() {
+            return failed.max(1);
+        }
+        offset = offset.saturating_add(pass.fetched.saturating_sub(pass.applied));
     }
 }
 
@@ -14251,7 +14267,7 @@ mod tests {
         config.live_photo_mode = LivePhotoMode::ImageOnly;
         config.force_resolution = true;
         config.keep_unicode_in_filenames = true;
-        config.set_exif_datetime = true;
+        config.metadata.set_exif_datetime = true;
         config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         config.temp_suffix = std::sync::Arc::from(".custom-tmp");
         let derived = config.with_pass(&make_pass(PassKind::Album, "Test"));
@@ -14260,7 +14276,7 @@ mod tests {
         assert_eq!(derived.live_photo_mode, LivePhotoMode::ImageOnly);
         assert!(derived.force_resolution);
         assert!(derived.keep_unicode_in_filenames);
-        assert!(derived.set_exif_datetime);
+        assert!(derived.metadata.set_exif_datetime);
         assert_eq!(derived.filename_exclude.len(), 1);
         assert_eq!(&*derived.temp_suffix, ".custom-tmp");
         assert_eq!(derived.directory, config.directory);
