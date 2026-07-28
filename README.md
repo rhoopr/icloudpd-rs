@@ -1,7 +1,4 @@
-<p align="center">
-  <img src="assets/logo.png" alt="kei logo" width="400">
-</p>
-
+<p align="center"><img src="assets/logo.png" alt="kei logo" width="500"></p>
 <h1 align="center">kei: fast, parallel backups<br>
   for cloud-hosted photos and videos.</h1>
 
