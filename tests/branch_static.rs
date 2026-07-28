@@ -165,6 +165,32 @@ fn docker_packaging_defaults_to_service_run() {
 }
 
 #[test]
+fn docker_runtime_is_version_pinned_and_maintained() {
+    let dockerfile = repo_file("Dockerfile");
+    let snapshot = dockerfile
+        .lines()
+        .find_map(|line| line.strip_prefix("FROM debian:bookworm-"))
+        .and_then(|suffix| suffix.strip_suffix("-slim"))
+        .expect("Docker runtime must use a dated Debian Bookworm slim image");
+    assert!(
+        snapshot.len() == 8 && snapshot.bytes().all(|byte| byte.is_ascii_digit()),
+        "Docker runtime snapshot must use a YYYYMMDD date"
+    );
+
+    let dependabot = repo_file(".github/dependabot.yml");
+    for expected in [
+        "package-ecosystem: docker",
+        "interval: weekly",
+        "dependency-name: debian",
+    ] {
+        assert!(
+            dependabot.contains(expected),
+            "Dependabot must keep the pinned Debian runtime current: missing {expected}"
+        );
+    }
+}
+
+#[test]
 fn migration_guide_uses_toml_for_durable_sync_settings() {
     let guide = repo_file("docs/migration-from-icloudpd.md");
     let stale = [
