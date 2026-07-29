@@ -21,6 +21,9 @@ Before editing code:
 5. Trace every consumer of shared types, CLI/API surfaces, schema, primary
    keys, sentinels, tokens, paths, and serialized values before changing them.
 
+Resolve material ambiguity before implementation. State assumptions in the
+plan when they affect behavior, safety, or a public interface.
+
 Keep policy in its owner. Path rendering does not decide sync policy; the
 download pipeline does not parse CloudKit records.
 
@@ -50,6 +53,8 @@ download pipeline does not parse CloudKit records.
 - Add `#[must_use]` when ignoring a result can lose state, safety, or a
   user-visible decision.
 - Keep provider, state, filesystem, and policy layers separate.
+- Every changed line must serve the requested behavior, required tests or docs,
+  or cleanup made necessary by the change. Report unrelated cleanup separately.
 
 ## Tests and completion
 
