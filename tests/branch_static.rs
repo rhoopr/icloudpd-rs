@@ -369,6 +369,45 @@ fn full_test_reports_include_newer_phase_metadata() {
     }
 }
 
+#[test]
+fn focused_scenario_catalog_lists_every_runner_slice() {
+    let readme = repo_file("tests/README.md");
+    let section = readme
+        .split_once("## Focused scenario slices")
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.split_once("\n## ").map(|(section, _)| section))
+        .expect("tests README must contain a bounded focused scenario section");
+    let documented: BTreeSet<String> = section
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("| `")
+                .and_then(|tail| tail.split_once("` |"))
+                .map(|(name, _)| name.to_owned())
+        })
+        .collect();
+
+    let scenario_dir = repo_path("scripts/test-scenarios");
+    let scripts: BTreeSet<String> = std::fs::read_dir(&scenario_dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", scenario_dir.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|e| panic!("read entry in {}: {e}", scenario_dir.display()))
+        })
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("sh") {
+                return None;
+            }
+            let name = path.file_stem()?.to_str()?;
+            (!matches!(name, "lib" | "list")).then(|| name.to_owned())
+        })
+        .collect();
+
+    assert_eq!(
+        documented, scripts,
+        "tests README focused scenario catalog must match runnable scenario scripts"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn scenario_runner_rejects_filters_that_match_no_tests() {

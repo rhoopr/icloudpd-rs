@@ -17,7 +17,8 @@ For a nontrivial change, post a short plan on the issue before implementation:
 - Can the change affect SQLite state, provider checkpoints, configuration,
   reports, or local files?
 - What happens after interruption, retry, partial failure, or config drift?
-- Which focused tests will prove the behavior?
+- Which safety contract or focused scenario slice applies, and which tests
+  will prove the behavior?
 - Which user-facing surfaces need matching changes?
 
 Discuss the approach before deleting production code or tests, changing a
@@ -131,6 +132,7 @@ Describe the end state, not the sequence of edits. Include:
 
 - The behavior changed and why
 - The related issue, using `Fixes #123` or `Closes #123` when appropriate
+- Affected safety-contract IDs or focused scenario slices, when applicable
 - Exact commands and scenarios tested
 - Data, state, filesystem, compatibility, or migration risks
 - Tradeoffs or follow-up work that remains

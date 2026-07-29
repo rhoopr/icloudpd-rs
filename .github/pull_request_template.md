@@ -4,11 +4,11 @@
 
 ## Contract and risk
 
-<!-- Acceptance criteria or safety contract affected. Note risks, tradeoffs, follow-up work, and independent/adversarial review results. Write "None" when not applicable. -->
+<!-- State the acceptance criteria and name any affected safety-contract ID. Note risks, tradeoffs, follow-up work, and independent/adversarial review results. Write "None" when not applicable. -->
 
 ## Test plan
 
-<!-- How you tested this. Commands you ran, scenarios you checked, edge cases you considered. -->
+<!-- List exact commands, focused scenario slices, and edge cases checked. -->
 
 ## Regression proof
 

@@ -46,6 +46,24 @@ tests/
 
 Counts are approximate and drift as tests are added.
 
+## Focused scenario slices
+
+Named scenario slices group existing Rust tests by risk so a change can run
+the smallest relevant proof before the broader gate. All slices are offline
+and require no credentials. Run one with `just test scenario NAME`; run the
+full set with `just test scenarios`.
+
+| Slice | Protects | Run for changes to |
+|-------|----------|--------------------|
+| `auth-session` | Persisted-session reuse, validation caching, 2FA push state, and reauthentication routing | Authentication recovery, session validation, or watch-mode reauthentication |
+| `config-docs` | Supported configuration stays aligned with examples, migration guidance, and contributor commands | Config keys, defaults, examples, migration docs, or gate commands |
+| `fulltest-harness` | Full-test phase reachability and rejection of stale or empty scenario filters | `just` dispatch, full-test orchestration, or scenario-runner helpers |
+| `identity-deltas` | Incremental identity mapping, hard and soft deletion, selected relations, and master-family transitions | CloudKit change parsing, identity mapping, membership, or tombstone policy |
+| `path-family` | Collision suffixes and primary, Live Photo, import, and pending-file family matching | Path rendering, collision handling, import matching, or on-disk adoption |
+| `pending-recovery` | Durable pending hydration, deletion proof, ambiguous identity retention, and sibling recovery | Retry resolution, pending state, provider identity, or targeted hydration |
+| `service-health` | Health and metrics facts exposed by unattended operation | Health checks, metrics, cycle reporting, or service monitoring |
+| `url-refresh` | Refresh of expired or aged download URLs without replaying stale deltas | Incremental downloads, URL freshness, album hydration, or retry downloads |
+
 ## Running
 
 ```sh
