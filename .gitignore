@@ -2,7 +2,6 @@
 .agents/
 .scratch/
 .codex/
-AGENTS.md
 CODEBASE.md
 CODEGRAPH.md
 UNSAFE.md
