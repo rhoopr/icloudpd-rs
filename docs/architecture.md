@@ -197,6 +197,19 @@ passwords, session cookies, bearer tokens, or unredacted provider identifiers
 to logs or machine output. Preserve process hardening that limits credential
 exposure through core dumps.
 
+## Safety contract catalog
+
+Stable IDs connect safety rules to production owners and focused tests.
+`scripts/check-contracts` rejects missing links in that chain.
+
+| Contract | Owner | Required behavior |
+|----------|-------|-------------------|
+| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs` | Publishing a completed `.part` file never replaces an existing final file. |
+| `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
+| `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
+| `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
+| `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
+
 ## Change-impact checklist
 
 | Change | Check |

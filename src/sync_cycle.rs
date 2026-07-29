@@ -179,6 +179,7 @@ fn source_checkpoint_decision(
     stale_pass_plan: bool,
     basis: CheckpointBasis,
 ) -> SourceCheckpointDecision {
+    // CONTRACT: SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY
     let preserve = |reason, recovery| SourceCheckpointDecision::Preserve { reason, recovery };
     if dry_run {
         return preserve(CheckpointHoldReason::DryRun, RecoveryAction::Stop);
@@ -636,6 +637,7 @@ pub(crate) async fn run_cycle(
              database pre-check token will not advance this cycle"
         );
     }
+    // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
     let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
     let mut force_full_for_config_hash = false;
     let mut force_full_for_download_config_hash = false;
@@ -1484,6 +1486,58 @@ mod tests {
                 recovery: RecoveryAction::RetryPasses(vec![pass]),
             }
         );
+    }
+
+    #[test]
+    fn contract_source_checkpoint_requires_durable_recovery_exhaustive() {
+        let tokens = [Some("zone-token"), None, Some("   ")];
+        for mask in 0u16..512 {
+            let dry_run = mask & 1 != 0;
+            let stale_pass_plan = mask & 2 != 0;
+            let session_expired = mask & 4 != 0;
+            let interrupted = mask & 8 != 0;
+            let enumeration_error = mask & 16 != 0;
+            let enumeration_incomplete = mask & 32 != 0;
+            let state_not_durable = mask & 64 != 0;
+            let token_proof_blocked = mask & 128 != 0;
+            let durable_transfer_failure = mask & 256 != 0;
+            let has_safety_blocker = mask & 255 != 0;
+            for token in tokens {
+                let result = download::SyncResult {
+                    outcome: if session_expired {
+                        download::DownloadOutcome::SessionExpired {
+                            auth_error_count: 1,
+                        }
+                    } else if durable_transfer_failure {
+                        download::DownloadOutcome::PartialFailure { failed_count: 1 }
+                    } else {
+                        download::DownloadOutcome::Success
+                    },
+                    sync_token: token.map(str::to_string),
+                    stats: download::SyncStats {
+                        interrupted,
+                        enumeration_errors: usize::from(enumeration_error),
+                        enumeration_incomplete,
+                        state_write_failures: usize::from(state_not_durable),
+                        sync_token_blocked: token_proof_blocked,
+                        ..download::SyncStats::default()
+                    },
+                    full_enumeration_ran: false,
+                };
+                let should_advance = !has_safety_blocker && token == Some("zone-token");
+                let decision = source_checkpoint_decision(
+                    &result,
+                    dry_run,
+                    stale_pass_plan,
+                    CheckpointBasis::IncrementalDelta,
+                );
+                assert_eq!(
+                    matches!(decision, SourceCheckpointDecision::Advance { .. }),
+                    should_advance,
+                    "unexpected checkpoint decision for mask {mask:#010b} and token {token:?}"
+                );
+            }
+        }
     }
 
     #[test]

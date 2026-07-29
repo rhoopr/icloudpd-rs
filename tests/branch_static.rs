@@ -947,6 +947,16 @@ fn contributor_docs_match_current_gate() {
         pr_template.contains("`just gate` passes"),
         "PR template should ask reviewers for the current local gate"
     );
+    for expected in [
+        "## Contract and risk",
+        "## Regression proof",
+        "independent/adversarial review results",
+    ] {
+        assert!(
+            pr_template.contains(expected),
+            "PR template must capture verification evidence: {expected}"
+        );
+    }
     assert!(
         !pr_template.contains("cargo test --bin kei --test cli --test behavioral"),
         "PR template must not keep stale partial test command"
