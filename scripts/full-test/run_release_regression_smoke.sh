@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline v0.20 regression smoke.
+# Offline release regression smoke.
 #
 # This is the quick patch-release gate for the May 27, 2026 regression set:
 # token reuse, targeted retry, on-disk pending adoption, pagination-shortfall

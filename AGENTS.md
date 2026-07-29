@@ -2,108 +2,75 @@
 
 kei is a Rust CLI that syncs iCloud Photos media to local storage.
 
-Read first:
+Read by scope:
 
-1. `CONTRIBUTING.md` for the contributor workflow and review contract.
-2. `docs/architecture.md` for owners, flows, and data-safety invariants.
-3. `tests/README.md` before changing or attributing test behavior.
+- Code work: workflow and Rust style in `CONTRIBUTING.md`.
+- Ownership, sync, state, filesystem, provider, or cross-cutting work: relevant
+  owner, flow, invariant, and impact sections in `docs/architecture.md`.
+- Test changes or failure attribution: relevant sections of `tests/README.md`.
 
 ## Discovery
 
-Before editing:
+Before editing code:
 
-1. Run `cargo check` for code work.
-2. Find the owning area in `docs/architecture.md`.
+1. Run `cargo check`.
+2. Locate the owner in `docs/architecture.md`.
 3. Use `rg` for the exact symbol, command, flag, SQL name, config key, error,
    durable key, or serialization shape.
-4. Read the owner module and direct callers.
-5. Trace every consumer before changing a shared type, trait, CLI/API surface,
-   schema, primary key, sentinel, token, path, or serialized value.
+4. Read the owner and direct callers.
+5. Trace every consumer of shared types, CLI/API surfaces, schema, primary
+   keys, sentinels, tokens, paths, and serialized values before changing them.
 
-Keep policy in its owner. Do not put sync policy in path rendering or CloudKit
-parsing in the download pipeline.
+Keep policy in its owner. Path rendering does not decide sync policy; the
+download pipeline does not parse CloudKit records.
 
 ## Safety
 
-- User media and metadata must not be lost, corrupted, truncated, overwritten,
-  or silently discarded.
+- Never lose, corrupt, truncate, overwrite, or silently discard user media or
+  metadata.
 - Preserve `.part` writes, SHA-256 verification, no-overwrite publication,
   parent-directory fsync, and durable state finalization.
-- Local file or metadata rewrites require an explicit user-controlled option.
+- Local media or metadata rewrites require an explicit user option.
 - Preserve provider checkpoint gates across interruption, retry, partial work,
   config drift, and stale planning.
-- Unknown provider identity is durable retry evidence, not permission to
-  delete or forget work.
+- Unknown provider identity is durable retry evidence, not permission to delete
+  or forget work.
 - Keep provider quirks and record parsing in `src/icloud/`.
-- Do not remove trust-boundary validation or data-loss guards as cleanup.
-- Never log passwords, session cookies, bearer tokens, Apple IDs, or
-  unredacted provider identifiers. Preserve secret wrappers and redaction.
-- Keep `unsafe` blocks minimal and local. Document each block with a concrete
-  `SAFETY` invariant, and update `UNSAFE.md` when unsafe code changes.
+- Keep trust-boundary validation and data-loss guards intact.
+- Never log passwords, cookies, bearer tokens, Apple IDs, or unredacted
+  provider identifiers. Preserve secret wrappers and redaction.
+- Keep `unsafe` local. Document each block with a concrete `SAFETY` invariant
+  and update `UNSAFE.md` when unsafe code changes.
 
 ## Implementation
 
-- Make the smallest complete change in the fewest owning files.
-- Reuse or delete before adding abstractions.
-- Prefer the standard library, native platform/SQLite support, and existing
-  dependencies, in that order.
-- Avoid speculative knobs, compatibility, helpers, factories, builders, and
-  one-implementation traits.
-- Prefer borrowing to cloning and enums to boolean mode arguments.
-- Use newtypes for IDs, paths, units, tokens, and other easy-to-mix values.
-- Use named constants for sentinels, magic values, timeouts, and retry limits.
-- Use typed errors and `?`.
-- Do not use `unwrap` in production code.
-- Use `expect` only for a proven same-flow invariant, and state the invariant
-  in the message.
-- Do not block the async runtime. Use async I/O or `spawn_blocking`.
-- Profile before performance-only changes. Use bounded concurrency only when
-  it preserves file, state, retry, and checkpoint invariants.
-- Keep internal APIs `pub(crate)` unless public or test-harness precedent
-  requires `pub`.
+- Do not block the async runtime; use async I/O or `spawn_blocking`.
+- Profile before performance-only changes. Bounded concurrency must preserve
+  file, state, retry, and checkpoint invariants.
 - Add `#[must_use]` when ignoring a result can lose state, safety, or a
   user-visible decision.
 - Keep provider, state, filesystem, and policy layers separate.
 
 ## Tests and completion
 
-- Every behavior change needs a focused test.
-- Prefer at least one test through the real production call graph.
-- Put unit tests near their owner and integration tests under `tests/`.
-- Assert concrete success, failure, retry, interruption, and boundary behavior.
-- Investigate every failure before changing product code or calling it
-  unrelated.
-- Use check-only formatter and linter commands unless explicitly asked to
-  autofix.
-
-Finish code changes with:
-
-```sh
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-Run focused tests while iterating and `just gate` for PR-ready work. Run live
-tests single-threaded only when the change needs them; follow
-`tests/README.md`.
-
-For CLI changes, run the changed command and inspect Docker CMD, systemd
-`ExecStart`, Homebrew formula paths, help, and docs where applicable.
-
-For schema, primary-key, sentinel, durable-key, or serialization changes,
-search every old literal and prove migration and round-trip behavior.
-
-Update `docs/architecture.md` when ownership, a documented flow, or an
-invariant changes.
+- Follow the testing contract in `CONTRIBUTING.md`; investigate every failure
+  before changing product code or calling it unrelated.
+- Run focused tests while iterating and `just gate` for PR-ready work.
+- Finish with `cargo fmt --all --check` and
+  `cargo clippy --all-targets --all-features -- -D warnings`.
+- Run live tests single-threaded only when needed; follow `tests/README.md`.
+- CLI changes: run the command and inspect help, docs, Docker CMD, systemd
+  `ExecStart`, and Homebrew paths where applicable.
+- Schema, primary-key, sentinel, durable-key, or serialization changes: search
+  every old literal and prove migration and round-trip behavior.
+- Update `docs/architecture.md` when ownership, a documented flow, or an
+  invariant changes.
 
 ## Restrictions
 
-Get explicit approval before:
-
-- Deleting production code or tests
-- Changing a public CLI/API contract
-- Adding a dependency
-- Pushing, opening a pull request, or changing `main`
+Get explicit approval before deleting production code or tests, changing a
+public CLI/API contract, adding a dependency, pushing, opening a pull request,
+or changing `main`.
 
 Never use star imports, unexplained `#[allow(...)]`, `git add -A`, `git add .`,
 `git commit --amend`, or `sudo`.

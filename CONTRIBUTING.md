@@ -6,8 +6,9 @@ or a public interface, open an issue first so we can agree on the approach.
 
 ## Before you start
 
-Read [the architecture guide](docs/architecture.md) before changing code. It
-maps the major owners and the data-safety boundaries between them.
+Use the owner table in [the architecture guide](docs/architecture.md) before
+changing code, then read the relevant flow, invariant, and change-impact
+sections.
 
 For a nontrivial change, post a short plan on the issue before implementation:
 
@@ -38,16 +39,11 @@ policy, and the download pipeline must not own CloudKit response parsing.
 
 ### Protect user data
 
-Media and metadata must never be lost, corrupted, truncated, overwritten, or
-silently discarded.
-
-- Downloads land through `.part` files and are verified before publication.
-- Downloaded bytes require SHA-256 verification.
-- Final publication must not overwrite an existing destination.
-- State transitions and provider checkpoint changes must remain durable.
-- Local media or metadata rewrites require an explicit user-controlled option.
-- Provider-specific behavior belongs in the provider adapter.
-- Trust-boundary validation and data-loss guards are not cleanup candidates.
+Follow the architecture guide's
+[data-safety invariants](docs/architecture.md#data-safety-invariants). Media and
+metadata must never be lost, corrupted, truncated, overwritten, or silently
+discarded. Local rewrites stay opt-in, provider behavior stays in its adapter,
+and trust-boundary validation and data-loss guards stay intact.
 
 Changes involving file writes, SQLite state, provider identity, or checkpoints
 must cover interruption, retry, partial completion, and stale configuration.
