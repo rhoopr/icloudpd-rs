@@ -36,6 +36,10 @@ parsing in the download pipeline.
   delete or forget work.
 - Keep provider quirks and record parsing in `src/icloud/`.
 - Do not remove trust-boundary validation or data-loss guards as cleanup.
+- Never log passwords, session cookies, bearer tokens, Apple IDs, or
+  unredacted provider identifiers. Preserve secret wrappers and redaction.
+- Keep `unsafe` blocks minimal and local. Document each block with a concrete
+  `SAFETY` invariant, and update `UNSAFE.md` when unsafe code changes.
 
 ## Implementation
 
@@ -53,6 +57,8 @@ parsing in the download pipeline.
 - Use `expect` only for a proven same-flow invariant, and state the invariant
   in the message.
 - Do not block the async runtime. Use async I/O or `spawn_blocking`.
+- Profile before performance-only changes. Use bounded concurrency only when
+  it preserves file, state, retry, and checkpoint invariants.
 - Keep internal APIs `pub(crate)` unless public or test-harness precedent
   requires `pub`.
 - Add `#[must_use]` when ignoring a result can lose state, safety, or a

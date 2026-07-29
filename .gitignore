@@ -4,7 +4,6 @@
 .codex/
 CODEBASE.md
 CODEGRAPH.md
-UNSAFE.md
 
 # Rust
 /target

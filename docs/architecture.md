@@ -189,6 +189,14 @@ Schema, primary-key, sentinel, durable-key, and serialization changes are
 cross-cutting. Search every reader and writer, migrations, fixtures, reports,
 status output, and round-trip tests before changing them.
 
+### Secrets and diagnostics
+
+Passwords stay behind `SecretString` and password-source boundaries. Logging
+uses a redacting writer as a backstop, but code must not send Apple IDs,
+passwords, session cookies, bearer tokens, or unredacted provider identifiers
+to logs or machine output. Preserve process hardening that limits credential
+exposure through core dumps.
+
 ## Change-impact checklist
 
 | Change | Check |
@@ -202,6 +210,7 @@ status output, and round-trip tests before changing them.
 | File or path behavior | `.part`, checksum, no-overwrite publish, fsync, import compatibility, collision handling |
 | Metadata writes | opt-in gate, pre-publish mutation, sidecars, retry markers, feature combinations |
 | Service behavior | Linux, macOS, Windows, container defaults, status, install/uninstall renderers |
+| Credentials or logging | secret wrappers, source lifetime, redaction, core-dump hardening, diagnostics, error paths |
 | Machine output | JSON/CSV shape, redaction, reports, health, metrics, downstream compatibility |
 
 ## Tests

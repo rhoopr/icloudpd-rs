@@ -162,6 +162,10 @@ Reviews prioritize:
 
 ## Logs and config snippets
 
+Code must not log Apple IDs, passwords, session cookies, bearer tokens, or
+unredacted provider identifiers. Preserve `SecretString`, password redaction,
+and other credential boundaries when changing logging or error paths.
+
 Before posting logs or configuration, redact Apple IDs, passwords, session
 cookies, bearer tokens, webhook URLs, and local paths you do not want public.
 Keep enough surrounding text for the failure to remain readable.
