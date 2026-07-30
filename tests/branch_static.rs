@@ -1003,6 +1003,38 @@ fn contributor_docs_match_current_gate() {
 }
 
 #[test]
+fn repo_pr_ready_skill_uses_current_validation_workflow() {
+    let gitignore = repo_file(".gitignore");
+    assert!(
+        !gitignore.lines().any(|line| line.trim() == ".agents/"),
+        "repository skills must remain available for version control"
+    );
+
+    let skill = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
+    for expected in [
+        "name: kei-pr-ready",
+        "without publishing or changing it",
+        "just agent-status",
+        "docs/architecture.md",
+        "tests/README.md",
+        "just test scenario NAME",
+        "just gate",
+        "final verdict: ready or not ready",
+    ] {
+        assert!(
+            skill.contains(expected),
+            "kei-pr-ready skill missing validation contract: {expected}"
+        );
+    }
+
+    let metadata = repo_file(".agents/skills/kei-pr-ready/agents/openai.yaml");
+    assert!(
+        metadata.contains("Use $kei-pr-ready"),
+        "skill metadata must keep its default invocation aligned with SKILL.md"
+    );
+}
+
+#[test]
 fn roundtrip_gate_documents_heuristic_limits_and_bypass_rationale() {
     let gate = repo_file("scripts/check-roundtrip-gate.sh");
 
