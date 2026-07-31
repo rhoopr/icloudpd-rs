@@ -54,6 +54,14 @@ impl std::fmt::Debug for PhotosService {
     }
 }
 
+/// Whether a CloudKit zone is a photo library.
+///
+/// `zones/list` also returns share-link bundles (`CMM-{UUID}`) and shared-album
+/// zones (`SharedCollection-{UUID}`), which carry no album index.
+fn is_photo_library_zone(zone_name: &str) -> bool {
+    zone_name == PRIMARY_ZONE_NAME || is_shared_zone(zone_name)
+}
+
 impl PhotosService {
     /// Create a new `PhotosService`.
     ///
@@ -196,16 +204,10 @@ impl PhotosService {
                 continue;
             }
             let zone_name = zone.zone_id.zone_name.clone();
-            // CMM-{UUID} zones are iCloud share-link bundles ("Cloud Master
-            // Moment Share Assets"), not Shared Photo Libraries. They use a
-            // different record schema and don't answer `CheckIndexingState`,
-            // so probing them produces noisy errors and they can't be
-            // enumerated through the library/album path anyway. Skip them
-            // entirely; they're not meaningful as a sync target today.
-            if zone_name.starts_with("CMM-") {
+            if !is_photo_library_zone(&zone_name) {
                 tracing::debug!(
                     zone = %zone_name,
-                    "Skipping CMM share-link zone (not a Shared Photo Library)"
+                    "Skipping zone that is not a photo library"
                 );
                 continue;
             }
@@ -617,7 +619,7 @@ mod tests {
                         "syncToken": "tok",
                     },
                     {
-                        "zoneID": {"zoneName": "CMMLibrary-ABC"},
+                        "zoneID": {"zoneName": "SharedSync-ABC"},
                         "syncToken": "tok2",
                     }
                 ]
@@ -627,7 +629,7 @@ mod tests {
         let libs = svc.fetch_private_libraries().await.unwrap();
         assert_eq!(libs.len(), 2);
         assert!(libs.contains_key("PrimarySync"));
-        assert!(libs.contains_key("CMMLibrary-ABC"));
+        assert!(libs.contains_key("SharedSync-ABC"));
     }
 
     /// Deleted zones are filtered out.
@@ -637,11 +639,11 @@ mod tests {
             response: json!({
                 "zones": [
                     {
-                        "zoneID": {"zoneName": "LiveZone"},
+                        "zoneID": {"zoneName": "PrimarySync"},
                         "syncToken": "tok",
                     },
                     {
-                        "zoneID": {"zoneName": "GoneZone"},
+                        "zoneID": {"zoneName": "SharedSync-GONE"},
                         "syncToken": "tok2",
                         "deleted": true,
                     }
@@ -651,8 +653,8 @@ mod tests {
         let mut svc = make_service(Box::new(session), HashMap::new());
         let libs = svc.fetch_private_libraries().await.unwrap();
         assert_eq!(libs.len(), 1);
-        assert!(libs.contains_key("LiveZone"));
-        assert!(!libs.contains_key("GoneZone"));
+        assert!(libs.contains_key("PrimarySync"));
+        assert!(!libs.contains_key("SharedSync-GONE"));
     }
 
     /// CMM-{UUID} share-link zones are filtered out of the library map.
@@ -683,18 +685,42 @@ mod tests {
         );
     }
 
+    /// Only `PrimarySync` and `SharedSync-{UUID}` are photo libraries; other
+    /// zones in the list are not enumerable and must be skipped.
+    #[tokio::test]
+    async fn test_fetch_libraries_skips_non_library_zones() {
+        let session = CloneableSession {
+            response: json!({
+                "zones": [
+                    {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "t"},
+                    {"zoneID": {"zoneName": "SharedSync-ABCD"}, "syncToken": "t2"},
+                    {"zoneID": {"zoneName": "SharedCollection-254E3E8C"}, "syncToken": "t3"},
+                    {"zoneID": {"zoneName": "CMM-657AE284"}, "syncToken": "t4"},
+                    {"zoneID": {"zoneName": "SharedSyncExtra"}, "syncToken": "t5"},
+                    {"zoneID": {"zoneName": "PrimarySyncExtra"}, "syncToken": "t6"}
+                ]
+            }),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        let libs = svc.fetch_private_libraries().await.unwrap();
+        let names: Vec<_> = libs.keys().map(String::as_str).collect();
+        assert!(libs.contains_key("PrimarySync"), "got {names:?}");
+        assert!(libs.contains_key("SharedSync-ABCD"), "got {names:?}");
+        assert_eq!(libs.len(), 2, "only photo libraries, got {names:?}");
+    }
+
     #[tokio::test]
     async fn test_fetch_libraries_fails_on_non_deleted_zone_initialization_failure() {
         let session = RunningIndexSession {
             zone_response: json!({
                 "zones": [
-                    {"zoneID": {"zoneName": "LiveZone"}, "syncToken": "tok"},
+                    {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "tok"},
                     {
                         "zoneID": {"zoneName": "CMM-657AE284-D1E0-4C7F-9B4D-987888651AC6"},
                         "syncToken": "tok2",
                     },
                     {
-                        "zoneID": {"zoneName": "GoneZone"},
+                        "zoneID": {"zoneName": "SharedSync-GONE"},
                         "syncToken": "tok3",
                         "deleted": true,
                     }
@@ -705,7 +731,7 @@ mod tests {
         let err = svc.fetch_private_libraries().await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("LiveZone") && msg.contains("RUNNING"),
+            msg.contains("PrimarySync") && msg.contains("RUNNING"),
             "regular non-deleted zone failure must fail discovery: {msg}"
         );
         assert!(
@@ -796,12 +822,12 @@ mod tests {
             private_response: json!({
                 "zones": [
                     {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "t"},
-                    {"zoneID": {"zoneName": "ExtraPrivate"}, "syncToken": "t2"}
+                    {"zoneID": {"zoneName": "SharedSync-EXTRA"}, "syncToken": "t2"}
                 ]
             }),
             shared_response: json!({
                 "zones": [
-                    {"zoneID": {"zoneName": "SharedOne"}, "syncToken": "t3"}
+                    {"zoneID": {"zoneName": "SharedSync-ONE"}, "syncToken": "t3"}
                 ]
             }),
         };
@@ -817,11 +843,11 @@ mod tests {
             "PrimarySync must appear once, got {names:?}"
         );
         assert!(
-            names.contains(&"ExtraPrivate".to_string()),
+            names.contains(&"SharedSync-EXTRA".to_string()),
             "non-primary private zone must be included: {names:?}"
         );
         assert!(
-            names.contains(&"SharedOne".to_string()),
+            names.contains(&"SharedSync-ONE".to_string()),
             "shared zone must be included: {names:?}"
         );
     }
