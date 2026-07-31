@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Zone discovery now selects photo libraries by matching `PrimarySync` and `SharedSync-{UUID}` instead of skipping only `CMM-{UUID}`. Accounts holding a shared album surface `SharedCollection-{UUID}` zones, which carry no `CPLAlbumByPositionLive` index, so listing their albums returned `BAD_REQUEST` / "Index has invalid data" and aborted the sync for every library. Such an account could not back up at all unless albums were disabled.
 - Already-downloaded assets are now tagged for metadata rewrite on the state-confirmed on-disk skip path, so corrected metadata reaches both the catalogue and the sidecar when an asset is revisited during a full enumeration. Previously that skip path refreshed the catalogue row but never re-applied the sidecar. ([#673])
 - Bounded and fallback full syncs now run targeted pending-asset revalidation after source enumeration, so provider-confirmed deletions clear stale pending rows without requiring an incremental checkpoint. ([#663])
 - Legacy pending rows with a live iCloud master now recover their missing asset identity and retry, so bounded syncs can finish old downloads without a wide photo enumeration. ([#663])
