@@ -94,8 +94,11 @@ are diagnostics. Recoverable pass-token gaps can be retried in the same cycle.
 
 Incremental enumeration consumes changes/zone events. It persists provider
 identity mappings before applying created, soft-deleted, hard-deleted, or
-hidden transitions. Album snapshots and smart folders may require targeted
-refresh work before or alongside the incremental stream.
+hidden transitions. An asset-only `CPLAsset` creation hydrates its paired
+master through `masterRef` or the durable mapping before routing; an
+inconclusive lookup preserves the prior zone checkpoint. Album snapshots and
+smart folders may require targeted refresh work before or alongside the
+incremental stream.
 
 Recent and date-bounded runs may advance only when the producer proves the
 bound did not truncate the stream.
@@ -181,7 +184,10 @@ recovery work needed after that checkpoint is durable.
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
 Metadata failure markers must survive so a later run can retry metadata
-without downloading the media again.
+without downloading the media again. Collecting incremental sync commits
+changed catalogue metadata and its configured rewrite marker before deciding
+whether unchanged media needs downloading. A failed commit preserves the
+provider checkpoint.
 
 ### State and serialization
 
