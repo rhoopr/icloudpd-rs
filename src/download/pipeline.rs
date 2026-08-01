@@ -673,7 +673,7 @@ fn filenames_match_ampm_equivalent(a: &str, b: &str) -> bool {
     a == b || super::paths::normalize_ampm(a) == super::paths::normalize_ampm(b)
 }
 
-fn state_confirmed_current_path_exists(
+pub(super) fn state_confirmed_current_path_exists(
     ctx: &DownloadContext,
     config: &DownloadConfig,
     asset: &PhotoAsset,

@@ -4269,6 +4269,7 @@ mod tests {
         replace_download_dir_on_upsert: Option<std::path::PathBuf>,
         fail_upsert_seen: bool,
         fail_mark_downloaded: bool,
+        fail_refresh_downloaded_metadata: bool,
     }
 
     impl std::fmt::Debug for FailingMetadataSetDb {
@@ -4298,6 +4299,7 @@ mod tests {
                 replace_download_dir_on_upsert: None,
                 fail_upsert_seen: false,
                 fail_mark_downloaded: false,
+                fail_refresh_downloaded_metadata: false,
             }
         }
 
@@ -4310,6 +4312,11 @@ mod tests {
                 MetadataSetFailure::Exact("__unused_metadata_key__"),
                 message,
             )
+        }
+
+        fn with_refresh_downloaded_metadata_failure(mut self) -> Self {
+            self.fail_refresh_downloaded_metadata = true;
+            self
         }
 
         fn with_get_failure(mut self, failure: MetadataSetFailure) -> Self {
@@ -4862,6 +4869,11 @@ mod tests {
             metadata: &state::AssetMetadata,
             mark_for_rewrite: bool,
         ) -> Result<usize, state::error::StateError> {
+            if self.fail_refresh_downloaded_metadata {
+                return Err(state::error::StateError::LockPoisoned(
+                    self.message.to_string(),
+                ));
+            }
             self.inner
                 .refresh_downloaded_asset_metadata(library, asset_id, metadata, mark_for_rewrite)
                 .await
@@ -5926,6 +5938,126 @@ mod tests {
             "stale plan must leave the old zone token in place for replay"
         );
         assert!(!config.runtime.dry_run);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_provider_metadata_write_failure_preserves_zone_checkpoint() {
+        use chrono::TimeZone as _;
+
+        let mut config = make_run_cycle_config();
+        config.filters.recent = Some(10);
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let media_dir = download_dir.path().join(run_cycle_expected_date_dir());
+        std::fs::create_dir_all(&media_dir).expect("create media directory");
+        let media_path = media_dir.join("photo.jpg");
+        std::fs::write(&media_path, vec![0u8; 1024]).expect("seed media file");
+        let mut stored_metadata = state::AssetMetadata {
+            is_favorite: false,
+            ..state::AssetMetadata::default()
+        };
+        stored_metadata.refresh_hash();
+        let record = crate::test_helpers::TestAssetRecord::new("master-PrimarySync")
+            .filename("photo.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .created_at(
+                chrono::Utc
+                    .timestamp_millis_opt(RUN_CYCLE_ASSET_DATE_MS)
+                    .single()
+                    .expect("valid asset date"),
+            )
+            .size(1024)
+            .metadata(stored_metadata)
+            .build();
+        inner.upsert_seen(&record).await.expect("seed state row");
+        inner
+            .mark_downloaded(
+                "PrimarySync",
+                "master-PrimarySync",
+                "original",
+                &media_path,
+                "local-checksum",
+                None,
+            )
+            .await
+            .expect("mark downloaded");
+
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(
+                Arc::clone(&inner),
+                "simulated provider metadata write failure",
+            )
+            .with_refresh_downloaded_metadata_failure(),
+        );
+        let mut page = full_album_page_with_download(
+            "PrimarySync",
+            "master-PrimarySync",
+            "zone-tok-new",
+            "https://p01.icloud-content.com/photo.jpg",
+            1024,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        );
+        page["records"][1]["fields"]["isFavorite"] =
+            serde_json::json!({"value": 1, "type": "INT64"});
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "zone-tok-new",
+                    "moreComing": false,
+                    "records": page["records"].clone()
+                }]
+            })),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                recent: Some(10),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert!(result.failed_count > 0);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.stats.failed, 0);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some("provider_metadata_state_write_failed")
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "failed provider metadata write must preserve the replay checkpoint"
+        );
     }
 
     #[tokio::test]

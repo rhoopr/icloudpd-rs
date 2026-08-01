@@ -23,7 +23,7 @@ pub(crate) use limiter::BandwidthLimiter;
 use pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, PassResult, StreamRuntime, StreamingResult,
     build_download_outcome, format_duration, log_sync_summary, run_download_pass,
-    stream_and_download_from_stream,
+    state_confirmed_current_path_exists, stream_and_download_from_stream,
 };
 
 pub(crate) use filter::AssetGroupings;
@@ -514,6 +514,8 @@ const UNKNOWN_ALBUM_RELATION_ASSET_REASON: &str = "unknown_album_relation_asset"
 const ALBUM_DELTA_STATE_WRITE_FAILED_REASON: &str = "album_delta_state_write_failed";
 const ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON: &str =
     "asset_master_mapping_state_write_failed";
+const ASSET_DELTA_HYDRATION_INCOMPLETE_REASON: &str = "asset_delta_hydration_incomplete";
+const PROVIDER_METADATA_STATE_WRITE_FAILED_REASON: &str = "provider_metadata_state_write_failed";
 const INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON: &str = "incremental_delete_state_write_failed";
 const INCREMENTAL_DELETE_ZERO_ROWS_REASON: &str = "incremental_delete_no_matching_state";
 const INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON: &str = "incremental_hidden_state_write_failed";
@@ -531,7 +533,9 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON
         | ALBUM_DELTA_STATE_WRITE_FAILED_REASON
+        | ASSET_DELTA_HYDRATION_INCOMPLETE_REASON
         | ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON
+        | PROVIDER_METADATA_STATE_WRITE_FAILED_REASON
         | DATE_BOUNDED_FULL_ENUMERATION_REASON
         | INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON
         | INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON
@@ -585,6 +589,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON => {
             "album membership state is not complete enough for incremental routing yet"
         }
+        ASSET_DELTA_HYDRATION_INCOMPLETE_REASON => {
+            "kei could not obtain a complete photo from an asset-only iCloud delta"
+        }
         UNPARSABLE_RELATION_DELTA_REASON => {
             "iCloud returned an album relation delta kei could not parse safely"
         }
@@ -597,6 +604,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         ALBUM_DELTA_STATE_WRITE_FAILED_REASON => "kei could not persist album delta state safely",
         ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON => {
             "kei could not persist asset-to-master mapping state safely"
+        }
+        PROVIDER_METADATA_STATE_WRITE_FAILED_REASON => {
+            "kei could not persist changed provider metadata safely"
         }
         INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON => {
             "kei could not persist an incremental source-delete safely"
@@ -1651,6 +1661,67 @@ impl DownloadContext {
             Some(stored) => stored.as_ref() != new_hash,
             None => true, // downloaded row has no stored hash yet -- refresh
         }
+    }
+
+    /// Whether at least one downloaded version has provider metadata that
+    /// differs from the complete asset returned by iCloud.
+    fn has_provider_metadata_drift(
+        &self,
+        library: &str,
+        asset_id: &str,
+        new_metadata_hash: Option<&str>,
+    ) -> bool {
+        let Some(new_hash) = new_metadata_hash else {
+            return false;
+        };
+        let Some(downloaded_versions) = self
+            .downloaded_ids
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+        else {
+            return false;
+        };
+        let stored_hashes = self
+            .downloaded_metadata_hashes
+            .get(library)
+            .and_then(|assets| assets.get(asset_id));
+        downloaded_versions.iter().any(|version_size| {
+            stored_hashes
+                .and_then(|hashes| hashes.get(version_size.as_ref()))
+                .is_none_or(|stored| stored.as_ref() != new_hash)
+        })
+    }
+
+    fn has_state_version(&self, library: &str, asset_id: &str) -> bool {
+        self.downloaded_ids
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+            .is_some_and(|versions| !versions.is_empty())
+            || self
+                .pending_ids
+                .get(library)
+                .and_then(|assets| assets.get(asset_id))
+                .is_some_and(|versions| !versions.is_empty())
+    }
+
+    fn has_matching_downloaded_checksum(
+        &self,
+        library: &str,
+        asset_id: &str,
+        asset: &PhotoAsset,
+    ) -> bool {
+        let Some(checksums) = self
+            .downloaded_checksums
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+        else {
+            return false;
+        };
+        asset.versions().iter().any(|(version_size, version)| {
+            checksums
+                .get(VersionSizeKey::from(*version_size).as_str())
+                .is_some_and(|stored| stored.as_ref() == version.checksum.as_ref())
+        })
     }
 
     /// Check if an asset should be downloaded based on pre-loaded state.
@@ -6108,12 +6179,184 @@ async fn apply_incremental_relation_delta(
     }
 }
 
+async fn hydrate_unpaired_created_asset_deltas(
+    events: &mut [ChangeEvent],
+    pass: Option<&crate::commands::AlbumPass>,
+    config: &DownloadConfig,
+    summary: &mut IncrementalDeltaSummary,
+) -> Option<Arc<DownloadContext>> {
+    let mut pending = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        if event.reason != ChangeReason::Created
+            || event.asset.is_some()
+            || !matches!(event.record_type.as_deref(), Some("CPLAsset"))
+        {
+            continue;
+        }
+
+        let master_record_name = if let Some(master) = event.master_record_name.as_deref() {
+            Some(master.to_string())
+        } else if let Some(db) = &config.state_db {
+            match db
+                .get_master_record_name_for_asset(&config.library, &event.record_name)
+                .await
+            {
+                Ok(master) => master,
+                Err(e) => {
+                    summary.state_transition_failures += 1;
+                    summary
+                        .token_unsafe_reason
+                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                    tracing::warn!(
+                        asset_record_name = %event.record_name,
+                        library = %config.library,
+                        error = %e,
+                        "Failed to resolve asset-only delta through persisted mapping"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let Some(master_record_name) = master_record_name else {
+            summary
+                .token_unsafe_reason
+                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            tracing::warn!(
+                asset_record_name = %event.record_name,
+                library = %config.library,
+                "Asset-only delta had no usable master identity"
+            );
+            continue;
+        };
+        pending.push((index, event.record_name.to_string(), master_record_name));
+    }
+
+    if pending.is_empty() {
+        return None;
+    }
+    let Some(pass) = pass else {
+        summary
+            .token_unsafe_reason
+            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+        return None;
+    };
+    let download_ctx = preload_download_context(config).await;
+    let requests: Vec<RecordLookupRequest> = pending
+        .iter()
+        .map(|(_, record_name, master)| {
+            RecordLookupRequest::paired(
+                ProviderRecordId::new(record_name.as_str()),
+                ProviderRecordId::new(master.as_str()),
+                ProviderRecordId::new(record_name.as_str()),
+            )
+        })
+        .collect();
+    let event_by_record_name: FxHashMap<String, (usize, String)> = pending
+        .iter()
+        .map(|(index, record_name, master)| (record_name.clone(), (*index, master.clone())))
+        .collect();
+    let resolutions = pass.album.resolve_records(&requests).await;
+    for (state_id, resolution) in resolutions.results {
+        let Some((index, master_record_name)) = event_by_record_name.get(state_id.as_str()) else {
+            summary
+                .token_unsafe_reason
+                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            continue;
+        };
+        let Some(event) = events.get_mut(*index) else {
+            summary
+                .token_unsafe_reason
+                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+            continue;
+        };
+        match resolution {
+            RecordResolution::Present(mut asset)
+                if asset.asset_record_name() == event.record_name.as_ref() =>
+            {
+                let library = asset.source_zone().unwrap_or(&config.library);
+                let asset_state_known =
+                    download_ctx.has_state_version(library, asset.asset_record_name());
+                let master_state_known =
+                    download_ctx.has_state_version(library, master_record_name);
+                let master_checksum_matches = download_ctx.has_matching_downloaded_checksum(
+                    library,
+                    master_record_name,
+                    &asset,
+                );
+                if !asset_state_known && (!master_state_known || master_checksum_matches) {
+                    asset = asset.with_state_record_name(Arc::from(master_record_name.as_str()));
+                }
+                summary
+                    .persist_asset_mapping_for_asset(&asset, config)
+                    .await;
+                event.asset = Some(asset);
+            }
+            RecordResolution::Deleted {
+                deleted_at,
+                master_family,
+            } => {
+                if let Some(db) = &config.state_db {
+                    let update = SourceStateUpdate::SoftDeleted { deleted_at };
+                    let (result, state_key) = if master_family {
+                        let state_key = SourceStateTransitionKey {
+                            record_name: Cow::Borrowed(master_record_name),
+                            record_type: Some("CPLMaster"),
+                            unresolved_identity: false,
+                        };
+                        let result = db
+                            .resolve_master_family_source_deleted_affected(
+                                &config.library,
+                                master_record_name,
+                                deleted_at,
+                            )
+                            .await;
+                        (result, state_key)
+                    } else {
+                        apply_source_state_update(db.as_ref(), config, event, update).await
+                    };
+                    record_incremental_state_transition_result(
+                        result,
+                        update.transition(),
+                        state_key,
+                        &mut summary.state_transition_failures,
+                        &mut summary.token_unsafe_reason,
+                    );
+                }
+            }
+            RecordResolution::Present(_)
+            | RecordResolution::MasterPresent
+            | RecordResolution::Unknown
+            | RecordResolution::TransientFailure(_) => {
+                summary
+                    .token_unsafe_reason
+                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                tracing::warn!(
+                    asset_record_name = %event.record_name,
+                    master_record_name,
+                    library = %config.library,
+                    "Could not hydrate a complete asset-only delta"
+                );
+            }
+        }
+    }
+    if !resolutions.complete {
+        summary
+            .token_unsafe_reason
+            .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+    }
+    Some(download_ctx)
+}
+
 async fn hydrate_missing_selected_relation_assets(
     change_events: &[ChangeEvent],
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     routing: &IncrementalPassRouting,
     asset_to_master: &mut FxHashMap<String, String>,
+    complete_delta_assets: &mut Vec<PhotoAsset>,
     downloadable_assets: &mut Vec<(PhotoAsset, usize)>,
     delta_summary: &mut IncrementalDeltaSummary,
 ) {
@@ -6187,6 +6430,7 @@ async fn hydrate_missing_selected_relation_assets(
             delta_summary
                 .persist_asset_mapping_for_asset(&asset, config)
                 .await;
+            complete_delta_assets.push(asset.clone());
             if let Some(pass_indices) = pass_indices_by_asset.get(asset_record_name.as_str()) {
                 for pass_index in pass_indices {
                     downloadable_assets.push((asset.clone(), *pass_index));
@@ -6200,6 +6444,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
     pass: crate::commands::AlbumPass,
     config: Arc<DownloadConfig>,
     zone_sync_token: String,
+    run_mode: DownloadRunMode,
     shutdown_token: CancellationToken,
 ) -> (
     ReceiverStream<Result<PhotoAsset>>,
@@ -6210,12 +6455,13 @@ fn stream_incremental_assets_for_single_unfiled_pass(
     let (mut change_stream, token_rx) = pass.album.changes_stream(&zone_sync_token);
     let handle = tokio::spawn(async move {
         let mut summary = IncrementalDeltaSummary::default();
-        let routing = IncrementalPassRouting::from_passes(&[pass]);
+        let routing = IncrementalPassRouting::from_passes(std::slice::from_ref(&pass));
         let planned_album_containers: FxHashMap<&str, &str> = FxHashMap::default();
         let mut ensured_planned_containers: FxHashSet<String> = FxHashSet::default();
         let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
         let mut album_events = Vec::new();
         let mut relation_events = Vec::new();
+        let mut unpaired_asset_events = Vec::new();
 
         while let Some(result) = change_stream.next().await {
             if shutdown_token.is_cancelled() {
@@ -6241,14 +6487,43 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             match event.reason {
                 ChangeReason::Created => {
                     summary.record_created();
-                    if let Some(asset) = event.asset
-                        && asset_tx.send(Ok(asset)).await.is_err()
-                    {
-                        return Ok(summary);
+                    if let Some(asset) = event.asset {
+                        if asset_tx.send(Ok(asset)).await.is_err() {
+                            return Ok(summary);
+                        }
+                    } else if matches!(event.record_type.as_deref(), Some("CPLAsset")) {
+                        unpaired_asset_events.push(event);
                     }
                 }
                 ChangeReason::SoftDeleted | ChangeReason::HardDeleted | ChangeReason::Hidden => {
                     summary.apply_source_state_event(&event, &config).await;
+                }
+            }
+        }
+
+        let hydrated_download_ctx = hydrate_unpaired_created_asset_deltas(
+            &mut unpaired_asset_events,
+            Some(&pass),
+            &config,
+            &mut summary,
+        )
+        .await;
+        let download_ctx = if run_mode.downloads_files() && !unpaired_asset_events.is_empty() {
+            match hydrated_download_ctx {
+                Some(download_ctx) => Some(download_ctx),
+                None => Some(preload_download_context(&config).await),
+            }
+        } else {
+            None
+        };
+        for event in unpaired_asset_events {
+            if let Some(asset) = event.asset {
+                if let Some(download_ctx) = download_ctx.as_deref() {
+                    apply_changed_provider_metadata(&config, &asset, download_ctx, &mut summary)
+                        .await;
+                }
+                if asset_tx.send(Ok(asset)).await.is_err() {
+                    return Ok(summary);
                 }
             }
         }
@@ -6291,6 +6566,7 @@ async fn download_photos_incremental_streaming(
         pass.clone(),
         Arc::clone(&pass_config),
         zone_sync_token.to_string(),
+        controls.run_mode,
         shutdown_token.clone(),
     );
     let streaming_result = match stream_and_download_from_stream(
@@ -6415,6 +6691,85 @@ async fn download_photos_incremental_collecting(
     .await
 }
 
+async fn apply_changed_provider_metadata(
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    download_ctx: &DownloadContext,
+    summary: &mut IncrementalDeltaSummary,
+) {
+    let Some(db) = &config.state_db else {
+        return;
+    };
+    let library = asset.source_zone().unwrap_or(&config.library);
+    if !download_ctx.has_provider_metadata_drift(
+        library,
+        asset.state_id(),
+        asset.metadata().metadata_hash.as_deref(),
+    ) {
+        return;
+    }
+    let mark_for_rewrite = MetadataFlags::from(config).has_any_write();
+    let refresh = db
+        .refresh_downloaded_asset_metadata(
+            library,
+            asset.state_id(),
+            asset.metadata(),
+            mark_for_rewrite,
+        )
+        .await;
+    match refresh {
+        Ok(updated) if updated > 0 => {}
+        Ok(_) => {
+            summary.state_transition_failures += 1;
+            summary
+                .token_unsafe_reason
+                .get_or_insert(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON);
+            tracing::warn!(
+                asset_id = %asset.id(),
+                library,
+                "Changed provider metadata matched no downloaded state row"
+            );
+        }
+        Err(e) => {
+            summary.state_transition_failures += 1;
+            summary
+                .token_unsafe_reason
+                .get_or_insert(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON);
+            tracing::warn!(
+                asset_id = %asset.id(),
+                library,
+                error = %e,
+                "Failed to persist changed provider metadata"
+            );
+        }
+    }
+}
+
+async fn run_collecting_metadata_rewrite_batch(
+    config: &DownloadConfig,
+    run_mode: DownloadRunMode,
+    shutdown_token: &CancellationToken,
+) -> usize {
+    if !run_mode.downloads_files() {
+        return 0;
+    }
+    let Some(db) = &config.state_db else {
+        return 0;
+    };
+    let metadata = MetadataFlags::from(config);
+    if !metadata.has_any_write() {
+        return 0;
+    }
+    metadata_rewrite::run_pending(
+        db.as_ref(),
+        metadata,
+        Arc::clone(&config.temp_suffix),
+        shutdown_token,
+    )
+    .await
+    .failed
+}
+
 async fn download_photos_incremental_collecting_inner(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -6475,6 +6830,26 @@ async fn download_photos_incremental_collecting_inner(
         IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
         delta_summary.persist_asset_mapping(event, config).await;
     }
+    let hydrated_download_ctx = hydrate_unpaired_created_asset_deltas(
+        &mut change_events,
+        passes.first(),
+        config,
+        &mut delta_summary,
+    )
+    .await;
+    let mut complete_delta_assets: Vec<PhotoAsset> = change_events
+        .iter()
+        .filter(|event| {
+            event.reason == ChangeReason::Created
+                && event.album.is_none()
+                && event.relation.is_none()
+                && event.token_unsafe_reason.is_none()
+        })
+        .filter_map(|event| event.asset.clone())
+        .collect();
+    for event in &change_events {
+        IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
+    }
     let planned_album_containers: FxHashMap<&str, &str> = passes
         .iter()
         .filter(|pass| pass.kind == crate::commands::PassKind::Album)
@@ -6503,6 +6878,7 @@ async fn download_photos_incremental_collecting_inner(
         config,
         &routing,
         &mut asset_to_master,
+        &mut complete_delta_assets,
         &mut downloadable_assets,
         &mut delta_summary,
     )
@@ -6521,6 +6897,22 @@ async fn download_photos_incremental_collecting_inner(
         hydrated_assets,
         "Incremental relation hydration phase complete"
     );
+
+    let mut download_ctx = hydrated_download_ctx;
+    if controls.run_mode.downloads_files() && !complete_delta_assets.is_empty() {
+        let context = match download_ctx.take() {
+            Some(context) => context,
+            None => preload_download_context(config).await,
+        };
+        let mut refreshed_assets = FxHashSet::default();
+        for asset in &complete_delta_assets {
+            if !refreshed_assets.insert(asset.state_id_arc()) {
+                continue;
+            }
+            apply_changed_provider_metadata(config, asset, &context, &mut delta_summary).await;
+        }
+        download_ctx = Some(context);
+    }
 
     let phase_started = Instant::now();
     for event in &change_events {
@@ -6587,9 +6979,12 @@ async fn download_photos_incremental_collecting_inner(
     delta_summary.log_debug();
 
     if downloadable_assets.is_empty() {
+        let rewrite_failures =
+            run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await;
         let mut stats = SyncStats {
             elapsed_secs: started.elapsed().as_secs_f64(),
             state_write_failures: delta_summary.state_transition_failures,
+            exif_failures: rewrite_failures,
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
@@ -6606,9 +7001,11 @@ async fn download_photos_incremental_collecting_inner(
                 .flatten()
         };
         return Ok(SyncResult {
-            outcome: if delta_summary.state_transition_failures > 0 {
+            outcome: if delta_summary.state_transition_failures > 0 || rewrite_failures > 0 {
                 DownloadOutcome::PartialFailure {
-                    failed_count: delta_summary.state_transition_failures,
+                    failed_count: delta_summary
+                        .state_transition_failures
+                        .saturating_add(rewrite_failures),
                 }
             } else {
                 DownloadOutcome::Success
@@ -6618,6 +7015,12 @@ async fn download_photos_incremental_collecting_inner(
             full_enumeration_ran: false,
         });
     }
+
+    let download_ctx = match download_ctx {
+        Some(download_ctx) => download_ctx,
+        None => preload_download_context(config).await,
+    };
+    let mut planning_state_write_failures = 0usize;
 
     // Respect --recent: cap the number of assets to download
     if let Some(recent) = config.recent {
@@ -6646,7 +7049,6 @@ async fn download_photos_incremental_collecting_inner(
     let mut task_planner = planner::TaskPlanner::new();
     let mut skip_breakdown = SkipBreakdown::default();
     let mut enumeration_errors = 0usize;
-    let mut planning_state_write_failures = 0usize;
     // Incremental routing already decides whether a changed asset belongs to
     // a selected album pass or the unfiled pass from trusted membership
     // state. Re-enumerating every album here to rebuild unfiled excludes
@@ -6665,7 +7067,7 @@ async fn download_photos_incremental_collecting_inner(
         )]
         let effective_config = &pass_configs[*pass_index];
 
-        let plan = task_planner.plan_asset(asset, effective_config).await;
+        let mut plan = task_planner.plan_asset(asset, effective_config).await;
         if let Some(reason) = plan.filter_reason {
             skip_breakdown.record_filter_reason(reason);
             continue;
@@ -6680,6 +7082,36 @@ async fn download_photos_incremental_collecting_inner(
             );
             continue;
         }
+
+        let mut state_skipped = 0usize;
+        plan.tasks.retain(|task| {
+            match download_ctx.should_download_fast(
+                &task.library,
+                &task.asset_id,
+                task.version_size,
+                &task.checksum,
+                false,
+            ) {
+                Some(false) => {
+                    state_skipped = state_skipped.saturating_add(1);
+                    false
+                }
+                None if state_confirmed_current_path_exists(
+                    &download_ctx,
+                    effective_config,
+                    asset,
+                    task,
+                    &mut task_planner,
+                )
+                .is_some() =>
+                {
+                    state_skipped = state_skipped.saturating_add(1);
+                    false
+                }
+                Some(true) | None => true,
+            }
+        });
+        skip_breakdown.by_state = skip_breakdown.by_state.saturating_add(state_skipped);
 
         for task in &plan.tasks {
             retry_sources.insert(
@@ -6725,7 +7157,7 @@ async fn download_photos_incremental_collecting_inner(
             }
         }
 
-        if plan.tasks.is_empty() {
+        if plan.tasks.is_empty() && state_skipped == 0 {
             skip_breakdown.on_disk += 1;
         }
         tasks.extend(plan.tasks);
@@ -6745,12 +7177,15 @@ async fn download_photos_incremental_collecting_inner(
     }
 
     if tasks.is_empty() {
+        let rewrite_failures =
+            run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await;
         let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
             state_write_failures: delta_summary
                 .state_transition_failures
                 .saturating_add(planning_state_write_failures),
+            exif_failures: rewrite_failures,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
@@ -6760,10 +7195,12 @@ async fn download_photos_incremental_collecting_inner(
         }
         tracing::info!("All incremental assets already downloaded or filtered");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
-        let outcome = if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
-            DownloadOutcome::PartialFailure {
-                failed_count: enumeration_errors + delta_summary.state_transition_failures,
-            }
+        let failed_count = enumeration_errors
+            .saturating_add(delta_summary.state_transition_failures)
+            .saturating_add(planning_state_write_failures)
+            .saturating_add(rewrite_failures);
+        let outcome = if failed_count > 0 {
+            DownloadOutcome::PartialFailure { failed_count }
         } else {
             DownloadOutcome::Success
         };
@@ -6919,6 +7356,10 @@ async fn download_photos_incremental_collecting_inner(
         }
     }
 
+    pass_result.exif_failures = pass_result.exif_failures.saturating_add(
+        run_collecting_metadata_rewrite_batch(config, controls.run_mode, &shutdown_token).await,
+    );
+
     let failed = pass_result.failed.len();
     let succeeded = pass_result.downloaded;
 
@@ -6980,6 +7421,7 @@ async fn download_photos_incremental_collecting_inner(
         || pass_result.exif_failures > 0
         || pass_result.state_write_failures > 0
         || delta_summary.state_transition_failures > 0
+        || planning_state_write_failures > 0
         || enumeration_errors > 0
     {
         DownloadOutcome::PartialFailure {
@@ -6987,6 +7429,7 @@ async fn download_photos_incremental_collecting_inner(
                 + pass_result.exif_failures
                 + pass_result.state_write_failures
                 + delta_summary.state_transition_failures
+                + planning_state_write_failures
                 + enumeration_errors,
         }
     } else {
@@ -7568,6 +8011,98 @@ mod tests {
                 "recordChangeTag": "ct2"
             }),
         ]
+    }
+
+    fn incremental_photo_records_with_favorite(record_name: &str, is_favorite: bool) -> Vec<Value> {
+        let mut records = incremental_photo_records(record_name);
+        records[1]["fields"]["isFavorite"] =
+            json!({"value": i64::from(is_favorite), "type": "INT64"});
+        records
+    }
+
+    async fn seed_downloaded_metadata_asset(
+        db: &SqliteStateDb,
+        config: &DownloadConfig,
+        pass: &AlbumPass,
+        asset: &PhotoAsset,
+    ) -> PathBuf {
+        let pass_config = config.with_pass(pass);
+        let expected = filter::expected_paths_for(asset, &pass_config)
+            .into_iter()
+            .next()
+            .expect("asset should have an expected path");
+        tokio::fs::create_dir_all(expected.path.parent().expect("path has parent"))
+            .await
+            .expect("create expected parent");
+        tokio::fs::write(
+            &expected.path,
+            vec![0u8; usize::try_from(expected.size).expect("test asset size fits usize")],
+        )
+        .await
+        .expect("seed existing media");
+        let filename = expected
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("path has UTF-8 filename");
+        let record = TestAssetRecord::new(asset.state_id())
+            .library(asset.source_zone().unwrap_or(&pass_config.library))
+            .checksum(&expected.checksum)
+            .filename(filename)
+            .created_at(asset.created())
+            .size(expected.size)
+            .version_size(expected.version_size)
+            .metadata(asset.metadata().clone())
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            asset.source_zone().unwrap_or(&pass_config.library),
+            asset.state_id(),
+            expected.version_size.as_str(),
+            &expected.path,
+            "seeded-local-sha256",
+            None,
+        )
+        .await
+        .expect("mark seeded media downloaded");
+        expected.path
+    }
+
+    async fn relation_removed_metadata_edit_fixture(
+        db: &Arc<SqliteStateDb>,
+        dir: &TempDir,
+    ) -> (Vec<AlbumPass>, DownloadConfig, PathBuf) {
+        seed_complete_album_snapshot(
+            db,
+            "container-vacation",
+            "Vacation",
+            &[("asset-ROUTED_METADATA", "ROUTED_METADATA")],
+        )
+        .await;
+        let stored_records = incremental_photo_records_with_favorite("ROUTED_METADATA", false);
+        let stored_asset = PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
+        let changed_records = incremental_photo_records_with_favorite("ROUTED_METADATA", true);
+        let mut delta_records = vec![relation_delete_record(
+            "container-vacation",
+            "asset-ROUTED_METADATA",
+        )];
+        delta_records.extend(changed_records);
+        let pass = AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container(
+                "Vacation",
+                Some("container-vacation"),
+                changes_zone_session(Arc::new(AtomicUsize::new(0)), delta_records),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.folder_structure_albums = Arc::from("{album}");
+        config.state_db = Some(Arc::clone(db) as Arc<dyn DownloadStore>);
+        let media_path = seed_downloaded_metadata_asset(db, &config, &pass, &stored_asset).await;
+
+        (vec![pass], config, media_path)
     }
 
     fn incremental_photo_records_with_url(
@@ -9788,6 +10323,26 @@ mod tests {
     // ── extract_skip_candidates tests ──────────────────────────────
 
     // ── hash_download_config additional sensitivity tests ──────────
+
+    #[test]
+    fn provider_metadata_refresh_is_a_noop_for_unchanged_hash() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset1".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_metadata_hashes
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset1".into())
+            .or_default()
+            .insert("original".into(), "metadata-a".into());
+
+        assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-a")));
+        assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-b")));
+    }
 
     #[test]
     fn test_hash_download_config_changes_on_file_match_policy() {
@@ -12439,6 +12994,525 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "changes/zone is zone-scoped; querying once per pass repeats the same delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both_path_policies()
+    {
+        for policy in [
+            FileMatchPolicy::NameSizeDedupWithSuffix,
+            FileMatchPolicy::NameId7,
+        ] {
+            let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+            let dir = TempDir::new().expect("temp dir");
+            let stored_records = incremental_photo_records_with_favorite("METADATA_EDIT", false);
+            let stored_asset =
+                PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
+            let changed_records = incremental_photo_records_with_favorite("METADATA_EDIT", true);
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album(
+                    "",
+                    changes_zone_session(Arc::new(AtomicUsize::new(0)), changed_records),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path());
+            config.file_match_policy = policy;
+            config.recent = Some(10);
+            config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+            let media_path =
+                seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
+
+            let result = download_photos_incremental(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                &Arc::new(config),
+                "zone-token-prev",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("metadata-only incremental sync should complete");
+
+            assert!(matches!(result.outcome, DownloadOutcome::Success));
+            assert_eq!(result.stats.downloaded, 0, "policy: {policy:?}");
+            assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+            let refreshed = db
+                .get_downloaded_page(0, 1)
+                .await
+                .expect("read refreshed row")
+                .remove(0);
+            assert!(refreshed.metadata.is_favorite, "policy: {policy:?}");
+            assert!(media_path.exists(), "policy: {policy:?}");
+            assert_eq!(
+                std::fs::read_dir(media_path.parent().expect("media parent"))
+                    .expect("read media parent")
+                    .count(),
+                1,
+                "metadata-only edit must not create a suffixed duplicate under {policy:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn collecting_unrouted_metadata_edit_refreshes_catalogue_and_queues_rewrite() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let (passes, mut config, media_path) =
+            relation_removed_metadata_edit_fixture(&db, &dir).await;
+        config.metadata.xmp_sidecar = true;
+        db.fail_metadata_marker_clear_for_test();
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unrouted metadata edit should remain durable");
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let refreshed = db
+            .get_downloaded_page(0, 1)
+            .await
+            .expect("read refreshed row")
+            .remove(0);
+        assert!(refreshed.metadata.is_favorite);
+        assert!(media_path.exists());
+        let sidecar_name = format!(
+            "{}.xmp",
+            media_path
+                .file_name()
+                .expect("media path has filename")
+                .to_string_lossy()
+        );
+        assert!(media_path.with_file_name(sidecar_name).exists());
+        assert_eq!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .expect("read rewrite queue")
+                .len(),
+            1,
+            "the configured rewrite marker must remain visible when clearing it fails"
+        );
+        assert!(
+            db.get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-ROUTED_METADATA",
+                &["container-vacation"],
+            )
+            .await
+            .expect("read album memberships")
+            .is_empty(),
+            "the relation removal must leave the changed asset unrouted"
+        );
+    }
+
+    #[tokio::test]
+    async fn collecting_unrouted_metadata_write_failure_preserves_incremental_checkpoint() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let (passes, mut config, _) = relation_removed_metadata_edit_fixture(&db, &dir).await;
+        config.metadata.set_exif_rating = true;
+        db.fail_provider_metadata_refresh_for_test();
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("failed unrouted metadata edit should return a safe partial result");
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON)
+        );
+        let unchanged = db
+            .get_downloaded_page(0, 1)
+            .await
+            .expect("read unchanged row")
+            .remove(0);
+        assert!(!unchanged.metadata.is_favorite);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .expect("read rewrite queue")
+                .is_empty(),
+            "the catalogue and rewrite marker must fail atomically"
+        );
+    }
+
+    #[tokio::test]
+    async fn collecting_unchanged_metadata_is_a_production_path_noop() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let records = incremental_photo_records_with_favorite("METADATA_UNCHANGED", false);
+        let stored_asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                changes_zone_session(Arc::new(AtomicUsize::new(0)), records),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.recent = Some(10);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        let media_path =
+            seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
+        db.fail_provider_metadata_refresh_for_test();
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unchanged metadata should not call the failing refresh operation");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(media_path.exists());
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .expect("read rewrite queue")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_only_delta_hydrates_refreshes_metadata_and_advances_token() {
+        for use_master_ref in [true, false] {
+            let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+            let dir = TempDir::new().expect("temp dir");
+            let stored_records = incremental_photo_records_with_favorite("ASSET_ONLY", false);
+            let stored_asset =
+                PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
+            let changed_records = incremental_photo_records_with_favorite("ASSET_ONLY", true);
+            let mut delta_record = changed_records[1].clone();
+            if !use_master_ref {
+                delta_record["fields"]
+                    .as_object_mut()
+                    .expect("asset fields")
+                    .remove("masterRef");
+                db.upsert_asset_master_mapping("PrimarySync", "asset-ASSET_ONLY", "ASSET_ONLY")
+                    .await
+                    .expect("seed durable mapping");
+            }
+            let session = changes_zone_session_with_query_page(
+                Arc::new(AtomicUsize::new(0)),
+                vec![delta_record],
+                json!({"records": changed_records}),
+                0,
+            );
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album("", session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path());
+            config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+            let media_path =
+                seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
+
+            let result = download_photos_incremental(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                &Arc::new(config),
+                "zone-token-prev",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("asset-only delta should hydrate");
+
+            assert!(matches!(result.outcome, DownloadOutcome::Success));
+            assert_eq!(result.stats.downloaded, 0, "masterRef: {use_master_ref}");
+            assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+            assert!(!result.stats.sync_token_blocked);
+            let refreshed = db
+                .get_downloaded_page(0, 1)
+                .await
+                .expect("read refreshed row")
+                .remove(0);
+            assert!(refreshed.metadata.is_favorite);
+            assert!(media_path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_asset_only_delta_preserves_incremental_token() {
+        let records = incremental_photo_records_with_favorite("ASSET_UNKNOWN", true);
+        let session = changes_zone_session_with_query_page(
+            Arc::new(AtomicUsize::new(0)),
+            vec![records[1].clone()],
+            json!({"records": []}),
+            0,
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().expect("state db")));
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("inconclusive hydration should remain a safe partial sync");
+
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_only_delta_master_deletion_tombstones_entire_family() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        for record_name in [
+            "ASSET_ONLY_DELETED",
+            "asset-ASSET_ONLY_DELETED",
+            "asset-ASSET_ONLY_DELETED-SIBLING",
+        ] {
+            db.upsert_seen(&TestAssetRecord::new(record_name).build())
+                .await
+                .expect("seed family state row");
+        }
+        for asset_record_name in [
+            "asset-ASSET_ONLY_DELETED",
+            "asset-ASSET_ONLY_DELETED-SIBLING",
+        ] {
+            db.upsert_asset_master_mapping("PrimarySync", asset_record_name, "ASSET_ONLY_DELETED")
+                .await
+                .expect("seed family mapping");
+        }
+
+        let records = incremental_photo_records("ASSET_ONLY_DELETED");
+        let session = changes_zone_session_with_query_page(
+            Arc::new(AtomicUsize::new(0)),
+            vec![records[1].clone()],
+            json!({
+                "records": [{
+                    "recordName": "ASSET_ONLY_DELETED",
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                }]
+            }),
+            0,
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("master deletion should resolve the complete family");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(!result.stats.sync_token_blocked);
+        let summary = db.get_summary().await.expect("read state summary");
+        assert_eq!(summary.source_deleted, 3);
+        assert_eq!(summary.pending, 0);
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn collecting_zero_download_cycle_drains_metadata_rewrite_batch() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let media_path = dir.path().join("rewrite-only.jpg");
+        tokio::fs::write(&media_path, b"existing media")
+            .await
+            .expect("seed media");
+        let record = TestAssetRecord::new("REWRITE_ONLY")
+            .filename("rewrite-only.jpg")
+            .checksum("provider-checksum")
+            .size(14)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE_ONLY",
+            "original",
+            &media_path,
+            "local-checksum",
+            None,
+        )
+        .await
+        .expect("mark downloaded");
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_ONLY", "original")
+            .await
+            .expect("queue rewrite");
+
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.recent = Some(10);
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("rewrite-only collecting cycle should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(media_path.with_file_name("rewrite-only.jpg.xmp").exists());
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .expect("read rewrite queue")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoint() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let media_path = dir.path().join("rewrite-retry.jpg");
+        tokio::fs::write(&media_path, b"existing media")
+            .await
+            .expect("seed media");
+        let mut metadata = crate::state::AssetMetadata {
+            title: Some("fresh catalogue title".to_string()),
+            ..crate::state::AssetMetadata::default()
+        };
+        metadata.refresh_hash();
+        let record = TestAssetRecord::new("REWRITE_RETRY")
+            .filename("rewrite-retry.jpg")
+            .checksum("provider-checksum")
+            .size(14)
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE_RETRY",
+            "original",
+            &media_path,
+            "local-checksum",
+            None,
+        )
+        .await
+        .expect("mark downloaded");
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_RETRY", "original")
+            .await
+            .expect("queue rewrite");
+        db.fail_metadata_marker_clear_for_test();
+
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.recent = Some(10);
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("rewrite failure should remain a durable partial result");
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.stats.exif_failures, 1);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(media_path.with_file_name("rewrite-retry.jpg.xmp").exists());
+        let pending = db
+            .get_pending_metadata_rewrites(10)
+            .await
+            .expect("read rewrite queue");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].metadata.title.as_deref(),
+            Some("fresh catalogue title"),
+            "the retained marker must reference the durable fresh catalogue state"
         );
     }
 
