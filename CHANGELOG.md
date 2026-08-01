@@ -9,13 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-01
+
 ### Added
 
-- `kei sync --refresh-metadata` is a one-shot recovery tool that fully re-enumerates the selected libraries, refreshes catalogue metadata for every downloaded version encountered, and rewrites embedded and sidecar metadata per the configured outputs without re-downloading media. It requires a complete library sweep, does not run under `kei service run`, and is a manual recovery step; the permanent automatic fix is tracked in [#687]. ([#673])
+- `kei sync --refresh-metadata` is a one-shot recovery tool that fully re-enumerates the selected libraries, refreshes catalogue metadata for every downloaded version encountered, and rewrites embedded and sidecar metadata per the configured outputs without re-downloading media. It requires a complete library sweep, does not run under `kei service run`, and is a manual recovery step; the permanent automatic fix is tracked in [#687]. ([#686], refs [#673], thanks [@te&#104;-hippo])
+
+### Changed
+
+- CLI help now links to the documentation and command-specific wiki pages, and generic runtime failures point to `kei doctor --json` and the issue tracker. ([#683])
 
 ### Fixed
 
-- Zone discovery now selects photo libraries by matching `PrimarySync` and `SharedSync-{UUID}` instead of skipping only `CMM-{UUID}`. Accounts holding a shared album surface `SharedCollection-{UUID}` zones, which carry no `CPLAlbumByPositionLive` index, so listing their albums returned `BAD_REQUEST` / "Index has invalid data" and aborted the sync for every library. Such an account could not back up at all unless albums were disabled.
+- Incremental sync now captures asset-only iCloud metadata edits, persists them before checkpoint advancement, and applies configured embedded and sidecar rewrites without downloading duplicate media. ([#706])
+- iCloud location decoding now reads longitude from Apple's `lon` field, restoring GPS capture in the catalogue and XMP sidecars. ([#671], thanks [@te&#104;-hippo])
+- Zone discovery now selects photo libraries by matching `PrimarySync` and `SharedSync-{UUID}` instead of skipping only `CMM-{UUID}`. Accounts holding a shared album surface `SharedCollection-{UUID}` zones, which carry no `CPLAlbumByPositionLive` index, so listing their albums returned `BAD_REQUEST` / "Index has invalid data" and aborted the sync for every library. Such an account could not back up at all unless albums were disabled. ([#705], thanks [@te&#104;-hippo])
 - Already-downloaded assets are now tagged for metadata rewrite on the state-confirmed on-disk skip path, so corrected metadata reaches both the catalogue and the sidecar when an asset is revisited during a full enumeration. Previously that skip path refreshed the catalogue row but never re-applied the sidecar. ([#673])
 - Bounded and fallback full syncs now run targeted pending-asset revalidation after source enumeration, so provider-confirmed deletions clear stale pending rows without requiring an incremental checkpoint. ([#663])
 - Legacy pending rows with a live iCloud master now recover their missing asset identity and retry, so bounded syncs can finish old downloads without a wide photo enumeration. ([#663])
@@ -23,7 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live pending assets excluded by the current filters now remain cataloged as policy-excluded without retrying or making backup status unsafe, and return to pending when a later sync selects them. ([#663])
 
 [#673]: https://github.com/rhoopr/kei/issues/673
+[#671]: https://github.com/rhoopr/kei/pull/671
+[#683]: https://github.com/rhoopr/kei/pull/683
+[#686]: https://github.com/rhoopr/kei/pull/686
 [#687]: https://github.com/rhoopr/kei/issues/687
+[#705]: https://github.com/rhoopr/kei/pull/705
+[#706]: https://github.com/rhoopr/kei/pull/706
+[@te&#104;-hippo]: https://github.com/teh-hippo
 
 ## [0.22.12] - 2026-07-13
 
