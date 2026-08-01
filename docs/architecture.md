@@ -185,9 +185,9 @@ Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
 Metadata failure markers must survive so a later run can retry metadata
 without downloading the media again. Collecting incremental sync commits
-changed catalogue metadata and its configured rewrite marker before deciding
-whether unchanged media needs downloading. A failed commit preserves the
-provider checkpoint.
+changed catalogue metadata and its configured rewrite marker before album
+routing or deciding whether unchanged media needs downloading. A failed commit
+preserves the provider checkpoint.
 
 ### State and serialization
 

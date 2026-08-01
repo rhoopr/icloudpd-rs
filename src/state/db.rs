@@ -4195,6 +4195,18 @@ impl MetadataRewriteStore for SqliteStateDb {
 
 #[cfg(test)]
 impl SqliteStateDb {
+    pub(crate) fn fail_provider_metadata_refresh_for_test(&self) {
+        let conn = self
+            .acquire_lock("test_fail_provider_metadata_refresh")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_provider_metadata_refresh \
+             BEFORE UPDATE OF metadata_hash ON assets \
+             BEGIN SELECT RAISE(FAIL, 'simulated provider metadata refresh failure'); END;",
+        )
+        .unwrap();
+    }
+
     #[cfg(feature = "xmp")]
     pub(crate) fn fail_metadata_marker_clear_for_test(&self) {
         let conn = self
