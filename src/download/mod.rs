@@ -6294,11 +6294,29 @@ async fn hydrate_unpaired_created_asset_deltas(
                     .await;
                 event.asset = Some(asset);
             }
-            RecordResolution::Deleted { deleted_at, .. } => {
+            RecordResolution::Deleted {
+                deleted_at,
+                master_family,
+            } => {
                 if let Some(db) = &config.state_db {
                     let update = SourceStateUpdate::SoftDeleted { deleted_at };
-                    let (result, state_key) =
-                        apply_source_state_update(db.as_ref(), config, event, update).await;
+                    let (result, state_key) = if master_family {
+                        let state_key = SourceStateTransitionKey {
+                            record_name: Cow::Borrowed(master_record_name),
+                            record_type: Some("CPLMaster"),
+                            unresolved_identity: false,
+                        };
+                        let result = db
+                            .resolve_master_family_source_deleted_affected(
+                                &config.library,
+                                master_record_name,
+                                deleted_at,
+                            )
+                            .await;
+                        (result, state_key)
+                    } else {
+                        apply_source_state_update(db.as_ref(), config, event, update).await
+                    };
                     record_incremental_state_transition_result(
                         result,
                         update.transition(),
@@ -13288,6 +13306,67 @@ mod tests {
             result.stats.sync_token_blocked_reason,
             Some(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON)
         );
+    }
+
+    #[tokio::test]
+    async fn asset_only_delta_master_deletion_tombstones_entire_family() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        for record_name in [
+            "ASSET_ONLY_DELETED",
+            "asset-ASSET_ONLY_DELETED",
+            "asset-ASSET_ONLY_DELETED-SIBLING",
+        ] {
+            db.upsert_seen(&TestAssetRecord::new(record_name).build())
+                .await
+                .expect("seed family state row");
+        }
+        for asset_record_name in [
+            "asset-ASSET_ONLY_DELETED",
+            "asset-ASSET_ONLY_DELETED-SIBLING",
+        ] {
+            db.upsert_asset_master_mapping("PrimarySync", asset_record_name, "ASSET_ONLY_DELETED")
+                .await
+                .expect("seed family mapping");
+        }
+
+        let records = incremental_photo_records("ASSET_ONLY_DELETED");
+        let session = changes_zone_session_with_query_page(
+            Arc::new(AtomicUsize::new(0)),
+            vec![records[1].clone()],
+            json!({
+                "records": [{
+                    "recordName": "ASSET_ONLY_DELETED",
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                }]
+            }),
+            0,
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("master deletion should resolve the complete family");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(!result.stats.sync_token_blocked);
+        let summary = db.get_summary().await.expect("read state summary");
+        assert_eq!(summary.source_deleted, 3);
+        assert_eq!(summary.pending, 0);
     }
 
     #[cfg(feature = "xmp")]
