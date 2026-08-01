@@ -111,6 +111,7 @@ pub(super) struct MetadataWriteRequest<'a> {
 pub(super) async fn write_download_metadata(
     request: MetadataWriteRequest<'_>,
 ) -> MetadataWriteOutcome {
+    // CONTRACT: METADATA_WRITES_REQUIRE_OPT_IN
     let mut outcome = MetadataWriteOutcome::default();
 
     if request.flags.any_embed()
@@ -618,6 +619,34 @@ mod tests {
         flags.remove(MetadataFlags::XMP_SIDECAR);
         flags.insert(MetadataFlags::EMBED_XMP);
         assert!(flags.any_embed());
+    }
+
+    #[tokio::test]
+    async fn contract_metadata_writes_require_opt_in_leaves_files_untouched() {
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let photo_path = dir.path().join("photo.jpg");
+        std::fs::write(&photo_path, b"original-media").expect("seed media");
+
+        write_download_metadata(MetadataWriteRequest {
+            final_path: &photo_path,
+            embed_path: Some(&photo_path),
+            sidecar_path: Some(&photo_path),
+            payload: Arc::new(MetadataPayload::default()),
+            created_local: Local::now(),
+            flags: MetadataFlags::default(),
+            temp_suffix: ".metadata-test",
+        })
+        .await;
+
+        assert_eq!(
+            std::fs::read(&photo_path).expect("read media"),
+            b"original-media",
+            "disabled metadata options must not change media bytes"
+        );
+        let files = std::fs::read_dir(dir.path())
+            .expect("read metadata temp dir")
+            .count();
+        assert_eq!(files, 1, "disabled metadata options created another file");
     }
 
     /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). XMP Toolkit can write

@@ -369,6 +369,45 @@ fn full_test_reports_include_newer_phase_metadata() {
     }
 }
 
+#[test]
+fn focused_scenario_catalog_lists_every_runner_slice() {
+    let readme = repo_file("tests/README.md");
+    let section = readme
+        .split_once("## Focused scenario slices")
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.split_once("\n## ").map(|(section, _)| section))
+        .expect("tests README must contain a bounded focused scenario section");
+    let documented: BTreeSet<String> = section
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("| `")
+                .and_then(|tail| tail.split_once("` |"))
+                .map(|(name, _)| name.to_owned())
+        })
+        .collect();
+
+    let scenario_dir = repo_path("scripts/test-scenarios");
+    let scripts: BTreeSet<String> = std::fs::read_dir(&scenario_dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", scenario_dir.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|e| panic!("read entry in {}: {e}", scenario_dir.display()))
+        })
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("sh") {
+                return None;
+            }
+            let name = path.file_stem()?.to_str()?;
+            (!matches!(name, "lib" | "list")).then(|| name.to_owned())
+        })
+        .collect();
+
+    assert_eq!(
+        documented, scripts,
+        "tests README focused scenario catalog must match runnable scenario scripts"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn scenario_runner_rejects_filters_that_match_no_tests() {
@@ -947,9 +986,51 @@ fn contributor_docs_match_current_gate() {
         pr_template.contains("`just gate` passes"),
         "PR template should ask reviewers for the current local gate"
     );
+    for expected in [
+        "## Contract and risk",
+        "## Regression proof",
+        "independent/adversarial review results",
+    ] {
+        assert!(
+            pr_template.contains(expected),
+            "PR template must capture verification evidence: {expected}"
+        );
+    }
     assert!(
         !pr_template.contains("cargo test --bin kei --test cli --test behavioral"),
         "PR template must not keep stale partial test command"
+    );
+}
+
+#[test]
+fn repo_pr_ready_skill_uses_current_validation_workflow() {
+    let gitignore = repo_file(".gitignore");
+    assert!(
+        !gitignore.lines().any(|line| line.trim() == ".agents/"),
+        "repository skills must remain available for version control"
+    );
+
+    let skill = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
+    for expected in [
+        "name: kei-pr-ready",
+        "without publishing or changing it",
+        "just agent-status",
+        "docs/architecture.md",
+        "tests/README.md",
+        "just test scenario NAME",
+        "just gate",
+        "final verdict: ready or not ready",
+    ] {
+        assert!(
+            skill.contains(expected),
+            "kei-pr-ready skill missing validation contract: {expected}"
+        );
+    }
+
+    let metadata = repo_file(".agents/skills/kei-pr-ready/agents/openai.yaml");
+    assert!(
+        metadata.contains("Use $kei-pr-ready"),
+        "skill metadata must keep its default invocation aligned with SKILL.md"
     );
 }
 

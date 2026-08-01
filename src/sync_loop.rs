@@ -5723,7 +5723,6 @@ mod tests {
         assert!(groupings.people.is_empty());
     }
 
-    // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
     // `should_store_sync_token` is the single decision gate protecting the
     // sync-token from being advanced after a partial sync or a dry run. Both
     // situations would lose change events on the next incremental cycle
@@ -5982,7 +5981,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_published_file_state_write_failure_blocks_token() {
-        // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
         // A published file with a failed state write is unsafe to skip on the
         // next incremental cycle, even though the media bytes are on disk.
         use base64::Engine as _;

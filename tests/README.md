@@ -46,6 +46,24 @@ tests/
 
 Counts are approximate and drift as tests are added.
 
+## Focused scenario slices
+
+Named scenario slices group existing Rust tests by risk so a change can run
+the smallest relevant proof before the broader gate. All slices are offline
+and require no credentials. Run one with `just test scenario NAME`; run the
+full set with `just test scenarios`.
+
+| Slice | Protects | Run for changes to |
+|-------|----------|--------------------|
+| `auth-session` | Persisted-session reuse, validation caching, 2FA push state, and reauthentication routing | Authentication recovery, session validation, or watch-mode reauthentication |
+| `config-docs` | Supported configuration stays aligned with examples, migration guidance, and contributor commands | Config keys, defaults, examples, migration docs, or gate commands |
+| `fulltest-harness` | Full-test phase reachability and rejection of stale or empty scenario filters | `just` dispatch, full-test orchestration, or scenario-runner helpers |
+| `identity-deltas` | Incremental identity mapping, hard and soft deletion, selected relations, and master-family transitions | CloudKit change parsing, identity mapping, membership, or tombstone policy |
+| `path-family` | Collision suffixes and primary, Live Photo, import, and pending-file family matching | Path rendering, collision handling, import matching, or on-disk adoption |
+| `pending-recovery` | Durable pending hydration, deletion proof, ambiguous identity retention, and sibling recovery | Retry resolution, pending state, provider identity, or targeted hydration |
+| `service-health` | Health and metrics facts exposed by unattended operation | Health checks, metrics, cycle reporting, or service monitoring |
+| `url-refresh` | Refresh of expired or aged download URLs without replaying stale deltas | Incremental downloads, URL freshness, album hydration, or retry downloads |
+
 ## Running
 
 ```sh
@@ -66,7 +84,7 @@ just test service               # local service-smoke wrapper
 just test PATTERN               # passes through to cargo test PATTERN
 just static-checks              # fmt, clippy, docs, audit, lint, contracts, typos
 just gate                       # static checks + offline behavior tests
-just release-smoke              # fast offline v0.20 hotfix regression smoke
+just release-smoke              # fast offline release regression smoke
 just full-test                  # grouped full battery with logs, live skips, metrics
 ```
 
@@ -229,17 +247,17 @@ happens:
   probes against the extracted binary. `just test packaging` runs the host
   release build plus this smoke.
 - **`scripts/full-test/run_release_regression_smoke.sh`** - fast offline
-  v0.20 hotfix gate. Run `just release-smoke` before any `v0.20.x` hotfix and
-  before release branches that touch sync tokens, retry state, download
-  validation, config paths, or reporting.
+  patch-release gate for sync tokens, retry and pending adoption, pagination
+  diagnostics, media validation, pass templates, and config paths. Run it
+  before releases that touch those areas.
 - **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
   checks for PUID/PGID drop, volume chown, `MALLOC_ARENA_MAX=2`, root-default
   behavior, and invalid env rejection. `just test docker-full` runs this with
   Docker build, multiarch, and CLI/default-command smokes.
 - **`scripts/full-test/run_live_import_rehearsal.sh`** - live mini rehearsal
-  for v0.20's TOML-first import path: seed a tiny real tree, import it into a
-  fresh DB, and verify a repeat dry-run stays matched. `just test live-smoke`
-  runs this after the release-binary live CLI smokes.
+  for the TOML-first import path: seed a tiny real tree, import it into a fresh
+  DB, and verify a repeat dry-run stays matched. `just test live-smoke` runs
+  this after the release-binary live CLI smokes.
 - **`scripts/full-test/run_cross_zone_album_hydration.sh`** - opt-in live
   release-binary check for accounts with a prepared cross-zone album fixture.
   It selects the named album with `libraries = ["all"]` and fails unless the

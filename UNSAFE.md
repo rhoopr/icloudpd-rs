@@ -1,0 +1,41 @@
+# Unsafe usage audit
+
+Audit date: 2026-07-29.
+
+This file lists each `unsafe` block or expression in repo-owned production
+Rust source. Test modules, `tests/`, plain-text mentions of "unsafe", Cargo
+lint settings, and dependency lockfile entries are not counted. There are no
+`unsafe fn`, `unsafe impl`, or raw `extern` declarations in production code.
+
+## Production code
+
+| Location | Usage | Justification | Removal assessment |
+| --- | --- | --- | --- |
+| `src/lib.rs::harden_process` | `libc::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)` in `harden_process`. | Disables Linux core dumps before secrets can leak into a dump. The call takes integer arguments only, so the local memory-safety risk is limited to correct FFI signature and constants. Failure is logged and ignored. | No safe `std` equivalent. It can be moved out of repo-local `unsafe` by adding a direct `rustix` dependency with the process APIs and calling `rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable)`. Dropping the call would weaken credential hardening. |
+| `src/lib.rs::harden_process` | `libc::setrlimit(RLIMIT_CORE, &rlim)` in `harden_process`. | Sets the core-file size limit to zero on Unix. The `rlimit` value is stack-allocated, initialized before the call, and the kernel only reads it during the syscall. Failure is logged and ignored. | No safe `std` equivalent. A direct `rustix` process dependency can replace this with `setrlimit(Resource::Core, Rlimit { current: 0, maximum: 0 })`. Dropping it would weaken the same hardening path. |
+| `src/lib.rs::available_disk_space` (Unix) | `std::mem::zeroed::<libc::statvfs>()` in `available_disk_space`. | Creates an output buffer for `statvfs`. The struct is integer fields on supported Unix targets, and the following syscall overwrites it on success. | Removable. `fs4` is already a direct dependency and exposes safe `fs4::available_space(path)`, which would remove both this initialization and the raw `statvfs` call below. |
+| `src/lib.rs::available_disk_space` (Unix) | `libc::statvfs(c_path.as_ptr(), &raw mut stat)` in `available_disk_space`. | Reads filesystem free-space data through a NUL-terminated path and a valid output pointer that outlives the call. | Removable with the same `fs4::available_space(path).ok()` rewrite as `src/lib.rs::available_disk_space` (Unix). |
+| `src/lib.rs::available_disk_space` (Windows) | `GetDiskFreeSpaceExW(...)` in `available_disk_space`. | Reads filesystem free-space data through a NUL-terminated UTF-16 path and a valid output pointer. The API permits null pointers for the unused totals. | Removable with the same `fs4::available_space(path).ok()` rewrite. |
+| `src/lib.rs::pid_is_alive` | `libc::kill(pid, 0)` in `pid_is_alive`. | Uses POSIX signal `0` as a process-existence probe. It does not deliver a signal; `EPERM` is treated as alive. | No safe `std` equivalent. A direct `rustix` process dependency can replace it with `test_kill_process`, preserving the `PERM` means alive case. The existing unsafe block is small and well-contained. |
+| `src/lib.rs::main_inner` | `std::env::remove_var("ICLOUD_PASSWORD")` in `main_inner`. | Scrubs the password environment variable before the Tokio runtime creates worker threads. This is the narrow window where process environment mutation is safe under Rust's current rules. | Hard to remove while preserving the scrub. Safe `std` has no thread-safe process-env mutation API. Options are to stop scrubbing, move all work into a child process launched with a cleaned environment, or keep a tiny documented unsafe wrapper at startup. |
+| `src/download/file.rs::renameat2_no_replace_blocking` | `libc::syscall(SYS_renameat2, ..., RENAME_NOREPLACE)` in `renameat2_no_replace_blocking`. | Performs atomic no-overwrite promotion of a verified `.part` file on Linux. The paths are owned `CString`s and no Rust references are retained by the kernel. | No safe `std` equivalent for Linux no-overwrite rename. A direct `rustix` fs dependency can replace it with `renameat_with(..., RenameFlags::NOREPLACE)`. Do not rewrite to `exists` then `rename`; that would reintroduce a race. |
+| `src/download/file.rs::rename_no_replace_blocking` (Windows) | Windows `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` in `rename_no_replace_blocking`. | Promotes the `.part` file on Windows with no-overwrite semantics and write-through intent. The UTF-16 paths are NUL-terminated and live for the call. | Not cleanly removable with `std` while preserving write-through behavior. `std::fs::rename` would hide this Windows-specific durability choice. A safe wrapper crate could move the unsafe out of kei, but the platform call is still needed for the current semantics. |
+| `src/download/metadata.rs::exif_datetime_to_iso` | `String::as_bytes_mut()` in `exif_datetime_to_iso`. | Mutates three delimiter bytes in an owned `String`. The length and delimiter checks prove the byte positions exist, and the replacement bytes are ASCII, so UTF-8 stays valid. | Removable. Build a `Vec<u8>` from `s.as_bytes()`, mutate the vector with safe indexing after the same length checks, and convert with `String::from_utf8`. A formatting-based rewrite would also work. |
+| `src/personality/tty_echo.rs::EchoGuard::install` | `std::mem::zeroed::<termios>()` before `tcgetattr` in `EchoGuard::install`. | Prepares a `termios` output buffer. `tcgetattr` fills it before fields are read. | Removable by switching the module to safe termios bindings, for example a direct `rustix` dependency with the `termios` feature. That would also remove the related `tcgetattr` and `tcsetattr` unsafe calls. |
+| `src/personality/tty_echo.rs::EchoGuard::install` | `tcgetattr(STDIN_FILENO, &mut t)` in `EchoGuard::install`. | Reads terminal flags from stdin into a valid `termios` pointer. Failure returns `None`. | Removable with safe termios bindings such as `rustix::termios::tcgetattr(std::io::stdin())`. |
+| `src/personality/tty_echo.rs::EchoGuard::install` | `tcsetattr(STDIN_FILENO, TCSANOW, &t)` in `EchoGuard::install`. | Writes the modified terminal flags back to stdin. The input pointer is valid for the call. | Removable with safe termios bindings such as `rustix::termios::tcsetattr`. |
+| `src/personality/tty_echo.rs::EchoGuard::restore_now` | `std::mem::zeroed::<termios>()` before restore-time `tcgetattr`. | Prepares a `termios` output buffer during terminal restore. | Removable with the same safe termios rewrite as `src/personality/tty_echo.rs::EchoGuard::install`. |
+| `src/personality/tty_echo.rs::EchoGuard::restore_now` | `tcgetattr(STDIN_FILENO, &mut t)` in `restore_now`. | Reads the current terminal flags so only the saved local flags are restored. Failure is ignored because shutdown recovery is best-effort. | Removable with the same safe termios rewrite as `src/personality/tty_echo.rs::EchoGuard::install`. |
+| `src/personality/tty_echo.rs::EchoGuard::restore_now` | `tcsetattr(STDIN_FILENO, TCSANOW, &t)` in `restore_now`. | Restores the saved terminal flags. Failure is ignored because the next shell prompt normally resets tty state. | Removable with the same safe termios rewrite as `src/personality/tty_echo.rs::EchoGuard::install`. |
+| `src/service/env.rs::effective_uid` | `libc::geteuid()` in `effective_uid`. | Centralizes effective-UID lookup for Unix service backends. `geteuid` is stateless and has no pointer or aliasing preconditions. | Removable by adding a direct safe wrapper dependency, for example `rustix::process::geteuid` or `nix::unistd::geteuid`. This is a good cleanup target because tests duplicate this same unsafe call. |
+
+## Best production removal candidates
+
+The easiest local removals are:
+
+1. Replace `available_disk_space` with `fs4::available_space`, removing
+   both Unix expressions and the Windows FFI call.
+2. Rewrite `exif_datetime_to_iso` without `String::as_bytes_mut`, removing
+   its local `unsafe` block.
+3. Add a direct `rustix` dependency for process, fs, and termios wrappers. That
+   would remove most Unix syscall wrappers while preserving their semantics.

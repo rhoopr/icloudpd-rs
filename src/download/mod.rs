@@ -12076,7 +12076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_retry_retains_legacy_siblings_without_durable_match() {
+    async fn contract_unknown_provider_identity_remains_pending_without_durable_match() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = TestAssetRecord::new("LEGACY_AMBIGUOUS")
             .checksum("no-sibling-matches")
@@ -15939,6 +15939,63 @@ mod tests {
             };
             assert_eq!(reason, expected_reason);
             assert_eq!(passes, vec![observations[1].pass.clone()]);
+        }
+    }
+
+    #[test]
+    fn contract_source_checkpoint_requires_durable_recovery_token_evidence_exhaustive() {
+        const RESULT_KINDS: usize = 6;
+        for len in 0..=3u32 {
+            for encoded in 0..RESULT_KINDS.pow(len) {
+                let mut value = encoded;
+                let mut observations = Vec::with_capacity(len as usize);
+                for index in 0..len as usize {
+                    let result = match value % RESULT_KINDS {
+                        0 => PassTokenResult::Present("token-a".to_string()),
+                        1 => PassTokenResult::Present("token-b".to_string()),
+                        2 => PassTokenResult::Missing,
+                        3 => PassTokenResult::Blank,
+                        4 => PassTokenResult::ReceiverDropped,
+                        _ => PassTokenResult::EnumerationIncomplete,
+                    };
+                    value /= RESULT_KINDS;
+                    observations.push(PassTokenObservation {
+                        pass: PassKey {
+                            index,
+                            kind: PassKind::Album,
+                            label: format!("pass-{index}"),
+                        },
+                        result,
+                    });
+                }
+
+                let first_token = observations.first().and_then(|observation| {
+                    if let PassTokenResult::Present(token) = &observation.result {
+                        Some(token.as_str())
+                    } else {
+                        None
+                    }
+                });
+                let complete_expected = first_token.is_some()
+                    && observations.iter().all(|observation| {
+                        matches!(
+                            &observation.result,
+                            PassTokenResult::Present(token)
+                                if Some(token.as_str()) == first_token
+                        )
+                    });
+                let evidence = classify_zone_token_evidence(&observations);
+                assert_eq!(
+                    matches!(evidence, ZoneTokenEvidence::Complete { .. }),
+                    complete_expected,
+                    "unexpected complete classification: {observations:?}"
+                );
+                assert_eq!(
+                    matches!(evidence, ZoneTokenEvidence::Incomplete { .. }),
+                    observations.is_empty(),
+                    "only an empty observation set may be incomplete"
+                );
+            }
         }
     }
 
