@@ -1,19 +1,20 @@
 # kei roadmap
 
-This roadmap is directional. GitHub milestones and issues track committed
-release work.
+This roadmap is directional. Versioned GitHub milestones track committed
+release work. The `later` milestone categorizes deferred work without promising
+a release.
 
 ## Current focus
 
-Stability and reliability, with backup confidence as the user-visible proof.
+Backup correctness, with safe recovery as the user-visible proof.
 
-kei already does the hard parts of local iCloud Photos backup: resumable
-downloads, safe file landing, checksum checks, stateful retries, service mode,
-reports, and selected-library sync. The near-term job is to make normal sync,
-interrupted-run recovery, reports, retry behavior, token safety, and support
-paths feel rock solid.
+v0.24 closes the known P0, P1, and P2 correctness gaps before kei expands its
+product surface. The work centers on provider metadata, durable retry evidence,
+stable asset identity, local metadata convergence, and truthful headless
+authentication behavior.
 
-New product surface should wait unless it directly proves or debugs reliability.
+Headless automation follows in v0.25. Catalog and scale work follows in v0.26,
+then media fidelity in v0.27.
 
 ## Roadmap themes
 
@@ -65,21 +66,26 @@ Success criteria:
   event.
 - Support reports explain the local installation without exposing credentials.
 
-### Scale and sync efficiency
+### Catalog and scale
 
-Reduce wasted work on large libraries.
+Expose useful catalog data and reduce wasted work on large libraries.
 
 Candidate work:
 
+- Export provider metadata through the JSON manifest.
+- Add bounded listings and discoverable named configurations.
+- Add a narrow read-only catalog query command.
 - Stream large incremental syncs.
 - Plan full-library syncs before downloads where that avoids duplicate or stale
   work.
-- Continue improving filtered sync follow-ups.
+- Share incremental delta handling between streaming and collecting paths.
 - Keep sync-token advancement tied to complete and safe enumeration.
 
 Success criteria:
 
 - Large libraries start producing useful work quickly.
+- Operators and integrations can inspect catalog data without parsing local
+  media files or opening the state database.
 - Selected albums, smart folders, and libraries avoid unnecessary whole-library
   scans where the provider model allows it.
 - Incomplete enumeration does not advance tokens.
@@ -167,97 +173,136 @@ Still out of scope:
 - Provider expansion.
 - UI work.
 
-### v0.23 - Headless operations
+### v0.23 - Metadata correctness and recovery - shipped
 
-Goal: make service and Docker operation easier to observe.
+v0.23 focused on capturing provider metadata consistently and repairing stale
+catalog or sidecar state without downloading media again.
 
-User outcome: a headless user can test notifications, inspect health, and gather
-support data without restarting into an interactive workflow.
+Shipped work:
 
-Candidate work:
+- Incremental sync captures metadata-only provider edits before advancing the
+  provider checkpoint.
+- `kei sync --refresh-metadata` repairs catalog metadata and configured local
+  metadata outputs through a complete library sweep.
+- Full-enumeration skips tag already-downloaded files for metadata rewrite when
+  provider metadata changes.
+- iCloud location decoding uses Apple's longitude field correctly.
+- Zone discovery selects photo-library zones without treating shared-album
+  collection zones as libraries.
+- Bounded and fallback full syncs can revalidate pending provider identities.
+- CLI help and runtime errors link to command documentation and redacted
+  diagnostics.
 
-- Notification test command.
-- Better webhook and desktop notification setup.
-- Watch-mode 2FA browser page.
-- Expand `kei doctor` into a redacted support bundle covering last-run backup
-  safety, health and report excerpts, state DB summary, service or Docker
-  context, notification and metrics readiness, and optional live session
-  validation.
-- Grafana or Prometheus example docs.
+### v0.24 - Backup correctness
 
-Out of scope:
+Goal: close known correctness gaps before adding new product surface.
 
-- Provider expansion.
-- Destructive cleanup.
+User outcome: provider changes, retries, and metadata repairs converge without
+duplicate downloads, stale sidecars, forgotten work, or misleading success.
 
-Success criteria:
+Committed work:
 
-- Headless setups expose clear health and diagnostic signals.
-- Notification setup can be tested on demand.
-- A user can run one command to get a redacted diagnostic summary that explains
-  whether the last run was safe, what is wrong if not, and what to send with a
-  support request.
-
-### v0.24 - Scale and sync efficiency
-
-Goal: reduce unnecessary work on large or filtered libraries.
-
-User outcome: large-library and filtered-sync users spend less time rescanning
-media that cannot affect the next run.
-
-Candidate work:
-
-- Large incremental sync streaming.
-- Full-library planning before download where it reduces waste.
-- Filtered sync follow-ups.
-
-Out of scope:
-
-- Unsafe token advancement.
-- Optimizations that hide enumeration errors.
+- Make provider metadata refresh atomic across full and incremental sync paths.
+- Render capture timestamps from Apple's per-asset offset.
+- Resolve legacy pending and policy-excluded rows from durable provider evidence.
+- Keep asset identity stable when provider records cross query-page boundaries.
+- Make sidecar rewrites reproduce current album, people, and cleared metadata.
+- Track metadata-capture revisions and schedule bounded repair after semantic
+  changes.
+- Make non-interactive authentication fail fast with truthful exit codes.
 
 Success criteria:
 
-- Large syncs do useful work earlier.
-- Token rules stay conservative when enumeration is incomplete.
+- Provider metadata is durable before a checkpoint can advance.
+- The same provider asset keeps one local identity across enumeration paths.
+- Catalog and configured local metadata converge after provider edits.
+- Inconclusive provider responses preserve retry evidence without claiming
+  success.
 
-### v0.25 - Media fidelity
+### v0.25 - Headless automation
+
+Goal: make unattended Docker, service, and automation workflows predictable.
+
+User outcome: operators and automation can inspect state, provide input, test
+notifications, and diagnose failures without parsing friendly terminal output.
+
+Committed work:
+
+- Standardize machine-readable output and add JSON status output.
+- Export provider catalog metadata through the JSON manifest.
+- Ship versioned agent context and workflow metadata.
+- Tighten non-interactive reset, password, and configuration behavior.
+- Improve Docker packaging and support Apple's container runtime.
+- Add testable notification paths, including webhook, desktop, and MQTT options.
+- Document Prometheus and Grafana setup.
+- Add a browser-assisted watch-mode 2FA path.
+
+Success criteria:
+
+- Data-returning commands have stable structured output.
+- Headless input requirements fail clearly instead of hanging or reporting
+  success.
+- Notification and metrics setup can be tested before a real sync event.
+- Published containers and service diagnostics agree with supported commands.
+
+### v0.26 - Catalog and scale
+
+Goal: expose useful catalog data and reduce wasted work on large libraries.
+
+User outcome: integrations can inspect the local catalog, and large or filtered
+syncs start useful work without unnecessary whole-library buffering.
+
+Committed work:
+
+- Add bounded listings and discoverable named configurations.
+- Add a narrow read-only catalog query command.
+- Stream large incremental syncs through bounded processing.
+- Plan full-library syncs before downloads where that reduces waste.
+- Share delta-state handling between streaming and collecting paths.
+- Remove avoidable allocation from retry and reconcile scans.
+
+Success criteria:
+
+- Catalog consumers have bounded, supported read paths.
+- Large syncs start useful work earlier with bounded memory.
+- Enumeration and checkpoint safety remain conservative.
+
+### v0.27 - Media fidelity
 
 Goal: improve how kei preserves media variants and metadata.
 
-User outcome: edited media, metadata, duplicates, and shared media are easier to
-understand and preserve.
+User outcome: edited media, HEIC-family metadata, duplicates, and shared media
+are easier to understand and preserve.
 
-Candidate work:
+Committed work:
 
-- Edited-photo filename improvements.
-- Safe HEIC, HEIF, and AVIF metadata writes.
-- Cross-library deduplication.
-- Shared albums research.
-
-Out of scope:
-
-- Broad provider expansion.
-- Default file rewrites.
+- Let edited photos use the primary filename when configured.
+- Restore HEIC, HEIF, and AVIF embedded metadata writes only through a proven
+  safe path.
+- Avoid duplicate local copies across primary and shared libraries when the
+  underlying media identity is the same.
+- Research shared albums separately from shared libraries.
 
 Success criteria:
 
 - Media variants stay traceable.
-- Metadata write behavior remains explicit and safe.
+- Local metadata writes remain explicit and safe.
+- Cross-library deduplication never removes or overwrites existing media.
 
-### Later - Destinations and providers
+### Later - Lifecycle, integrations, and maintenance
 
-Goal: use kei's local catalog as the base for new sources and destinations.
+This milestone is categorized backlog, not a release commitment.
 
 Candidate work:
 
-- Immich.
-- Google Takeout.
-- Nextcloud or WebDAV.
-- S3 or object storage.
-- Destructive lifecycle workflows after read-only planning exists.
+- Read-only prune planning before any destructive lifecycle workflow.
+- Immich, Google Takeout, Nextcloud, WebDAV, and object storage integrations.
+- Decide the boundary between kei and native service management.
+- SQLite schema hardening and focused internal maintenance.
 
 Success criteria:
 
 - New workflows build on the backup and catalog model.
-- Users can test and inspect changes before any destructive action.
+- Users can inspect proposed changes before any destructive action.
+- Maintenance work is pulled into a versioned milestone only when it supports a
+  committed user outcome.
