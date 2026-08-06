@@ -471,6 +471,7 @@ There are 11 resource size variants on CPLMaster records. Not all variants are p
 | `resOriginal` | Original full-resolution file | All photos and videos |
 | `resOriginalAlt` | Alternative original (e.g., RAW+JPEG pair) | Photos with alternative originals |
 | `resOriginalVidCompl` | "Video Complement" - the motion video of a Live Photo | Live Photos only |
+| `resVidCompl` | The adjusted motion video of an edited Live Photo (CPLAsset) | Edited Live Photos only |
 | `resJPEGFull` | Full-size JPEG rendition (also the edited/adjusted version) | Photos |
 | `resJPEGLarge` | Large JPEG rendition | Photos |
 | `resJPEGMed` | Medium JPEG rendition | Photos |
@@ -485,7 +486,7 @@ Photos and videos use different subsets of these variants:
 | Asset type | Resource variants |
 |------------|------------------|
 | Standard photo | `resOriginal`, `resOriginalAlt`, `resJPEGFull`, `resJPEGLarge`, `resJPEGMed`, `resJPEGThumb`, `resSidecar` |
-| Live Photo | All photo variants + `resOriginalVidCompl`, `resVidMed`, `resVidSmall` |
+| Live Photo | All photo variants + `resOriginalVidCompl`, `resVidCompl` (when edited), `resVidMed`, `resVidSmall` |
 | Video | `resOriginal`, `resVidFull`, `resVidMed`, `resVidSmall` |
 
 ### Version Size Mapping
@@ -501,6 +502,7 @@ For download purposes, logical version names map to resource field prefixes:
 | Adjusted | `resJPEGFull` | Apple's pre-rendered edited version |
 | Medium | `resJPEGMed` | Medium JPEG |
 | Thumb | `resJPEGThumb` | Thumbnail JPEG |
+| LiveAdjusted | `resVidCompl` | Apple's pre-rendered edited Live Photo video |
 | LiveOriginal | `resOriginalVidCompl` | Live Photo video (original quality) |
 | LiveMedium | `resVidMed` | Live Photo video (medium quality) |
 | LiveThumb | `resVidSmall` | Live Photo video (small/thumbnail) |
@@ -680,6 +682,7 @@ resOriginalWidth, resOriginalHeight, resOriginalFileType, resOriginalFingerprint
 resOriginalAltWidth, resOriginalAltHeight, resOriginalAltFileType, resOriginalAltFingerprint, resOriginalAltRes,
 resOriginalVidComplWidth, resOriginalVidComplHeight, resOriginalVidComplFileType,
 resOriginalVidComplFingerprint, resOriginalVidComplRes,
+resVidComplWidth, resVidComplHeight, resVidComplFileType, resVidComplFingerprint, resVidComplRes,
 isDeleted, isExpunged, dateExpunged, remappedRef,
 recordName, recordType, recordChangeTag,
 masterRef, adjustmentRenderType,

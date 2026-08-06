@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Edited Live Photos now download their adjusted motion video. `LiveAdjusted` resolved `resVidFullRes`, which Apple only populates on video assets, so the adjusted video was never found and an edited Live Photo arrived as a still with no companion `.MOV`. A photo asset exposes it as `resVidComplRes` on the CPLAsset, which was also missing from `desiredKeys`. Existing libraries need one `kei reset sync-token --yes` to revisit already-synced assets. ([#713])
+
+[#713]: https://github.com/rhoopr/kei/issues/713
+
 ## [0.23.0] - 2026-08-01
 
 ### Added

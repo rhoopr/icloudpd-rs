@@ -4019,12 +4019,12 @@ mod tests {
                     "fileChecksum": "live_med_ck"
                 }},
                 "resVidMedFileType": {"value": "com.apple.quicktime-movie"},
-                "resVidFullRes": {"value": {
+                "resVidComplRes": {"value": {
                     "size": 2500_u64,
                     "downloadURL": "https://p01.icloud-content.com/live_adjusted",
                     "fileChecksum": "live_adjusted_ck"
                 }},
-                "resVidFullFileType": {"value": "com.apple.quicktime-movie"}
+                "resVidComplFileType": {"value": "com.apple.quicktime-movie"}
             }}),
             json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
         );
@@ -4044,6 +4044,50 @@ mod tests {
         );
         assert_eq!(&*paths[1].checksum, "live_adjusted_ck");
         assert_eq!(&*paths[2].checksum, "live_med_ck");
+    }
+
+    #[test]
+    fn live_edited_extra_reads_vidcompl_not_vidfull() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "PR4_LIVE_EDITED_VIDCOMPL", "fields": {
+                "filenameEnc": {"value": "IMG_LIVE_EDITED.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 4000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_orig",
+                    "fileChecksum": "live_orig_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                "resVidComplRes": {"value": {
+                    "size": 2500_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_adjusted",
+                    "fileChecksum": "live_adjusted_ck"
+                }},
+                "resVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                "resVidFullRes": {"value": {
+                    "size": 2400_u64,
+                    "downloadURL": "https://p01.icloud-content.com/vid_full",
+                    "fileChecksum": "vid_full_ck"
+                }},
+                "resVidFullFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        );
+        let mut config = test_config();
+        config.edited = true;
+
+        let paths = expected_paths_for(&asset, &config);
+        let adjusted = paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveAdjusted)
+            .expect("edited live photo must yield a LiveAdjusted task");
+        assert_eq!(&*adjusted.checksum, "live_adjusted_ck");
     }
 
     #[test]
