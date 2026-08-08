@@ -344,6 +344,9 @@ pub struct AssetRecord {
     /// Locally-computed SHA-256 hash of the downloaded file (hex-encoded).
     /// None for assets downloaded before schema v3.
     pub local_checksum: Option<String>,
+    /// SHA-256 hash captured before kei applies configured metadata writes.
+    /// Differs from `local_checksum` when kei changed the downloaded bytes.
+    pub download_checksum: Option<String>,
 
     // 8-byte primitives
     /// File size in bytes.
@@ -404,6 +407,7 @@ impl AssetRecord {
             local_path: None,
             last_error: None,
             local_checksum: None,
+            download_checksum: None,
             size_bytes,
             created_at,
             added_at,

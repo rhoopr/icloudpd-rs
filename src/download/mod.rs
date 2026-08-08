@@ -11784,6 +11784,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_retry_preserves_recorded_local_path_across_album_passes() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let recorded_path = dir.path().join("2019/11/2019-11-28/photo.jpg");
+        let wrong_album_path = dir.path().join("AlbumOne/photo.jpg");
+        tokio::fs::create_dir_all(wrong_album_path.parent().expect("album parent"))
+            .await
+            .expect("create wrong album directory");
+        tokio::fs::write(&wrong_album_path, vec![0; 1024])
+            .await
+            .expect("seed colliding first-album file");
+        let record = crate::test_helpers::TestAssetRecord::new("FAILED_WITH_PATH")
+            .filename("photo.jpg")
+            .checksum("ck_failed_with_path")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        db.mark_downloaded(
+            "PrimarySync",
+            "FAILED_WITH_PATH",
+            "original",
+            &recorded_path,
+            "local-checksum",
+            Some("download-checksum"),
+        )
+        .await
+        .expect("seed recorded local path");
+        db.mark_failed(
+            "PrimarySync",
+            "FAILED_WITH_PATH",
+            "original",
+            "missing local file",
+        )
+        .await
+        .expect("mark failed");
+        db.prepare_for_retry(Some("PrimarySync"))
+            .await
+            .expect("prepare failed row for retry");
+        db.upsert_asset_master_mapping("PrimarySync", "asset-FAILED_WITH_PATH", "FAILED_WITH_PATH")
+            .await
+            .expect("seed asset/master mapping");
+
+        let session = PendingLookupSession {
+            records: Arc::new(mock_photo_records_for_zone_with_filename(
+                "FAILED_WITH_PATH",
+                "PrimarySync",
+                "photo.jpg",
+            )),
+        };
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: album_with_session("PrimarySync", "AlbumOne", Box::new(session.clone())),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Album,
+                album: album_with_session("PrimarySync", "AlbumTwo", Box::new(session)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("build pending retry plan");
+
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, recorded_path);
+    }
+
+    #[tokio::test]
     async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
         #[derive(Clone, Debug)]
         struct LookupOnlySession {

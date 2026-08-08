@@ -1,5 +1,6 @@
 //! Durable pending-retry identity resolution and targeted provider revalidation.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -42,6 +43,7 @@ impl PendingRetryTarget {
 struct PendingRetryEvidence {
     checksum: Arc<str>,
     filename: Arc<str>,
+    local_path: Option<PathBuf>,
     size_bytes: u64,
 }
 
@@ -50,8 +52,15 @@ impl PendingRetryEvidence {
         Self {
             checksum: Arc::from(record.checksum.as_ref()),
             filename: Arc::from(record.filename.as_ref()),
+            local_path: record.local_path.clone(),
             size_bytes: record.size_bytes,
         }
+    }
+
+    fn local_path_under<'a>(&'a self, directory: &Path) -> Option<&'a Path> {
+        self.local_path
+            .as_deref()
+            .filter(|path| path.starts_with(directory))
     }
 }
 
@@ -160,6 +169,7 @@ impl PendingRetryPlanning<'_> {
                         version_size: target.version_size,
                         filename: &evidence.filename,
                         checksum: &evidence.checksum,
+                        local_path: evidence.local_path_under(&pass_config.directory),
                         size: evidence.size_bytes,
                     },
                 )
@@ -200,6 +210,20 @@ impl PendingRetryPlanning<'_> {
                 .into_iter()
                 .filter(|task| {
                     !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
+                })
+                .map(|mut task| {
+                    let target = PendingRetryTarget::from_task(&task);
+                    if let Some(local_path) = self
+                        .pending_evidence
+                        .get(&target)
+                        .and_then(|evidence| evidence.local_path_under(&pass_config.directory))
+                    {
+                        // A safe durable path is the canonical destination for
+                        // repair work. Pass configs rehydrate and filter the
+                        // asset, but must not relocate it to the first pass.
+                        task.download_path = local_path.to_path_buf();
+                    }
+                    task
                 })
                 .collect();
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
