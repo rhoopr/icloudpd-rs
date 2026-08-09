@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `kei reset session` discards the local iCloud session, including the cookie jar, persisted session, response cache, and trust tokens, so the next `kei login`
+  runs a clean password and two-factor authentication flow. The stored password and state database are kept, and a running kei instance blocks the reset through
+  the per-account session lock. Without `--yes`, it prompts on a TTY and errors under non-interactive use, matching `reset sync-token`. ([#717], fixes [#716])
 - Added `kei sync --refresh-metadata --repair-capture-timestamps`, an explicit repair for embedded timestamps written before capture-local resolution. It replaces an existing timestamp only for a state-recorded downloaded file with a usable Apple offset, writes the capture-local timestamp and offset together, and keeps ordinary metadata refreshes non-destructive. The command requires `metadata.set_exif_datetime = true` and can overwrite camera-supplied metadata. ([#726])
 - XMP sidecars carry the source photo's GPS fix time, speed, speed reference, and horizontal positioning error from the media's own EXIF alongside the CloudKit
   location. This includes DNG and other TIFF-based RAW content, and uses the standard `exif:GPSTimeStamp` and `exif:GPSHPositioningError` properties. HEIF files with
@@ -35,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [#698]: https://github.com/rhoopr/kei/issues/698
 [#703]: https://github.com/rhoopr/kei/issues/703
+[#716]: https://github.com/rhoopr/kei/issues/716
+[#717]: https://github.com/rhoopr/kei/pull/717
 [#726]: https://github.com/rhoopr/kei/issues/726
 
 ## [0.23.1] - 2026-08-16

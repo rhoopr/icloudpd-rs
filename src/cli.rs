@@ -488,6 +488,19 @@ pub enum ResetCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Discard the local iCloud session, including trust tokens.
+    ///
+    /// Removes the cookie jar, persisted session, and response cache for the
+    /// configured account, so the next `kei login` runs the full password +
+    /// 2FA flow again. The stored password (`kei password`) and the state
+    /// database are kept. Useful when Apple rejects 2FA pushes for a stale
+    /// session. Without `--yes`, prompts for confirmation on a TTY and
+    /// errors out under non-interactive use, matching `reset sync-token`.
+    Session {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Config management actions.
@@ -629,7 +642,7 @@ pub enum Command {
         action: PasswordAction,
     },
 
-    /// Reset state database or sync tokens
+    /// Reset state database, sync tokens, or the local session
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Reset")]
     Reset {
         #[command(subcommand)]
@@ -1398,6 +1411,39 @@ mod tests {
             cli.command,
             Command::Reset {
                 what: ResetCommand::SyncToken { yes: true },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reset_session() {
+        let cli = Cli::try_parse_from(["kei", "reset", "session"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Reset {
+                what: ResetCommand::Session { yes: false },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reset_session_with_yes() {
+        let cli = Cli::try_parse_from(["kei", "reset", "session", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Reset {
+                what: ResetCommand::Session { yes: true },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reset_session_with_short_y() {
+        let cli = Cli::try_parse_from(["kei", "reset", "session", "-y"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Reset {
+                what: ResetCommand::Session { yes: true },
             }
         ));
     }

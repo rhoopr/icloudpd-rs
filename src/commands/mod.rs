@@ -19,7 +19,7 @@ pub(crate) use login::run_login;
 pub(crate) use manifest::run_manifest;
 pub(crate) use password::run_password;
 pub(crate) use reconcile::run_reconcile;
-pub(crate) use reset::{run_reset_state, run_reset_sync_token};
+pub(crate) use reset::{run_reset_session, run_reset_state, run_reset_sync_token};
 pub(crate) use service::{
     AlbumPass, AlbumPlan, CollectionContext, MAX_REAUTH_ATTEMPTS, PassKind, PassScope,
     attempt_reauth, build_collection_context, collection_libraries, init_photos_service,
