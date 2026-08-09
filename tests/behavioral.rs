@@ -2254,6 +2254,105 @@ fn reset_sync_token_with_yes_clears_under_non_tty() {
     );
 }
 
+#[test]
+fn reset_session_no_session() {
+    // With no session files at all, `reset session` reports and exits 0
+    // before the confirmation/`--yes` guard fires, mirroring the no-DB
+    // early return of `reset state` / `reset sync-token`.
+    let dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "session"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No local session found"));
+}
+
+#[test]
+fn reset_session_removes_session_files_and_keeps_bystanders() {
+    // assert_cmd pipes stdin, so this also covers `--yes` under non-TTY:
+    // the guard only fires on the missing-flag path, not in scripted use.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let slug = sanitize_username(username);
+
+    let jar = dir.path().join(&slug);
+    let session = dir.path().join(format!("{slug}.session"));
+    let cache = dir.path().join(format!("{slug}.cache"));
+    let credential = dir.path().join(format!("{slug}.credential"));
+    let db = dir.path().join(format!("{slug}.db"));
+    for (path, contents) in [
+        (&jar, "jar"),
+        (&session, "session"),
+        (&cache, "cache"),
+        (&credential, "cred"),
+        (&db, "db"),
+    ] {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "session", "--yes"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Removed"),
+        "stdout should report removed files: {stdout}"
+    );
+    assert!(
+        stdout.contains("kei login"),
+        "stdout should point at `kei login`: {stdout}"
+    );
+
+    assert!(!jar.exists(), "cookie jar must be removed");
+    assert!(!session.exists(), "persisted session must be removed");
+    assert!(!cache.exists(), "response cache must be removed");
+    assert!(credential.exists(), "password store must survive the reset");
+    assert!(db.exists(), "state database must survive the reset");
+}
+
+#[test]
+fn reset_session_without_yes_on_non_tty_errors() {
+    // `kei reset session` ships the same non-interactive guard as
+    // `reset sync-token`. Under non-TTY use (CI, scripts, docker exec
+    // without -t), running without `--yes` errors out instead of silently
+    // doing nothing — or worse, discarding trust tokens by accident.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let slug = sanitize_username(username);
+
+    let jar = dir.path().join(&slug);
+    let session = dir.path().join(format!("{slug}.session"));
+    std::fs::write(&jar, "jar").unwrap();
+    std::fs::write(&session, "session").unwrap();
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "session"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--yes"),
+        "non-tty error must mention --yes; stderr: {stderr}"
+    );
+
+    assert!(jar.exists(), "cookie jar must not be removed without --yes");
+    assert!(
+        session.exists(),
+        "persisted session must not be removed without --yes"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Password source behavior
 // ═══════════════════════════════════════════════════════════════════════

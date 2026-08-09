@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `kei reset session` discards the local iCloud session — the cookie jar, the persisted session, and the response cache, including trust tokens — so the next `kei login` runs a clean password + 2FA flow. The stored password and the state database are kept, and a running kei instance blocks the reset via the per-account session lock. Without `--yes` it prompts on a TTY and errors under non-interactive use, matching `reset sync-token`. ([PR #717], fixes [issue #716])
+
+[issue #716]: https://github.com/rhoopr/kei/issues/716
+[PR #717]: https://github.com/rhoopr/kei/pull/717
+
 ## [0.23.0] - 2026-08-01
 
 ### Added
