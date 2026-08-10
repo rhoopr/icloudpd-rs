@@ -68,6 +68,11 @@ pub(crate) const DESIRED_KEYS: &[&str] = &[
     "resOriginalVidComplFileType",
     "resOriginalVidComplFingerprint",
     "resOriginalVidComplRes",
+    "resVidComplWidth",
+    "resVidComplHeight",
+    "resVidComplFileType",
+    "resVidComplFingerprint",
+    "resVidComplRes",
     "isDeleted",
     "isExpunged",
     "dateExpunged",
@@ -171,10 +176,13 @@ pub(crate) const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str)] = &[
         "resJPEGFullRes",
         "resJPEGFullFileType",
     ),
+    // `resVidFull` is the video-asset spelling of an adjusted rendition; a
+    // photo asset's adjusted live video is `resVidCompl` on the CPLAsset,
+    // mirroring `resOriginalVidCompl` on the CPLMaster.
     (
         AssetVersionSize::LiveAdjusted,
-        "resVidFullRes",
-        "resVidFullFileType",
+        "resVidComplRes",
+        "resVidComplFileType",
     ),
     (
         AssetVersionSize::LiveOriginal,
@@ -446,6 +454,32 @@ mod tests {
                 "Missing critical field: {field}"
             );
         }
+    }
+
+    #[test]
+    fn live_adjusted_maps_to_the_photo_asset_vidcompl_fields() {
+        let (_, res_field, type_field) = PHOTO_VERSION_LOOKUP
+            .iter()
+            .find(|(size, ..)| *size == AssetVersionSize::LiveAdjusted)
+            .expect("LiveAdjusted must be mapped");
+        assert_eq!(*res_field, "resVidComplRes");
+        assert_eq!(*type_field, "resVidComplFileType");
+        for field in ["resVidComplRes", "resVidComplFileType"] {
+            assert!(
+                DESIRED_KEYS.contains(&field),
+                "LiveAdjusted field not requested: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjusted_video_asset_still_maps_to_the_vidfull_fields() {
+        let (_, res_field, type_field) = VIDEO_VERSION_LOOKUP
+            .iter()
+            .find(|(size, ..)| *size == AssetVersionSize::Adjusted)
+            .expect("Adjusted must be mapped");
+        assert_eq!(*res_field, "resVidFullRes");
+        assert_eq!(*type_field, "resVidFullFileType");
     }
 
     #[test]
