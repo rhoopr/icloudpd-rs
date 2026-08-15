@@ -3075,7 +3075,8 @@ pub(crate) async fn reconcile_catalog_paths(
                 }
                 targets.retain(|target| target.asset_id.as_ref() != id);
             }
-            RecordResolution::MasterPresent
+            RecordResolution::AssetPresent { .. }
+            | RecordResolution::MasterPresent
             | RecordResolution::Unknown
             | RecordResolution::TransientFailure(_) => {}
         }
@@ -5825,17 +5826,31 @@ impl IncrementalDeltaSummary {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) {
+        let library = asset.source_zone().unwrap_or(&config.library);
+        self.persist_asset_master_mapping(asset.asset_record_name(), asset.id(), library, config)
+            .await;
+    }
+
+    async fn persist_asset_master_mapping(
+        &mut self,
+        asset_record_name: &str,
+        master_record_name: &str,
+        library: &str,
+        config: &DownloadConfig,
+    ) {
         let Some(db) = &config.state_db else {
             return;
         };
-        let library = asset.source_zone().unwrap_or(&config.library);
-        if let Err(e) = planner::upsert_asset_master_mapping(db.as_ref(), library, asset).await {
+        if let Err(e) = db
+            .upsert_asset_master_mapping(library, asset_record_name, master_record_name)
+            .await
+        {
             self.state_transition_failures += 1;
             self.token_unsafe_reason
                 .get_or_insert(ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON);
             tracing::warn!(
-                asset_id = %asset.id(),
-                asset_record_name = %asset.asset_record_name(),
+                asset_id = master_record_name,
+                asset_record_name,
                 library,
                 error = %e,
                 "Failed to record asset/master mapping from incremental delta"
@@ -6186,6 +6201,7 @@ async fn hydrate_unpaired_created_asset_deltas(
     summary: &mut IncrementalDeltaSummary,
 ) -> Option<Arc<DownloadContext>> {
     let mut pending = Vec::new();
+    let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (index, event) in events.iter().enumerate() {
         if event.reason != ChangeReason::Created
             || event.asset.is_some()
@@ -6220,21 +6236,18 @@ async fn hydrate_unpaired_created_asset_deltas(
             None
         };
 
-        let Some(master_record_name) = master_record_name else {
-            summary
-                .token_unsafe_reason
-                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
-            tracing::warn!(
-                asset_record_name = %event.record_name,
-                library = %config.library,
-                "Asset-only delta had no usable master identity"
-            );
-            continue;
-        };
-        pending.push((index, event.record_name.to_string(), master_record_name));
+        match master_record_name {
+            Some(master_record_name) => {
+                pending.push((index, event.record_name.to_string(), master_record_name));
+            }
+            None => unresolved
+                .entry(event.record_name.to_string())
+                .or_default()
+                .push(index),
+        }
     }
 
-    if pending.is_empty() {
+    if pending.is_empty() && unresolved.is_empty() {
         return None;
     }
     let Some(pass) = pass else {
@@ -6243,6 +6256,89 @@ async fn hydrate_unpaired_created_asset_deltas(
             .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
         return None;
     };
+
+    if !unresolved.is_empty() {
+        let requests: Vec<RecordLookupRequest> = unresolved
+            .keys()
+            .map(|record_name| {
+                RecordLookupRequest::asset_only(ProviderRecordId::new(record_name.as_str()))
+            })
+            .collect();
+        let identity_resolutions = pass.album.resolve_records(&requests).await;
+        for (state_id, resolution) in identity_resolutions.results {
+            let Some(indices) = unresolved.remove(state_id.as_str()) else {
+                summary
+                    .token_unsafe_reason
+                    .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                continue;
+            };
+            match resolution {
+                RecordResolution::AssetPresent { master_record_name } => {
+                    summary
+                        .persist_asset_master_mapping(
+                            state_id.as_str(),
+                            master_record_name.as_str(),
+                            &config.library,
+                            config,
+                        )
+                        .await;
+                    pending.extend(indices.into_iter().map(|index| {
+                        (
+                            index,
+                            state_id.as_str().to_string(),
+                            master_record_name.as_str().to_string(),
+                        )
+                    }));
+                }
+                RecordResolution::Deleted {
+                    master_family: false,
+                    ..
+                } => {
+                    tracing::debug!(
+                        asset_record_name = state_id.as_str(),
+                        library = %config.library,
+                        "Asset-only delta disappeared before identity recovery"
+                    );
+                }
+                RecordResolution::TransientFailure(error) => {
+                    summary
+                        .token_unsafe_reason
+                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                    tracing::warn!(
+                        asset_record_name = state_id.as_str(),
+                        library = %config.library,
+                        error = %error,
+                        "Failed to recover master identity for asset-only delta"
+                    );
+                }
+                RecordResolution::Present(_)
+                | RecordResolution::MasterPresent
+                | RecordResolution::Deleted {
+                    master_family: true,
+                    ..
+                }
+                | RecordResolution::Unknown => {
+                    summary
+                        .token_unsafe_reason
+                        .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+                    tracing::warn!(
+                        asset_record_name = state_id.as_str(),
+                        library = %config.library,
+                        "Asset-only delta had no usable master identity"
+                    );
+                }
+            }
+        }
+        if !unresolved.is_empty() {
+            summary
+                .token_unsafe_reason
+                .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
+        }
+    }
+
+    if pending.is_empty() {
+        return None;
+    }
     let download_ctx = preload_download_context(config).await;
     let requests: Vec<RecordLookupRequest> = pending
         .iter()
@@ -6327,6 +6423,7 @@ async fn hydrate_unpaired_created_asset_deltas(
                 }
             }
             RecordResolution::Present(_)
+            | RecordResolution::AssetPresent { .. }
             | RecordResolution::MasterPresent
             | RecordResolution::Unknown
             | RecordResolution::TransientFailure(_) => {
@@ -13212,8 +13309,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asset_only_delta_hydrates_refreshes_metadata_and_advances_token() {
-        for use_master_ref in [true, false] {
+    async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_token() {
+        #[derive(Debug, Clone, Copy)]
+        enum IdentitySource {
+            Delta,
+            State,
+            ProviderLookup,
+        }
+
+        for identity_source in [
+            IdentitySource::Delta,
+            IdentitySource::State,
+            IdentitySource::ProviderLookup,
+        ] {
             let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
             let dir = TempDir::new().expect("temp dir");
             let stored_records = incremental_photo_records_with_favorite("ASSET_ONLY", false);
@@ -13221,11 +13329,13 @@ mod tests {
                 PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
             let changed_records = incremental_photo_records_with_favorite("ASSET_ONLY", true);
             let mut delta_record = changed_records[1].clone();
-            if !use_master_ref {
+            if !matches!(identity_source, IdentitySource::Delta) {
                 delta_record["fields"]
                     .as_object_mut()
                     .expect("asset fields")
                     .remove("masterRef");
+            }
+            if matches!(identity_source, IdentitySource::State) {
                 db.upsert_asset_master_mapping("PrimarySync", "asset-ASSET_ONLY", "ASSET_ONLY")
                     .await
                     .expect("seed durable mapping");
@@ -13236,6 +13346,7 @@ mod tests {
                 json!({"records": changed_records}),
                 0,
             );
+            let session_probe = session.clone();
             let pass = AlbumPass {
                 kind: PassKind::Unfiled,
                 album: changes_album("", session),
@@ -13259,9 +13370,25 @@ mod tests {
             .expect("asset-only delta should hydrate");
 
             assert!(matches!(result.outcome, DownloadOutcome::Success));
-            assert_eq!(result.stats.downloaded, 0, "masterRef: {use_master_ref}");
+            assert_eq!(result.stats.downloaded, 0, "{identity_source:?}");
             assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
             assert!(!result.stats.sync_token_blocked);
+            assert_eq!(
+                session_probe.records_query_count(),
+                match identity_source {
+                    IdentitySource::ProviderLookup => 2,
+                    IdentitySource::Delta | IdentitySource::State => 1,
+                },
+                "{identity_source:?}"
+            );
+            assert_eq!(
+                db.get_master_record_name_for_asset("PrimarySync", "asset-ASSET_ONLY")
+                    .await
+                    .expect("read durable mapping")
+                    .as_deref(),
+                Some("ASSET_ONLY"),
+                "{identity_source:?}"
+            );
             let refreshed = db
                 .get_downloaded_page(0, 1)
                 .await

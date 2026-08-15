@@ -499,7 +499,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                     "Pending asset cleared: provider confirmed source deletion"
                 );
             }
-            RecordResolution::Unknown => {
+            RecordResolution::AssetPresent { .. } | RecordResolution::Unknown => {
                 // CONTRACT: UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING
                 set_verification_for_state_id(
                     db.as_ref(),
