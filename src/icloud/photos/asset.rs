@@ -631,7 +631,7 @@ pub(crate) fn classify_change_reason(record: &Record) -> ChangeReason {
 }
 
 /// Extract the `masterRef` record name from a `CPLAsset`'s fields.
-fn extract_master_ref(fields: &Value) -> Option<String> {
+pub(super) fn extract_master_ref(fields: &Value) -> Option<String> {
     fields
         .get("masterRef")
         .and_then(|r| r.get("value"))
