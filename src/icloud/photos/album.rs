@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 
-use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
+use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset, extract_master_ref};
 use super::cloudkit::ChangesZoneResponse;
 use super::queries::{DESIRED_KEYS_VALUES, build_changes_zone_request, encode_params};
 use super::session::{PhotosSession, check_changes_zone_error};
@@ -58,6 +58,13 @@ pub(crate) struct RecordLookupRequest {
     pub(crate) state_id: ProviderRecordId,
     pub(crate) master_record_name: ProviderRecordId,
     pub(crate) asset_record_name: Option<ProviderRecordId>,
+    target: RecordLookupTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordLookupTarget {
+    Master,
+    Asset,
 }
 
 impl RecordLookupRequest {
@@ -70,6 +77,7 @@ impl RecordLookupRequest {
             state_id,
             master_record_name,
             asset_record_name: Some(asset_record_name),
+            target: RecordLookupTarget::Master,
         }
     }
 
@@ -81,6 +89,16 @@ impl RecordLookupRequest {
             state_id,
             master_record_name,
             asset_record_name: None,
+            target: RecordLookupTarget::Master,
+        }
+    }
+
+    pub(crate) fn asset_only(asset_record_name: ProviderRecordId) -> Self {
+        Self {
+            state_id: asset_record_name.clone(),
+            master_record_name: asset_record_name,
+            asset_record_name: None,
+            target: RecordLookupTarget::Asset,
         }
     }
 }
@@ -118,6 +136,9 @@ fn classify_provider_lookup_error(error: &anyhow::Error) -> ProviderLookupError 
 #[derive(Debug)]
 pub(crate) enum RecordResolution {
     Present(PhotoAsset),
+    AssetPresent {
+        master_record_name: ProviderRecordId,
+    },
     MasterPresent,
     Deleted {
         deleted_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -138,6 +159,7 @@ enum ResolutionEvidence {
     ChildDeleted,
     Inconclusive,
     MasterPresent,
+    AssetPresent,
     MasterDeleted,
     Present,
 }
@@ -145,6 +167,7 @@ enum ResolutionEvidence {
 fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
     match resolution {
         RecordResolution::Present(_) => ResolutionEvidence::Present,
+        RecordResolution::AssetPresent { .. } => ResolutionEvidence::AssetPresent,
         RecordResolution::MasterPresent => ResolutionEvidence::MasterPresent,
         RecordResolution::Deleted {
             master_family: true,
@@ -984,12 +1007,13 @@ impl PhotoAlbum {
                         .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
                 });
 
-                let master_deleted = explicit_not_found(master) || tombstoned(master);
+                let primary_deleted = explicit_not_found(master) || tombstoned(master);
                 let asset_deleted = explicit_not_found(asset) || tombstoned(asset);
-                let resolution = if master_deleted || asset_deleted {
+                let resolution = if primary_deleted || asset_deleted {
                     RecordResolution::Deleted {
                         deleted_at,
-                        master_family: master_deleted,
+                        master_family: primary_deleted
+                            && request.target == RecordLookupTarget::Master,
                     }
                 } else if let Some(master) = master {
                     match (
@@ -1015,6 +1039,17 @@ impl PhotoAlbum {
                         {
                             RecordResolution::MasterPresent
                         }
+                        (Ok(asset), None)
+                            if request.target == RecordLookupTarget::Asset
+                                && asset.record_type == "CPLAsset" =>
+                        {
+                            extract_master_ref(&asset.fields).map_or(
+                                RecordResolution::Unknown,
+                                |master_record_name| RecordResolution::AssetPresent {
+                                    master_record_name: ProviderRecordId::new(master_record_name),
+                                },
+                            )
+                        }
                         _ => RecordResolution::Unknown,
                     }
                 } else {
@@ -1022,6 +1057,7 @@ impl PhotoAlbum {
                 };
                 let outcome = match &resolution {
                     RecordResolution::Present(_) => "present",
+                    RecordResolution::AssetPresent { .. } => "asset_present",
                     RecordResolution::MasterPresent => "master_present_unpaired",
                     RecordResolution::Deleted { .. } => "deleted",
                     RecordResolution::Unknown => "unknown",
@@ -2889,6 +2925,7 @@ mod tests {
         let master_only_state_id = "live-master-only";
         let requests = [
             lookup_request(asset.id(), asset.id(), asset.asset_record_name()),
+            RecordLookupRequest::asset_only(ProviderRecordId::new(asset.asset_record_name())),
             RecordLookupRequest::master_only(
                 ProviderRecordId::new(master_only_state_id),
                 ProviderRecordId::new(asset.id()),
@@ -2911,6 +2948,15 @@ mod tests {
                 .iter()
                 .find(|(id, _)| id.as_str() == asset.id()),
             Some((_, RecordResolution::Present(_)))
+        ));
+        assert!(matches!(
+            result.results.iter().find(|(id, _)|
+                id.as_str() == asset.asset_record_name()
+            ),
+            Some((
+                _,
+                RecordResolution::AssetPresent { master_record_name }
+            )) if master_record_name.as_str() == asset.id()
         ));
         assert!(matches!(
             result
@@ -3026,6 +3072,32 @@ mod tests {
         assert!(matches!(
             batch.results.as_slice(),
             [(_, RecordResolution::MasterPresent)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn asset_only_delta_targeted_lookup_recovers_master_identity() {
+        let response = json!({
+            "records": [test_asset_record_for("asset-present", "master-present")]
+        });
+        let album = make_album_with_session(100, Box::new(MockPhotosSession::new().ok(response)));
+
+        let batch = album
+            .resolve_records(&[RecordLookupRequest::asset_only(ProviderRecordId::new(
+                "asset-present",
+            ))])
+            .await;
+
+        assert!(
+            !batch.complete,
+            "identity lookup still needs the master pair"
+        );
+        assert!(matches!(
+            batch.results.as_slice(),
+            [(
+                _,
+                RecordResolution::AssetPresent { master_record_name }
+            )] if master_record_name.as_str() == "master-present"
         ));
     }
 

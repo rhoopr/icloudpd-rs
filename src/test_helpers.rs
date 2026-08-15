@@ -462,12 +462,12 @@ impl TestPhotoAsset {
         }
 
         if let Some(lp) = &self.live_adjusted {
-            fields["resVidFullRes"] = json!({"value": {
+            fields["resVidComplRes"] = json!({"value": {
                 "size": lp.size,
                 "downloadURL": lp.url,
                 "fileChecksum": lp.checksum,
             }});
-            fields["resVidFullFileType"] = json!({"value": "com.apple.quicktime-movie"});
+            fields["resVidComplFileType"] = json!({"value": "com.apple.quicktime-movie"});
         }
 
         if let Some(alt) = &self.alt_version {
