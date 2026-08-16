@@ -1,5 +1,6 @@
 //! Durable pending-retry identity resolution and targeted provider revalidation.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -42,6 +43,8 @@ impl PendingRetryTarget {
 struct PendingRetryEvidence {
     checksum: Arc<str>,
     filename: Arc<str>,
+    local_path: Option<PathBuf>,
+    downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
     size_bytes: u64,
 }
 
@@ -50,7 +53,29 @@ impl PendingRetryEvidence {
         Self {
             checksum: Arc::from(record.checksum.as_ref()),
             filename: Arc::from(record.filename.as_ref()),
+            local_path: record.local_path.clone(),
+            downloaded_at: record.downloaded_at,
             size_bytes: record.size_bytes,
+        }
+    }
+
+    fn local_path_under<'a>(&'a self, directory: &Path) -> Option<&'a Path> {
+        self.local_path
+            .as_deref()
+            .filter(|path| path.starts_with(directory))
+    }
+
+    fn local_path_evidence_under<'a>(
+        &'a self,
+        directory: &Path,
+    ) -> pipeline::PendingRetryLocalPath<'a> {
+        let Some(path) = self.local_path_under(directory) else {
+            return pipeline::PendingRetryLocalPath::Unrecorded;
+        };
+        if self.downloaded_at.is_some() {
+            pipeline::PendingRetryLocalPath::Current(path)
+        } else {
+            pipeline::PendingRetryLocalPath::Historical
         }
     }
 }
@@ -160,6 +185,7 @@ impl PendingRetryPlanning<'_> {
                         version_size: target.version_size,
                         filename: &evidence.filename,
                         checksum: &evidence.checksum,
+                        local_path: evidence.local_path_evidence_under(&pass_config.directory),
                         size: evidence.size_bytes,
                     },
                 )
@@ -195,13 +221,38 @@ impl PendingRetryPlanning<'_> {
                         .cloned(),
                 );
             }
-            let retry_tasks: Vec<DownloadTask> = plan
-                .tasks
-                .into_iter()
-                .filter(|task| {
-                    !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
-                })
-                .collect();
+            let mut retry_tasks = Vec::with_capacity(plan.tasks.len());
+            for mut task in plan.tasks.into_iter().filter(|task| {
+                !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
+            }) {
+                let target = PendingRetryTarget::from_task(&task);
+                if let Some(local_path) = self
+                    .pending_evidence
+                    .get(&target)
+                    .and_then(|evidence| evidence.local_path_under(&pass_config.directory))
+                {
+                    let Some(retry_path) = self
+                        .task_planner
+                        .resolve_recorded_retry_path(
+                            local_path,
+                            &task.download_path,
+                            task.size,
+                            &task.asset_id,
+                        )
+                        .await
+                    else {
+                        tracing::warn!(
+                            asset_id = %task.asset_id,
+                            version_size = %task.version_size.as_str(),
+                            path = %local_path.display(),
+                            "Could not choose a safe sibling for the recorded retry path; retaining pending work"
+                        );
+                        continue;
+                    };
+                    task.download_path = retry_path;
+                }
+                retry_tasks.push(task);
+            }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
                 .iter()
                 .map(PendingRetryTarget::from_task)

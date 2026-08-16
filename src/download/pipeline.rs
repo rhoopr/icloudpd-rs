@@ -366,7 +366,14 @@ pub(super) struct PendingRetryFileEvidence<'a> {
     pub(super) version_size: VersionSizeKey,
     pub(super) filename: &'a str,
     pub(super) checksum: &'a str,
+    pub(super) local_path: PendingRetryLocalPath<'a>,
     pub(super) size: u64,
+}
+
+pub(super) enum PendingRetryLocalPath<'a> {
+    Unrecorded,
+    Current(&'a Path),
+    Historical,
 }
 
 pub(super) async fn adopt_pending_on_disk_for_retry(
@@ -377,6 +384,59 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
     planned_tasks: &[DownloadTask],
     evidence: PendingRetryFileEvidence<'_>,
 ) -> PendingRetryAdoption {
+    if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
+        return PendingRetryAdoption::NotFound;
+    }
+
+    if let PendingRetryLocalPath::Current(local_path) = evidence.local_path {
+        let recorded_filename_matches = local_path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .is_some_and(|filename| pending_filename_matches_derived(evidence.filename, filename));
+        if !recorded_filename_matches {
+            return PendingRetryAdoption::NotFound;
+        }
+
+        task_planner.prepare_path_parent(local_path).await;
+        for task in planned_tasks.iter().filter(|task| {
+            task.version_size == evidence.version_size
+                && task.checksum.as_ref() == evidence.checksum
+                && task.size == evidence.size
+        }) {
+            let mut recorded_task = task.clone();
+            recorded_task.download_path = local_path.to_path_buf();
+            if let Some(adoption) =
+                adopt_pending_task_path(db, config, asset, task_planner, &recorded_task).await
+            {
+                return adoption.into();
+            }
+        }
+
+        for derived in derive_expected_paths(asset, config)
+            .into_iter()
+            .filter(|derived| {
+                derived.version_size == evidence.version_size
+                    && derived.checksum.as_ref() == evidence.checksum
+                    && derived.size == evidence.size
+                    && pending_filename_matches_derived(evidence.filename, &derived.filename)
+            })
+        {
+            if let Some(adoption) = adopt_pending_derived_path_at(
+                db,
+                effective_asset_library(asset, config),
+                asset,
+                task_planner,
+                &derived,
+                local_path,
+            )
+            .await
+            {
+                return adoption.into();
+            }
+        }
+        return PendingRetryAdoption::NotFound;
+    }
+
     for task in planned_tasks.iter().filter(|task| {
         task.version_size == evidence.version_size
             && task.checksum.as_ref() == evidence.checksum
@@ -494,8 +554,19 @@ async fn adopt_pending_derived_path(
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
 ) -> Option<PendingOnDiskAdoption> {
+    adopt_pending_derived_path_at(db, library, asset, task_planner, derived, &derived.path).await
+}
+
+async fn adopt_pending_derived_path_at(
+    db: &dyn DownloadStore,
+    library: &str,
+    asset: &PhotoAsset,
+    task_planner: &mut TaskPlanner,
+    derived: &DerivedPath,
+    path: &Path,
+) -> Option<PendingOnDiskAdoption> {
     let version_size = derived.version_size.as_str();
-    let (existing_path, existing_size) = task_planner.existing_path_with_size(&derived.path)?;
+    let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
     if existing_size != derived.size {
         return None;
     }

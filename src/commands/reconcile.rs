@@ -101,6 +101,8 @@ pub(crate) async fn classify_local_drift(
         version_size,
         local_path,
         size_bytes,
+        local_checksum,
+        download_checksum,
         ..
     } = asset;
 
@@ -127,6 +129,19 @@ pub(crate) async fn classify_local_drift(
 
     let actual_size = metadata.len();
     if size_bytes > 0 && actual_size < size_bytes {
+        let metadata_changed_download = matches!(
+            (&local_checksum, &download_checksum),
+            (Some(local), Some(download)) if local != download
+        );
+        if metadata_changed_download {
+            // The provider size describes the pre-metadata download. Prove
+            // the smaller current file still matches kei's post-write bytes
+            // before treating the size difference as local damage.
+            let actual_checksum = crate::download::file::compute_sha256(&local_path).await?;
+            if local_checksum.as_deref() == Some(actual_checksum.as_str()) {
+                return Ok((None, false));
+            }
+        }
         return Ok((
             Some(LocalDriftAsset {
                 library,
@@ -532,6 +547,76 @@ mod tests {
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].last_error.as_deref(), Some(FILE_TRUNCATED_REASON));
+    }
+
+    #[tokio::test]
+    async fn reconcile_accepts_smaller_intact_metadata_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let path = dir.path().join("metadata-rewritten.jpg");
+        std::fs::write(&path, b"post-write bytes").unwrap();
+        let local_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        let record = TestAssetRecord::new("METADATA_REWRITTEN").size(100).build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "METADATA_REWRITTEN",
+            "original",
+            &path,
+            &local_checksum,
+            Some("pre-metadata-download-checksum"),
+        )
+        .await
+        .unwrap();
+
+        let (counts, drift) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
+            .await
+            .unwrap();
+
+        assert_eq!(counts.present, 1);
+        assert_eq!(counts.damaged, 0);
+        assert!(drift.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_changed_metadata_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let path = dir.path().join("changed-after-metadata.jpg");
+        std::fs::write(&path, b"intact post-write bytes").unwrap();
+        let local_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        let record = TestAssetRecord::new("CHANGED_AFTER_METADATA")
+            .size(100)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "CHANGED_AFTER_METADATA",
+            "original",
+            &path,
+            &local_checksum,
+            Some("pre-metadata-download-checksum"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(&path, b"changed").unwrap();
+
+        let (counts, drift) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
+            .await
+            .unwrap();
+
+        assert_eq!(counts.present, 0);
+        assert_eq!(counts.damaged, 1);
+        assert!(matches!(
+            drift.as_slice(),
+            [LocalDriftUpdate {
+                kind: LocalDriftKind::Truncated {
+                    actual_size: 7,
+                    expected_size: 100,
+                },
+                ..
+            }]
+        ));
     }
 
     #[test]

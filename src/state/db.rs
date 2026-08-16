@@ -837,8 +837,13 @@ fn upsert_asset_row(
                         ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
                 ON CONFLICT(library, id, version_size) DO UPDATE SET
                     status = CASE
-                        WHEN assets.status = 'policy_excluded' THEN 'pending'
+                        WHEN assets.status = 'policy_excluded'
+                          OR assets.checksum <> excluded.checksum THEN 'pending'
                         ELSE assets.status
+                    END,
+                    downloaded_at = CASE
+                        WHEN assets.checksum <> excluded.checksum THEN NULL
+                        ELSE assets.downloaded_at
                     END,
                     checksum = excluded.checksum,
                     filename = excluded.filename,
@@ -4264,12 +4269,12 @@ const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
      source, is_favorite, rating, latitude, longitude, altitude, orientation, \
      duration_secs, timezone_offset, width, height, title, keywords, description, \
      media_subtype, burst_id, is_hidden, is_archived, modified_at, is_deleted, \
-     deleted_at, provider_data, metadata_hash, library";
+     deleted_at, provider_data, metadata_hash, library, download_checksum";
 
 /// Total number of columns in `ASSET_COLUMNS`. Validated by a unit test that
 /// asserts `row_to_asset_record` reads exactly this many indices (0..N).
 #[cfg(test)]
-const ASSET_COLUMN_COUNT: usize = 39;
+const ASSET_COLUMN_COUNT: usize = 40;
 
 struct ManifestJoinedRow {
     asset: ManifestAssetRow,
@@ -4373,6 +4378,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     let provider_data: Option<String> = row.get(36)?;
     let metadata_hash: Option<String> = row.get(37)?;
     let library: String = row.get(38)?;
+    let download_checksum: Option<String> = row.get(39)?;
 
     let metadata = AssetMetadata {
         source,
@@ -4408,6 +4414,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
         local_path: local_path_str.map(PathBuf::from),
         last_error,
         local_checksum,
+        download_checksum,
         size_bytes: u64::try_from(size_bytes).unwrap_or(0),
         created_at: ts_to_utc(created_at_ts),
         added_at: optional_ts_to_utc(added_at_ts),
@@ -7812,9 +7819,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Re-upsert with updated metadata (e.g., checksum changed in iCloud)
+        // Re-upsert with updated metadata for the same provider version.
         let updated = TestAssetRecord::new("PRESERVE")
-            .checksum("ck_v2")
+            .checksum("ck_v1")
             .filename("keep_me.jpg")
             .size(7)
             .build();
