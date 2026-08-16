@@ -11881,21 +11881,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_retry_preserves_recorded_local_path_across_album_passes() {
+    async fn truncated_reconcile_retry_uses_safe_recorded_directory_sibling() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let dir = TempDir::new().expect("temp dir");
         let recorded_path = dir.path().join("2019/11/2019-11-28/photo.jpg");
-        let wrong_album_path = dir.path().join("AlbumOne/photo.jpg");
-        tokio::fs::create_dir_all(wrong_album_path.parent().expect("album parent"))
+        tokio::fs::create_dir_all(recorded_path.parent().expect("recorded parent"))
             .await
-            .expect("create wrong album directory");
-        tokio::fs::write(&wrong_album_path, vec![0; 1024])
+            .expect("create recorded directory");
+        tokio::fs::write(&recorded_path, &body)
             .await
-            .expect("seed colliding first-album file");
+            .expect("seed intact download");
+        let original_local_checksum = file::compute_sha256(&recorded_path)
+            .await
+            .expect("hash intact download");
         let record = crate::test_helpers::TestAssetRecord::new("FAILED_WITH_PATH")
             .filename("photo.jpg")
-            .checksum("ck_failed_with_path")
-            .size(1024)
+            .checksum(&checksum)
+            .size(body.len() as u64)
             .build();
         db.upsert_seen(&record).await.expect("seed pending row");
         db.mark_downloaded(
@@ -11903,55 +11924,87 @@ mod tests {
             "FAILED_WITH_PATH",
             "original",
             &recorded_path,
-            "local-checksum",
-            Some("download-checksum"),
+            &original_local_checksum,
+            Some(&original_local_checksum),
         )
         .await
         .expect("seed recorded local path");
-        db.mark_failed(
-            "PrimarySync",
-            "FAILED_WITH_PATH",
-            "original",
-            "missing local file",
+        tokio::fs::write(&recorded_path, b"bad")
+            .await
+            .expect("truncate recorded download");
+
+        let (counts, drift) = crate::commands::reconcile::scan_local_drift(
+            db.as_ref(),
+            |_: &crate::commands::reconcile::LocalDriftAsset| {},
+            |_: &str| {},
         )
         .await
-        .expect("mark failed");
-        db.prepare_for_retry(Some("PrimarySync"))
+        .expect("scan truncated download");
+        assert_eq!(counts.damaged, 1);
+        assert_eq!(drift.len(), 1);
+        for update in &drift {
+            db.mark_failed(
+                &update.library,
+                &update.id,
+                update.version_size.as_str(),
+                update.kind.reason(),
+            )
             .await
-            .expect("prepare failed row for retry");
+            .expect("mark truncated download failed");
+        }
         db.upsert_asset_master_mapping("PrimarySync", "asset-FAILED_WITH_PATH", "FAILED_WITH_PATH")
             .await
             .expect("seed asset/master mapping");
 
+        let download_url = format!("{}/photo.jpg", server.uri());
+        let mut records = incremental_photo_records_with_url(
+            "FAILED_WITH_PATH",
+            "photo.jpg",
+            &download_url,
+            body.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
         let session = PendingLookupSession {
-            records: Arc::new(mock_photo_records_for_zone_with_filename(
-                "FAILED_WITH_PATH",
-                "PrimarySync",
-                "photo.jpg",
-            )),
+            records: Arc::new(records),
         };
-        let passes = vec![
-            AlbumPass {
-                kind: PassKind::Album,
-                album: album_with_session("PrimarySync", "AlbumOne", Box::new(session.clone())),
-                exclude_ids: Arc::new(FxHashSet::default()),
-            },
-            AlbumPass {
-                kind: PassKind::Album,
-                album: album_with_session("PrimarySync", "AlbumTwo", Box::new(session)),
-                exclude_ids: Arc::new(FxHashSet::default()),
-            },
-        ];
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session("PrimarySync", "AlbumOne", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
         let mut config = test_config();
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(db);
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
 
-        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
-            .await
-            .expect("build pending retry plan");
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("retry truncated download through the production pipeline");
 
-        assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].download_path, recorded_path);
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"bad");
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(downloaded.len(), 1);
+        let repaired_path = downloaded[0]
+            .local_path
+            .as_ref()
+            .expect("repair records its final path");
+        assert_ne!(repaired_path, &recorded_path);
+        assert_eq!(repaired_path.parent(), recorded_path.parent());
+        assert_eq!(tokio::fs::read(repaired_path).await.unwrap(), body);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
     }
 
     #[tokio::test]

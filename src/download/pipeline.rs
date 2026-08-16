@@ -379,6 +379,7 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
     evidence: PendingRetryFileEvidence<'_>,
 ) -> PendingRetryAdoption {
     if let Some(local_path) = evidence.local_path {
+        task_planner.prepare_path_parent(local_path).await;
         for task in planned_tasks.iter().filter(|task| {
             task.version_size == evidence.version_size
                 && task.checksum.as_ref() == evidence.checksum

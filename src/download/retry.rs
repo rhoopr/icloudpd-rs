@@ -205,27 +205,33 @@ impl PendingRetryPlanning<'_> {
                         .cloned(),
                 );
             }
-            let retry_tasks: Vec<DownloadTask> = plan
-                .tasks
-                .into_iter()
-                .filter(|task| {
-                    !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
-                })
-                .map(|mut task| {
-                    let target = PendingRetryTarget::from_task(&task);
-                    if let Some(local_path) = self
-                        .pending_evidence
-                        .get(&target)
-                        .and_then(|evidence| evidence.local_path_under(&pass_config.directory))
-                    {
-                        // A safe durable path is the canonical destination for
-                        // repair work. Pass configs rehydrate and filter the
-                        // asset, but must not relocate it to the first pass.
-                        task.download_path = local_path.to_path_buf();
-                    }
-                    task
-                })
-                .collect();
+            let mut retry_tasks = Vec::with_capacity(plan.tasks.len());
+            for mut task in plan.tasks.into_iter().filter(|task| {
+                !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
+            }) {
+                let target = PendingRetryTarget::from_task(&task);
+                if let Some(local_path) = self
+                    .pending_evidence
+                    .get(&target)
+                    .and_then(|evidence| evidence.local_path_under(&pass_config.directory))
+                {
+                    let Some(retry_path) = self
+                        .task_planner
+                        .resolve_recorded_retry_path(local_path, task.size, &task.asset_id)
+                        .await
+                    else {
+                        tracing::warn!(
+                            asset_id = %task.asset_id,
+                            version_size = %task.version_size.as_str(),
+                            path = %local_path.display(),
+                            "Could not choose a safe sibling for the recorded retry path; retaining pending work"
+                        );
+                        continue;
+                    };
+                    task.download_path = retry_path;
+                }
+                retry_tasks.push(task);
+            }
             let queued_targets: Vec<PendingRetryTarget> = retry_tasks
                 .iter()
                 .map(PendingRetryTarget::from_task)

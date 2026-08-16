@@ -87,6 +87,79 @@ impl TaskPlanner {
             Some((variant, size))
         }
     }
+
+    pub(super) async fn prepare_path_parent(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.dir_cache.ensure_dir_async(parent).await;
+        }
+    }
+
+    pub(super) async fn resolve_recorded_retry_path(
+        &mut self,
+        recorded_path: &Path,
+        expected_size: u64,
+        asset_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let parent = recorded_path.parent()?;
+        let filename = recorded_path.file_name()?.to_str()?;
+        self.dir_cache.ensure_dir_async(parent).await;
+
+        let existing_size = self.dir_cache.file_size(recorded_path);
+        let normalized = NormalizedPath::normalize(recorded_path);
+        if existing_size.is_none() && !self.claimed_paths.contains_key(normalized.as_ref()) {
+            self.claimed_paths
+                .insert(NormalizedPath::new(recorded_path), expected_size);
+            return Some(recorded_path.to_path_buf());
+        }
+
+        let mut tried = Vec::<Box<str>>::with_capacity(4);
+        let preferred = if existing_size == Some(expected_size) {
+            paths::insert_asset_identity_suffix(filename, asset_id)
+        } else {
+            paths::add_dedup_suffix(filename, expected_size)
+        };
+        for candidate in [
+            preferred,
+            paths::insert_asset_identity_suffix(filename, asset_id),
+        ] {
+            if let Some(path) = self.available_recorded_retry_sibling(parent, candidate, &mut tried)
+            {
+                self.claimed_paths
+                    .insert(NormalizedPath::new(&path), expected_size);
+                return Some(path);
+            }
+        }
+
+        let mut ordinal = 2u64;
+        loop {
+            let candidate =
+                paths::insert_asset_identity_ordinal_suffix(filename, asset_id, ordinal);
+            if let Some(path) = self.available_recorded_retry_sibling(parent, candidate, &mut tried)
+            {
+                self.claimed_paths
+                    .insert(NormalizedPath::new(&path), expected_size);
+                return Some(path);
+            }
+            ordinal = ordinal.checked_add(1)?;
+        }
+    }
+
+    fn available_recorded_retry_sibling(
+        &mut self,
+        parent: &Path,
+        filename: String,
+        tried: &mut Vec<Box<str>>,
+    ) -> Option<std::path::PathBuf> {
+        let path = parent.join(filename);
+        let normalized = NormalizedPath::normalize(&path).into_owned();
+        if tried.iter().any(|seen| seen.as_ref() == normalized) {
+            return None;
+        }
+        tried.push(normalized.clone().into_boxed_str());
+
+        (!self.dir_cache.exists(&path) && !self.claimed_paths.contains_key(normalized.as_str()))
+            .then_some(path)
+    }
 }
 
 /// Result of planning a single asset.
