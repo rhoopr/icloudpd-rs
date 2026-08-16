@@ -97,9 +97,17 @@ impl TaskPlanner {
     pub(super) async fn resolve_recorded_retry_path(
         &mut self,
         recorded_path: &Path,
+        planned_path: &Path,
         expected_size: u64,
         asset_id: &str,
     ) -> Option<std::path::PathBuf> {
+        // `plan_asset` reserved this path for the current task. Release that
+        // reservation before the task chooses its recorded retry destination.
+        let planned = NormalizedPath::normalize(planned_path);
+        if self.claimed_paths.get(planned.as_ref()) == Some(&expected_size) {
+            self.claimed_paths.remove(planned.as_ref());
+        }
+
         let parent = recorded_path.parent()?;
         let filename = recorded_path.file_name()?.to_str()?;
         self.dir_cache.ensure_dir_async(parent).await;

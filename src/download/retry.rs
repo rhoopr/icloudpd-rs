@@ -217,7 +217,12 @@ impl PendingRetryPlanning<'_> {
                 {
                     let Some(retry_path) = self
                         .task_planner
-                        .resolve_recorded_retry_path(local_path, task.size, &task.asset_id)
+                        .resolve_recorded_retry_path(
+                            local_path,
+                            &task.download_path,
+                            task.size,
+                            &task.asset_id,
+                        )
                         .await
                     else {
                         tracing::warn!(

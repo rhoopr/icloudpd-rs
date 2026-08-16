@@ -11880,6 +11880,151 @@ mod tests {
         );
     }
 
+    async fn seed_pending_retry_with_recorded_path(
+        db: &crate::state::SqliteStateDb,
+        asset: &PhotoAsset,
+        checksum: &str,
+        size: u64,
+        recorded_path: &Path,
+    ) {
+        let filename = recorded_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("recorded filename");
+        let record = TestAssetRecord::new(asset.state_id())
+            .filename(filename)
+            .checksum(checksum)
+            .size(size)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            asset.state_id(),
+            VersionSizeKey::Original.as_str(),
+            recorded_path,
+            "previous-local-checksum",
+            None,
+        )
+        .await
+        .expect("seed recorded path");
+        db.mark_failed(
+            "PrimarySync",
+            asset.state_id(),
+            VersionSizeKey::Original.as_str(),
+            "retry recorded path",
+        )
+        .await
+        .expect("mark retry pending");
+        db.prepare_for_retry(Some("PrimarySync"))
+            .await
+            .expect("prepare failed row for retry");
+        db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.state_id())
+            .await
+            .expect("seed asset/master mapping");
+    }
+
+    #[tokio::test]
+    async fn pending_retry_reuses_missing_recorded_path_when_it_matches_planned_path() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+
+        let mut records = incremental_photo_records_with_url(
+            "MISSING_PATH",
+            "missing.jpg",
+            "https://p01.icloud-content.com/missing.jpg",
+            8,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("ck_missing");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let recorded_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .expect("asset should derive a path")
+            .path;
+        seed_pending_retry_with_recorded_path(db.as_ref(), &asset, "ck_missing", 8, &recorded_path)
+            .await;
+
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("plan targeted retry");
+
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, recorded_path);
+    }
+
+    #[tokio::test]
+    async fn name_id7_targeted_retry_adopts_intact_recorded_path_without_planned_task() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        let mut records = incremental_photo_records_with_url(
+            "ID7_ADOPT",
+            "id7.jpg",
+            "https://p01.icloud-content.com/id7.jpg",
+            8,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("ck_id7");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let recorded_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .expect("asset should derive a path")
+            .path;
+        tokio::fs::create_dir_all(recorded_path.parent().expect("recorded path parent"))
+            .await
+            .expect("create recorded path parent");
+        tokio::fs::write(&recorded_path, b"12345678")
+            .await
+            .expect("seed intact recorded file");
+        seed_pending_retry_with_recorded_path(db.as_ref(), &asset, "ck_id7", 8, &recorded_path)
+            .await;
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("adopt targeted retry");
+
+        assert!(plan.tasks.is_empty());
+        let summary = db.get_summary().await.expect("state summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.policy_excluded, 0);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(recorded_path.as_path())
+        );
+    }
+
     #[tokio::test]
     async fn truncated_reconcile_retry_uses_safe_recorded_directory_sibling() {
         use base64::Engine as _;

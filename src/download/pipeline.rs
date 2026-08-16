@@ -393,6 +393,29 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
                 return adoption.into();
             }
         }
+
+        for derived in derive_expected_paths(asset, config)
+            .into_iter()
+            .filter(|derived| {
+                derived.version_size == evidence.version_size
+                    && derived.checksum.as_ref() == evidence.checksum
+                    && derived.size == evidence.size
+                    && pending_filename_matches_derived(evidence.filename, &derived.filename)
+            })
+        {
+            if let Some(adoption) = adopt_pending_derived_path_at(
+                db,
+                effective_asset_library(asset, config),
+                asset,
+                task_planner,
+                &derived,
+                local_path,
+            )
+            .await
+            {
+                return adoption.into();
+            }
+        }
         return PendingRetryAdoption::NotFound;
     }
 
@@ -513,8 +536,19 @@ async fn adopt_pending_derived_path(
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
 ) -> Option<PendingOnDiskAdoption> {
+    adopt_pending_derived_path_at(db, library, asset, task_planner, derived, &derived.path).await
+}
+
+async fn adopt_pending_derived_path_at(
+    db: &dyn DownloadStore,
+    library: &str,
+    asset: &PhotoAsset,
+    task_planner: &mut TaskPlanner,
+    derived: &DerivedPath,
+    path: &Path,
+) -> Option<PendingOnDiskAdoption> {
     let version_size = derived.version_size.as_str();
-    let (existing_path, existing_size) = task_planner.existing_path_with_size(&derived.path)?;
+    let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
     if existing_size != derived.size {
         return None;
     }
