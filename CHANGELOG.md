@@ -9,11 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-08-16
+
 ### Fixed
 
-- Edited Live Photos now download their adjusted motion video. `LiveAdjusted` resolved `resVidFullRes`, which Apple only populates on video assets, so the adjusted video was never found and an edited Live Photo arrived as a still with no companion `.MOV`. A photo asset exposes it as `resVidComplRes` on the CPLAsset, which was also missing from `desiredKeys`. Existing libraries need one `kei reset sync-token --yes` to revisit already-synced assets. ([#713])
+- Edited Live Photos now download their adjusted motion video. Existing libraries need one `kei reset sync-token --yes` to revisit already-synced assets. ([#714], fixes [#713], thanks [@mmenanno])
+- Incremental sync now recovers asset-only changes that arrive without a master identity. kei keeps the previous provider checkpoint when identity recovery or paired hydration is incomplete. ([#720], fixes [#719])
+- Pending retries now preserve their recorded destination across multi-album planning and use the recorded post-write checksum to distinguish an intact metadata rewrite from a truncated file. Recorded destinations outside the configured download directory are ignored. ([#718], fixes [#711])
 
+[#711]: https://github.com/rhoopr/kei/issues/711
 [#713]: https://github.com/rhoopr/kei/issues/713
+[#714]: https://github.com/rhoopr/kei/pull/714
+[#718]: https://github.com/rhoopr/kei/pull/718
+[#719]: https://github.com/rhoopr/kei/issues/719
+[#720]: https://github.com/rhoopr/kei/pull/720
+[@mmenanno]: https://github.com/mmenanno
 
 ## [0.23.0] - 2026-08-01
 
@@ -1781,7 +1791,11 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.10...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.23.1...HEAD
+[0.23.1]: https://github.com/rhoopr/kei/compare/v0.23.0...v0.23.1
+[0.23.0]: https://github.com/rhoopr/kei/compare/v0.22.12...v0.23.0
+[0.22.12]: https://github.com/rhoopr/kei/compare/v0.22.11...v0.22.12
+[0.22.11]: https://github.com/rhoopr/kei/compare/v0.22.10...v0.22.11
 [0.22.10]: https://github.com/rhoopr/kei/compare/v0.22.9...v0.22.10
 [0.22.9]: https://github.com/rhoopr/kei/compare/v0.22.8...v0.22.9
 [0.22.8]: https://github.com/rhoopr/kei/compare/v0.22.7...v0.22.8
