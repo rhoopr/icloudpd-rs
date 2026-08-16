@@ -135,6 +135,10 @@ inventory. The retry owner:
 
 Unknown identity is not permission to delete or forget work.
 
+A provider checksum change makes the previous local path historical. Retry
+adoption requires durable proof that the path holds the current provider
+version and that its filename matches the recorded task filename.
+
 ### Import-existing
 
 `src/commands/import.rs` shares configuration, selection, pass planning, and

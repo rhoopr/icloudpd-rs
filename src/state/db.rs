@@ -837,8 +837,13 @@ fn upsert_asset_row(
                         ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
                 ON CONFLICT(library, id, version_size) DO UPDATE SET
                     status = CASE
-                        WHEN assets.status = 'policy_excluded' THEN 'pending'
+                        WHEN assets.status = 'policy_excluded'
+                          OR assets.checksum <> excluded.checksum THEN 'pending'
                         ELSE assets.status
+                    END,
+                    downloaded_at = CASE
+                        WHEN assets.checksum <> excluded.checksum THEN NULL
+                        ELSE assets.downloaded_at
                     END,
                     checksum = excluded.checksum,
                     filename = excluded.filename,
@@ -7814,9 +7819,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Re-upsert with updated metadata (e.g., checksum changed in iCloud)
+        // Re-upsert with updated metadata for the same provider version.
         let updated = TestAssetRecord::new("PRESERVE")
-            .checksum("ck_v2")
+            .checksum("ck_v1")
             .filename("keep_me.jpg")
             .size(7)
             .build();

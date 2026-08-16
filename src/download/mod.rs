@@ -12153,6 +12153,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_size_provider_change_retry_does_not_adopt_stale_recorded_path() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let failed_server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/changed.jpg"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&failed_server)
+            .await;
+
+        let new_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let new_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&new_body));
+        let failed_url = format!("{}/changed.jpg", failed_server.uri());
+        let mut changed_records = incremental_photo_records_with_url(
+            "SAME_SIZE_CHANGED",
+            "changed.jpg",
+            &failed_url,
+            new_body.len() as u64,
+        );
+        changed_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(new_checksum);
+        let changed_asset = PhotoAsset::new(changed_records[0].clone(), changed_records[1].clone());
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+        config.retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let config = Arc::new(config);
+
+        let recorded_path = filter::expected_paths_for(&changed_asset, config.as_ref())
+            .into_iter()
+            .next()
+            .expect("asset should derive a path")
+            .path;
+        tokio::fs::create_dir_all(recorded_path.parent().expect("recorded parent"))
+            .await
+            .expect("create recorded directory");
+        let old_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x45];
+        tokio::fs::write(&recorded_path, &old_body)
+            .await
+            .expect("seed old provider version");
+        let old_local_checksum = file::compute_sha256(&recorded_path)
+            .await
+            .expect("hash old provider version");
+        let old_record = TestAssetRecord::new("SAME_SIZE_CHANGED")
+            .filename("changed.jpg")
+            .checksum("old-provider-checksum")
+            .size(old_body.len() as u64)
+            .build();
+        db.upsert_seen(&old_record)
+            .await
+            .expect("seed old state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            "SAME_SIZE_CHANGED",
+            VersionSizeKey::Original.as_str(),
+            &recorded_path,
+            &old_local_checksum,
+            None,
+        )
+        .await
+        .expect("record old provider version");
+
+        let first = stream_and_download_from_stream(
+            &Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(changed_asset)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("changed provider version should reach the download pipeline");
+        assert_eq!(first.downloaded, 0);
+        assert_eq!(first.failed.len(), 1);
+        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), old_body);
+        let failed = db.get_failed().await.expect("failed row");
+        assert!(failed[0].downloaded_at.is_none());
+
+        let success_server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/changed.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(new_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&success_server)
+            .await;
+        changed_records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+            json!(format!("{}/changed.jpg", success_server.uri()));
+        let retry_passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(changed_records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let retry = download_photos_with_sync(
+            &Client::new(),
+            &retry_passes,
+            config,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("targeted retry should download the changed provider version");
+
+        assert!(matches!(retry.outcome, DownloadOutcome::Success));
+        assert_eq!(retry.stats.downloaded, 1);
+        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), old_body);
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        let changed_path = downloaded[0]
+            .local_path
+            .as_ref()
+            .expect("changed provider version has a local path");
+        assert_ne!(changed_path, &recorded_path);
+        assert_eq!(tokio::fs::read(changed_path).await.unwrap(), new_body);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
     async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
         #[derive(Clone, Debug)]
         struct LookupOnlySession {

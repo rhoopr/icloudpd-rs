@@ -44,6 +44,7 @@ struct PendingRetryEvidence {
     checksum: Arc<str>,
     filename: Arc<str>,
     local_path: Option<PathBuf>,
+    downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
     size_bytes: u64,
 }
 
@@ -53,6 +54,7 @@ impl PendingRetryEvidence {
             checksum: Arc::from(record.checksum.as_ref()),
             filename: Arc::from(record.filename.as_ref()),
             local_path: record.local_path.clone(),
+            downloaded_at: record.downloaded_at,
             size_bytes: record.size_bytes,
         }
     }
@@ -61,6 +63,20 @@ impl PendingRetryEvidence {
         self.local_path
             .as_deref()
             .filter(|path| path.starts_with(directory))
+    }
+
+    fn local_path_evidence_under<'a>(
+        &'a self,
+        directory: &Path,
+    ) -> pipeline::PendingRetryLocalPath<'a> {
+        let Some(path) = self.local_path_under(directory) else {
+            return pipeline::PendingRetryLocalPath::Unrecorded;
+        };
+        if self.downloaded_at.is_some() {
+            pipeline::PendingRetryLocalPath::Current(path)
+        } else {
+            pipeline::PendingRetryLocalPath::Historical
+        }
     }
 }
 
@@ -169,7 +185,7 @@ impl PendingRetryPlanning<'_> {
                         version_size: target.version_size,
                         filename: &evidence.filename,
                         checksum: &evidence.checksum,
-                        local_path: evidence.local_path_under(&pass_config.directory),
+                        local_path: evidence.local_path_evidence_under(&pass_config.directory),
                         size: evidence.size_bytes,
                     },
                 )

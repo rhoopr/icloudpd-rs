@@ -366,8 +366,14 @@ pub(super) struct PendingRetryFileEvidence<'a> {
     pub(super) version_size: VersionSizeKey,
     pub(super) filename: &'a str,
     pub(super) checksum: &'a str,
-    pub(super) local_path: Option<&'a Path>,
+    pub(super) local_path: PendingRetryLocalPath<'a>,
     pub(super) size: u64,
+}
+
+pub(super) enum PendingRetryLocalPath<'a> {
+    Unrecorded,
+    Current(&'a Path),
+    Historical,
 }
 
 pub(super) async fn adopt_pending_on_disk_for_retry(
@@ -378,7 +384,19 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
     planned_tasks: &[DownloadTask],
     evidence: PendingRetryFileEvidence<'_>,
 ) -> PendingRetryAdoption {
-    if let Some(local_path) = evidence.local_path {
+    if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
+        return PendingRetryAdoption::NotFound;
+    }
+
+    if let PendingRetryLocalPath::Current(local_path) = evidence.local_path {
+        let recorded_filename_matches = local_path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .is_some_and(|filename| pending_filename_matches_derived(evidence.filename, filename));
+        if !recorded_filename_matches {
+            return PendingRetryAdoption::NotFound;
+        }
+
         task_planner.prepare_path_parent(local_path).await;
         for task in planned_tasks.iter().filter(|task| {
             task.version_size == evidence.version_size
