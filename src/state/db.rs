@@ -3389,7 +3389,24 @@ impl SqliteStateDb {
                     ],
                 )
                 .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
-            Ok(updated)
+            if updated > 0 {
+                return Ok(updated);
+            }
+            // A row can leave `downloaded` mid-cycle when the provider
+            // publishes new media for the same asset, which stores the
+            // incoming metadata as it resets the row for re-download. The
+            // metadata is durable, so report the match rather than a lost
+            // write. A missing or still-stale row stays a failure.
+            let durable: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM assets \
+                     WHERE library = ?1 AND id = ?2 AND is_deleted = 0 \
+                       AND metadata_hash IS NOT NULL AND metadata_hash = ?3",
+                    rusqlite::params![library, asset_id, metadata.metadata_hash.as_deref()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
+            Ok(usize::try_from(durable).unwrap_or(0))
         })
         .await
     }
@@ -8774,6 +8791,57 @@ mod tests {
 
         assert_eq!(deleted, 0);
         assert_eq!(hidden, 0);
+    }
+
+    /// #707 review: new provider media returns a downloaded row to pending and
+    /// stores the incoming metadata in the same statement. A refresh that then
+    /// matches no downloaded row has still found its metadata durable, so it
+    /// must not be reported as a lost write and hold the provider checkpoint.
+    #[tokio::test]
+    async fn refresh_reports_metadata_already_durable_on_a_row_that_left_downloaded() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut edited = AssetMetadata {
+            is_favorite: true,
+            rating: Some(5),
+            ..AssetMetadata::default()
+        };
+        edited.refresh_hash();
+
+        let seeded = TestAssetRecord::new("MOVED_ON").checksum("ck_v1").build();
+        db.upsert_seen(&seeded).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "MOVED_ON",
+            "original",
+            std::path::Path::new("/tmp/moved-on.jpg"),
+            "local_v1",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // New media for the same asset: the row returns to pending and carries
+        // the edited metadata forward.
+        let republished = TestAssetRecord::new("MOVED_ON")
+            .checksum("ck_v2")
+            .metadata(edited.clone())
+            .build();
+        db.upsert_seen(&republished).await.unwrap();
+
+        let matched = db
+            .refresh_downloaded_asset_metadata("PrimarySync", "MOVED_ON", &edited, true)
+            .await
+            .unwrap();
+        assert!(
+            matched > 0,
+            "metadata already stored by the reset must count as durable"
+        );
+
+        let stale = db
+            .refresh_downloaded_asset_metadata("PrimarySync", "ABSENT", &edited, true)
+            .await
+            .unwrap();
+        assert_eq!(stale, 0, "a missing row is still a lost write");
     }
 
     #[tokio::test]
