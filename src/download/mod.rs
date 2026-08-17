@@ -3028,6 +3028,18 @@ impl From<&DownloadTask> for RetryTaskKey {
     }
 }
 
+fn retry_state_ids_by_asset_record(tasks: &[DownloadTask]) -> FxHashMap<Arc<str>, Arc<str>> {
+    tasks
+        .iter()
+        .map(|task| {
+            (
+                Arc::clone(&task.asset_record_name),
+                Arc::clone(&task.asset_id),
+            )
+        })
+        .collect()
+}
+
 fn retry_hydrator_pass_index(
     passes: &[crate::commands::AlbumPass],
     pass_indices: &FxHashSet<usize>,
@@ -3361,15 +3373,7 @@ async fn build_retry_download_tasks(
 
     let mut pending_keys: FxHashSet<RetryTaskKey> =
         failed_tasks.iter().map(RetryTaskKey::from).collect();
-    let retry_state_ids: FxHashMap<Arc<str>, Arc<str>> = failed_tasks
-        .iter()
-        .map(|task| {
-            (
-                Arc::clone(&task.asset_record_name),
-                Arc::clone(&task.asset_id),
-            )
-        })
-        .collect();
+    let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
     let requested_count = pending_keys.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested_count);
@@ -3436,6 +3440,7 @@ async fn build_incremental_expired_url_retry_tasks(
 
     let mut pending_keys: FxHashSet<RetryTaskKey> =
         failed_tasks.iter().map(RetryTaskKey::from).collect();
+    let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
     let requested_count = pending_keys.len();
     let mut pass_indices_by_asset: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
 
@@ -3508,6 +3513,10 @@ async fn build_incremental_expired_url_retry_tasks(
                 else {
                     continue;
                 };
+                let Some(state_id) = retry_state_ids.get(asset_record_name.as_str()) else {
+                    continue;
+                };
+                let asset = asset.with_state_record_name(Arc::clone(state_id));
 
                 for pass_index in pass_indices {
                     let Some(pass_config) = pass_configs.get(pass_index) else {
@@ -8881,6 +8890,46 @@ mod tests {
                 .expect("poisoned")
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("unexpected extra changes/zone call"))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AssetOnlyExpiredUrlSession {
+        delta_records: Arc<Vec<Value>>,
+        lookup_records: Arc<Vec<Value>>,
+        hydration_records: Arc<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for AssetOnlyExpiredUrlSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                return Ok(json!({"records": self.lookup_records.as_ref().clone()}));
+            }
+            if url.contains("/changes/zone?") {
+                let request: Value = serde_json::from_str(&body)?;
+                let has_sync_token = request["zones"]
+                    .as_array()
+                    .and_then(|zones| zones.first())
+                    .and_then(|zone| zone.get("syncToken"))
+                    .is_some();
+                let records = if has_sync_token {
+                    self.delta_records.as_ref().clone()
+                } else {
+                    self.hydration_records.as_ref().clone()
+                };
+                return Ok(changes_zone_response(records, "zone-token-next"));
+            }
+            Ok(json!({"records": []}))
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -14732,6 +14781,86 @@ mod tests {
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_asset_only_expired_url_retry_preserves_child_state_identity() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired-asset-only.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/fresh-asset-only.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let stale_url = format!("{}/expired-asset-only.jpg", server.uri());
+        let fresh_url = format!("{}/fresh-asset-only.jpg", server.uri());
+        let mut stale_records =
+            incremental_photo_records_with_url("URL_ASSET_ONLY", "asset-only.jpg", &stale_url, 8);
+        stale_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(checksum.clone());
+        let mut fresh_records =
+            incremental_photo_records_with_url("URL_ASSET_ONLY", "asset-only.jpg", &fresh_url, 8);
+        fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+
+        let asset_only_delta = stale_records[1].clone();
+        let session = AssetOnlyExpiredUrlSession {
+            delta_records: Arc::new(vec![asset_only_delta]),
+            lookup_records: Arc::new(stale_records),
+            hydration_records: Arc::new(fresh_records),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.recent = Some(10);
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("asset-only retry should keep its child state identity");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].id.as_ref(), "asset-URL_ASSET_ONLY");
     }
 
     #[tokio::test]
