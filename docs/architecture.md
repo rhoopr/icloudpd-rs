@@ -188,10 +188,15 @@ recovery work needed after that checkpoint is durable.
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
 Metadata failure markers must survive so a later run can retry metadata
-without downloading the media again. Collecting incremental sync commits
-changed catalogue metadata and its configured rewrite marker before album
-routing or deciding whether unchanged media needs downloading. A failed commit
-preserves the provider checkpoint.
+without downloading the media again. Full enumeration, single-pass incremental,
+and collecting incremental sync all commit changed catalogue metadata and its
+configured rewrite marker together, before filtering, album routing, or
+deciding whether unchanged media needs downloading. A failed commit preserves
+the provider checkpoint. Queued rewrites drain once per cycle, after every
+producer has finished, so a single writer owns each file. Read-only runs never
+drain. Only that drain retires a marker on success, because it writes the file
+from the same row it then clears. A completed download writes the snapshot it
+was planned from, so it records a marker on failure but never retires one.
 
 ### State and serialization
 

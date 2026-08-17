@@ -3712,6 +3712,11 @@ mod tests {
         per_pass_paths: bool,
         recent: Option<u32>,
         file_match_policy: Option<crate::types::FileMatchPolicy>,
+        #[cfg(feature = "xmp")]
+        xmp_sidecar: bool,
+        /// Passes run through `buffer_unordered(pass_parallelism)`, which is
+        /// capped by this, so it must exceed one for passes to overlap.
+        concurrent_downloads: Option<usize>,
     }
 
     fn media_without_photo_downloads() -> config::MediaSelection {
@@ -3763,7 +3768,14 @@ mod tests {
                 config.file_match_policy = file_match_policy;
             }
             config.media = options.media;
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = options.xmp_sidecar;
+            }
             config.recent = options.recent;
+            if let Some(concurrent_downloads) = options.concurrent_downloads {
+                config.concurrent_downloads = concurrent_downloads;
+            }
             config.state_db = Some(Arc::clone(&db));
             config.sync_mode = sync_mode;
             config.exclude_asset_ids = exclude_asset_ids;
@@ -4270,6 +4282,13 @@ mod tests {
         fail_upsert_seen: bool,
         fail_mark_downloaded: bool,
         fail_refresh_downloaded_metadata: bool,
+        /// Stands in for a concurrent pass: refreshes the row to this snapshot
+        /// and marks it for rewrite in the window between the downloader
+        /// writing the file and the finaliser deciding the marker's fate.
+        refresh_on_mark_downloaded: Option<state::AssetMetadata>,
+        /// Counts drains: `run_pending` starts each one with an offset-zero
+        /// page fetch.
+        drains: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl std::fmt::Debug for FailingMetadataSetDb {
@@ -4300,7 +4319,14 @@ mod tests {
                 fail_upsert_seen: false,
                 fail_mark_downloaded: false,
                 fail_refresh_downloaded_metadata: false,
+                refresh_on_mark_downloaded: None,
+                drains: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
+        }
+
+        #[cfg(feature = "xmp")]
+        fn drain_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+            Arc::clone(&self.drains)
         }
 
         fn without_set_failure(
@@ -4336,6 +4362,12 @@ mod tests {
 
         fn with_mark_downloaded_failure(mut self) -> Self {
             self.fail_mark_downloaded = true;
+            self
+        }
+
+        #[cfg(feature = "xmp")]
+        fn with_refresh_on_mark_downloaded(mut self, metadata: state::AssetMetadata) -> Self {
+            self.refresh_on_mark_downloaded = Some(metadata);
             self
         }
 
@@ -4394,6 +4426,11 @@ mod tests {
             if self.fail_mark_downloaded {
                 return Err(state::error::StateError::LockPoisoned(self.message.into()));
             }
+            if let Some(newer) = &self.refresh_on_mark_downloaded {
+                self.inner
+                    .refresh_downloaded_asset_metadata(library, id, newer, true)
+                    .await?;
+            }
             self.inner
                 .mark_downloaded(
                     library,
@@ -4447,6 +4484,12 @@ mod tests {
         ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
         {
             self.inner.get_downloaded_ids().await
+        }
+
+        async fn get_soft_deleted_downloaded_ids(
+            &self,
+        ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError> {
+            self.inner.get_soft_deleted_downloaded_ids().await
         }
 
         async fn get_all_known_ids(
@@ -4901,20 +4944,12 @@ mod tests {
             offset: usize,
             limit: usize,
         ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            if offset == 0 {
+                self.drains
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.inner
                 .get_pending_metadata_rewrites_page(library_scope, offset, limit)
-                .await
-        }
-
-        async fn update_metadata_hash(
-            &self,
-            library: &str,
-            asset_id: &str,
-            version_size: &str,
-            metadata_hash: &str,
-        ) -> Result<(), state::error::StateError> {
-            self.inner
-                .update_metadata_hash(library, asset_id, version_size, metadata_hash)
                 .await
         }
 
@@ -5942,8 +5977,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_provider_metadata_write_failure_preserves_zone_checkpoint() {
-        use chrono::TimeZone as _;
-
         let mut config = make_run_cycle_config();
         config.filters.recent = Some(10);
         let inner = make_state_db();
@@ -5952,39 +5985,7 @@ mod tests {
             .await
             .expect("seed zone token");
         let download_dir = tempfile::tempdir().expect("download tempdir");
-        let media_dir = download_dir.path().join(run_cycle_expected_date_dir());
-        std::fs::create_dir_all(&media_dir).expect("create media directory");
-        let media_path = media_dir.join("photo.jpg");
-        std::fs::write(&media_path, vec![0u8; 1024]).expect("seed media file");
-        let mut stored_metadata = state::AssetMetadata {
-            is_favorite: false,
-            ..state::AssetMetadata::default()
-        };
-        stored_metadata.refresh_hash();
-        let record = crate::test_helpers::TestAssetRecord::new("master-PrimarySync")
-            .filename("photo.jpg")
-            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .created_at(
-                chrono::Utc
-                    .timestamp_millis_opt(RUN_CYCLE_ASSET_DATE_MS)
-                    .single()
-                    .expect("valid asset date"),
-            )
-            .size(1024)
-            .metadata(stored_metadata)
-            .build();
-        inner.upsert_seen(&record).await.expect("seed state row");
-        inner
-            .mark_downloaded(
-                "PrimarySync",
-                "master-PrimarySync",
-                "original",
-                &media_path,
-                "local-checksum",
-                None,
-            )
-            .await
-            .expect("mark downloaded");
+        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
 
         let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(
@@ -5993,16 +5994,7 @@ mod tests {
             )
             .with_refresh_downloaded_metadata_failure(),
         );
-        let mut page = full_album_page_with_download(
-            "PrimarySync",
-            "master-PrimarySync",
-            "zone-tok-new",
-            "https://p01.icloud-content.com/photo.jpg",
-            1024,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        );
-        page["records"][1]["fields"]["isFavorite"] =
-            serde_json::json!({"value": 1, "type": "INT64"});
+        let page = run_cycle_favourited_asset_page();
         let album = make_full_album_with_session(
             "PrimarySync",
             crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
@@ -6057,6 +6049,659 @@ mod tests {
                 .as_deref(),
             Some("zone-tok-prev"),
             "failed provider metadata write must preserve the replay checkpoint"
+        );
+    }
+
+    /// Seeds a downloaded asset whose stored metadata is not a favourite,
+    /// with its media file on disk, ready for the provider to report a
+    /// metadata-only edit against it.
+    async fn seed_run_cycle_metadata_drift_asset(
+        inner: &Arc<dyn download::DownloadStore>,
+        download_dir: &std::path::Path,
+    ) {
+        use chrono::TimeZone as _;
+
+        let media_dir = download_dir.join(run_cycle_expected_date_dir());
+        std::fs::create_dir_all(&media_dir).expect("create media directory");
+        let media_path = media_dir.join("photo.jpg");
+        std::fs::write(&media_path, vec![0u8; 1024]).expect("seed media file");
+
+        let mut stored_metadata = state::AssetMetadata {
+            is_favorite: false,
+            ..state::AssetMetadata::default()
+        };
+        stored_metadata.refresh_hash();
+        let record = crate::test_helpers::TestAssetRecord::new("master-PrimarySync")
+            .filename("photo.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .created_at(
+                chrono::Utc
+                    .timestamp_millis_opt(RUN_CYCLE_ASSET_DATE_MS)
+                    .single()
+                    .expect("valid asset date"),
+            )
+            .size(1024)
+            .metadata(stored_metadata)
+            .build();
+        inner.upsert_seen(&record).await.expect("seed state row");
+        inner
+            .mark_downloaded(
+                "PrimarySync",
+                "master-PrimarySync",
+                "original",
+                &media_path,
+                "local-checksum",
+                None,
+            )
+            .await
+            .expect("mark downloaded");
+    }
+
+    /// The same asset as `seed_run_cycle_metadata_drift_asset`, but reported
+    /// by the provider as a favourite, so its metadata drifts from the row.
+    fn run_cycle_favourited_asset_page() -> serde_json::Value {
+        let mut page = full_album_page_with_download(
+            "PrimarySync",
+            "master-PrimarySync",
+            "zone-tok-new",
+            "https://p01.icloud-content.com/photo.jpg",
+            1024,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        );
+        page["records"][1]["fields"]["isFavorite"] =
+            serde_json::json!({"value": 1, "type": "INT64"});
+        page
+    }
+
+    /// The same asset carrying a caption edit instead of a favourite, so two
+    /// passes can deliver different provider snapshots of one asset and both
+    /// drift from the stored row.
+    #[cfg(feature = "xmp")]
+    fn run_cycle_captioned_asset_page() -> serde_json::Value {
+        let mut page = run_cycle_favourited_asset_page();
+        page["records"][1]["fields"]["isFavorite"] =
+            serde_json::json!({"value": 0, "type": "INT64"});
+        page["records"][1]["fields"]["captionEnc"] =
+            serde_json::json!({"value": "edited in another pass", "type": "STRING"});
+        page
+    }
+
+    /// #707: the paired single-pass streaming path must gate the zone
+    /// checkpoint on provider-metadata durability exactly as the collecting
+    /// path does. Identical to the collecting regression above but without
+    /// `recent`, which is what routes the cycle through the streaming
+    /// producer rather than collecting incremental planning.
+    #[tokio::test]
+    async fn run_cycle_single_pass_metadata_refresh_failure_preserves_zone_checkpoint() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(
+                Arc::clone(&inner),
+                "simulated provider metadata write failure",
+            )
+            .with_refresh_downloaded_metadata_failure(),
+        );
+        let mut page = full_album_page_with_download(
+            "PrimarySync",
+            "master-PrimarySync",
+            "zone-tok-new",
+            "https://p01.icloud-content.com/photo.jpg",
+            1024,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        );
+        // A metadata-only edit: the provider now reports the asset as a
+        // favourite while the stored row does not.
+        page["records"][1]["fields"]["isFavorite"] =
+            serde_json::json!({"value": 1, "type": "INT64"});
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "zone-tok-new",
+                    "moreComing": false,
+                    "records": page["records"].clone()
+                }]
+            })),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(
+            result.stats.state_write_failures > 0,
+            "the streaming producer must report the failed refresh as non-durable state"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "a failed provider metadata refresh must preserve the replay checkpoint"
+        );
+    }
+
+    /// #707: the single-pass streaming path must advance the zone checkpoint
+    /// once the refreshed provider metadata is durable, applying the edit
+    /// without downloading media.
+    #[tokio::test]
+    async fn run_cycle_single_pass_metadata_refresh_advances_checkpoint_after_durable_state() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+
+        let db: Arc<dyn download::DownloadStore> =
+            Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
+        let page = run_cycle_favourited_asset_page();
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "zone-tok-new",
+                    "moreComing": false,
+                    "records": page["records"].clone()
+                }]
+            })),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(
+            result.stats.downloaded, 0,
+            "a metadata-only edit downloads nothing"
+        );
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(
+            inner.get_downloaded_page(0, 1).await.unwrap()[0]
+                .metadata
+                .is_favorite,
+            "the edited provider metadata must reach the catalogue"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-new"),
+            "durable provider state must allow the zone checkpoint to advance"
+        );
+    }
+
+    /// Runs one full-enumeration cycle with XMP sidecars enabled over a
+    /// downloaded asset the provider now reports as a favourite.
+    #[cfg(feature = "xmp")]
+    async fn run_full_enumeration_metadata_cycle(
+        inner: &Arc<dyn download::DownloadStore>,
+        download_dir: &std::path::Path,
+        per_pass_paths: bool,
+        controls: download::DownloadControls,
+    ) -> crate::sync_cycle::CycleResult {
+        let config = make_run_cycle_config();
+        let db: Arc<dyn download::DownloadStore> = Arc::clone(inner);
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(run_cycle_favourited_asset_page()),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir,
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                xmp_sidecar: true,
+                per_pass_paths,
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            controls,
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle")
+    }
+
+    /// #707 review: both enumeration branches defer their queue, so a full
+    /// enumeration drains once. A second drain in the same cycle would retry a
+    /// failed rewrite immediately and report it twice.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
+        for per_pass_paths in [false, true] {
+            let inner = make_state_db();
+            let download_dir = tempfile::tempdir().expect("download tempdir");
+            seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+            // A directory where the sidecar belongs makes the rewrite fail.
+            std::fs::create_dir(
+                download_dir
+                    .path()
+                    .join(run_cycle_expected_date_dir())
+                    .join("photo.jpg.xmp"),
+            )
+            .expect("block the sidecar path");
+
+            let result = run_full_enumeration_metadata_cycle(
+                &inner,
+                download_dir.path(),
+                per_pass_paths,
+                download::DownloadControls::download_hidden(),
+            )
+            .await;
+
+            assert_eq!(
+                result.stats.exif_failures, 1,
+                "one failing rewrite must be attempted and reported once (per_pass_paths = {per_pass_paths})"
+            );
+            assert!(
+                !inner
+                    .get_pending_metadata_rewrites_page(None, 0, 10)
+                    .await
+                    .expect("read markers")
+                    .is_empty(),
+                "the marker must survive for the next run to retry"
+            );
+        }
+    }
+
+    /// #707 review: the interleaving the maintainer described. Two passes run
+    /// concurrently over one asset carrying different provider snapshots. They
+    /// must share one drain, so a single writer owns the file, and the sidecar
+    /// must agree with whichever snapshot the row settled on with no marker
+    /// left claiming otherwise.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+
+        let counting = FailingMetadataSetDb::without_set_failure(
+            Arc::clone(&inner),
+            "__unused_metadata_message__",
+        );
+        let drains = counting.drain_counter();
+        let db: Arc<dyn download::DownloadStore> = Arc::new(counting);
+        let pass = |name: &str, page: serde_json::Value| crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Album,
+            album: make_named_full_album_with_boxed_session(
+                "PrimarySync",
+                name,
+                Box::new(
+                    crate::test_helpers::MockPhotosSession::new()
+                        .ok(album_count_response(1))
+                        .ok(page),
+                ),
+            ),
+            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+        };
+        let lib_state = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            vec![
+                pass("Favourited", run_cycle_favourited_asset_page()),
+                pass("Captioned", run_cycle_captioned_asset_page()),
+            ],
+        );
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                xmp_sidecar: true,
+                per_pass_paths: true,
+                concurrent_downloads: Some(2),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        let stored = inner
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("read downloaded rows");
+        let row = stored.first().expect("the asset stays downloaded");
+        let sidecar = std::fs::read_to_string(
+            download_dir
+                .path()
+                .join(run_cycle_expected_date_dir())
+                .join("photo.jpg.xmp"),
+        )
+        .expect("the drain writes a sidecar");
+
+        assert_eq!(
+            drains.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the passes must share one drain, so a single writer owns the file"
+        );
+        assert_eq!(
+            sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
+            row.metadata.rating == Some(5),
+            "the sidecar must hold the snapshot the row settled on: {sidecar}"
+        );
+        assert!(
+            inner
+                .get_metadata_retry_markers()
+                .await
+                .expect("read markers")
+                .is_empty(),
+            "no marker may survive a completed drain"
+        );
+    }
+
+    /// #707 review: a forwarded download writes the snapshot it was planned
+    /// from. If a concurrent pass has since refreshed the row and raised a
+    /// marker, the finaliser must not retire it, or the row keeps the new
+    /// metadata while the file keeps the old and nothing is left to repair it.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_cycle_download_does_not_retire_a_marker_raised_for_newer_metadata() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+
+        // The row stays downloaded but its file is gone, so the media task is
+        // forwarded rather than skipped as already on disk.
+        let media_path = download_dir
+            .path()
+            .join(run_cycle_expected_date_dir())
+            .join("photo.jpg");
+        std::fs::remove_file(&media_path).expect("remove the media file");
+
+        let mut newer = state::AssetMetadata {
+            is_favorite: true,
+            rating: Some(5),
+            ..state::AssetMetadata::default()
+        };
+        newer.refresh_hash();
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(
+                Arc::clone(&inner),
+                "__unused_metadata_message__",
+            )
+            .with_refresh_on_mark_downloaded(newer),
+        );
+
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        Mock::given(method("GET"))
+            .and(path("/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(full_album_page_with_download(
+                    "PrimarySync",
+                    "master-PrimarySync",
+                    "zone-tok-new",
+                    &format!("{}/photo.jpg", server.uri()),
+                    body.len() as u64,
+                    // The provider reports the stored version, so the media
+                    // task is forwarded only because the file is missing. A
+                    // different checksum would make this a new version and
+                    // return the row to pending, which is a separate flow.
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                )),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                xmp_sidecar: true,
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        let row = inner
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("read downloaded rows")
+            .into_iter()
+            .next()
+            .expect("the asset stays downloaded");
+        assert_eq!(
+            row.metadata.rating,
+            Some(5),
+            "precondition: the racing pass leaves the newer snapshot on the row"
+        );
+
+        let published = row.local_path.as_deref().expect("the download published");
+        let mut sidecar_name = published.file_name().expect("a file name").to_os_string();
+        sidecar_name.push(".xmp");
+        let sidecar = std::fs::read_to_string(published.with_file_name(sidecar_name))
+            .expect("sidecar written next to the media file");
+        assert!(
+            sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
+            "the file must end on the snapshot the row holds: {sidecar}"
+        );
+    }
+
+    /// #707 review: deferring the drain moved it outside the pipeline, which
+    /// returns early for the read-only run modes. The drain writes sidecars,
+    /// so it must stay behind the same gate.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_cycle_full_enumeration_writes_no_metadata_in_read_only_modes() {
+        for controls in [
+            download::DownloadControls::dry_run_hidden(),
+            download::DownloadControls::new(
+                download::DownloadRunMode::PrintFilenames,
+                download::DownloadReporting::hidden(),
+            ),
+        ] {
+            let inner = make_state_db();
+            let download_dir = tempfile::tempdir().expect("download tempdir");
+            seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+            inner
+                .record_metadata_write_failure("PrimarySync", "master-PrimarySync", "original")
+                .await
+                .expect("queue a rewrite");
+
+            run_full_enumeration_metadata_cycle(&inner, download_dir.path(), false, controls).await;
+
+            assert!(
+                !download_dir
+                    .path()
+                    .join(run_cycle_expected_date_dir())
+                    .join("photo.jpg.xmp")
+                    .exists(),
+                "a read-only run must not write a sidecar"
+            );
+            assert!(
+                !inner
+                    .get_pending_metadata_rewrites_page(None, 0, 10)
+                    .await
+                    .expect("read markers")
+                    .is_empty(),
+                "a read-only run must not retire the marker"
+            );
+        }
+    }
+
+    /// #707: the full-enumeration path shares the streaming producer with the
+    /// single-pass path, so a failed provider-metadata refresh must equally
+    /// stop the zone checkpoint from being stored.
+    #[tokio::test]
+    async fn run_cycle_full_enumeration_metadata_refresh_failure_preserves_zone_checkpoint() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        // No seeded zone token, so the cycle runs a full enumeration.
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(
+                Arc::clone(&inner),
+                "simulated provider metadata write failure",
+            )
+            .with_refresh_downloaded_metadata_failure(),
+        );
+        let page = run_cycle_favourited_asset_page();
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(page),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::NoStoredToken),
+            "this regression must exercise the full-enumeration path"
+        );
+        assert!(
+            result.stats.state_write_failures > 0,
+            "the full-enumeration producer must report the failed refresh as non-durable state"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token"),
+            None,
+            "a failed provider metadata refresh must not store a zone checkpoint"
         );
     }
 

@@ -349,8 +349,8 @@ pub(super) struct RewritePass {
 /// Process one bounded batch of persisted metadata-rewrite markers: for each
 /// asset whose `metadata_write_failed_at` is set and whose local file is still
 /// on disk, re-apply EXIF/XMP using the stored metadata. On success clears the
-/// marker and refreshes `metadata_hash`; on failure leaves the marker so the
-/// next pass retries. Returns the per-batch counts.
+/// marker; on failure leaves it so the next pass retries. Returns the
+/// per-batch counts.
 pub(super) async fn run_pending<D>(
     db: &D,
     metadata_flags: MetadataFlags,
@@ -445,20 +445,6 @@ where
         .await;
 
         if !outcome.any_failed() {
-            if let Some(new_hash) = record.metadata.metadata_hash.as_deref()
-                && let Err(e) = db
-                    .update_metadata_hash(
-                        &record.library,
-                        &record.id,
-                        version_size.as_str(),
-                        new_hash,
-                    )
-                    .await
-            {
-                tracing::warn!(asset_id = %record.id, error = %e, "Failed to update metadata_hash");
-                errored += 1;
-                continue;
-            }
             if let Err(e) = db
                 .clear_metadata_write_failure(&record.library, &record.id, version_size.as_str())
                 .await
@@ -664,7 +650,7 @@ mod tests {
     /// calls `run_pending` and asserts:
     /// 1. the on-disk JPEG now carries the rating in its XMP packet,
     /// 2. the DB marker is cleared (rewrite won't re-fire next cycle),
-    /// 3. `metadata_hash` is refreshed to match the asset state.
+    /// 3. the recorded `metadata_hash` is left in place.
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn run_pending_applies_embed_and_clears_marker() {
@@ -735,7 +721,7 @@ mod tests {
             .expect("row must remain in the downloaded set");
         assert_eq!(
             new_hash, &seeded_hash,
-            "update_metadata_hash uses the asset's recorded metadata_hash"
+            "a successful rewrite leaves the recorded metadata_hash in place"
         );
 
         // The file on disk now contains an XMP packet with the rating.
@@ -962,7 +948,7 @@ mod tests {
             "unselected and soft-deleted failures must not fail the selected repair"
         );
         let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
-        assert_eq!(pending.len(), 5);
+        assert_eq!(pending.len(), 4);
         assert!(
             pending
                 .iter()
@@ -970,10 +956,11 @@ mod tests {
             "unselected library marker must remain untouched"
         );
         assert!(
-            pending
+            !pending
                 .iter()
                 .any(|record| record.id.as_ref() == "SOFT_DELETED"),
-            "soft-deleted marker must remain untouched"
+            "a soft-deleted row must not be offered for rewrite, since its \
+             metadata is frozen at the values held before the deletion"
         );
     }
 

@@ -183,6 +183,12 @@ pub trait DownloadStateStore: Send + Sync {
         Ok(0)
     }
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
+    /// Assets whose downloaded rows survive a provider deletion. Staleness
+    /// checks skip these, so an implementor must answer deliberately rather
+    /// than inherit an empty default.
+    async fn get_soft_deleted_downloaded_ids(
+        &self,
+    ) -> Result<HashSet<(String, String)>, StateError>;
     async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError>;
     async fn get_downloaded_checksums(
         &self,
@@ -575,13 +581,6 @@ pub trait MetadataRewriteStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError>;
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError>;
     async fn clear_metadata_write_failure(
         &self,
         library: &str,
@@ -2118,6 +2117,37 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Assets that still hold `status = 'downloaded'` rows after the provider
+    /// reported them deleted. Soft deletion flips every version of an asset
+    /// together, so this is keyed by asset rather than by version.
+    pub(crate) async fn get_soft_deleted_downloaded_ids(
+        &self,
+    ) -> Result<HashSet<(String, String)>, StateError> {
+        self.with_conn("get_soft_deleted_downloaded_ids", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT DISTINCT library, id FROM assets \
+                     WHERE status = 'downloaded' AND is_deleted = 1",
+                )
+                .map_err(|e| StateError::query("get_soft_deleted_downloaded_ids", e))?;
+
+            let mut ids = HashSet::new();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_soft_deleted_downloaded_ids", e))?;
+            for row in rows {
+                ids.insert(
+                    row.map_err(|e| StateError::query("get_soft_deleted_downloaded_ids", e))?,
+                );
+            }
+
+            Ok(ids)
+        })
+        .await
+    }
+
     pub(crate) async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         self.with_conn("get_all_known_ids", move |conn| {
             let mut stmt = conn
@@ -3477,6 +3507,7 @@ impl SqliteStateDb {
                 "SELECT {ASSET_COLUMNS} FROM assets \
                  WHERE metadata_write_failed_at IS NOT NULL \
                    AND status = 'downloaded' \
+                   AND is_deleted = 0 \
                    AND local_path IS NOT NULL \
                  ORDER BY metadata_write_failed_at ASC, library, id, version_size \
                  LIMIT ?1 OFFSET ?2"
@@ -3524,29 +3555,6 @@ impl SqliteStateDb {
                 markers.insert(key);
             }
             Ok(markers)
-        })
-        .await
-    }
-
-    pub(crate) async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError> {
-        let library = library.to_owned();
-        let asset_id = asset_id.to_owned();
-        let version_size = version_size.to_owned();
-        let metadata_hash = metadata_hash.to_owned();
-        self.with_conn("update_metadata_hash", move |conn| {
-            conn.execute(
-                "UPDATE assets SET metadata_hash = ?1 \
-                 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
-                rusqlite::params![metadata_hash, library, asset_id, version_size],
-            )
-            .map_err(|e| StateError::query("update_metadata_hash", e))?;
-            Ok(())
         })
         .await
     }
@@ -3657,6 +3665,12 @@ impl DownloadStateStore for SqliteStateDb {
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
         SqliteStateDb::get_downloaded_ids(self).await
+    }
+
+    async fn get_soft_deleted_downloaded_ids(
+        &self,
+    ) -> Result<HashSet<(String, String)>, StateError> {
+        SqliteStateDb::get_soft_deleted_downloaded_ids(self).await
     }
 
     async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
@@ -4171,17 +4185,6 @@ impl MetadataRewriteStore for SqliteStateDb {
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError> {
         SqliteStateDb::get_pending_metadata_rewrites_page(self, library_scope, offset, limit).await
-    }
-
-    async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::update_metadata_hash(self, library, asset_id, version_size, metadata_hash)
-            .await
     }
 
     async fn clear_metadata_write_failure(
@@ -8943,6 +8946,18 @@ mod tests {
                 record.metadata.metadata_hash.as_deref(),
                 Some(expected_hash.as_str())
             );
+        }
+
+        // The refresh must not disturb download state: #707 requires every
+        // live downloaded version to keep its status, local path, checksums
+        // and download timestamp while its metadata is replaced.
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 2, "both versions must remain downloaded");
+        for record in &downloaded {
+            assert_eq!(record.local_path.as_deref(), Some(Path::new("/photo.jpg")));
+            assert_eq!(record.local_checksum.as_deref(), Some("checksum"));
+            assert_eq!(record.checksum.as_ref(), "checksum123");
+            assert_eq!(record.metadata.rating, Some(4));
         }
     }
 

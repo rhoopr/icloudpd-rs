@@ -25,8 +25,6 @@ use super::filter::{
     DerivedPath, DownloadTask, derive_expected_paths, determine_media_type,
     extract_skip_candidates, is_asset_filtered,
 };
-#[cfg(test)]
-use super::finalize::update_metadata_marker_for_test as update_metadata_marker;
 use super::finalize::{
     DownloadedFinalization, PendingStateWrite, StateWriteFlush, check_state_write_circuit_breaker,
     finalize_downloaded, finalize_failed, flush_pending_state_writes,
@@ -824,52 +822,6 @@ async fn record_seen_for_forwarded_task(
     result
 }
 
-async fn backfill_downloaded_metadata_for_on_disk_skip(
-    state_db: Option<&dyn DownloadStore>,
-    config: &DownloadConfig,
-    asset: &PhotoAsset,
-    ctx: &DownloadContext,
-) {
-    if !ctx.has_downloaded_without_metadata_hash() {
-        return;
-    }
-    let Some(db) = state_db else {
-        return;
-    };
-    let library = effective_asset_library(asset, config);
-    let downloaded_versions = ctx
-        .downloaded_ids
-        .get(library)
-        .and_then(|assets| assets.get(asset.state_id()));
-    let Some(downloaded_versions) = downloaded_versions else {
-        return;
-    };
-    let version_hashes = ctx
-        .downloaded_metadata_hashes
-        .get(library)
-        .and_then(|assets| assets.get(asset.state_id()));
-
-    for derived in derive_expected_paths(asset, config) {
-        let version_size = derived.version_size.as_str();
-        let has_metadata_hash =
-            version_hashes.is_some_and(|hashes| hashes.contains_key(version_size));
-        if !downloaded_versions.contains(version_size) || has_metadata_hash {
-            continue;
-        }
-
-        let record = asset_record_for_derived_path(Arc::from(library), asset, &derived);
-
-        if let Err(e) = db.upsert_seen(&record).await {
-            tracing::warn!(
-                asset_id = %asset.id(),
-                version_size,
-                error = %e,
-                "Failed to backfill metadata for skipped downloaded asset"
-            );
-        }
-    }
-}
-
 /// Configuration for a download pass.
 pub(super) struct PassConfig<'a> {
     pub(super) client: &'a Client,
@@ -960,6 +912,11 @@ pub(super) struct StreamRuntime {
     shared_pb: Option<ProgressBar>,
     shared_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     preloaded_download_ctx: Option<Arc<DownloadContext>>,
+    /// Set when the caller runs several of these pipelines concurrently and
+    /// drains the shared rewrite queue itself once they have all finished.
+    /// Concurrent drains can otherwise write the same file, and the later
+    /// write wins regardless of which holds the newer metadata.
+    defer_metadata_drain: bool,
 }
 
 impl StreamRuntime {
@@ -971,6 +928,7 @@ impl StreamRuntime {
             shared_pb,
             shared_bytes,
             preloaded_download_ctx: None,
+            defer_metadata_drain: false,
         }
     }
 
@@ -983,7 +941,15 @@ impl StreamRuntime {
             shared_pb,
             shared_bytes,
             preloaded_download_ctx,
+            defer_metadata_drain: false,
         }
+    }
+
+    /// Leaves the rewrite queue for the caller to drain once every concurrent
+    /// pipeline has finished.
+    pub(super) fn deferring_metadata_drain(mut self) -> Self {
+        self.defer_metadata_drain = true;
+        self
     }
 }
 
@@ -1223,6 +1189,7 @@ where
     let mode = reporting.personality_mode;
 
     // Pre-load download context for O(1) skip decisions
+    let defer_metadata_drain = runtime.defer_metadata_drain;
     let download_ctx = match runtime.preloaded_download_ctx {
         Some(ctx) => ctx,
         None => preload_download_context(config).await,
@@ -1309,7 +1276,15 @@ where
     )
     .await;
 
-    finalize_streaming_download(producer, consumer_result, sync_run_id, owns_pb, shared).await
+    finalize_streaming_download(
+        producer,
+        consumer_result,
+        sync_run_id,
+        owns_pb,
+        shared,
+        defer_metadata_drain,
+    )
+    .await
 }
 
 fn spawn_stream_download_producer<S>(
@@ -1338,8 +1313,7 @@ where
 
     let handle = tokio::spawn(async move {
         let config = &producer_config;
-        let mark_refreshed_metadata_for_rewrite =
-            config.refresh_metadata && MetadataFlags::from(config.as_ref()).has_any_write();
+        let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
         let mut task_planner = TaskPlanner::new();
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
         // Skipped-asset IDs accumulated across the producer run and
@@ -1451,6 +1425,10 @@ where
                     }
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The pre-plan refresh has already committed the marker,
+                    // so the skip sites must not re-stamp it from the stale
+                    // context.
+                    let mut metadata_refresh_attempted = false;
                     if let Some(db) = &producer_state_db {
                         let library = effective_asset_library(&asset, config);
                         if let Err(e) =
@@ -1466,24 +1444,61 @@ where
                                 "Failed to record asset/master mapping"
                             );
                         }
-                        if config.refresh_metadata
-                            && let Err(e) = db
+                        // Apply changed provider metadata before filtering and
+                        // path planning, so a metadata-only edit reaches the
+                        // catalogue even when the media task is filtered or
+                        // skipped as already on disk.
+                        let drift = download_ctx.has_provider_metadata_drift(
+                            library,
+                            asset.state_id(),
+                            asset.metadata().metadata_hash.as_deref(),
+                        );
+                        // A marker outlives a stale row whose stored hash still
+                        // matches the provider, which drift alone cannot see.
+                        let retry_marker = !drift
+                            && download_ctx
+                                .has_downloaded_metadata_retry_marker(library, asset.state_id());
+                        if config.refresh_metadata || drift || retry_marker {
+                            metadata_refresh_attempted = true;
+                            // A marker-only refresh must not queue more work:
+                            // the marker is already visible for retry.
+                            let mark_for_rewrite =
+                                metadata_writers_enabled && (config.refresh_metadata || drift);
+                            match db
                                 .refresh_downloaded_asset_metadata(
                                     library,
                                     asset.state_id(),
                                     asset.metadata(),
-                                    mark_refreshed_metadata_for_rewrite,
+                                    mark_for_rewrite,
                                 )
                                 .await
-                        {
-                            state_write_failures_producer
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                asset_id = %asset.id(),
-                                library,
-                                error = %e,
-                                "Failed to refresh downloaded asset metadata"
-                            );
+                            {
+                                Ok(updated) if updated > 0 => {}
+                                Ok(_) => {
+                                    // A forced sweep legitimately visits assets
+                                    // with no live downloaded row; drift and
+                                    // markers imply one exists.
+                                    if drift || retry_marker {
+                                        state_write_failures_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::warn!(
+                                            asset_id = %asset.id(),
+                                            library,
+                                            "Changed provider metadata matched no downloaded state row"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(
+                                        asset_id = %asset.id(),
+                                        library,
+                                        error = %e,
+                                        "Failed to refresh downloaded asset metadata"
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -1512,14 +1527,16 @@ where
                         // is already on disk; if adoption fails, the touched
                         // flush still lets stuck-pipeline recovery promote it.
                         let candidates = extract_skip_candidates(&asset, config.as_ref());
-                        metadata_rewrite::tag_if_needed(
-                            producer_state_db.as_deref(),
-                            config,
-                            &asset,
-                            &candidates,
-                            &download_ctx,
-                        )
-                        .await;
+                        if !metadata_refresh_attempted {
+                            metadata_rewrite::tag_if_needed(
+                                producer_state_db.as_deref(),
+                                config,
+                                &asset,
+                                &candidates,
+                                &download_ctx,
+                            )
+                            .await;
+                        }
                         let adoption = adopt_pending_on_disk_skip(
                             producer_state_db.as_deref(),
                             config,
@@ -1534,13 +1551,6 @@ where
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         }
-                        backfill_downloaded_metadata_for_on_disk_skip(
-                            producer_state_db.as_deref(),
-                            config,
-                            &asset,
-                            &download_ctx,
-                        )
-                        .await;
                         if producer_state_db.is_some() {
                             let library = effective_asset_library_arc(&asset, config);
                             touched_assets.push((library, asset.state_id_arc()));
@@ -1701,21 +1711,16 @@ where
                                             );
                                             let candidates =
                                                 extract_skip_candidates(&asset, config.as_ref());
-                                            metadata_rewrite::tag_if_needed(
-                                                producer_state_db.as_deref(),
-                                                config,
-                                                &asset,
-                                                &candidates,
-                                                &download_ctx,
-                                            )
-                                            .await;
-                                            backfill_downloaded_metadata_for_on_disk_skip(
-                                                producer_state_db.as_deref(),
-                                                config,
-                                                &asset,
-                                                &download_ctx,
-                                            )
-                                            .await;
+                                            if !metadata_refresh_attempted {
+                                                metadata_rewrite::tag_if_needed(
+                                                    producer_state_db.as_deref(),
+                                                    config,
+                                                    &asset,
+                                                    &candidates,
+                                                    &download_ctx,
+                                                )
+                                                .await;
+                                            }
                                             continue;
                                         }
 
@@ -2142,6 +2147,7 @@ async fn finalize_streaming_download(
     sync_run_id: Option<i64>,
     owns_pb: bool,
     shared: StreamPipelineShared,
+    defer_metadata_drain: bool,
 ) -> Result<StreamingResult> {
     let StreamProducer { handle, metrics } = producer;
     let config = shared.config;
@@ -2245,6 +2251,7 @@ async fn finalize_streaming_download(
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
     if consumer.state_write_circuit_error.is_none()
+        && !defer_metadata_drain
         && !config.refresh_metadata
         && let Some(db) = &state_db
     {
@@ -2395,6 +2402,7 @@ pub(super) async fn build_download_outcome(
         let mut stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             skipped: skip_breakdown,
+            exif_failures,
             state_write_failures,
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
@@ -2411,7 +2419,11 @@ pub(super) async fn build_download_outcome(
         } else {
             tracing::info!("No new photos to download");
         }
+        // A metadata-only edit cycle downloads nothing, so rewrite failures
+        // must still surface here. They stay out of `state_write_failures`:
+        // the catalogue and marker are durable, so the checkpoint may advance.
         let failed_count = state_write_failures
+            + exif_failures
             + retry_exhausted
             + enumeration_errors
             + usize::from(streaming_result.url_expired_abort)
@@ -4122,7 +4134,6 @@ mod tests {
         failed_calls: AtomicUsize,
         downloaded_id_loads: AtomicUsize,
         track_failed_calls: bool,
-        fail_metadata_clear: bool,
         fail_complete_sync_run: bool,
     }
 
@@ -4135,7 +4146,6 @@ mod tests {
                 failed_calls: AtomicUsize::new(0),
                 downloaded_id_loads: AtomicUsize::new(0),
                 track_failed_calls: false,
-                fail_metadata_clear: false,
                 fail_complete_sync_run: false,
             }
         }
@@ -4143,12 +4153,6 @@ mod tests {
         fn with_mark_failed_tracking() -> Self {
             let mut s = Self::new(0);
             s.track_failed_calls = true;
-            s
-        }
-
-        fn with_failing_metadata_clear() -> Self {
-            let mut s = Self::new(0);
-            s.fail_metadata_clear = true;
             s
         }
 
@@ -4246,6 +4250,12 @@ mod tests {
             &self,
         ) -> Result<HashSet<(String, String, String)>, StateError> {
             self.downloaded_id_loads.fetch_add(1, Ordering::Relaxed);
+            Ok(HashSet::new())
+        }
+
+        async fn get_soft_deleted_downloaded_ids(
+            &self,
+        ) -> Result<HashSet<(String, String)>, StateError> {
             Ok(HashSet::new())
         }
 
@@ -4454,11 +4464,7 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<(), StateError> {
-            if self.fail_metadata_clear {
-                Err(StateError::LockPoisoned("simulated clear failure".into()))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
 
         async fn get_downloaded_metadata_hashes(
@@ -4482,16 +4488,6 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn update_metadata_hash(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<(), StateError> {
-            Ok(())
-        }
-
         async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
             Ok(false)
         }
@@ -4503,26 +4499,6 @@ mod tests {
         let result = flush_pending_state_writes(&db, &[]).await;
         assert_eq!(result, 0);
         assert_eq!(db.success_count(), 0);
-    }
-
-    /// CG-13: when `clear_metadata_write_failure` returns Err, the
-    /// previous `let _ = ...` swallow let the metadata-rewrite marker
-    /// stay set forever. The asset would be re-rewritten on every
-    /// subsequent sync. Surface the failure as a structured warn so it
-    /// shows up in logs/metrics.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn update_metadata_marker_warns_when_clear_fails() {
-        let db = FailingDownloadStore::with_failing_metadata_clear();
-        update_metadata_marker(&db, "PrimarySync", "ASSET_X", "original", true).await;
-        assert!(
-            logs_contain("Could not clear metadata-write-failed marker"),
-            "warn must fire when clear returns Err"
-        );
-        assert!(
-            logs_contain("asset_id=\"ASSET_X\""),
-            "structured asset_id field expected"
-        );
     }
 
     /// CG-2 (broadened from adversarial pass, 2026-05-03): `log_sync_summary`
@@ -5739,6 +5715,804 @@ mod tests {
             Some("stale-hash")
         );
         assert_eq!(rewrites[0].metadata.title, None);
+    }
+
+    /// #674 regression: a metadata-only edit drifts the source hash from the
+    /// stored hash. On the on-disk skip the catalogue must be refreshed to the
+    /// edited source metadata (not left stale) without re-downloading, so a
+    /// queued rewrite applies corrected values instead of replaying old ones.
+    #[tokio::test]
+    async fn on_disk_skip_refreshes_catalogue_on_metadata_drift() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        // Downloaded while a favourite; the source has since dropped it.
+        let stored: PhotoAsset = TestPhotoAsset::new("DRIFT")
+            .filename("drift.jpg")
+            .orig_size(1000)
+            .orig_checksum("ck_drift")
+            .favorite(true)
+            .build();
+        let edited: PhotoAsset = TestPhotoAsset::new("DRIFT")
+            .filename("drift.jpg")
+            .orig_size(1000)
+            .orig_checksum("ck_drift")
+            .favorite(false)
+            .build();
+
+        let derived = derive_expected_paths(&stored, config.as_ref())
+            .into_iter()
+            .next()
+            .unwrap();
+        fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+        fs::write(&derived.path, vec![0u8; 1000]).unwrap();
+        let record = asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived);
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+            &derived.path,
+            "local-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0, "unchanged bytes must not re-download");
+        let refreshed = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+        assert!(
+            !refreshed.metadata.is_favorite,
+            "the on-disk skip must refresh the stale catalogue to the edited source metadata"
+        );
+        let queued = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert!(
+            queued.is_empty(),
+            "the queued rewrite must run from the fresh catalogue and clear its marker"
+        );
+        assert_eq!(result.exif_failures, 0);
+        assert_eq!(
+            fs::read_dir(derived.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "the refresh must not create a suffixed duplicate"
+        );
+    }
+
+    /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). The XMP toolkit accepts it,
+    /// so a metadata write against it exercises the real writer.
+    #[cfg(feature = "xmp")]
+    const MINIMAL_JPEG: [u8; 22] = [
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+
+    /// A `PhotoAsset` backed by `MINIMAL_JPEG`, so a metadata write against its
+    /// file exercises the real writer rather than failing to decode.
+    #[cfg(feature = "xmp")]
+    fn jpeg_asset(id: &str, filename: &str, favorite: bool) -> crate::icloud::photos::PhotoAsset {
+        TestPhotoAsset::new(id)
+            .filename(filename)
+            .orig_size(MINIMAL_JPEG.len() as u64)
+            .orig_checksum(&format!("ck_{id}"))
+            .favorite(favorite)
+            .build()
+    }
+
+    /// Seeds a downloaded asset whose on-disk file is a real JPEG.
+    #[cfg(feature = "xmp")]
+    async fn seed_downloaded_jpeg_asset(
+        db: &Arc<crate::state::SqliteStateDb>,
+        config: &DownloadConfig,
+        stored: &crate::icloud::photos::PhotoAsset,
+    ) -> super::DerivedPath {
+        let derived = derive_expected_paths(stored, config)
+            .into_iter()
+            .next()
+            .unwrap();
+        fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+        fs::write(&derived.path, MINIMAL_JPEG).unwrap();
+        let record = asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived);
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+            &derived.path,
+            "local-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        derived
+    }
+
+    /// The `.xmp` sidecar kei writes beside a media file.
+    #[cfg(feature = "xmp")]
+    fn sidecar_path_for(media_path: &std::path::Path) -> std::path::PathBuf {
+        let mut name = media_path.file_name().unwrap().to_os_string();
+        name.push(".xmp");
+        media_path.with_file_name(name)
+    }
+
+    /// A stored/edited `PhotoAsset` pair sharing identical bytes but differing
+    /// provider metadata, which is the shape of a metadata-only iCloud edit.
+    fn drifted_asset_pair(
+        id: &str,
+        filename: &str,
+    ) -> (
+        crate::icloud::photos::PhotoAsset,
+        crate::icloud::photos::PhotoAsset,
+    ) {
+        let checksum = format!("ck_{id}");
+        let stored = TestPhotoAsset::new(id)
+            .filename(filename)
+            .orig_size(1000)
+            .orig_checksum(&checksum)
+            .favorite(true)
+            .build();
+        let edited = TestPhotoAsset::new(id)
+            .filename(filename)
+            .orig_size(1000)
+            .orig_checksum(&checksum)
+            .favorite(false)
+            .build();
+        (stored, edited)
+    }
+
+    /// Seed a downloaded asset with its file on disk, as a prior sync would
+    /// have left it, and return the derived path it was recorded against.
+    async fn seed_downloaded_drift_asset(
+        db: &Arc<crate::state::SqliteStateDb>,
+        config: &DownloadConfig,
+        stored: &crate::icloud::photos::PhotoAsset,
+    ) -> super::DerivedPath {
+        let derived = derive_expected_paths(stored, config)
+            .into_iter()
+            .next()
+            .unwrap();
+        fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+        fs::write(&derived.path, vec![0u8; 1000]).unwrap();
+        let record = asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived);
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+            &derived.path,
+            "local-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        derived
+    }
+
+    /// #707: with local metadata outputs disabled the catalogue must still be
+    /// refreshed, and no rewrite may be queued. Backup fidelity of the
+    /// manifest does not depend on the user opting into sidecars or EXIF.
+    #[tokio::test]
+    async fn metadata_drift_without_writers_refreshes_catalogue_and_queues_nothing() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        // No metadata writers enabled.
+        let config = Arc::new(config);
+
+        let (stored, edited) = drifted_asset_pair("NOWRITERS", "nowriters.jpg");
+        let derived = seed_downloaded_drift_asset(&db, &config, &stored).await;
+        let before = fs::metadata(&derived.path).unwrap().len();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.state_write_failures, 0);
+        let refreshed = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+        assert!(
+            !refreshed.metadata.is_favorite,
+            "the catalogue must refresh even with local metadata outputs disabled"
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no rewrite may be queued when no metadata writer is enabled"
+        );
+        assert_eq!(
+            fs::metadata(&derived.path).unwrap().len(),
+            before,
+            "local files must be untouched"
+        );
+    }
+
+    /// #707: a downloaded asset whose media task is filtered out must still
+    /// have its provider metadata applied. The refresh runs before filtering
+    /// and path planning, so an excluded asset cannot strand a stale
+    /// catalogue row.
+    #[tokio::test]
+    async fn metadata_drift_refreshes_when_media_task_is_filtered() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+
+        let (stored, edited) = drifted_asset_pair("FILTERED", "filtered.jpg");
+        // Filter the asset out of media planning entirely.
+        config.exclude_asset_ids = Arc::new(std::iter::once(stored.id().to_string()).collect());
+        let config = Arc::new(config);
+
+        seed_downloaded_drift_asset(&db, &config, &stored).await;
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.state_write_failures, 0);
+        let refreshed = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+        assert!(
+            !refreshed.metadata.is_favorite,
+            "a filtered media task must not prevent the provider metadata refresh"
+        );
+    }
+
+    /// #707: a photo the provider deleted and the user then restored must
+    /// still be recognised as already held. The exclusion for deleted rows
+    /// belongs in the staleness checks, not in the shared downloaded list:
+    /// filtering that list sends the asset down the fast path, which skips the
+    /// on-disk check, so the default naming policy files a copy beside the
+    /// original.
+    #[tokio::test]
+    async fn restored_soft_deleted_asset_is_skipped_without_downloading() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let (stored, _) = drifted_asset_pair("RESTORED", "restored.jpg");
+        let derived = seed_downloaded_drift_asset(&db, &config, &stored).await;
+        db.mark_soft_deleted("PrimarySync", stored.state_id(), None)
+            .await
+            .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(stored.clone())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert!(
+            result.failed.is_empty(),
+            "a restored photo must not be queued for download"
+        );
+        assert_eq!(result.skip_summary.on_disk, 1);
+        assert_eq!(
+            fs::read_dir(derived.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "no duplicate may be written beside the original"
+        );
+    }
+
+    /// #707: a restored photo that was also edited must not report unsafe
+    /// provider state. Its rows cannot be refreshed while the deletion stands,
+    /// and reporting that every cycle would hold the checkpoint forever.
+    #[tokio::test]
+    async fn restored_and_edited_asset_does_not_report_unsafe_state() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let (stored, edited) = drifted_asset_pair("RESTORED_EDIT", "restored_edit.jpg");
+        seed_downloaded_drift_asset(&db, &config, &stored).await;
+        db.mark_soft_deleted("PrimarySync", stored.state_id(), None)
+            .await
+            .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.state_write_failures, 0,
+            "a deleted row that cannot be refreshed is not a durability failure"
+        );
+        assert_eq!(result.downloaded, 0);
+    }
+
+    /// #707 acceptance criterion 1, sidecar half: the rewrite must run from
+    /// the refreshed catalogue and land the new value on disk. The direction
+    /// matters. Un-favouriting clears the rating and writes nothing, so only
+    /// favouriting proves the fresh value reached the file.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn metadata_drift_writes_fresh_value_into_the_sidecar() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let stored = jpeg_asset("SIDECAR", "sidecar.jpg", false);
+        let edited = jpeg_asset("SIDECAR", "sidecar.jpg", true);
+        let derived = seed_downloaded_jpeg_asset(&db, &config, &stored).await;
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0, "a metadata edit must not fetch media");
+        assert_eq!(result.exif_failures, 0);
+
+        let sidecar = fs::read_to_string(sidecar_path_for(&derived.path))
+            .expect("sidecar written next to the media file");
+        assert!(
+            sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
+            "the sidecar must carry the favourite from the refreshed catalogue: {sidecar}"
+        );
+    }
+
+    /// #707: a rewrite marker that predates a provider deletion must not
+    /// drain against the tombstoned row. Its metadata is frozen at the values
+    /// held before the deletion, so writing it would publish stale data.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn marker_predating_a_deletion_is_not_drained() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let stored = jpeg_asset("OLDMARKER", "oldmarker.jpg", false);
+        let derived = seed_downloaded_jpeg_asset(&db, &config, &stored).await;
+        db.record_metadata_write_failure(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+        )
+        .await
+        .unwrap();
+        db.mark_soft_deleted("PrimarySync", stored.state_id(), None)
+            .await
+            .unwrap();
+
+        stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(jpeg_asset(
+                "OLDMARKER",
+                "oldmarker.jpg",
+                true,
+            ))]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !sidecar_path_for(&derived.path).exists(),
+            "a marker on a deleted row must not write metadata"
+        );
+    }
+
+    /// #707: a tombstoned row cannot be refreshed, so it must not be queued
+    /// for rewrite either. Doing so would publish the stale values the issue
+    /// exists to stop.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn restored_asset_is_not_rewritten_from_the_stale_catalogue() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let stored = jpeg_asset("TOMBSTONE", "tombstone.jpg", false);
+        let derived = seed_downloaded_jpeg_asset(&db, &config, &stored).await;
+        db.mark_soft_deleted("PrimarySync", stored.state_id(), None)
+            .await
+            .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(jpeg_asset(
+                "TOMBSTONE",
+                "tombstone.jpg",
+                true,
+            ))]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert!(
+            !sidecar_path_for(&derived.path).exists(),
+            "a tombstoned asset must not have metadata written from its stale row"
+        );
+        assert!(
+            db.get_metadata_retry_markers().await.unwrap().is_empty(),
+            "a tombstoned asset must not be queued for a later rewrite either"
+        );
+    }
+
+    /// #707: when the catalogue write fails, the prior metadata must survive
+    /// intact and the failure must reach `state_write_failures`, which is the
+    /// signal `sync_cycle` uses to hold the zone checkpoint.
+    #[tokio::test]
+    async fn metadata_drift_refresh_failure_preserves_state_and_reports_not_durable() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let (stored, edited) = drifted_asset_pair("DBFAIL", "dbfail.jpg");
+        seed_downloaded_drift_asset(&db, &config, &stored).await;
+
+        db.fail_provider_metadata_refresh_for_test();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.state_write_failures > 0,
+            "a failed catalogue refresh must be reported as non-durable provider state"
+        );
+        let unchanged = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+        assert!(
+            unchanged.metadata.is_favorite,
+            "a failed refresh must leave the prior catalogue metadata intact"
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed refresh must not queue a rewrite, which would publish the stale row"
+        );
+    }
+
+    /// #707: unchanged provider metadata is a no-op. The failure trigger
+    /// would turn any attempted catalogue write into an error, so a clean
+    /// result proves no write was attempted and no rewrite was queued.
+    #[tokio::test]
+    async fn unchanged_metadata_performs_no_catalogue_write() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let (stored, _) = drifted_asset_pair("SAME", "same.jpg");
+        seed_downloaded_drift_asset(&db, &config, &stored).await;
+
+        db.fail_provider_metadata_refresh_for_test();
+
+        // Re-enumerate the identical asset: same bytes, same metadata.
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(stored.clone())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.state_write_failures, 0,
+            "unchanged metadata must not attempt a catalogue write"
+        );
+        assert_eq!(result.downloaded, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unchanged metadata must not queue a rewrite"
+        );
+    }
+
+    /// #707: a retry marker must trigger a refresh even when the stored hash
+    /// matches the provider. `mark_hidden_at_source` sets `is_hidden` without
+    /// recomputing `metadata_hash`, so after an unhide the hashes agree while
+    /// the row still reads hidden. Drift alone cannot see that.
+    #[tokio::test]
+    async fn retry_marker_refreshes_row_whose_hash_matches_but_columns_are_stale() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let (visible, _) = drifted_asset_pair("UNHIDE", "unhide.jpg");
+        let derived = seed_downloaded_drift_asset(&db, &config, &visible).await;
+
+        // Hidden at source: the column flips, the stored hash does not.
+        db.mark_hidden_at_source("PrimarySync", visible.state_id())
+            .await
+            .unwrap();
+        db.record_metadata_write_failure(
+            "PrimarySync",
+            visible.state_id(),
+            derived.version_size.as_str(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_downloaded_page(0, 1).await.unwrap()[0]
+                .metadata
+                .is_hidden,
+            "precondition: the stored row reads hidden"
+        );
+
+        // The provider now reports it visible again, matching the stored hash.
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(visible.clone())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.state_write_failures, 0);
+        assert!(
+            !db.get_downloaded_page(0, 1).await.unwrap()[0]
+                .metadata
+                .is_hidden,
+            "the retry marker must drive a refresh that clears the stale hidden flag"
+        );
+    }
+
+    /// #707: when the queued rewrite cannot complete, its marker must survive
+    /// for retry and the surviving row must hold the fresh provider metadata,
+    /// so the retry cannot replay stale values.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let (stored, edited) = drifted_asset_pair("REWRITEFAIL", "rewritefail.jpg");
+        seed_downloaded_drift_asset(&db, &config, &stored).await;
+        db.fail_metadata_marker_clear_for_test();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.state_write_failures, 0,
+            "a local rewrite failure is not a provider-state failure"
+        );
+        let surviving = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(
+            surviving.len(),
+            1,
+            "a failed rewrite must remain visible for retry"
+        );
+        assert!(
+            !surviving[0].metadata.is_favorite,
+            "the retained marker must point at the fresh catalogue metadata"
+        );
+
+        // A metadata-only edit downloads nothing, so the zero-download branch
+        // is the one that has to report the failure.
+        assert_eq!(result.downloaded, 0);
+        assert!(result.exif_failures > 0);
+        let (outcome, stats) = build_download_outcome(
+            &reqwest::Client::new(),
+            &[],
+            &config,
+            DownloadControls::download_hidden(),
+            result,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { .. }),
+            "a failed rewrite must not report a clean sync, got {outcome:?}"
+        );
+        assert!(stats.exif_failures > 0);
+        assert_eq!(
+            stats.state_write_failures, 0,
+            "the checkpoint may still advance once the marker is durable"
+        );
     }
 
     /// Data-sacred regression for the trust-state fast-skip removal.

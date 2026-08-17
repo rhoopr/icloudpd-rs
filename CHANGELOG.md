@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A metadata-only iCloud edit (favourite, rating, keywords, caption, GPS) on an unchanged file now refreshes the catalogue during full enumeration and single-pass incremental sync. Changed provider metadata is applied before filtering and path planning, so the refresh reaches every downloaded version of the asset even when its media task is skipped as already on disk or excluded by a filter. The catalogue row and the rewrite marker commit together, so a queued sidecar or EXIF rewrite reads the corrected values instead of replaying stale ones, and no media is re-downloaded. ([#707], refs [#674])
+- A failed catalogue refresh now preserves the previous zone checkpoint instead of advancing past a provider edit that was never stored. ([#707])
+- Metadata rewrite failures are now reported when a sync downloads nothing. A metadata-only edit cycle transfers no media, so a failed sidecar or EXIF write was previously invisible in the sync result. ([#707])
+
 ## [0.23.1] - 2026-08-16
 
 ### Fixed
@@ -48,11 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [#673]: https://github.com/rhoopr/kei/issues/673
 [#671]: https://github.com/rhoopr/kei/pull/671
+[#674]: https://github.com/rhoopr/kei/issues/674
 [#683]: https://github.com/rhoopr/kei/pull/683
 [#686]: https://github.com/rhoopr/kei/pull/686
 [#687]: https://github.com/rhoopr/kei/issues/687
 [#705]: https://github.com/rhoopr/kei/pull/705
 [#706]: https://github.com/rhoopr/kei/pull/706
+[#707]: https://github.com/rhoopr/kei/issues/707
 [@te&#104;-hippo]: https://github.com/teh-hippo
 
 ## [0.22.12] - 2026-07-13
