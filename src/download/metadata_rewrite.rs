@@ -363,6 +363,32 @@ where
     run_pending_page(db, metadata_flags, temp_suffix, shutdown_token, None, 0).await
 }
 
+/// Drops a recorded hash that a rewrite may already have invalidated. Keeping a
+/// known-stale hash would make the next pass read kei's own rewrite as damage
+/// and refuse it forever, so recording "unknown" is both truthful and the only
+/// state a later pass can recover from.
+async fn forget_stale_checksum<D>(
+    db: &D,
+    record: &crate::state::types::AssetRecord,
+    version_size: &str,
+) where
+    D: MetadataRewriteStore + ?Sized,
+{
+    if record.local_checksum.is_none() {
+        return;
+    }
+    if let Err(e) = db
+        .set_metadata_rewrite_checksums(&record.library, &record.id, version_size, None, None)
+        .await
+    {
+        tracing::warn!(
+            asset_id = %record.id,
+            error = %e,
+            "Could not clear the stale media checksum; `kei reconcile` can still repair the file"
+        );
+    }
+}
+
 pub(super) async fn run_pending_page<D>(
     db: &D,
     metadata_flags: MetadataFlags,
@@ -397,6 +423,7 @@ where
     );
     let mut applied = 0usize;
     let mut skipped_missing = 0usize;
+    let mut skipped_drifted = 0usize;
     let mut errored = 0usize;
     let mut deferred = 0usize;
     for (idx, record) in pending.into_iter().enumerate() {
@@ -433,9 +460,49 @@ where
         let payload = Arc::new(MetadataPayload::from_metadata(&record.metadata));
         let created_local: DateTime<Local> = DateTime::from(record.created_at);
         let version_size = record.version_size;
+
+        // Only an embedded write touches media bytes, so the drain needs the
+        // pre-write hash to tell its own rewrite apart from damage that
+        // arrived some other way.
+        let pre_rewrite_checksum = if metadata_flags.any_embed() {
+            match super::file::compute_sha256(&path).await {
+                Ok(checksum) => Some(checksum),
+                Err(e) => {
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        error = %e,
+                        "Could not hash file before metadata rewrite; leaving marker for future retry"
+                    );
+                    errored += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        // A file that no longer matches the recorded hash is not kei's to
+        // rewrite: embedding would overwrite the evidence that `verify` and
+        // `reconcile` rely on, and re-hashing would bless the damage. The
+        // sidecar is a separate file, so it still runs.
+        let drifted = matches!(
+            (&pre_rewrite_checksum, &record.local_checksum),
+            (Some(actual), Some(recorded)) if actual != recorded
+        );
+        if drifted {
+            tracing::warn!(
+                asset_id = %record.id,
+                path = %path.display(),
+                "On-disk file does not match its recorded checksum; leaving the media and the \
+                 marker alone. Run `kei verify --checksums` or `kei reconcile`"
+            );
+            skipped_drifted += 1;
+        }
+
         let outcome = write_download_metadata(MetadataWriteRequest {
             final_path: &path,
-            embed_path: Some(&path),
+            embed_path: if drifted { None } else { Some(&path) },
             sidecar_path: Some(&path),
             payload,
             created_local,
@@ -443,6 +510,61 @@ where
             temp_suffix: &temp_suffix,
         })
         .await;
+
+        if drifted {
+            // The media still owes its metadata, so the marker cannot retire
+            // no matter how the sidecar fared.
+            continue;
+        }
+
+        // Hash whenever an embed could have run. A reported failure can still
+        // leave replaced bytes, because the durable install renames before it
+        // syncs the parent directory.
+        //
+        // `download_checksum` asserts the provider's pre-metadata bytes. Only a
+        // row that already agreed with its file can make that claim, so a row
+        // without a recorded checksum establishes `local_checksum` alone and
+        // stays visible to reconcile's size check.
+        let verified_before = record.local_checksum.is_some();
+        if let Some(before) = &pre_rewrite_checksum {
+            match super::file::compute_sha256(&path).await {
+                // Stored before the marker retires below, so a later failure
+                // cannot leave a rewritten file behind a stale hash. An
+                // unchanged file is left alone: kei only vouches for bytes it
+                // wrote.
+                Ok(after) if after != *before => {
+                    if let Err(e) = db
+                        .set_metadata_rewrite_checksums(
+                            &record.library,
+                            &record.id,
+                            version_size.as_str(),
+                            Some(after.as_str()),
+                            verified_before.then_some(before.as_str()),
+                        )
+                        .await
+                    {
+                        tracing::warn!(asset_id = %record.id, error = %e, "Failed to record rewritten media checksum");
+                        forget_stale_checksum(db, &record, version_size.as_str()).await;
+                        errored += 1;
+                        continue;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        error = %e,
+                        "Could not hash file after metadata rewrite; leaving marker for future retry"
+                    );
+                    // The rewrite may already have replaced the bytes, so the
+                    // recorded hash can no longer be trusted either way.
+                    forget_stale_checksum(db, &record, version_size.as_str()).await;
+                    errored += 1;
+                    continue;
+                }
+            }
+        }
 
         if !outcome.any_failed() {
             if let Err(e) = db
@@ -469,13 +591,14 @@ where
         applied,
         errored,
         skipped_missing,
+        skipped_drifted,
         deferred,
         "Metadata rewrite pass complete"
     );
     RewritePass {
         fetched: pending_count,
         applied,
-        failed: errored + deferred,
+        failed: errored + deferred + skipped_drifted,
     }
 }
 
@@ -662,6 +785,9 @@ mod tests {
         std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
 
         let db = SqliteStateDb::open_in_memory().unwrap();
+        let seeded_checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
 
         let seeded_hash = "seed_hash_before_rewrite".to_string();
         let metadata = AssetMetadata {
@@ -681,7 +807,7 @@ mod tests {
             "REWRITE_1",
             "original",
             &photo_path,
-            "rewrite_ck",
+            &seeded_checksum,
             None,
         )
         .await
@@ -1016,6 +1142,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clear-failure.jpg");
         std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+        let seeded_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
         let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
         let record = crate::test_helpers::TestAssetRecord::new("CLEAR_FAIL")
             .filename("clear-failure.jpg")
@@ -1031,7 +1158,7 @@ mod tests {
             "CLEAR_FAIL",
             "original",
             &path,
-            "checksum",
+            &seeded_checksum,
             None,
         )
         .await
@@ -1058,6 +1185,416 @@ mod tests {
         assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
     }
 
+    /// Seeds a downloaded JPEG carrying a rewrite marker. Returns the
+    /// database, the media path, and the checksum recorded for the file.
+    /// `rating` drives whether the embedded writer has anything to write.
+    #[cfg(feature = "xmp")]
+    async fn seed_marked_jpeg(
+        dir: &std::path::Path,
+        asset_id: &'static str,
+        rating: Option<u8>,
+    ) -> (crate::state::SqliteStateDb, PathBuf, String) {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let path = dir.join(format!("{asset_id}.jpg"));
+        std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+        let recorded = crate::download::file::compute_sha256(&path).await.unwrap();
+
+        // File backed so a test can reopen it and drop connection-scoped
+        // failure triggers between passes.
+        let db = SqliteStateDb::open(&dir.join("state.db")).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new(asset_id)
+            .filename(&format!("{asset_id}.jpg"))
+            .metadata(AssetMetadata {
+                rating,
+                metadata_hash: Some("fresh-hash".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("PrimarySync", asset_id, "original", &path, &recorded, None)
+            .await
+            .unwrap();
+        db.record_metadata_write_failure("PrimarySync", asset_id, "original")
+            .await
+            .unwrap();
+
+        (db, path, recorded)
+    }
+
+    #[cfg(feature = "xmp")]
+    fn embedded_rating_flags() -> MetadataFlags {
+        MetadataFlags::RATING | MetadataFlags::EMBED_XMP
+    }
+
+    #[cfg(feature = "xmp")]
+    async fn stored_checksums(
+        db: &crate::state::SqliteStateDb,
+    ) -> (Option<String>, Option<String>) {
+        let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+        (row.local_checksum, row.download_checksum)
+    }
+
+    /// #707 review: the drain must not re-hash a file it did not write. A file
+    /// that already drifted from its recorded checksum is damage `verify` and
+    /// `reconcile` must keep reporting, so the rewrite is refused outright.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_refuses_to_rewrite_a_file_that_drifted_from_its_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, path, recorded) = seed_marked_jpeg(dir.path(), "DRIFTED", Some(3)).await;
+        // Trailing bytes after EOI keep the container readable, so the writer
+        // would still accept the file if the drain offered it.
+        let mut drifted_bytes = minimal_jpeg_bytes();
+        drifted_bytes.push(0x00);
+        std::fs::write(&path, &drifted_bytes).unwrap();
+
+        let pass = run_pending_page(
+            &db,
+            embedded_rating_flags() | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+            None,
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            drifted_bytes,
+            "a file that does not match its checksum must not be rewritten"
+        );
+        let mut sidecar = path.clone().into_os_string();
+        sidecar.push(".xmp");
+        assert!(
+            PathBuf::from(sidecar).exists(),
+            "the sidecar is a separate file, so the export still runs"
+        );
+        assert_eq!(
+            pass.failed, 1,
+            "a refused rewrite is unfinished work, not a clean pass"
+        );
+        let (local, download) = stored_checksums(&db).await;
+        assert_eq!(
+            local.as_deref(),
+            Some(recorded.as_str()),
+            "the recorded checksum is the evidence of damage and must survive"
+        );
+        assert_eq!(download, None, "a refused rewrite records no download hash");
+        assert_eq!(
+            db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+            1,
+            "the marker stays because the metadata never reached the file"
+        );
+    }
+
+    /// #707 review: an embedded rewrite changes the media, so the row must
+    /// carry the new hash and keep the pre-rewrite hash as the provider
+    /// download checksum.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_records_the_rewritten_media_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, path, recorded) = seed_marked_jpeg(dir.path(), "REWRITTEN", Some(3)).await;
+
+        run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let on_disk = crate::download::file::compute_sha256(&path).await.unwrap();
+        assert_ne!(
+            on_disk, recorded,
+            "precondition: the rewrite must change the media bytes"
+        );
+        let (local, download) = stored_checksums(&db).await;
+        assert_eq!(local.as_deref(), Some(on_disk.as_str()));
+        assert_eq!(download.as_deref(), Some(recorded.as_str()));
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a complete rewrite retires its marker"
+        );
+    }
+
+    /// #707 review: the checksum is stored before the marker retires, so a
+    /// failure in between leaves a rewritten file the next pass can still
+    /// recognise as its own.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_keeps_the_marker_when_the_rewritten_checksum_cannot_be_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, path, recorded) = seed_marked_jpeg(dir.path(), "CKFAIL", Some(3)).await;
+        db.fail_metadata_checksum_write_for_test();
+
+        run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let on_disk = crate::download::file::compute_sha256(&path).await.unwrap();
+        assert_ne!(on_disk, recorded, "precondition: the media was rewritten");
+        assert_eq!(
+            db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+            1,
+            "the marker must survive so the rewrite is retried"
+        );
+        let (local, _) = stored_checksums(&db).await;
+        assert_eq!(
+            local, None,
+            "a hash kei could not confirm must read as unknown, not as the              pre-rewrite value the next pass would treat as damage"
+        );
+
+        // A later pass, once the state write works again, must be able to
+        // finish the job rather than refuse its own rewrite forever.
+        let db = crate::state::SqliteStateDb::open(db.path()).await.unwrap();
+        run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let healed = crate::download::file::compute_sha256(&path).await.unwrap();
+        let (local, _) = stored_checksums(&db).await;
+        assert_eq!(
+            local.as_deref(),
+            Some(healed.as_str()),
+            "the retry must record the bytes on disk"
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the retry must retire the marker"
+        );
+    }
+
+    /// #707 review: a sidecar-only rewrite leaves the media untouched, so it
+    /// must not restate either checksum.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_leaves_checksums_untouched_for_a_sidecar_only_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, path, recorded) = seed_marked_jpeg(dir.path(), "SIDECAR", Some(3)).await;
+        let before = std::fs::read(&path).unwrap();
+
+        run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a sidecar write must not touch the media"
+        );
+        let (local, download) = stored_checksums(&db).await;
+        assert_eq!(local.as_deref(), Some(recorded.as_str()));
+        assert_eq!(
+            download, None,
+            "no media rewrite happened, so no pre-rewrite hash is established"
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the sidecar rewrite completed, so its marker retires"
+        );
+    }
+
+    /// #707 review: a legacy row carries no checksum, so there is nothing to
+    /// verify against and nothing to protect. The rewrite proceeds and
+    /// establishes the baseline.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_establishes_a_checksum_baseline_when_none_was_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, path, _recorded) = seed_marked_jpeg(dir.path(), "LEGACY", Some(3)).await;
+        db.clear_local_checksum_for_test("PrimarySync", "LEGACY", "original");
+
+        run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let on_disk = crate::download::file::compute_sha256(&path).await.unwrap();
+        let (local, download) = stored_checksums(&db).await;
+        assert_eq!(
+            local.as_deref(),
+            Some(on_disk.as_str()),
+            "the rewrite establishes the checksum a legacy row never had"
+        );
+        assert_eq!(
+            download, None,
+            "the pre-rewrite bytes were never verified, so kei cannot claim              them as the provider download"
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a legacy row must not be stranded behind a missing checksum"
+        );
+        let (counts, _) = crate::commands::reconcile::scan_local_drift(
+            &db,
+            |_: &crate::commands::reconcile::LocalDriftAsset| {},
+            |_: &str| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counts.damaged, 1,
+            "a legacy file short of its provider size must still read as damaged"
+        );
+    }
+
+    /// #707 review: the rewritten hash is stored before the marker retires, so
+    /// a failure later in the same attempt still leaves the row describing the
+    /// bytes on disk. Without that, the next pass would read its own rewrite as
+    /// damage and refuse to touch it again.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_records_the_rewritten_checksum_even_when_the_sidecar_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, path, recorded) = seed_marked_jpeg(dir.path(), "SIDEFAIL", Some(3)).await;
+
+        // A directory where the sidecar belongs fails the sidecar write while
+        // leaving the embedded write free to change the media.
+        let mut sidecar = path.clone().into_os_string();
+        sidecar.push(".xmp");
+        std::fs::create_dir(PathBuf::from(sidecar)).unwrap();
+
+        run_pending(
+            &db,
+            embedded_rating_flags() | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let on_disk = crate::download::file::compute_sha256(&path).await.unwrap();
+        assert_ne!(
+            on_disk, recorded,
+            "precondition: the embedded write must land before the sidecar fails"
+        );
+        let (local, download) = stored_checksums(&db).await;
+        assert_eq!(
+            local.as_deref(),
+            Some(on_disk.as_str()),
+            "the row must describe the rewritten bytes even though the attempt failed"
+        );
+        assert_eq!(download.as_deref(), Some(recorded.as_str()));
+        assert_eq!(
+            db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+            1,
+            "the sidecar still owes a write, so the marker stays"
+        );
+    }
+
+    /// #707 review: a rewrite with nothing to write leaves the media alone, so
+    /// the row must not gain a checksum for bytes kei never wrote. Vouching for
+    /// an untouched file would hide damage that arrived some other way.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_writing_nothing_does_not_vouch_for_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // No rating to write, and only the rating writer is enabled, so the
+        // embedded plan comes out empty.
+        let (db, path, recorded) = seed_marked_jpeg(dir.path(), "UNTOUCHED", None).await;
+        let before = std::fs::read(&path).unwrap();
+
+        run_pending(
+            &db,
+            MetadataFlags::RATING,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "precondition: an empty plan must leave the media alone"
+        );
+        let (local, download) = stored_checksums(&db).await;
+        assert_eq!(local.as_deref(), Some(recorded.as_str()));
+        assert_eq!(
+            download, None,
+            "kei must not claim a pre-rewrite hash for a file it did not rewrite"
+        );
+    }
+
+    /// #718 taught reconcile that a metadata-rewritten file is legitimately
+    /// smaller than the provider size, proving it by hashing against
+    /// `local_checksum`. That proof needs both checksums, so a drained file
+    /// must not be reported as truncated damage.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drained_file_is_not_reported_as_truncated_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _path, _recorded) = seed_marked_jpeg(dir.path(), "SHRUNK", Some(3)).await;
+
+        let (before, _) = stored_checksums(&db).await;
+        let (counts, drift) = crate::commands::reconcile::scan_local_drift(
+            &db,
+            |_: &crate::commands::reconcile::LocalDriftAsset| {},
+            |_: &str| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counts.damaged, 1,
+            "precondition: the provider size is larger than the file, so an \
+             unexplained difference reads as damage"
+        );
+        assert_eq!(drift.len(), 1);
+
+        run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let (after, download) = stored_checksums(&db).await;
+        assert_ne!(after, before, "precondition: the drain rewrote the media");
+        assert!(
+            download.is_some(),
+            "reconcile needs the pre-rewrite hash to run its proof"
+        );
+
+        let (counts, drift) = crate::commands::reconcile::scan_local_drift(
+            &db,
+            |_: &crate::commands::reconcile::LocalDriftAsset| {},
+            |_: &str| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(counts.present, 1);
+        assert_eq!(counts.damaged, 0, "a drained file is intact, not truncated");
+        assert!(drift.is_empty());
+    }
+
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn drain_reaches_newer_marker_after_retained_batch() {
@@ -1070,6 +1607,9 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let invalid_path = dir.path().join("invalid.jpg");
         std::fs::write(&invalid_path, b"not a jpeg").unwrap();
+        let invalid_checksum = crate::download::file::compute_sha256(&invalid_path)
+            .await
+            .unwrap();
         for i in 0..METADATA_REWRITE_BATCH {
             let id = format!("A{i:04}");
             let metadata = AssetMetadata {
@@ -1082,15 +1622,25 @@ mod tests {
                 .metadata(metadata)
                 .build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded("PrimarySync", &id, "original", &invalid_path, "ck", None)
-                .await
-                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &id,
+                "original",
+                &invalid_path,
+                &invalid_checksum,
+                None,
+            )
+            .await
+            .unwrap();
             db.record_metadata_write_failure("PrimarySync", &id, "original")
                 .await
                 .unwrap();
         }
         let valid_path = dir.path().join("valid.jpg");
         std::fs::write(&valid_path, minimal_jpeg_bytes()).unwrap();
+        let valid_checksum = crate::download::file::compute_sha256(&valid_path)
+            .await
+            .unwrap();
         let valid = crate::test_helpers::TestAssetRecord::new("Z_VALID")
             .filename("valid.jpg")
             .metadata(AssetMetadata {
@@ -1105,7 +1655,7 @@ mod tests {
             "Z_VALID",
             "original",
             &valid_path,
-            "ck",
+            &valid_checksum,
             None,
         )
         .await

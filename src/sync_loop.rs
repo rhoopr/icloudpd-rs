@@ -4289,6 +4289,9 @@ mod tests {
         /// Counts drains: `run_pending` starts each one with an offset-zero
         /// page fetch.
         drains: Arc<std::sync::atomic::AtomicUsize>,
+        /// Fails the rewritten-media checksum write so a drain can be driven
+        /// into the window where the file changed but the row has not caught up.
+        fail_metadata_checksum_write: bool,
     }
 
     impl std::fmt::Debug for FailingMetadataSetDb {
@@ -4321,6 +4324,7 @@ mod tests {
                 fail_refresh_downloaded_metadata: false,
                 refresh_on_mark_downloaded: None,
                 drains: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_metadata_checksum_write: false,
             }
         }
 
@@ -4961,6 +4965,28 @@ mod tests {
         ) -> Result<(), state::error::StateError> {
             self.inner
                 .clear_metadata_write_failure(library, asset_id, version_size)
+                .await
+        }
+
+        async fn set_metadata_rewrite_checksums(
+            &self,
+            library: &str,
+            asset_id: &str,
+            version_size: &str,
+            local_checksum: Option<&str>,
+            pre_rewrite_checksum: Option<&str>,
+        ) -> Result<(), state::error::StateError> {
+            if self.fail_metadata_checksum_write {
+                return Err(state::error::StateError::LockPoisoned(self.message.into()));
+            }
+            self.inner
+                .set_metadata_rewrite_checksums(
+                    library,
+                    asset_id,
+                    version_size,
+                    local_checksum,
+                    pre_rewrite_checksum,
+                )
                 .await
         }
 

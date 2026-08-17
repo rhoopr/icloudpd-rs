@@ -4467,6 +4467,17 @@ mod tests {
             Ok(())
         }
 
+        async fn set_metadata_rewrite_checksums(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+
         async fn get_downloaded_metadata_hashes(
             &self,
         ) -> Result<HashMap<(String, String, String), String>, StateError> {
@@ -5717,6 +5728,109 @@ mod tests {
         assert_eq!(rewrites[0].metadata.title, None);
     }
 
+    /// #707 review: the pre-plan refresh makes embedded rewrites reachable for
+    /// a filtered downloaded asset. The drain rewrites the media, so the row
+    /// must end holding a checksum of the bytes that are now on disk, and the
+    /// pre-rewrite hash must survive as the provider download checksum.
+    #[tokio::test]
+    async fn filtered_embed_rewrite_keeps_stored_checksums_current() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.metadata.set_exif_rating = true;
+        config.filename_exclude =
+            Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
+        let config = Arc::new(config);
+
+        let media_path = dir.path().join("filtered-embed.jpg");
+        fs::write(
+            &media_path,
+            [
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+            ],
+        )
+        .unwrap();
+        let seeded_checksum = crate::download::file::compute_sha256(&media_path)
+            .await
+            .expect("hash the seeded media");
+
+        // Stored without the favourite, so the provider edit below raises the
+        // rating and gives the embedded writer real work to do.
+        let record = crate::test_helpers::TestAssetRecord::new("FILTERED_EMBED")
+            .checksum("ck_filtered_embed")
+            .filename("filtered-embed.jpg")
+            .size(1234)
+            .metadata(AssetMetadata {
+                metadata_hash: Some("stale-hash".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "FILTERED_EMBED",
+            "original",
+            &media_path,
+            &seeded_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let edited: PhotoAsset = TestPhotoAsset::new("FILTERED_EMBED")
+            .filename("filtered-embed.jpg")
+            .item_type("public.jpeg")
+            .orig_file_type("public.jpeg")
+            .orig_size(1234)
+            .orig_url("https://p01.icloud-content.com/filtered-embed.jpg")
+            .orig_checksum("ck_filtered_embed")
+            .favorite(true)
+            .build();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(result.downloaded, 0, "the filter must skip the media task");
+        let on_disk = crate::download::file::compute_sha256(&media_path)
+            .await
+            .expect("hash the rewritten media");
+        assert_ne!(
+            on_disk, seeded_checksum,
+            "precondition: the embedded rewrite must change the media bytes"
+        );
+
+        let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+        assert_eq!(
+            row.local_checksum.as_deref(),
+            Some(on_disk.as_str()),
+            "the row must record the bytes the rewrite left on disk"
+        );
+        assert_eq!(
+            row.download_checksum.as_deref(),
+            Some(seeded_checksum.as_str()),
+            "the pre-rewrite hash must survive as the provider download checksum"
+        );
+    }
+
     /// #674 regression: a metadata-only edit drifts the source hash from the
     /// stored hash. On the on-disk skip the catalogue must be refreshed to the
     /// edited source metadata (not left stale) without re-downloading, so a
@@ -5757,6 +5871,9 @@ mod tests {
             .unwrap();
         fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
         fs::write(&derived.path, vec![0u8; 1000]).unwrap();
+        let seeded_checksum = crate::download::file::compute_sha256(&derived.path)
+            .await
+            .unwrap();
         let record = asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived);
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
@@ -5764,7 +5881,7 @@ mod tests {
             stored.state_id(),
             derived.version_size.as_str(),
             &derived.path,
-            "local-checksum",
+            &seeded_checksum,
             None,
         )
         .await

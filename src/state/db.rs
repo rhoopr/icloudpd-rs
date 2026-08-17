@@ -587,6 +587,15 @@ pub trait MetadataRewriteStore: Send + Sync {
         asset_id: &str,
         version_size: &str,
     ) -> Result<(), StateError>;
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    async fn set_metadata_rewrite_checksums(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+    ) -> Result<(), StateError>;
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
 }
 
@@ -3432,6 +3441,48 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Records the media hash a metadata rewrite left on disk, keeping the
+    /// rewrite marker so the caller decides when the write is complete.
+    /// `pre_rewrite_checksum` seeds `download_checksum` only when the column is
+    /// empty, so the provider's pre-metadata hash is established once and later
+    /// rewrites never overwrite it. Pass `None` for `pre_rewrite_checksum` when
+    /// those bytes were never verified against the row, because an unproven
+    /// hash would tell reconcile the file is an intentional rewrite rather than
+    /// damage. A `None` `local_checksum` records that the file changed and its
+    /// hash is unknown, which is the truth after a rewrite whose result could
+    /// not be measured, and which lets a later pass rewrite it again.
+    pub(crate) async fn set_metadata_rewrite_checksums(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        let local_checksum = local_checksum.map(str::to_owned);
+        let pre_rewrite_checksum = pre_rewrite_checksum.map(str::to_owned);
+        self.with_conn("set_metadata_rewrite_checksums", move |conn| {
+            conn.execute(
+                "UPDATE assets SET local_checksum = ?4, \
+                 download_checksum = COALESCE(download_checksum, ?5) \
+                 WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+                rusqlite::params![
+                    library,
+                    asset_id,
+                    version_size,
+                    local_checksum,
+                    pre_rewrite_checksum
+                ],
+            )
+            .map_err(|e| StateError::query("set_metadata_rewrite_checksums", e))?;
+            Ok(())
+        })
+        .await
+    }
+
     pub(crate) async fn get_downloaded_metadata_hashes(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError> {
@@ -4213,6 +4264,25 @@ impl MetadataRewriteStore for SqliteStateDb {
         SqliteStateDb::clear_metadata_write_failure(self, library, asset_id, version_size).await
     }
 
+    async fn set_metadata_rewrite_checksums(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::set_metadata_rewrite_checksums(
+            self,
+            library,
+            asset_id,
+            version_size,
+            local_checksum,
+            pre_rewrite_checksum,
+        )
+        .await
+    }
+
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
         SqliteStateDb::has_downloaded_without_metadata_hash(self).await
     }
@@ -4242,6 +4312,36 @@ impl SqliteStateDb {
              BEFORE UPDATE OF metadata_write_failed_at ON assets \
              WHEN NEW.metadata_write_failed_at IS NULL \
              BEGIN SELECT RAISE(FAIL, 'simulated metadata marker clear failure'); END;",
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(crate) fn fail_metadata_checksum_write_for_test(&self) {
+        let conn = self
+            .acquire_lock("test_fail_metadata_checksum_write")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_metadata_checksum_write \
+             BEFORE UPDATE OF local_checksum ON assets \
+             WHEN NEW.local_checksum IS NOT NULL \
+             BEGIN SELECT RAISE(FAIL, 'simulated rewritten checksum write failure'); END;",
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(crate) fn clear_local_checksum_for_test(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) {
+        let conn = self.acquire_lock("test_clear_local_checksum").unwrap();
+        conn.execute(
+            "UPDATE assets SET local_checksum = NULL \
+             WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+            rusqlite::params![library, asset_id, version_size],
         )
         .unwrap();
     }

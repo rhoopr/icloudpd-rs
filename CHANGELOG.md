@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A metadata-only iCloud edit (favourite, rating, keywords, caption, GPS) on an unchanged file now refreshes the catalogue during full enumeration and single-pass incremental sync. Changed provider metadata is applied before filtering and path planning, so the refresh reaches every downloaded version of the asset even when its media task is skipped as already on disk or excluded by a filter. The catalogue row and the rewrite marker commit together, so a queued sidecar or EXIF rewrite reads the corrected values instead of replaying stale ones, and no media is re-downloaded. ([#707], refs [#674])
 - A failed catalogue refresh now preserves the previous zone checkpoint instead of advancing past a provider edit that was never stored. ([#707])
 - Metadata rewrite failures are now reported when a sync downloads nothing. A metadata-only edit cycle transfers no media, so a failed sidecar or EXIF write was previously invisible in the sync result. ([#707])
+- An embedded metadata rewrite now records the hash of the file it leaves on disk, keeping the pre-rewrite hash as the provider download checksum, so `kei verify --checksums` and `kei reconcile` read an intentional edit as intact rather than corrupted or truncated. A file that no longer matches its recorded checksum keeps its marker and is left untouched for those commands to report. ([#707])
 
 ## [0.23.1] - 2026-08-16
 
