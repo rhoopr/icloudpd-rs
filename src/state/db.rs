@@ -183,6 +183,12 @@ pub trait DownloadStateStore: Send + Sync {
         Ok(0)
     }
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
+    /// Assets whose downloaded rows survive a provider deletion. Staleness
+    /// checks skip these, so an implementor must answer deliberately rather
+    /// than inherit an empty default.
+    async fn get_soft_deleted_downloaded_ids(
+        &self,
+    ) -> Result<HashSet<(String, String)>, StateError>;
     async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError>;
     async fn get_downloaded_checksums(
         &self,
@@ -575,18 +581,20 @@ pub trait MetadataRewriteStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError>;
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError>;
     async fn clear_metadata_write_failure(
         &self,
         library: &str,
         asset_id: &str,
         version_size: &str,
+    ) -> Result<(), StateError>;
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    async fn set_metadata_rewrite_checksums(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
     ) -> Result<(), StateError>;
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
 }
@@ -2118,6 +2126,37 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Assets that still hold `status = 'downloaded'` rows after the provider
+    /// reported them deleted. Soft deletion flips every version of an asset
+    /// together, so this is keyed by asset rather than by version.
+    pub(crate) async fn get_soft_deleted_downloaded_ids(
+        &self,
+    ) -> Result<HashSet<(String, String)>, StateError> {
+        self.with_conn("get_soft_deleted_downloaded_ids", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT DISTINCT library, id FROM assets \
+                     WHERE status = 'downloaded' AND is_deleted = 1",
+                )
+                .map_err(|e| StateError::query("get_soft_deleted_downloaded_ids", e))?;
+
+            let mut ids = HashSet::new();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_soft_deleted_downloaded_ids", e))?;
+            for row in rows {
+                ids.insert(
+                    row.map_err(|e| StateError::query("get_soft_deleted_downloaded_ids", e))?,
+                );
+            }
+
+            Ok(ids)
+        })
+        .await
+    }
+
     pub(crate) async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         self.with_conn("get_all_known_ids", move |conn| {
             let mut stmt = conn
@@ -3359,7 +3398,24 @@ impl SqliteStateDb {
                     ],
                 )
                 .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
-            Ok(updated)
+            if updated > 0 {
+                return Ok(updated);
+            }
+            // A row can leave `downloaded` mid-cycle when the provider
+            // publishes new media for the same asset, which stores the
+            // incoming metadata as it resets the row for re-download. The
+            // metadata is durable, so report the match rather than a lost
+            // write. A missing or still-stale row stays a failure.
+            let durable: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM assets \
+                     WHERE library = ?1 AND id = ?2 AND is_deleted = 0 \
+                       AND metadata_hash IS NOT NULL AND metadata_hash = ?3",
+                    rusqlite::params![library, asset_id, metadata.metadata_hash.as_deref()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
+            Ok(usize::try_from(durable).unwrap_or(0))
         })
         .await
     }
@@ -3380,6 +3436,48 @@ impl SqliteStateDb {
                 rusqlite::params![library, asset_id, version_size],
             )
             .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records the media hash a metadata rewrite left on disk, keeping the
+    /// rewrite marker so the caller decides when the write is complete.
+    /// `pre_rewrite_checksum` seeds `download_checksum` only when the column is
+    /// empty, so the provider's pre-metadata hash is established once and later
+    /// rewrites never overwrite it. Pass `None` for `pre_rewrite_checksum` when
+    /// those bytes were never verified against the row, because an unproven
+    /// hash would tell reconcile the file is an intentional rewrite rather than
+    /// damage. A `None` `local_checksum` records that the file changed and its
+    /// hash is unknown, which is the truth after a rewrite whose result could
+    /// not be measured, and which lets a later pass rewrite it again.
+    pub(crate) async fn set_metadata_rewrite_checksums(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        let local_checksum = local_checksum.map(str::to_owned);
+        let pre_rewrite_checksum = pre_rewrite_checksum.map(str::to_owned);
+        self.with_conn("set_metadata_rewrite_checksums", move |conn| {
+            conn.execute(
+                "UPDATE assets SET local_checksum = ?4, \
+                 download_checksum = COALESCE(download_checksum, ?5) \
+                 WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+                rusqlite::params![
+                    library,
+                    asset_id,
+                    version_size,
+                    local_checksum,
+                    pre_rewrite_checksum
+                ],
+            )
+            .map_err(|e| StateError::query("set_metadata_rewrite_checksums", e))?;
             Ok(())
         })
         .await
@@ -3477,6 +3575,7 @@ impl SqliteStateDb {
                 "SELECT {ASSET_COLUMNS} FROM assets \
                  WHERE metadata_write_failed_at IS NOT NULL \
                    AND status = 'downloaded' \
+                   AND is_deleted = 0 \
                    AND local_path IS NOT NULL \
                  ORDER BY metadata_write_failed_at ASC, library, id, version_size \
                  LIMIT ?1 OFFSET ?2"
@@ -3524,29 +3623,6 @@ impl SqliteStateDb {
                 markers.insert(key);
             }
             Ok(markers)
-        })
-        .await
-    }
-
-    pub(crate) async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError> {
-        let library = library.to_owned();
-        let asset_id = asset_id.to_owned();
-        let version_size = version_size.to_owned();
-        let metadata_hash = metadata_hash.to_owned();
-        self.with_conn("update_metadata_hash", move |conn| {
-            conn.execute(
-                "UPDATE assets SET metadata_hash = ?1 \
-                 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
-                rusqlite::params![metadata_hash, library, asset_id, version_size],
-            )
-            .map_err(|e| StateError::query("update_metadata_hash", e))?;
-            Ok(())
         })
         .await
     }
@@ -3657,6 +3733,12 @@ impl DownloadStateStore for SqliteStateDb {
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
         SqliteStateDb::get_downloaded_ids(self).await
+    }
+
+    async fn get_soft_deleted_downloaded_ids(
+        &self,
+    ) -> Result<HashSet<(String, String)>, StateError> {
+        SqliteStateDb::get_soft_deleted_downloaded_ids(self).await
     }
 
     async fn get_all_known_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
@@ -4173,17 +4255,6 @@ impl MetadataRewriteStore for SqliteStateDb {
         SqliteStateDb::get_pending_metadata_rewrites_page(self, library_scope, offset, limit).await
     }
 
-    async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::update_metadata_hash(self, library, asset_id, version_size, metadata_hash)
-            .await
-    }
-
     async fn clear_metadata_write_failure(
         &self,
         library: &str,
@@ -4191,6 +4262,25 @@ impl MetadataRewriteStore for SqliteStateDb {
         version_size: &str,
     ) -> Result<(), StateError> {
         SqliteStateDb::clear_metadata_write_failure(self, library, asset_id, version_size).await
+    }
+
+    async fn set_metadata_rewrite_checksums(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::set_metadata_rewrite_checksums(
+            self,
+            library,
+            asset_id,
+            version_size,
+            local_checksum,
+            pre_rewrite_checksum,
+        )
+        .await
     }
 
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
@@ -4222,6 +4312,36 @@ impl SqliteStateDb {
              BEFORE UPDATE OF metadata_write_failed_at ON assets \
              WHEN NEW.metadata_write_failed_at IS NULL \
              BEGIN SELECT RAISE(FAIL, 'simulated metadata marker clear failure'); END;",
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(crate) fn fail_metadata_checksum_write_for_test(&self) {
+        let conn = self
+            .acquire_lock("test_fail_metadata_checksum_write")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_metadata_checksum_write \
+             BEFORE UPDATE OF local_checksum ON assets \
+             WHEN NEW.local_checksum IS NOT NULL \
+             BEGIN SELECT RAISE(FAIL, 'simulated rewritten checksum write failure'); END;",
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(crate) fn clear_local_checksum_for_test(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) {
+        let conn = self.acquire_lock("test_clear_local_checksum").unwrap();
+        conn.execute(
+            "UPDATE assets SET local_checksum = NULL \
+             WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+            rusqlite::params![library, asset_id, version_size],
         )
         .unwrap();
     }
@@ -8773,6 +8893,57 @@ mod tests {
         assert_eq!(hidden, 0);
     }
 
+    /// #707 review: new provider media returns a downloaded row to pending and
+    /// stores the incoming metadata in the same statement. A refresh that then
+    /// matches no downloaded row has still found its metadata durable, so it
+    /// must not be reported as a lost write and hold the provider checkpoint.
+    #[tokio::test]
+    async fn refresh_reports_metadata_already_durable_on_a_row_that_left_downloaded() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut edited = AssetMetadata {
+            is_favorite: true,
+            rating: Some(5),
+            ..AssetMetadata::default()
+        };
+        edited.refresh_hash();
+
+        let seeded = TestAssetRecord::new("MOVED_ON").checksum("ck_v1").build();
+        db.upsert_seen(&seeded).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "MOVED_ON",
+            "original",
+            std::path::Path::new("/tmp/moved-on.jpg"),
+            "local_v1",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // New media for the same asset: the row returns to pending and carries
+        // the edited metadata forward.
+        let republished = TestAssetRecord::new("MOVED_ON")
+            .checksum("ck_v2")
+            .metadata(edited.clone())
+            .build();
+        db.upsert_seen(&republished).await.unwrap();
+
+        let matched = db
+            .refresh_downloaded_asset_metadata("PrimarySync", "MOVED_ON", &edited, true)
+            .await
+            .unwrap();
+        assert!(
+            matched > 0,
+            "metadata already stored by the reset must count as durable"
+        );
+
+        let stale = db
+            .refresh_downloaded_asset_metadata("PrimarySync", "ABSENT", &edited, true)
+            .await
+            .unwrap();
+        assert_eq!(stale, 0, "a missing row is still a lost write");
+    }
+
     #[tokio::test]
     async fn record_and_clear_metadata_write_failure_roundtrip() {
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -8943,6 +9114,18 @@ mod tests {
                 record.metadata.metadata_hash.as_deref(),
                 Some(expected_hash.as_str())
             );
+        }
+
+        // The refresh must not disturb download state: #707 requires every
+        // live downloaded version to keep its status, local path, checksums
+        // and download timestamp while its metadata is replaced.
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 2, "both versions must remain downloaded");
+        for record in &downloaded {
+            assert_eq!(record.local_path.as_deref(), Some(Path::new("/photo.jpg")));
+            assert_eq!(record.local_checksum.as_deref(), Some("checksum"));
+            assert_eq!(record.checksum.as_ref(), "checksum123");
+            assert_eq!(record.metadata.rating, Some(4));
         }
     }
 

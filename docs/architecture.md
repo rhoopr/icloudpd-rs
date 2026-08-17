@@ -188,10 +188,30 @@ recovery work needed after that checkpoint is durable.
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
 Metadata failure markers must survive so a later run can retry metadata
-without downloading the media again. Collecting incremental sync commits
-changed catalogue metadata and its configured rewrite marker before album
-routing or deciding whether unchanged media needs downloading. A failed commit
-preserves the provider checkpoint.
+without downloading the media again. Full enumeration, single-pass incremental,
+and collecting incremental sync all commit changed catalogue metadata and its
+configured rewrite marker together, before filtering, album routing, or
+deciding whether unchanged media needs downloading. A failed commit preserves
+the provider checkpoint. Queued rewrites drain once per cycle, after every
+producer has finished, so a single writer owns each file. Read-only runs never
+drain. Only that drain retires a marker on success, because it writes the file
+from the same row it then clears. A completed download writes the snapshot it
+was planned from, so it records a marker on failure but never retires one.
+
+A drain only rewrites a file whose bytes still match the checksum on its row,
+because the alternative is embedding into damage and then vouching for it. A
+file that no longer matches keeps its marker and its recorded checksum, so
+`kei verify --checksums` and `kei reconcile` continue to report it. When a
+rewrite does change the media, the new hash is stored before the marker
+retires, and the pre-rewrite hash is kept as the provider download checksum so
+reconcile can still tell an intentional rewrite from a truncated file. A
+retired marker therefore implies the row describes the bytes on disk.
+
+A rewrite whose result could not be measured records the checksum as unknown
+rather than leaving the superseded value in place, because a known-stale hash
+would make the next pass read kei's own rewrite as damage and refuse it. A row
+that never recorded a checksum is rewritten but claims no provider download
+hash, so reconcile keeps reporting a file that is short of its provider size.
 
 ### State and serialization
 

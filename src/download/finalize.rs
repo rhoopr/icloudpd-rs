@@ -51,8 +51,9 @@ pub(super) enum DownloadedFinalization {
 }
 
 /// Persist success state for a task that has already landed safely on disk.
-/// On success, metadata retry markers are updated immediately. On failure,
-/// the caller receives a deferred write record for bounded retry.
+/// A failed metadata write records a retry marker; retiring markers is left to
+/// the rewrite drain. On failure, the caller receives a deferred write record
+/// for bounded retry.
 pub(super) async fn finalize_downloaded<D>(
     db: &D,
     library: &Arc<str>,
@@ -114,8 +115,14 @@ where
         .await
 }
 
-/// Set or clear the metadata-rewrite marker for an asset-version pair based
-/// on whether the EXIF/XMP writer succeeded.
+/// Record a metadata-rewrite marker when the EXIF/XMP writer failed.
+///
+/// A successful write does not retire an existing marker. This writes the file
+/// from the snapshot the task was planned with, while the marker describes the
+/// row, and a concurrent pass may have moved the row on since. Retiring it here
+/// would leave the row and the file on different snapshots with nothing left to
+/// repair them. The rewrite drain owns that decision, because it writes the
+/// file from the same row it then clears.
 async fn update_metadata_marker<D>(
     db: &D,
     library: &str,
@@ -126,19 +133,6 @@ async fn update_metadata_marker<D>(
     D: MetadataRewriteStore + ?Sized,
 {
     if exif_ok {
-        if let Err(e) = db
-            .clear_metadata_write_failure(library, asset_id, version_size)
-            .await
-        {
-            tracing::warn!(
-                library,
-                asset_id,
-                version_size,
-                error = %e,
-                "Could not clear metadata-write-failed marker; asset will be \
-                 re-rewritten on next sync"
-            );
-        }
         return;
     }
     if let Err(e) = db
@@ -316,19 +310,6 @@ where
 }
 
 #[cfg(test)]
-pub(super) async fn update_metadata_marker_for_test<D>(
-    db: &D,
-    library: &str,
-    asset_id: &str,
-    version_size: &str,
-    exif_ok: bool,
-) where
-    D: MetadataRewriteStore + ?Sized,
-{
-    update_metadata_marker(db, library, asset_id, version_size, exif_ok).await;
-}
-
-#[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -372,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_downloaded_marks_persisted_and_clears_metadata_marker() {
+    async fn finalize_downloaded_marks_persisted_and_keeps_metadata_marker() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("persisted.jpg");
         write_file(&path).await;
@@ -399,12 +380,10 @@ mod tests {
                 .unwrap(),
             "downloaded row with existing file should not be queued again"
         );
-        assert!(
-            db.get_pending_metadata_rewrites(32)
-                .await
-                .unwrap()
-                .is_empty(),
-            "successful metadata write must clear the retry marker"
+        assert_eq!(
+            db.get_pending_metadata_rewrites(32).await.unwrap().len(),
+            1,
+            "the marker describes the row, so only the drain may retire it"
         );
     }
 

@@ -308,6 +308,7 @@ pub struct TestPhotoAsset {
     orig_checksum: String,
     orig_file_type: String,
     asset_date: f64,
+    favorite: bool,
     live_photo: Option<LivePhotoFields>,
     adjusted_version: Option<AdjustedVersionFields>,
     live_adjusted: Option<LivePhotoFields>,
@@ -345,6 +346,7 @@ impl TestPhotoAsset {
             orig_checksum: "abc123".to_string(),
             orig_file_type: "public.jpeg".to_string(),
             asset_date: 1736899200000.0,
+            favorite: false,
             live_photo: None,
             adjusted_version: None,
             live_adjusted: None,
@@ -384,6 +386,12 @@ impl TestPhotoAsset {
 
     pub fn asset_date(mut self, d: f64) -> Self {
         self.asset_date = d;
+        self
+    }
+
+    /// Toggle the source favourite flag, which iCloud maps to a 5-star rating.
+    pub fn favorite(mut self, favorite: bool) -> Self {
+        self.favorite = favorite;
         self
     }
 
@@ -484,7 +492,10 @@ impl TestPhotoAsset {
             "fields": fields,
         });
         let asset = json!({
-            "fields": {"assetDate": {"value": self.asset_date}},
+            "fields": {
+                "assetDate": {"value": self.asset_date},
+                "isFavorite": {"value": i64::from(self.favorite)},
+            },
         });
         PhotoAsset::new(master, asset)
     }

@@ -1399,6 +1399,10 @@ struct DownloadContext {
     /// changed.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     metadata_retry_markers: LibraryAssetVersionSet,
+    /// Assets the provider reported deleted whose downloaded rows remain.
+    /// Staleness checks skip these so they cannot report a change that
+    /// `refresh_downloaded_asset_metadata` is unable to apply.
+    soft_deleted_ids: LibraryAssetSet,
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
     /// are pending at sync start. Used to resolve failed/pending rows when
     /// the expected file is already on disk instead of promoting them back to
@@ -1424,7 +1428,7 @@ impl DownloadContext {
     /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
-    async fn load<D>(db: &D, retry_only: bool, metadata_writes_enabled: bool) -> Self
+    async fn load<D>(db: &D, retry_only: bool) -> Self
     where
         D: DownloadStateStore + MetadataRewriteStore + ?Sized,
     {
@@ -1438,10 +1442,26 @@ impl DownloadContext {
                 Default::default()
             }
         };
-        let (ids, checksums, paths, hashes, markers, pending, attempts, known_id_rows) = tokio::join!(
+        let (
+            ids,
+            soft_deleted,
+            checksums,
+            paths,
+            hashes,
+            markers,
+            pending,
+            attempts,
+            known_id_rows,
+        ) = tokio::join!(
             async {
                 db.get_downloaded_ids().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_soft_deleted_downloaded_ids().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load soft-deleted assets from state DB");
                     Default::default()
                 })
             },
@@ -1466,14 +1486,10 @@ impl DownloadContext {
                     })
             },
             async {
-                if metadata_writes_enabled {
-                    db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
-                        Default::default()
-                    })
-                } else {
+                db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
                     Default::default()
-                }
+                })
             },
             async {
                 db.get_pending().await.unwrap_or_else(|e| {
@@ -1511,6 +1527,13 @@ impl DownloadContext {
                 .entry(id)
                 .or_default()
                 .insert(version_size.into_boxed_str());
+        }
+
+        let mut soft_deleted_ids: LibraryAssetSet = FxHashMap::default();
+        for (library, asset_id) in soft_deleted {
+            let lib = intern_id(&mut interner, library);
+            let id = intern_id(&mut interner, asset_id);
+            soft_deleted_ids.entry(lib).or_default().insert(id);
         }
 
         let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
@@ -1606,6 +1629,7 @@ impl DownloadContext {
             downloaded_local_paths,
             downloaded_metadata_hashes,
             metadata_retry_markers,
+            soft_deleted_ids,
             pending_ids,
             pending_filenames,
             known_ids,
@@ -1640,6 +1664,9 @@ impl DownloadContext {
         version_size: VersionSizeKey,
         new_metadata_hash: Option<&str>,
     ) -> bool {
+        if self.is_soft_deleted(library, asset_id) {
+            return false;
+        }
         let vs_str = version_size.as_str();
         let has_retry_marker = self
             .metadata_retry_markers
@@ -1663,6 +1690,16 @@ impl DownloadContext {
         }
     }
 
+    /// Whether the provider reported this asset deleted while its downloaded
+    /// rows remain. `refresh_downloaded_asset_metadata` cannot match those
+    /// rows, so treating them as stale would report a change that can never
+    /// be applied.
+    fn is_soft_deleted(&self, library: &str, asset_id: &str) -> bool {
+        self.soft_deleted_ids
+            .get(library)
+            .is_some_and(|assets| assets.contains(asset_id))
+    }
+
     /// Whether at least one downloaded version has provider metadata that
     /// differs from the complete asset returned by iCloud.
     fn has_provider_metadata_drift(
@@ -1674,6 +1711,9 @@ impl DownloadContext {
         let Some(new_hash) = new_metadata_hash else {
             return false;
         };
+        if self.is_soft_deleted(library, asset_id) {
+            return false;
+        }
         let Some(downloaded_versions) = self
             .downloaded_ids
             .get(library)
@@ -1690,6 +1730,30 @@ impl DownloadContext {
                 .and_then(|hashes| hashes.get(version_size.as_ref()))
                 .is_none_or(|stored| stored.as_ref() != new_hash)
         })
+    }
+
+    /// Whether any live downloaded version of this asset carries a metadata
+    /// rewrite retry marker. Asset-level counterpart to the per-version
+    /// `needs_metadata_rewrite`, for callers that decide once per asset.
+    fn has_downloaded_metadata_retry_marker(&self, library: &str, asset_id: &str) -> bool {
+        if self.is_soft_deleted(library, asset_id) {
+            return false;
+        }
+        let Some(markers) = self
+            .metadata_retry_markers
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+        else {
+            return false;
+        };
+        self.downloaded_ids
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+            .is_some_and(|downloaded| {
+                markers
+                    .iter()
+                    .any(|version_size| downloaded.contains(version_size.as_ref()))
+            })
     }
 
     fn has_state_version(&self, library: &str, asset_id: &str) -> bool {
@@ -1839,8 +1903,7 @@ fn count_value_map_entries(map: &LibraryAssetVersionValueMap) -> usize {
 async fn preload_download_context(config: &DownloadConfig) -> Arc<DownloadContext> {
     let download_ctx = if let Some(db) = &config.state_db {
         tracing::debug!("Pre-loading download state from database");
-        let metadata_writes_enabled = MetadataFlags::from(config).has_any_write();
-        DownloadContext::load(db.as_ref(), config.retry_only, metadata_writes_enabled).await
+        DownloadContext::load(db.as_ref(), config.retry_only).await
     } else {
         DownloadContext::default()
     };
@@ -2779,7 +2842,8 @@ where
             Some(pass_pb.clone()),
             Some(std::sync::Arc::clone(&pass_bytes)),
             options.download_ctx,
-        ),
+        )
+        .deferring_metadata_drain(),
     )
     .await?;
     if let Some(snapshot) = &options.album_snapshot {
@@ -5261,7 +5325,7 @@ async fn download_photos_full_with_token_policy(
             controls,
             display_total,
             shutdown_token.clone(),
-            StreamRuntime::new(None, None),
+            StreamRuntime::new(None, None).deferring_metadata_drain(),
         )
         .await?;
 
@@ -5681,6 +5745,26 @@ async fn download_photos_full_with_token_policy(
     let count_undercount_assets = exact_total
         .map(|count| streaming_result.assets_seen.saturating_sub(count))
         .unwrap_or(0);
+
+    // Both enumeration branches defer their rewrite queue to here, so a full
+    // enumeration drains exactly once. Per-pass pipelines run concurrently and
+    // separate drains can otherwise write the same file, where the later write
+    // wins whether or not it holds the newer metadata.
+    let metadata_flags = MetadataFlags::from(config.as_ref());
+    if controls.run_mode.downloads_files()
+        && !config.refresh_metadata
+        && metadata_flags.has_any_write()
+        && let Some(db) = &config.state_db
+    {
+        streaming_result.exif_failures += metadata_rewrite::run_pending(
+            db.as_ref(),
+            metadata_flags,
+            Arc::clone(&config.temp_suffix),
+            &shutdown_token,
+        )
+        .await
+        .failed;
+    }
 
     // Build the outcome using the same logic as download_photos
     let (outcome, mut stats) = build_download_outcome(
@@ -10439,6 +10523,48 @@ mod tests {
 
         assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-a")));
         assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-b")));
+    }
+
+    /// A tombstoned row cannot be refreshed, so no staleness check may
+    /// report it as needing one.
+    #[test]
+    fn staleness_checks_ignore_soft_deleted_assets() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset1".into())
+            .or_default()
+            .insert("original".into());
+        ctx.metadata_retry_markers
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset1".into())
+            .or_default()
+            .insert("original".into());
+
+        assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-b")));
+        assert!(ctx.has_downloaded_metadata_retry_marker("PrimarySync", "asset1"));
+        assert!(ctx.needs_metadata_rewrite(
+            "PrimarySync",
+            "asset1",
+            VersionSizeKey::Original,
+            Some("metadata-b")
+        ));
+
+        ctx.soft_deleted_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("asset1".into());
+
+        assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", Some("metadata-b")));
+        assert!(!ctx.has_downloaded_metadata_retry_marker("PrimarySync", "asset1"));
+        assert!(!ctx.needs_metadata_rewrite(
+            "PrimarySync",
+            "asset1",
+            VersionSizeKey::Original,
+            Some("metadata-b")
+        ));
     }
 
     #[test]
