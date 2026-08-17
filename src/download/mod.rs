@@ -1373,6 +1373,12 @@ type LibraryAssetVersionValueMap =
 type LibraryAssetVersionPathMap =
     FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, PathBuf>>>;
 
+/// `library -> master_record_name -> asset_record_names`. Full enumeration
+/// uses this durable family history to keep a legacy master-keyed state row
+/// attached to the same child when CloudKit changes record order or page
+/// boundaries.
+type LibraryMasterAssetSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<Arc<str>>>>;
+
 #[derive(Debug, Default)]
 struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
@@ -1412,6 +1418,15 @@ struct DownloadContext {
     /// for pending rows. Pending on-disk adoption uses this to avoid adopting
     /// a same-name/same-size collision that belongs to a different asset.
     pending_filenames: LibraryAssetVersionValueMap,
+    /// Provider checksums for pending rows. Identity stabilization uses these
+    /// to retain a compatible legacy master-keyed retry without merging a
+    /// different sibling into it.
+    pending_checksums: LibraryAssetVersionValueMap,
+    /// Provider identity families recorded before this pipeline started.
+    /// `None` disables legacy adoption after a mapping query failure. The
+    /// snapshot intentionally excludes mappings discovered during the current
+    /// run so a newly seen sibling cannot claim another child's legacy state.
+    asset_master_mappings: Option<LibraryMasterAssetSet>,
     /// Nested map: `library` -> set of asset IDs known to the state DB (any
     /// status). Used in retry-only mode to skip new assets that were never
     /// synced in the same CloudKit zone.
@@ -1452,6 +1467,7 @@ impl DownloadContext {
             pending,
             attempts,
             known_id_rows,
+            mapping_rows,
         ) = tokio::join!(
             async {
                 db.get_downloaded_ids().await.unwrap_or_else(|e| {
@@ -1504,6 +1520,7 @@ impl DownloadContext {
                 })
             },
             known_ids_fut,
+            db.get_asset_master_mappings(),
         );
 
         // Shared interner so the same asset_id allocates exactly one
@@ -1589,6 +1606,7 @@ impl DownloadContext {
 
         let mut pending_ids: LibraryAssetVersionSet = FxHashMap::default();
         let mut pending_filenames: LibraryAssetVersionValueMap = FxHashMap::default();
+        let mut pending_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
         for record in pending {
             let lib = intern_id(&mut interner, record.library.to_string());
             let id = intern_id(&mut interner, record.id.to_string());
@@ -1600,12 +1618,42 @@ impl DownloadContext {
                 .or_default()
                 .insert(version_size.clone());
             pending_filenames
+                .entry(Arc::clone(&lib))
+                .or_default()
+                .entry(Arc::clone(&id))
+                .or_default()
+                .insert(
+                    version_size.clone(),
+                    record.filename.to_string().into_boxed_str(),
+                );
+            pending_checksums
                 .entry(lib)
                 .or_default()
                 .entry(id)
                 .or_default()
-                .insert(version_size, record.filename.to_string().into_boxed_str());
+                .insert(version_size, record.checksum.to_string().into_boxed_str());
         }
+
+        let asset_master_mappings = mapping_rows
+            .map(|mapping_rows| {
+                let mut mappings: LibraryMasterAssetSet = FxHashMap::default();
+                for (library, asset_record_name, master_record_name) in mapping_rows {
+                    let lib = intern_id(&mut interner, library);
+                    let asset = intern_id(&mut interner, asset_record_name);
+                    let master = intern_id(&mut interner, master_record_name);
+                    mappings
+                        .entry(lib)
+                        .or_default()
+                        .entry(master)
+                        .or_default()
+                        .insert(asset);
+                }
+                mappings
+            })
+            .map_err(|e| {
+                tracing::warn!(error = %e, "Failed to load asset/master mappings from state DB");
+            })
+            .ok();
 
         let mut known_ids: LibraryAssetSet = FxHashMap::default();
         for (library, asset_id) in known_id_rows {
@@ -1632,6 +1680,8 @@ impl DownloadContext {
             soft_deleted_ids,
             pending_ids,
             pending_filenames,
+            pending_checksums,
+            asset_master_mappings,
             known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
@@ -1786,6 +1836,63 @@ impl DownloadContext {
                 .get(VersionSizeKey::from(*version_size).as_str())
                 .is_some_and(|stored| stored.as_ref() == version.checksum.as_ref())
         })
+    }
+
+    fn has_matching_state_checksum(
+        &self,
+        library: &str,
+        asset_id: &str,
+        asset: &PhotoAsset,
+    ) -> bool {
+        self.has_matching_downloaded_checksum(library, asset_id, asset)
+            || self
+                .pending_checksums
+                .get(library)
+                .and_then(|assets| assets.get(asset_id))
+                .is_some_and(|checksums| {
+                    asset.versions().iter().any(|(version_size, version)| {
+                        checksums
+                            .get(VersionSizeKey::from(*version_size).as_str())
+                            .is_some_and(|stored| stored.as_ref() == version.checksum.as_ref())
+                    })
+                })
+    }
+
+    /// Select the durable local state identity for a provider asset.
+    ///
+    /// New assets use their unique `CPLAsset.recordName`. A pre-v0.24 row can
+    /// still be keyed by `CPLMaster.recordName`; retain that key only when its
+    /// provider checksum matches and durable family history identifies this
+    /// child as the sole sibling without its own state row.
+    fn should_use_legacy_master_state(&self, library: &str, asset: &PhotoAsset) -> bool {
+        let asset_record_name = asset.asset_record_name();
+        let master_record_name = asset.id();
+        if asset_record_name == master_record_name
+            || self.has_state_version(library, asset_record_name)
+        {
+            return false;
+        }
+        if !self.has_matching_state_checksum(library, master_record_name, asset) {
+            return false;
+        }
+
+        let Some(mappings) = &self.asset_master_mappings else {
+            return false;
+        };
+        let Some(mapped_children) = mappings
+            .get(library)
+            .and_then(|masters| masters.get(master_record_name))
+        else {
+            // Databases predating durable asset/master mappings can still
+            // retain a checksum-compatible master row for their first child.
+            return true;
+        };
+        let mut children_without_state = mapped_children
+            .iter()
+            .filter(|child| !self.has_state_version(library, child));
+        let sole_child = children_without_state.next();
+        children_without_state.next().is_none()
+            && sole_child.is_some_and(|child| child.as_ref() == asset_record_name)
     }
 
     /// Check if an asset should be downloaded based on pre-loaded state.
@@ -3254,6 +3361,15 @@ async fn build_retry_download_tasks(
 
     let mut pending_keys: FxHashSet<RetryTaskKey> =
         failed_tasks.iter().map(RetryTaskKey::from).collect();
+    let retry_state_ids: FxHashMap<Arc<str>, Arc<str>> = failed_tasks
+        .iter()
+        .map(|task| {
+            (
+                Arc::clone(&task.asset_record_name),
+                Arc::clone(&task.asset_id),
+            )
+        })
+        .collect();
     let requested_count = pending_keys.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested_count);
@@ -3276,7 +3392,11 @@ async fn build_retry_download_tasks(
             if pending_keys.is_empty() || shutdown_token.is_cancelled() {
                 break;
             }
-            let plan = task_planner.plan_asset(asset, pass_config).await;
+            let Some(state_id) = retry_state_ids.get(asset.asset_record_name()) else {
+                continue;
+            };
+            let asset = asset.clone().with_state_record_name(Arc::clone(state_id));
+            let plan = task_planner.plan_asset(&asset, pass_config).await;
             if plan.filter_reason.is_some() {
                 continue;
             }
@@ -6457,16 +6577,7 @@ async fn hydrate_unpaired_created_asset_deltas(
                 if asset.asset_record_name() == event.record_name.as_ref() =>
             {
                 let library = asset.source_zone().unwrap_or(&config.library);
-                let asset_state_known =
-                    download_ctx.has_state_version(library, asset.asset_record_name());
-                let master_state_known =
-                    download_ctx.has_state_version(library, master_record_name);
-                let master_checksum_matches = download_ctx.has_matching_downloaded_checksum(
-                    library,
-                    master_record_name,
-                    &asset,
-                );
-                if !asset_state_known && (!master_state_known || master_checksum_matches) {
+                if download_ctx.should_use_legacy_master_state(library, &asset) {
                     asset = asset.with_state_record_name(Arc::from(master_record_name.as_str()));
                 }
                 summary
@@ -7753,6 +7864,7 @@ mod tests {
             download_path: Path::new("/tmp/codex/kei/retry-tests").join(path),
             checksum: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             asset_id: Arc::from(asset_id),
+            asset_record_name: Arc::from(asset_id),
             library: Arc::from("PrimarySync"),
             metadata: Arc::new(filter::MetadataPayload::default()),
             size: 1024,
@@ -10180,11 +10292,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_enumeration_sibling_cplassets_do_not_count_as_duplicate_asset_ids() {
+    async fn full_sync_page_split_sibling_cplassets_keep_identity_and_download_nothing() {
         let records = vec![
-            mock_asset_record_for("asset-sibling-b", "MASTER_SIBLING"),
-            mock_master_record_with_filename("MASTER_SIBLING", "sibling.jpg"),
             mock_asset_record_for("asset-sibling-a", "MASTER_SIBLING"),
+            mock_master_record_with_filename("MASTER_SIBLING", "sibling.jpg"),
+            mock_asset_record_for("asset-sibling-b", "MASTER_SIBLING"),
         ];
         let session = MockPhotosFlow::new()
             .album_count(2)
@@ -10203,14 +10315,28 @@ mod tests {
         config.file_match_policy = FileMatchPolicy::NameId7;
 
         let pass_config = config.with_pass(&passes[0]);
-        let first_asset = PhotoAsset::new(records[1].clone(), records[2].clone());
-        let second_asset = PhotoAsset::new(records[1].clone(), records[0].clone())
+        let first_asset = PhotoAsset::new(records[1].clone(), records[0].clone());
+        let second_asset = PhotoAsset::new(records[1].clone(), records[2].clone())
             .with_state_record_name(Arc::from("asset-sibling-b"));
-        for asset in [&first_asset, &second_asset] {
-            let expected_path = filter::expected_paths_for(asset, &pass_config)
+        let mut seeded_paths = Vec::new();
+        for (index, asset) in [&first_asset, &second_asset].into_iter().enumerate() {
+            let mut expected_path = filter::expected_paths_for(asset, &pass_config)
                 .into_iter()
                 .next()
                 .expect("mock sibling asset should have an expected path");
+            if index > 0 {
+                let filename = expected_path
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("expected path has filename");
+                expected_path
+                    .path
+                    .set_file_name(paths::insert_asset_identity_suffix(
+                        filename,
+                        asset.state_id(),
+                    ));
+            }
             tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
                 .await
                 .expect("create parent dir");
@@ -10224,25 +10350,86 @@ mod tests {
                 &expected_path,
             )
             .await;
+            seeded_paths.push(expected_path.path);
         }
 
-        let result = download_photos_full_with_token(
+        let config = Arc::new(config);
+        let first = download_photos_full_with_token(
             &Client::new(),
             &passes,
-            &Arc::new(config),
+            &config,
             DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
         .await
         .expect("sibling CPLAssets should complete");
 
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert_eq!(result.stats.assets_seen, 2);
-        assert_eq!(result.stats.skipped.duplicates, 0);
-        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
-        assert_eq!(result.stats.pagination_shortfall_assets, 0);
-        assert!(!result.stats.sync_token_blocked);
-        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
+        assert!(matches!(first.outcome, DownloadOutcome::Success));
+        assert_eq!(first.stats.assets_seen, 2);
+        assert_eq!(first.stats.downloaded, 0);
+        assert_eq!(first.stats.failed, 0);
+        assert_eq!(first.stats.skipped.duplicates, 0);
+        assert_eq!(first.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(first.stats.pagination_shortfall_assets, 0);
+        assert!(!first.stats.sync_token_blocked);
+        assert_eq!(first.sync_token.as_deref(), Some("zone-token"));
+
+        let split_session = MockPhotosFlow::new()
+            .album_count(2)
+            .query_page(
+                vec![records[2].clone(), records[1].clone()],
+                Some("zone-token-split"),
+            )
+            .query_page(vec![records[0].clone()], Some("zone-token-split"))
+            .build();
+        let split_passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", split_session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let second = download_photos_full_with_token(
+            &Client::new(),
+            &split_passes,
+            &config,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("page-split sibling sync should reuse both downloaded identities");
+
+        assert!(matches!(second.outcome, DownloadOutcome::Success));
+        assert_eq!(second.stats.assets_seen, 2);
+        assert_eq!(second.stats.downloaded, 0);
+        assert_eq!(second.stats.failed, 0);
+        assert_eq!(second.stats.skipped.duplicates, 0);
+        assert_eq!(second.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(second.stats.pagination_shortfall_assets, 0);
+        assert!(!second.stats.sync_token_blocked);
+        assert_eq!(second.sync_token.as_deref(), Some("zone-token-split"));
+        assert!(seeded_paths.iter().all(|path| path.exists()));
+        let downloaded_ids = config
+            .state_db
+            .as_ref()
+            .expect("test state db")
+            .get_downloaded_ids()
+            .await
+            .expect("downloaded state IDs");
+        assert!(
+            downloaded_ids
+                .iter()
+                .any(|(_, id, _)| id == "MASTER_SIBLING")
+        );
+        assert!(
+            downloaded_ids
+                .iter()
+                .any(|(_, id, _)| id == "asset-sibling-b")
+        );
+        assert!(
+            !downloaded_ids
+                .iter()
+                .any(|(_, id, _)| id == "asset-sibling-a")
+        );
     }
 
     #[tokio::test]
@@ -12412,14 +12599,18 @@ mod tests {
         assert_eq!(retry.stats.downloaded, 1);
         assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), old_body);
         let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
-        let changed_path = downloaded[0]
+        assert_eq!(downloaded.len(), 2);
+        let changed_path = downloaded
+            .iter()
+            .find(|record| record.id.as_ref() == "asset-SAME_SIZE_CHANGED")
+            .expect("changed child has a downloaded row")
             .local_path
             .as_ref()
             .expect("changed provider version has a local path");
         assert_ne!(changed_path, &recorded_path);
         assert_eq!(tokio::fs::read(changed_path).await.unwrap(), new_body);
         let summary = db.get_summary().await.expect("summary");
-        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.downloaded, 2);
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 0);
     }
@@ -15277,6 +15468,93 @@ mod tests {
             VersionSizeKey::Original,
             Some("new-hash")
         ));
+    }
+
+    #[test]
+    fn legacy_master_state_requires_compatible_unambiguous_history() {
+        let master = mock_master_record_with_filename("master-family", "family.jpg");
+        let asset_a = PhotoAsset::new(
+            master.clone(),
+            mock_asset_record_for("asset-a", "master-family"),
+        );
+        let asset_b = PhotoAsset::new(master, mock_asset_record_for("asset-b", "master-family"));
+        let checksum = asset_a
+            .versions()
+            .first()
+            .expect("mock asset has an original version")
+            .1
+            .checksum
+            .clone();
+
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("master-family".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_checksums
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("master-family".into())
+            .or_default()
+            .insert("original".into(), checksum);
+
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+
+        ctx.asset_master_mappings = Some(FxHashMap::default());
+        assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+
+        ctx.asset_master_mappings
+            .as_mut()
+            .expect("mapping snapshot")
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("master-family".into())
+            .or_default()
+            .extend([Arc::from("asset-a"), Arc::from("asset-b")]);
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_b));
+
+        ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset-b".into())
+            .or_default()
+            .insert("original".into());
+        assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_b));
+    }
+
+    #[test]
+    fn legacy_master_state_accepts_matching_pending_retry() {
+        let records = mock_photo_records_with_filename("master-pending", "pending.jpg");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let checksum = asset
+            .versions()
+            .first()
+            .expect("mock asset has an original version")
+            .1
+            .checksum
+            .clone();
+        let mut ctx = DownloadContext {
+            asset_master_mappings: Some(FxHashMap::default()),
+            ..DownloadContext::default()
+        };
+        ctx.pending_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("master-pending".into())
+            .or_default()
+            .insert("original".into());
+        ctx.pending_checksums
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("master-pending".into())
+            .or_default()
+            .insert("original".into(), checksum);
+
+        assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset));
     }
 
     #[test]

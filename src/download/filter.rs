@@ -537,6 +537,9 @@ pub(super) struct DownloadTask {
     /// iCloud asset ID for state tracking. Shared with the producer's
     /// dedup set and any deferred state writes via refcount bump.
     pub(super) asset_id: Arc<str>,
+    /// Stable `CPLAsset.recordName` used to recover this task's selected state
+    /// identity when cleanup re-enumeration returns a different sibling order.
+    pub(super) asset_record_name: Arc<str>,
     /// CloudKit zone that owns this asset. Usually matches the pass config's
     /// library, but cross-zone album hydration can produce bounded assets
     /// from another zone while preserving the album pass context.
@@ -1753,6 +1756,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: p,
                 checksum,
                 asset_id: asset.state_id_arc(),
+                asset_record_name: asset.asset_record_name_arc(),
                 library: Arc::clone(&task_library),
                 metadata: Arc::clone(&payload),
                 size,
@@ -1817,6 +1821,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: p,
                 checksum,
                 asset_id: asset.state_id_arc(),
+                asset_record_name: asset.asset_record_name_arc(),
                 library: Arc::clone(&task_library),
                 metadata: Arc::clone(&payload),
                 size,
@@ -1873,6 +1878,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: p,
                 checksum,
                 asset_id: asset.state_id_arc(),
+                asset_record_name: asset.asset_record_name_arc(),
                 library: task_library,
                 metadata: Arc::clone(&payload),
                 size,

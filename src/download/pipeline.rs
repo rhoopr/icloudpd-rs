@@ -1316,6 +1316,8 @@ where
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
         let mut task_planner = TaskPlanner::new();
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
+        let mut claimed_legacy_master_states: FxHashSet<(Arc<str>, Arc<str>)> =
+            FxHashSet::default();
         // Skipped-asset IDs accumulated across the producer run and
         // flushed to the DB in a single transaction at the end. This
         // collapses N UPDATE statements (one per fast-skip / on-disk
@@ -1413,7 +1415,7 @@ where
                 break;
             }
             match result {
-                Ok(asset) => {
+                Ok(mut asset) => {
                     if !seen_asset_record_names.insert(asset.asset_record_name_arc()) {
                         tracing::debug!(
                             asset_id = %asset.id(),
@@ -1423,6 +1425,18 @@ where
                         skips.duplicates += 1;
                         continue;
                     }
+
+                    let library = effective_asset_library(&asset, config);
+                    let use_legacy_master = download_ctx
+                        .should_use_legacy_master_state(library, &asset)
+                        && claimed_legacy_master_states
+                            .insert((Arc::from(library), Arc::from(asset.id())));
+                    let state_record_name = if use_legacy_master {
+                        Arc::from(asset.id())
+                    } else {
+                        asset.asset_record_name_arc()
+                    };
+                    asset = asset.with_state_record_name(state_record_name);
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // The pre-plan refresh has already committed the marker,
@@ -3848,6 +3862,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 1000,
                                 asset_id: "ASSET_A".into(),
+                                asset_record_name: "ASSET_A".into(),
                                 library: "PrimarySync".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
@@ -3860,6 +3875,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 2000,
                                 asset_id: "ASSET_B".into(),
+                                asset_record_name: "ASSET_B".into(),
                                 library: "PrimarySync".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
@@ -3912,6 +3928,7 @@ mod tests {
                             created_local: chrono::Local::now(),
                             size: 500,
                             asset_id: "ASSET_C".into(),
+                            asset_record_name: "ASSET_C".into(),
                             library: "PrimarySync".into(),
                             metadata: Arc::new(MetadataPayload::default()),
                             version_size: VersionSizeKey::Original,
@@ -4795,6 +4812,7 @@ mod tests {
             download_path: download_path.clone(),
             checksum: checksum.into(),
             asset_id: "UNKNOWN_MEDIA".into(),
+            asset_record_name: "UNKNOWN_MEDIA".into(),
             library: "PrimarySync".into(),
             metadata: Arc::new(MetadataPayload::default()),
             size: body.len() as u64,
@@ -4876,6 +4894,7 @@ mod tests {
                 download_path: dir.path().join(format!("photo_{i}.jpg")),
                 checksum: checksum.clone().into(),
                 asset_id: format!("CIRCUIT_{i}").into(),
+                asset_record_name: format!("CIRCUIT_{i}").into(),
                 library: "PrimarySync".into(),
                 metadata: Arc::new(MetadataPayload::default()),
                 size: jpeg_body.len() as u64,

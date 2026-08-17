@@ -7965,6 +7965,7 @@ mod tests {
         )
         .await
         .expect("run cycle");
+        let events = capture.events();
 
         assert_eq!(
             result.failed_count, 1,
@@ -7993,13 +7994,13 @@ mod tests {
             "failed asset error should name the failing filesystem operation, got: {last_error}"
         );
         let root = download_root.display().to_string();
-        let events = capture.events();
+        let asset_record_name = format!("asset-{master_record_name}");
         let failure_event = events
             .iter()
             .find(|event| {
                 event.level == tracing::Level::ERROR
                     && event.message() == Some("Download failed")
-                    && event.field("asset_id") == Some(master_record_name)
+                    && event.field("asset_id") == Some(asset_record_name.as_str())
             })
             .unwrap_or_else(|| panic!("missing structured download failure event: {events:?}"));
         assert!(

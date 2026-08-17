@@ -226,6 +226,11 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<Vec<String>, StateError> {
         Ok(Vec::new())
     }
+    async fn get_asset_master_mappings(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        Ok(HashSet::new())
+    }
     async fn set_asset_verification(
         &self,
         _library: &str,
@@ -3017,6 +3022,30 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_asset_master_mappings(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        self.with_conn("get_asset_master_mappings", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT library, asset_record_name, master_record_name \
+                     FROM asset_master_mappings",
+                )
+                .map_err(|e| StateError::query("get_asset_master_mappings::prepare", e))?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| StateError::query("get_asset_master_mappings::query", e))?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| StateError::query("get_asset_master_mappings::row", e))
+        })
+        .await
+    }
+
     pub(crate) async fn set_asset_verification(
         &self,
         library: &str,
@@ -3798,6 +3827,12 @@ impl DownloadStateStore for SqliteStateDb {
         master_record_name: &str,
     ) -> Result<Vec<String>, StateError> {
         SqliteStateDb::get_asset_record_names_for_master(self, library, master_record_name).await
+    }
+
+    async fn get_asset_master_mappings(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        SqliteStateDb::get_asset_master_mappings(self).await
     }
 
     async fn set_asset_verification(
@@ -4589,6 +4624,21 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+        assert_eq!(
+            db.get_asset_master_mappings().await.unwrap(),
+            HashSet::from([
+                (
+                    "PrimarySync".to_string(),
+                    "asset-a".to_string(),
+                    "master-primary".to_string(),
+                ),
+                (
+                    "SharedSync-AAAA".to_string(),
+                    "asset-a".to_string(),
+                    "master-shared".to_string(),
+                ),
+            ])
         );
     }
 
