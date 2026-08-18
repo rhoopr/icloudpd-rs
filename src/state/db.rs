@@ -3109,18 +3109,29 @@ impl SqliteStateDb {
         asset_record_name: &str,
     ) -> Result<bool, StateError> {
         #[cfg(test)]
-        if self
-            .legacy_owner_claim_failures
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
         {
-            return Err(StateError::LockPoisoned(
-                "injected legacy owner claim failure".into(),
-            ));
+            let mut remaining = self
+                .legacy_owner_claim_failures
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let inject_failure = loop {
+                if remaining == 0 {
+                    break false;
+                }
+                match self.legacy_owner_claim_failures.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break true,
+                    Err(actual) => remaining = actual,
+                }
+            };
+            if inject_failure {
+                return Err(StateError::LockPoisoned(
+                    "injected legacy owner claim failure".into(),
+                ));
+            }
         }
         let library = library.to_owned();
         let master_record_name = master_record_name.to_owned();
