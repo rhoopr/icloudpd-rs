@@ -1379,6 +1379,8 @@ type LibraryAssetVersionPathMap =
 /// boundaries.
 type LibraryMasterAssetSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<Arc<str>>>>;
 
+type ClaimedLegacyMasterStates = FxHashSet<(Arc<str>, Arc<str>)>;
+
 #[derive(Debug, Default)]
 struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
@@ -1893,6 +1895,21 @@ impl DownloadContext {
         let sole_child = children_without_state.next();
         children_without_state.next().is_none()
             && sole_child.is_some_and(|child| child.as_ref() == asset_record_name)
+    }
+
+    fn select_asset_state_record_name(
+        &self,
+        library: &str,
+        asset: &PhotoAsset,
+        claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
+    ) -> Arc<str> {
+        let use_legacy_master = self.should_use_legacy_master_state(library, asset)
+            && claimed_legacy_master_states.insert((Arc::from(library), Arc::from(asset.id())));
+        if use_legacy_master {
+            Arc::from(asset.id())
+        } else {
+            asset.asset_record_name_arc()
+        }
     }
 
     /// Check if an asset should be downloaded based on pre-loaded state.
@@ -6412,7 +6429,7 @@ async fn hydrate_unpaired_created_asset_deltas(
     pass: Option<&crate::commands::AlbumPass>,
     config: &DownloadConfig,
     summary: &mut IncrementalDeltaSummary,
-) -> Option<Arc<DownloadContext>> {
+) {
     let mut pending = Vec::new();
     let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (index, event) in events.iter().enumerate() {
@@ -6461,13 +6478,13 @@ async fn hydrate_unpaired_created_asset_deltas(
     }
 
     if pending.is_empty() && unresolved.is_empty() {
-        return None;
+        return;
     }
     let Some(pass) = pass else {
         summary
             .token_unsafe_reason
             .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
-        return None;
+        return;
     };
 
     if !unresolved.is_empty() {
@@ -6550,9 +6567,8 @@ async fn hydrate_unpaired_created_asset_deltas(
     }
 
     if pending.is_empty() {
-        return None;
+        return;
     }
-    let download_ctx = preload_download_context(config).await;
     let requests: Vec<RecordLookupRequest> = pending
         .iter()
         .map(|(_, record_name, master)| {
@@ -6582,13 +6598,9 @@ async fn hydrate_unpaired_created_asset_deltas(
             continue;
         };
         match resolution {
-            RecordResolution::Present(mut asset)
+            RecordResolution::Present(asset)
                 if asset.asset_record_name() == event.record_name.as_ref() =>
             {
-                let library = asset.source_zone().unwrap_or(&config.library);
-                if download_ctx.should_use_legacy_master_state(library, &asset) {
-                    asset = asset.with_state_record_name(Arc::from(master_record_name.as_str()));
-                }
                 summary
                     .persist_asset_mapping_for_asset(&asset, config)
                     .await;
@@ -6648,7 +6660,14 @@ async fn hydrate_unpaired_created_asset_deltas(
             .token_unsafe_reason
             .get_or_insert(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON);
     }
-    Some(download_ctx)
+}
+
+struct IncrementalAssetHydrationContext<'a> {
+    asset_to_master: &'a mut FxHashMap<String, String>,
+    complete_delta_assets: &'a mut Vec<PhotoAsset>,
+    downloadable_assets: &'a mut Vec<(PhotoAsset, usize)>,
+    download_ctx: Option<&'a DownloadContext>,
+    claimed_legacy_master_states: &'a mut ClaimedLegacyMasterStates,
 }
 
 async fn hydrate_missing_selected_relation_assets(
@@ -6656,9 +6675,7 @@ async fn hydrate_missing_selected_relation_assets(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     routing: &IncrementalPassRouting,
-    asset_to_master: &mut FxHashMap<String, String>,
-    complete_delta_assets: &mut Vec<PhotoAsset>,
-    downloadable_assets: &mut Vec<(PhotoAsset, usize)>,
+    context: &mut IncrementalAssetHydrationContext<'_>,
     delta_summary: &mut IncrementalDeltaSummary,
 ) {
     let mut missing_by_hydrator: FxHashMap<usize, FxHashSet<String>> = FxHashMap::default();
@@ -6678,7 +6695,10 @@ async fn hydrate_missing_selected_relation_assets(
             continue;
         };
 
-        if asset_to_master.contains_key(relation.asset_record_name.as_ref()) {
+        if context
+            .asset_to_master
+            .contains_key(relation.asset_record_name.as_ref())
+        {
             continue;
         }
 
@@ -6695,7 +6715,9 @@ async fn hydrate_missing_selected_relation_assets(
     let mut hydrated_asset_record_names = FxHashSet::default();
     for (pass_index, mut missing) in missing_by_hydrator {
         missing.retain(|asset_record_name| {
-            !asset_to_master.contains_key(asset_record_name.as_str())
+            !context
+                .asset_to_master
+                .contains_key(asset_record_name.as_str())
                 && !hydrated_asset_record_names.contains(asset_record_name.as_str())
         });
         if missing.is_empty() {
@@ -6725,16 +6747,31 @@ async fn hydrate_missing_selected_relation_assets(
         };
 
         for asset in assets {
+            let asset = if let Some(download_ctx) = context.download_ctx {
+                let library = asset.source_zone().unwrap_or(&config.library);
+                let state_record_name = download_ctx.select_asset_state_record_name(
+                    library,
+                    &asset,
+                    context.claimed_legacy_master_states,
+                );
+                asset.with_state_record_name(state_record_name)
+            } else {
+                asset
+            };
             let asset_record_name = asset.asset_record_name().to_string();
             hydrated_asset_record_names.insert(asset_record_name.clone());
-            asset_to_master.insert(asset_record_name.clone(), asset.id().to_string());
+            context
+                .asset_to_master
+                .insert(asset_record_name.clone(), asset.id().to_string());
             delta_summary
                 .persist_asset_mapping_for_asset(&asset, config)
                 .await;
-            complete_delta_assets.push(asset.clone());
+            context.complete_delta_assets.push(asset.clone());
             if let Some(pass_indices) = pass_indices_by_asset.get(asset_record_name.as_str()) {
                 for pass_index in pass_indices {
-                    downloadable_assets.push((asset.clone(), *pass_index));
+                    context
+                        .downloadable_assets
+                        .push((asset.clone(), *pass_index));
                 }
             }
         }
@@ -6802,7 +6839,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             }
         }
 
-        let hydrated_download_ctx = hydrate_unpaired_created_asset_deltas(
+        hydrate_unpaired_created_asset_deltas(
             &mut unpaired_asset_events,
             Some(&pass),
             &config,
@@ -6810,16 +6847,21 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         )
         .await;
         let download_ctx = if run_mode.downloads_files() && !unpaired_asset_events.is_empty() {
-            match hydrated_download_ctx {
-                Some(download_ctx) => Some(download_ctx),
-                None => Some(preload_download_context(&config).await),
-            }
+            Some(preload_download_context(&config).await)
         } else {
             None
         };
+        let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
         for event in unpaired_asset_events {
-            if let Some(asset) = event.asset {
+            if let Some(mut asset) = event.asset {
                 if let Some(download_ctx) = download_ctx.as_deref() {
+                    let library = asset.source_zone().unwrap_or(&config.library);
+                    let state_record_name = download_ctx.select_asset_state_record_name(
+                        library,
+                        &asset,
+                        &mut claimed_legacy_master_states,
+                    );
+                    asset = asset.with_state_record_name(state_record_name);
                     apply_changed_provider_metadata(&config, &asset, download_ctx, &mut summary)
                         .await;
                 }
@@ -7127,17 +7169,43 @@ async fn download_photos_incremental_collecting_inner(
 
     let phase_started = Instant::now();
     let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
+    let mut download_ctx = if change_events
+        .iter()
+        .any(|event| event.reason == ChangeReason::Created)
+    {
+        Some(preload_download_context(config).await)
+    } else {
+        None
+    };
     for event in &change_events {
         IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
         delta_summary.persist_asset_mapping(event, config).await;
     }
-    let hydrated_download_ctx = hydrate_unpaired_created_asset_deltas(
+    hydrate_unpaired_created_asset_deltas(
         &mut change_events,
         passes.first(),
         config,
         &mut delta_summary,
     )
     .await;
+    let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
+    if let Some(download_ctx) = download_ctx.as_deref() {
+        for event in &mut change_events {
+            if event.reason != ChangeReason::Created {
+                continue;
+            }
+            let Some(asset) = event.asset.take() else {
+                continue;
+            };
+            let library = asset.source_zone().unwrap_or(&config.library);
+            let state_record_name = download_ctx.select_asset_state_record_name(
+                library,
+                &asset,
+                &mut claimed_legacy_master_states,
+            );
+            event.asset = Some(asset.with_state_record_name(state_record_name));
+        }
+    }
     let mut complete_delta_assets: Vec<PhotoAsset> = change_events
         .iter()
         .filter(|event| {
@@ -7173,17 +7241,24 @@ async fn download_photos_incremental_collecting_inner(
 
     let phase_started = Instant::now();
     let downloadable_before_relation_hydration = downloadable_assets.len();
-    hydrate_missing_selected_relation_assets(
-        &change_events,
-        passes,
-        config,
-        &routing,
-        &mut asset_to_master,
-        &mut complete_delta_assets,
-        &mut downloadable_assets,
-        &mut delta_summary,
-    )
-    .await;
+    {
+        let mut hydration_context = IncrementalAssetHydrationContext {
+            asset_to_master: &mut asset_to_master,
+            complete_delta_assets: &mut complete_delta_assets,
+            downloadable_assets: &mut downloadable_assets,
+            download_ctx: download_ctx.as_deref(),
+            claimed_legacy_master_states: &mut claimed_legacy_master_states,
+        };
+        hydrate_missing_selected_relation_assets(
+            &change_events,
+            passes,
+            config,
+            &routing,
+            &mut hydration_context,
+            &mut delta_summary,
+        )
+        .await;
+    }
     if first_download_url_obtained_at.is_none()
         && downloadable_assets.len() > downloadable_before_relation_hydration
     {
@@ -7199,7 +7274,6 @@ async fn download_photos_incremental_collecting_inner(
         "Incremental relation hydration phase complete"
     );
 
-    let mut download_ctx = hydrated_download_ctx;
     if controls.run_mode.downloads_files() && !complete_delta_assets.is_empty() {
         let context = match download_ctx.take() {
             Some(context) => context,
@@ -11531,7 +11605,7 @@ mod tests {
         assert!(
             pending
                 .iter()
-                .any(|record| record.id.as_ref() == "VALID_ASSET"),
+                .any(|record| record.id.as_ref() == "asset-VALID_ASSET"),
             "valid incremental asset should still be recorded for the planned work"
         );
         let memberships = db
@@ -14476,7 +14550,7 @@ mod tests {
         let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
         assert_eq!(
             album_rows,
-            vec![("MASTER_CHANGED".to_string(), "Vacation".to_string())],
+            vec![("asset-MASTER_CHANGED".to_string(), "Vacation".to_string())],
             "selected album asset should route through the album pass"
         );
     }
@@ -14781,6 +14855,135 @@ mod tests {
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let original_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let changed_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x00];
+        Mock::given(method("GET"))
+            .and(path("/collecting-original.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(original_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/collecting-changed.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(changed_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let original_url = format!("{}/collecting-original.jpg", server.uri());
+        let changed_url = format!("{}/collecting-changed.jpg", server.uri());
+        let mut original_records = incremental_photo_records_with_url(
+            "COLLECTING_IDENTITY",
+            "collecting.jpg",
+            &original_url,
+            original_body.len() as u64,
+        );
+        original_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&original_body)));
+        let mut changed_records = incremental_photo_records_with_url(
+            "COLLECTING_IDENTITY",
+            "collecting.jpg",
+            &changed_url,
+            changed_body.len() as u64,
+        );
+        changed_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&changed_body)));
+
+        let full_passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album(
+                "Library",
+                MockPhotosFlow::new()
+                    .album_count(1)
+                    .query_page(original_records, Some("zone-token-full"))
+                    .build(),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.state_db = Some(db.clone());
+
+        let full = download_photos_with_sync(
+            &Client::new(),
+            &full_passes,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("full sync should store the child identity");
+        assert!(matches!(full.outcome, DownloadOutcome::Success));
+        assert_eq!(full.stats.downloaded, 1);
+        let full_rows = db.get_downloaded_page(0, 10).await.expect("full state row");
+        assert_eq!(full_rows.len(), 1);
+        assert_eq!(full_rows[0].id.as_ref(), "asset-COLLECTING_IDENTITY");
+        let original_path = full_rows[0]
+            .local_path
+            .clone()
+            .expect("full state row has a local path");
+
+        let incremental_passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album(
+                "Library",
+                MockPhotosFlow::new()
+                    .changes_zone_page(changed_records, "zone-token-next", false)
+                    .build(),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        config.recent = Some(10);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-full".to_string(),
+        };
+
+        let incremental = download_photos_with_sync(
+            &Client::new(),
+            &incremental_passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("collecting incremental sync should keep the child identity");
+
+        assert!(matches!(incremental.outcome, DownloadOutcome::Success));
+        assert_eq!(incremental.stats.downloaded, 1);
+        assert_eq!(incremental.stats.failed, 0);
+        assert_eq!(incremental.sync_token.as_deref(), Some("zone-token-next"));
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].id.as_ref(), "asset-COLLECTING_IDENTITY");
+        assert_ne!(
+            downloaded[0].local_path.as_deref(),
+            Some(original_path.as_path())
+        );
+        assert!(
+            original_path.exists(),
+            "the prior provider bytes must remain on disk"
+        );
     }
 
     #[tokio::test]
@@ -15094,7 +15297,7 @@ mod tests {
         let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
         assert_eq!(
             album_rows,
-            vec![("MASTER_CHANGED".to_string(), "Vacation".to_string())],
+            vec![("asset-MASTER_CHANGED".to_string(), "Vacation".to_string())],
             "relation add should route the photo event through the album pass"
         );
     }

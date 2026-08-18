@@ -91,12 +91,13 @@ Full enumeration streams records/query results and gathers a provider token
 from every active pass. Natural stream completion and usable, unanimous pass
 tokens are the authoritative proof. Count probes and pagination differences
 are diagnostics. Recoverable pass-token gaps can be retried in the same cycle.
-The download producer normalizes each child to its `CPLAsset.recordName` before
-planning, so page boundaries and sibling order cannot change its state ID. It
-retains a legacy master-keyed state ID only when the provider checksum matches
-and durable asset/master history identifies the sole child without its own
-state row. Cleanup retries carry the child record name and reapply the state ID
-selected by the first pass before they rebuild download tasks.
+Download orchestration normalizes each child to its `CPLAsset.recordName`
+before streaming or collecting paths plan it, so page boundaries and sibling
+order cannot change its state ID. It retains a legacy master-keyed state ID
+only when the provider checksum matches and durable asset/master history
+identifies the sole child without its own state row. Cleanup retries carry the
+child record name and reapply the state ID selected by the first pass before
+they rebuild download tasks.
 
 Incremental enumeration consumes changes/zone events. It persists provider
 identity mappings before applying created, soft-deleted, hard-deleted, or

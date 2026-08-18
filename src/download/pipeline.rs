@@ -39,8 +39,8 @@ use super::planner::ADD_ASSET_ALBUM_MAX_RETRIES;
 use super::planner::add_asset_album_with_retry;
 use super::planner::{self, ExistingPathMatch, TaskPlanner};
 use super::{
-    DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome, DownloadReporting,
-    DownloadStore, metadata_rewrite, preload_download_context,
+    ClaimedLegacyMasterStates, DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome,
+    DownloadReporting, DownloadStore, metadata_rewrite, preload_download_context,
 };
 
 pub(super) use metadata_rewrite::MetadataFlags;
@@ -1316,8 +1316,7 @@ where
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
         let mut task_planner = TaskPlanner::new();
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
-        let mut claimed_legacy_master_states: FxHashSet<(Arc<str>, Arc<str>)> =
-            FxHashSet::default();
+        let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
         // Skipped-asset IDs accumulated across the producer run and
         // flushed to the DB in a single transaction at the end. This
         // collapses N UPDATE statements (one per fast-skip / on-disk
@@ -1427,15 +1426,11 @@ where
                     }
 
                     let library = effective_asset_library(&asset, config);
-                    let use_legacy_master = download_ctx
-                        .should_use_legacy_master_state(library, &asset)
-                        && claimed_legacy_master_states
-                            .insert((Arc::from(library), Arc::from(asset.id())));
-                    let state_record_name = if use_legacy_master {
-                        Arc::from(asset.id())
-                    } else {
-                        asset.asset_record_name_arc()
-                    };
+                    let state_record_name = download_ctx.select_asset_state_record_name(
+                        library,
+                        &asset,
+                        &mut claimed_legacy_master_states,
+                    );
                     asset = asset.with_state_record_name(state_record_name);
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
