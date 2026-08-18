@@ -9,8 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- State databases now use schema version 17 to record which iCloud asset owns an adopted legacy master row. Older kei versions reject a version 17 database instead of opening it. To downgrade, restore a state DB backup made before the upgrade; downloaded media files are unchanged. ([#721])
+
 ### Fixed
 
+- A filtered sibling can no longer displace the child that owns a legacy master-keyed state row on the next sync. kei records the owner before planning downloads and reuses it during full sync, incremental sync, and pending retry. ([#721], fixes [#691])
 - A metadata-only iCloud edit (favourite, rating, keywords, caption, GPS) on an unchanged file now refreshes the catalogue during full enumeration and single-pass incremental sync. Changed provider metadata is applied before filtering and path planning, so the refresh reaches every downloaded version of the asset even when its media task is skipped as already on disk or excluded by a filter. The catalogue row and the rewrite marker commit together, so a queued sidecar or EXIF rewrite reads the corrected values instead of replaying stale ones, and no media is re-downloaded. ([#707], refs [#674])
 - A failed catalogue refresh now preserves the previous zone checkpoint instead of advancing past a provider edit that was never stored. ([#707])
 - Metadata rewrite failures are now reported when a sync downloads nothing. A metadata-only edit cycle transfers no media, so a failed sidecar or EXIF write was previously invisible in the sync result. ([#707])
@@ -30,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#718]: https://github.com/rhoopr/kei/pull/718
 [#719]: https://github.com/rhoopr/kei/issues/719
 [#720]: https://github.com/rhoopr/kei/pull/720
+[#721]: https://github.com/rhoopr/kei/pull/721
+[#691]: https://github.com/rhoopr/kei/issues/691
 [@mmenanno]: https://github.com/mmenanno
 
 ## [0.23.0] - 2026-08-01

@@ -4535,6 +4535,70 @@ mod tests {
             self.inner.touch_last_seen_many(library, asset_ids).await
         }
 
+        async fn upsert_asset_master_mapping(
+            &self,
+            library: &str,
+            asset_record_name: &str,
+            master_record_name: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .upsert_asset_master_mapping(library, asset_record_name, master_record_name)
+                .await
+        }
+
+        async fn get_master_record_name_for_asset(
+            &self,
+            library: &str,
+            asset_record_name: &str,
+        ) -> Result<Option<String>, state::error::StateError> {
+            self.inner
+                .get_master_record_name_for_asset(library, asset_record_name)
+                .await
+        }
+
+        async fn get_asset_record_names_for_master(
+            &self,
+            library: &str,
+            master_record_name: &str,
+        ) -> Result<Vec<String>, state::error::StateError> {
+            self.inner
+                .get_asset_record_names_for_master(library, master_record_name)
+                .await
+        }
+
+        async fn get_asset_master_mappings(
+            &self,
+        ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
+        {
+            self.inner.get_asset_master_mappings().await
+        }
+
+        async fn get_legacy_master_state_owners(
+            &self,
+        ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
+        {
+            self.inner.get_legacy_master_state_owners().await
+        }
+
+        async fn claim_legacy_master_state_owner(
+            &self,
+            library: &str,
+            master_record_name: &str,
+            asset_record_name: &str,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .claim_legacy_master_state_owner(library, master_record_name, asset_record_name)
+                .await
+        }
+
+        async fn backfill_asset_master_mappings_from_album_memberships(
+            &self,
+        ) -> Result<u64, state::error::StateError> {
+            self.inner
+                .backfill_asset_master_mappings_from_album_memberships()
+                .await
+        }
+
         async fn mark_policy_excluded(
             &self,
             library: &str,

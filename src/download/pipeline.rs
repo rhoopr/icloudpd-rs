@@ -1335,6 +1335,7 @@ where
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
         let mut task_planner = TaskPlanner::new();
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
+        let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
         // Skipped-asset IDs accumulated across the producer run and
         // flushed to the DB in a single transaction at the end. This
         // collapses N UPDATE statements (one per fast-skip / on-disk
@@ -1432,7 +1433,7 @@ where
                 break;
             }
             match result {
-                Ok(asset) => {
+                Ok(mut asset) => {
                     if !seen_asset_record_names.insert(asset.asset_record_name_arc()) {
                         tracing::debug!(
                             asset_id = %asset.id(),
@@ -1449,26 +1450,53 @@ where
                     // context.
                     let mut metadata_refresh_attempted = false;
                     if let Some(db) = &producer_state_db {
-                        let library = effective_asset_library(&asset, config);
+                        let library = effective_asset_library(&asset, config).to_owned();
                         if let Err(e) =
-                            planner::upsert_asset_master_mapping(db.as_ref(), library, &asset).await
+                            planner::upsert_asset_master_mapping(db.as_ref(), &library, &asset)
+                                .await
                         {
                             state_write_failures_producer
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!(
                                 asset_id = %asset.id(),
                                 asset_record_name = %asset.asset_record_name(),
-                                library,
+                                library = %library,
                                 error = %e,
                                 "Failed to record asset/master mapping"
                             );
+                        }
+                        match download_ctx
+                            .select_asset_state_record_name_for_download(
+                                Some(db.as_ref()),
+                                &library,
+                                &asset,
+                                &mut claimed_legacy_master_states,
+                            )
+                            .await
+                        {
+                            Ok(state_record_name) => {
+                                asset = asset.with_state_record_name(state_record_name);
+                            }
+                            Err(e) => {
+                                state_write_failures_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::warn!(
+                                    asset_id = %asset.id(),
+                                    asset_record_name = %asset.asset_record_name(),
+                                    library = %library,
+                                    error = %e,
+                                    "Failed to claim legacy master state owner"
+                                );
+                                producer_pb.inc(1);
+                                continue;
+                            }
                         }
                         // Apply changed provider metadata before filtering and
                         // path planning, so a metadata-only edit reaches the
                         // catalogue even when the media task is filtered or
                         // skipped as already on disk.
                         let drift = download_ctx.has_provider_metadata_drift(
-                            library,
+                            &library,
                             asset.state_id(),
                             asset.metadata().metadata_hash.as_deref(),
                         );
@@ -1476,7 +1504,7 @@ where
                         // matches the provider, which drift alone cannot see.
                         let retry_marker = !drift
                             && download_ctx
-                                .has_downloaded_metadata_retry_marker(library, asset.state_id());
+                                .has_downloaded_metadata_retry_marker(&library, asset.state_id());
                         if config.refresh_metadata || drift || retry_marker {
                             metadata_refresh_attempted = true;
                             // A marker-only refresh must not queue more work:
@@ -1485,7 +1513,7 @@ where
                                 metadata_writers_enabled && (config.refresh_metadata || drift);
                             match db
                                 .refresh_downloaded_asset_metadata(
-                                    library,
+                                    &library,
                                     asset.state_id(),
                                     asset.metadata(),
                                     mark_for_rewrite,
@@ -1502,7 +1530,7 @@ where
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         tracing::warn!(
                                             asset_id = %asset.id(),
-                                            library,
+                                            library = %library,
                                             "Changed provider metadata matched no downloaded state row"
                                         );
                                     }
@@ -1512,7 +1540,7 @@ where
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(
                                         asset_id = %asset.id(),
-                                        library,
+                                        library = %library,
                                         error = %e,
                                         "Failed to refresh downloaded asset metadata"
                                     );

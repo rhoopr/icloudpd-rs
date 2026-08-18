@@ -1379,7 +1379,17 @@ type LibraryAssetVersionPathMap =
 /// boundaries.
 type LibraryMasterAssetSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<Arc<str>>>>;
 
+/// `library -> master_record_name -> asset_record_name`. The value is the
+/// durable child that owns a legacy master-keyed state row.
+type LibraryMasterAssetMap = FxHashMap<Arc<str>, FxHashMap<Arc<str>, Arc<str>>>;
+
 type ClaimedLegacyMasterStates = FxHashSet<(Arc<str>, Arc<str>)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyOwnerClaimMode {
+    ReadOnly,
+    Persist,
+}
 
 #[derive(Debug, Default)]
 struct DownloadContext {
@@ -1429,6 +1439,9 @@ struct DownloadContext {
     /// snapshot intentionally excludes mappings discovered during the current
     /// run so a newly seen sibling cannot claim another child's legacy state.
     asset_master_mappings: Option<LibraryMasterAssetSet>,
+    /// Persisted child owner for each adopted legacy master-keyed state row.
+    /// `None` disables new legacy adoption after an owner query failure.
+    legacy_master_state_owners: Option<LibraryMasterAssetMap>,
     /// Nested map: `library` -> set of asset IDs known to the state DB (any
     /// status). Used in retry-only mode to skip new assets that were never
     /// synced in the same CloudKit zone.
@@ -1470,6 +1483,7 @@ impl DownloadContext {
             attempts,
             known_id_rows,
             mapping_rows,
+            legacy_owner_rows,
         ) = tokio::join!(
             async {
                 db.get_downloaded_ids().await.unwrap_or_else(|e| {
@@ -1523,6 +1537,7 @@ impl DownloadContext {
             },
             known_ids_fut,
             db.get_asset_master_mappings(),
+            db.get_legacy_master_state_owners(),
         );
 
         // Shared interner so the same asset_id allocates exactly one
@@ -1657,6 +1672,22 @@ impl DownloadContext {
             })
             .ok();
 
+        let legacy_master_state_owners = legacy_owner_rows
+            .map(|owner_rows| {
+                let mut owners: LibraryMasterAssetMap = FxHashMap::default();
+                for (library, master_record_name, asset_record_name) in owner_rows {
+                    let lib = intern_id(&mut interner, library);
+                    let master = intern_id(&mut interner, master_record_name);
+                    let asset = intern_id(&mut interner, asset_record_name);
+                    owners.entry(lib).or_default().insert(master, asset);
+                }
+                owners
+            })
+            .map_err(|e| {
+                tracing::warn!(error = %e, "Failed to load legacy master state owners from state DB");
+            })
+            .ok();
+
         let mut known_ids: LibraryAssetSet = FxHashMap::default();
         for (library, asset_id) in known_id_rows {
             let lib = intern_id(&mut interner, library);
@@ -1684,6 +1715,7 @@ impl DownloadContext {
             pending_filenames,
             pending_checksums,
             asset_master_mappings,
+            legacy_master_state_owners,
             known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
@@ -1878,6 +1910,16 @@ impl DownloadContext {
             return false;
         }
 
+        let Some(owners) = &self.legacy_master_state_owners else {
+            return false;
+        };
+        if let Some(owner) = owners
+            .get(library)
+            .and_then(|masters| masters.get(master_record_name))
+        {
+            return owner.as_ref() == asset_record_name;
+        }
+
         let Some(mappings) = &self.asset_master_mappings else {
             return false;
         };
@@ -1909,6 +1951,39 @@ impl DownloadContext {
             Arc::from(asset.id())
         } else {
             asset.asset_record_name_arc()
+        }
+    }
+
+    async fn select_asset_state_record_name_for_download(
+        &self,
+        db: Option<&dyn DownloadStore>,
+        library: &str,
+        asset: &PhotoAsset,
+        claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
+    ) -> std::result::Result<Arc<str>, crate::state::error::StateError> {
+        let state_record_name =
+            self.select_asset_state_record_name(library, asset, claimed_legacy_master_states);
+        if state_record_name.as_ref() != asset.id()
+            || self
+                .legacy_master_state_owners
+                .as_ref()
+                .and_then(|libraries| libraries.get(library))
+                .and_then(|masters| masters.get(asset.id()))
+                .is_some()
+        {
+            return Ok(state_record_name);
+        }
+
+        let Some(db) = db else {
+            return Ok(asset.asset_record_name_arc());
+        };
+        if db
+            .claim_legacy_master_state_owner(library, asset.id(), asset.asset_record_name())
+            .await?
+        {
+            Ok(state_record_name)
+        } else {
+            Ok(asset.asset_record_name_arc())
         }
     }
 
@@ -6061,6 +6136,50 @@ impl IncrementalDeltaSummary {
             .await;
     }
 
+    async fn select_asset_state_identity(
+        &mut self,
+        asset: PhotoAsset,
+        config: &DownloadConfig,
+        download_ctx: &DownloadContext,
+        claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
+        claim_mode: LegacyOwnerClaimMode,
+    ) -> Option<PhotoAsset> {
+        let library = asset.source_zone().unwrap_or(&config.library);
+        let selection = if claim_mode == LegacyOwnerClaimMode::Persist {
+            download_ctx
+                .select_asset_state_record_name_for_download(
+                    config.state_db.as_deref(),
+                    library,
+                    &asset,
+                    claimed_legacy_master_states,
+                )
+                .await
+        } else {
+            Ok(download_ctx.select_asset_state_record_name(
+                library,
+                &asset,
+                claimed_legacy_master_states,
+            ))
+        };
+        let state_record_name = match selection {
+            Ok(state_record_name) => state_record_name,
+            Err(e) => {
+                self.state_transition_failures += 1;
+                self.token_unsafe_reason
+                    .get_or_insert(ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON);
+                tracing::warn!(
+                    asset_id = %asset.id(),
+                    asset_record_name = %asset.asset_record_name(),
+                    library,
+                    error = %e,
+                    "Failed to claim legacy master state owner"
+                );
+                return None;
+            }
+        };
+        Some(asset.with_state_record_name(state_record_name))
+    }
+
     async fn persist_asset_master_mapping(
         &mut self,
         asset_record_name: &str,
@@ -6668,6 +6787,7 @@ struct IncrementalAssetHydrationContext<'a> {
     downloadable_assets: &'a mut Vec<(PhotoAsset, usize)>,
     download_ctx: Option<&'a DownloadContext>,
     claimed_legacy_master_states: &'a mut ClaimedLegacyMasterStates,
+    claim_mode: LegacyOwnerClaimMode,
 }
 
 async fn hydrate_missing_selected_relation_assets(
@@ -6747,14 +6867,23 @@ async fn hydrate_missing_selected_relation_assets(
         };
 
         for asset in assets {
+            delta_summary
+                .persist_asset_mapping_for_asset(&asset, config)
+                .await;
             let asset = if let Some(download_ctx) = context.download_ctx {
-                let library = asset.source_zone().unwrap_or(&config.library);
-                let state_record_name = download_ctx.select_asset_state_record_name(
-                    library,
-                    &asset,
-                    context.claimed_legacy_master_states,
-                );
-                asset.with_state_record_name(state_record_name)
+                let Some(asset) = delta_summary
+                    .select_asset_state_identity(
+                        asset,
+                        config,
+                        download_ctx,
+                        context.claimed_legacy_master_states,
+                        context.claim_mode,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                asset
             } else {
                 asset
             };
@@ -6763,9 +6892,6 @@ async fn hydrate_missing_selected_relation_assets(
             context
                 .asset_to_master
                 .insert(asset_record_name.clone(), asset.id().to_string());
-            delta_summary
-                .persist_asset_mapping_for_asset(&asset, config)
-                .await;
             context.complete_delta_assets.push(asset.clone());
             if let Some(pass_indices) = pass_indices_by_asset.get(asset_record_name.as_str()) {
                 for pass_index in pass_indices {
@@ -6855,13 +6981,19 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         for event in unpaired_asset_events {
             if let Some(mut asset) = event.asset {
                 if let Some(download_ctx) = download_ctx.as_deref() {
-                    let library = asset.source_zone().unwrap_or(&config.library);
-                    let state_record_name = download_ctx.select_asset_state_record_name(
-                        library,
-                        &asset,
-                        &mut claimed_legacy_master_states,
-                    );
-                    asset = asset.with_state_record_name(state_record_name);
+                    let Some(selected_asset) = summary
+                        .select_asset_state_identity(
+                            asset,
+                            &config,
+                            download_ctx,
+                            &mut claimed_legacy_master_states,
+                            LegacyOwnerClaimMode::Persist,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    asset = selected_asset;
                     apply_changed_provider_metadata(&config, &asset, download_ctx, &mut summary)
                         .await;
                 }
@@ -7123,6 +7255,11 @@ async fn download_photos_incremental_collecting_inner(
     preflight_url_refresh_after: Duration,
 ) -> Result<SyncResult> {
     let started = Instant::now();
+    let legacy_owner_claim_mode = if controls.run_mode.downloads_files() {
+        LegacyOwnerClaimMode::Persist
+    } else {
+        LegacyOwnerClaimMode::ReadOnly
+    };
 
     // Each asset is paired with its source pass index so both `{album}`
     // expansion and per-pass exclusion (notably, the unfiled pass's set
@@ -7197,13 +7334,15 @@ async fn download_photos_incremental_collecting_inner(
             let Some(asset) = event.asset.take() else {
                 continue;
             };
-            let library = asset.source_zone().unwrap_or(&config.library);
-            let state_record_name = download_ctx.select_asset_state_record_name(
-                library,
-                &asset,
-                &mut claimed_legacy_master_states,
-            );
-            event.asset = Some(asset.with_state_record_name(state_record_name));
+            event.asset = delta_summary
+                .select_asset_state_identity(
+                    asset,
+                    config,
+                    download_ctx,
+                    &mut claimed_legacy_master_states,
+                    legacy_owner_claim_mode,
+                )
+                .await;
         }
     }
     let mut complete_delta_assets: Vec<PhotoAsset> = change_events
@@ -7248,6 +7387,7 @@ async fn download_photos_incremental_collecting_inner(
             downloadable_assets: &mut downloadable_assets,
             download_ctx: download_ctx.as_deref(),
             claimed_legacy_master_states: &mut claimed_legacy_master_states,
+            claim_mode: legacy_owner_claim_mode,
         };
         hydrate_missing_selected_relation_assets(
             &change_events,
@@ -10556,6 +10696,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_sync_filtered_sibling_cannot_displace_legacy_master_owner_next_cycle() {
+        let asset_a_record = mock_asset_record_for("asset-owner-a", "MASTER_OWNER");
+        let asset_b_record = mock_asset_record_for("asset-owner-b", "MASTER_OWNER");
+        let master_record = mock_master_record_with_filename("MASTER_OWNER", "owner.jpg");
+        let excluded_ids = Arc::new(["asset-owner-b".to_string()].into_iter().collect());
+        let first_session = MockPhotosFlow::new()
+            .album_count(2)
+            .query_page(
+                vec![
+                    asset_a_record.clone(),
+                    master_record.clone(),
+                    asset_b_record.clone(),
+                ],
+                Some("zone-token-first"),
+            )
+            .build();
+        let first_passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", first_session),
+            exclude_ids: Arc::clone(&excluded_ids),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let legacy_asset = PhotoAsset::new(master_record.clone(), asset_a_record.clone());
+        seed_existing_file_for_asset(&mut config, &first_passes[0], &legacy_asset).await;
+        let config = Arc::new(config);
+
+        let first = download_photos_full_with_token(
+            &Client::new(),
+            &first_passes,
+            &config,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first owner-claim cycle should complete");
+        assert!(matches!(first.outcome, DownloadOutcome::Success));
+        assert_eq!(first.stats.downloaded, 0);
+        assert_eq!(first.stats.skipped.by_excluded_album, 1);
+        assert_eq!(
+            config
+                .state_db
+                .as_ref()
+                .expect("test state db")
+                .get_legacy_master_state_owners()
+                .await
+                .expect("legacy owner rows"),
+            std::collections::HashSet::from([(
+                "PrimarySync".to_string(),
+                "MASTER_OWNER".to_string(),
+                "asset-owner-a".to_string(),
+            )])
+        );
+
+        let second_session = MockPhotosFlow::new()
+            .album_count(2)
+            .query_page(
+                vec![asset_b_record, master_record, asset_a_record],
+                Some("zone-token-second"),
+            )
+            .build();
+        let second_passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", second_session),
+            exclude_ids: excluded_ids,
+        }];
+        let second = download_photos_full_with_token(
+            &Client::new(),
+            &second_passes,
+            &config,
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second owner-reuse cycle should complete");
+
+        assert!(matches!(second.outcome, DownloadOutcome::Success));
+        assert_eq!(second.stats.downloaded, 0);
+        assert_eq!(second.stats.failed, 0);
+        assert_eq!(second.stats.skipped.by_excluded_album, 1);
+        let downloaded_ids = config
+            .state_db
+            .as_ref()
+            .expect("test state db")
+            .get_downloaded_ids()
+            .await
+            .expect("downloaded state IDs");
+        assert!(downloaded_ids.iter().any(|(_, id, _)| id == "MASTER_OWNER"));
+        assert!(
+            !downloaded_ids
+                .iter()
+                .any(|(_, id, _)| id == "asset-owner-a")
+        );
+    }
+
+    #[tokio::test]
     async fn full_sync_blank_query_sync_token_blocks_advancement() {
         let records = mock_photo_records_with_filename("MASTER_BLANK_TOKEN", "blank-token.jpg");
         let session = MockPhotosFlow::new()
@@ -13633,6 +13873,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_retry_uses_legacy_owner_to_resolve_matching_siblings() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = TestAssetRecord::new("LEGACY_OWNED_RETRY")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .filename("owned-retry.jpg")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        assert!(
+            db.claim_legacy_master_state_owner(
+                "PrimarySync",
+                "LEGACY_OWNED_RETRY",
+                "asset-owned-b",
+            )
+            .await
+            .expect("claim legacy owner")
+        );
+
+        let master = mock_master_record_with_filename("LEGACY_OWNED_RETRY", "owned-retry.jpg");
+        let session = LegacyPendingHydrationSession {
+            lookup_records: Arc::new(vec![master.clone()]),
+            hydration_records: Arc::new(vec![
+                master,
+                mock_asset_record_for("asset-owned-a", "LEGACY_OWNED_RETRY"),
+                mock_asset_record_for("asset-owned-b", "LEGACY_OWNED_RETRY"),
+            ]),
+            hydration_error: None,
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("persisted owner should resolve matching siblings");
+
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.unmatched_targets.len(), 0);
+        assert_eq!(plan.tasks[0].asset_id.as_ref(), "LEGACY_OWNED_RETRY");
+        assert_eq!(plan.tasks[0].asset_record_name.as_ref(), "asset-owned-b");
+    }
+
+    #[tokio::test]
     async fn pending_retry_retains_transient_legacy_hydration_failure() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = TestAssetRecord::new("LEGACY_TRANSIENT").build();
@@ -15835,6 +16124,7 @@ mod tests {
         assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
 
         ctx.asset_master_mappings = Some(FxHashMap::default());
+        ctx.legacy_master_state_owners = Some(FxHashMap::default());
         assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
 
         ctx.asset_master_mappings
@@ -15856,6 +16146,15 @@ mod tests {
             .insert("original".into());
         assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
         assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_b));
+
+        ctx.legacy_master_state_owners
+            .as_mut()
+            .expect("owner snapshot")
+            .entry("PrimarySync".into())
+            .or_default()
+            .insert("master-family".into(), "asset-a".into());
+        assert!(ctx.should_use_legacy_master_state("PrimarySync", &asset_a));
+        assert!(!ctx.should_use_legacy_master_state("PrimarySync", &asset_b));
     }
 
     #[test]
@@ -15871,6 +16170,7 @@ mod tests {
             .clone();
         let mut ctx = DownloadContext {
             asset_master_mappings: Some(FxHashMap::default()),
+            legacy_master_state_owners: Some(FxHashMap::default()),
             ..DownloadContext::default()
         };
         ctx.pending_ids

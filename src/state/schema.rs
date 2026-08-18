@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 16;
+pub(crate) const SCHEMA_VERSION: i32 = 17;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -464,6 +464,21 @@ CREATE INDEX IF NOT EXISTS idx_asset_verifications_state
     ON asset_verifications (state, checked_at);
 ";
 
+/// V17 durable owner for a legacy CPLMaster-keyed state row.
+///
+/// A master can have more than one CPLAsset child. Once kei adopts a legacy
+/// master-keyed row for one child, this record keeps later siblings from
+/// changing that choice across sync cycles.
+const SCHEMA_V17: &str = r"
+CREATE TABLE IF NOT EXISTS legacy_master_state_owners (
+    library TEXT NOT NULL,
+    master_record_name TEXT NOT NULL,
+    asset_record_name TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL,
+    PRIMARY KEY (library, master_record_name)
+);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -617,6 +632,7 @@ fn migrate_to_version(
         14 => conn.execute_batch(SCHEMA_V14)?,
         15 => conn.execute_batch(SCHEMA_V15)?,
         16 => conn.execute_batch(SCHEMA_V16)?,
+        17 => conn.execute_batch(SCHEMA_V17)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1855,6 +1871,36 @@ mod tests {
         ] {
             assert!(column_exists(&conn, "asset_verifications", column).unwrap());
         }
+    }
+
+    #[test]
+    fn test_v17_creates_legacy_master_state_owners_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=16 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        set_schema_version(&conn, 16).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'legacy_master_state_owners'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        for column in [
+            "library",
+            "master_record_name",
+            "asset_record_name",
+            "claimed_at",
+        ] {
+            assert!(column_exists(&conn, "legacy_master_state_owners", column).unwrap());
+        }
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

@@ -94,10 +94,13 @@ are diagnostics. Recoverable pass-token gaps can be retried in the same cycle.
 Download orchestration normalizes each child to its `CPLAsset.recordName`
 before streaming or collecting paths plan it, so page boundaries and sibling
 order cannot change its state ID. It retains a legacy master-keyed state ID
-only when the provider checksum matches and durable asset/master history
-identifies the sole child without its own state row. Cleanup retries carry the
-child record name and reapply the state ID selected by the first pass before
-they rebuild download tasks.
+only when the provider checksum matches and durable identity history permits
+that child to adopt it. Before a download pass adopts a legacy master-keyed
+row, it atomically records that child as the durable owner. Later sibling
+mappings cannot change the owner. Print-only and dry-run paths select from
+existing state without claiming an owner. Cleanup retries carry the child
+record name and reapply the state ID selected by the first pass before they
+rebuild download tasks.
 
 Incremental enumeration consumes changes/zone events. It persists provider
 identity mappings before applying created, soft-deleted, hard-deleted, or
@@ -134,7 +137,8 @@ inventory. The retry owner:
 1. Removes only work already proven source-deleted.
 2. Resolves current provider records in targeted batches.
 3. Uses durable asset/master mappings and checksum/size evidence for legacy
-   identities.
+   identities. A persisted legacy owner resolves matching siblings without
+   changing the selected child.
 4. Adopts an existing matching local file when safe.
 5. Marks current filter exclusions as policy-excluded.
 6. Persists unknown or transient verification state.

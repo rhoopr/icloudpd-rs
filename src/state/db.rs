@@ -231,6 +231,19 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<HashSet<(String, String, String)>, StateError> {
         Ok(HashSet::new())
     }
+    async fn get_legacy_master_state_owners(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        Ok(HashSet::new())
+    }
+    async fn claim_legacy_master_state_owner(
+        &self,
+        _library: &str,
+        _master_record_name: &str,
+        _asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        Ok(false)
+    }
     async fn set_asset_verification(
         &self,
         _library: &str,
@@ -3046,6 +3059,70 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_legacy_master_state_owners(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        self.with_conn("get_legacy_master_state_owners", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT library, master_record_name, asset_record_name \
+                     FROM legacy_master_state_owners",
+                )
+                .map_err(|e| StateError::query("get_legacy_master_state_owners::prepare", e))?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| StateError::query("get_legacy_master_state_owners::query", e))?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| StateError::query("get_legacy_master_state_owners::row", e))
+        })
+        .await
+    }
+
+    pub(crate) async fn claim_legacy_master_state_owner(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        let library = library.to_owned();
+        let master_record_name = master_record_name.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        self.with_conn_mut("claim_legacy_master_state_owner", move |conn| {
+            let tx = conn.transaction().map_err(|e| {
+                StateError::query("claim_legacy_master_state_owner::transaction", e)
+            })?;
+            tx.execute(
+                "INSERT OR IGNORE INTO legacy_master_state_owners \
+                    (library, master_record_name, asset_record_name, claimed_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    library,
+                    master_record_name,
+                    asset_record_name,
+                    Utc::now().timestamp()
+                ],
+            )
+            .map_err(|e| StateError::query("claim_legacy_master_state_owner::insert", e))?;
+            let owner: String = tx
+                .query_row(
+                    "SELECT asset_record_name FROM legacy_master_state_owners \
+                     WHERE library = ?1 AND master_record_name = ?2",
+                    rusqlite::params![library, master_record_name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("claim_legacy_master_state_owner::query", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("claim_legacy_master_state_owner::commit", e))?;
+            Ok(owner == asset_record_name)
+        })
+        .await
+    }
+
     pub(crate) async fn set_asset_verification(
         &self,
         library: &str,
@@ -3833,6 +3910,27 @@ impl DownloadStateStore for SqliteStateDb {
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {
         SqliteStateDb::get_asset_master_mappings(self).await
+    }
+
+    async fn get_legacy_master_state_owners(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        SqliteStateDb::get_legacy_master_state_owners(self).await
+    }
+
+    async fn claim_legacy_master_state_owner(
+        &self,
+        library: &str,
+        master_record_name: &str,
+        asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::claim_legacy_master_state_owner(
+            self,
+            library,
+            master_record_name,
+            asset_record_name,
+        )
+        .await
     }
 
     async fn set_asset_verification(
@@ -4637,6 +4735,47 @@ mod tests {
                     "SharedSync-AAAA".to_string(),
                     "asset-a".to_string(),
                     "master-shared".to_string(),
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_master_state_owner_claim_is_atomic_and_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "master", "asset-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "master", "asset-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.claim_legacy_master_state_owner("PrimarySync", "master", "asset-b")
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_legacy_master_state_owner("SharedSync-AAAA", "master", "asset-b")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_legacy_master_state_owners().await.unwrap(),
+            HashSet::from([
+                (
+                    "PrimarySync".to_string(),
+                    "master".to_string(),
+                    "asset-a".to_string(),
+                ),
+                (
+                    "SharedSync-AAAA".to_string(),
+                    "master".to_string(),
+                    "asset-b".to_string(),
                 ),
             ])
         );
