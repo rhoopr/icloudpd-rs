@@ -501,7 +501,7 @@ impl PhotoAsset {
 
     /// Local state/download identity for this asset.
     ///
-    /// The download producer normalizes this to `CPLAsset.recordName`, which
+    /// The download pipeline normalizes this to `CPLAsset.recordName`, which
     /// stays unique across sibling order and pagination changes. It can
     /// preserve a compatible legacy `CPLMaster.recordName` when durable
     /// mapping history identifies the child that owns that row.
