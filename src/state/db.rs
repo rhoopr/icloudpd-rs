@@ -629,6 +629,8 @@ pub struct SqliteStateDb {
     conn: Arc<Mutex<Connection>>,
     /// Path to the database file (for error messages).
     path: PathBuf,
+    #[cfg(test)]
+    legacy_owner_claim_failures: std::sync::atomic::AtomicUsize,
 }
 
 /// One row from the read-only local manifest export.
@@ -707,6 +709,8 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
+            #[cfg(test)]
+            legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -750,6 +754,8 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
+            #[cfg(test)]
+            legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -764,7 +770,20 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(":memory:"),
+            legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_legacy_master_state_owner_claims(&self, count: usize) {
+        self.legacy_owner_claim_failures
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining_legacy_master_state_owner_claim_failures(&self) -> usize {
+        self.legacy_owner_claim_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the path to the database file.
@@ -3089,6 +3108,20 @@ impl SqliteStateDb {
         master_record_name: &str,
         asset_record_name: &str,
     ) -> Result<bool, StateError> {
+        #[cfg(test)]
+        if self
+            .legacy_owner_claim_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(StateError::LockPoisoned(
+                "injected legacy owner claim failure".into(),
+            ));
+        }
         let library = library.to_owned();
         let master_record_name = master_record_name.to_owned();
         let asset_record_name = asset_record_name.to_owned();

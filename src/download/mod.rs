@@ -1391,6 +1391,9 @@ enum LegacyOwnerClaimMode {
     Persist,
 }
 
+const LEGACY_OWNER_CLAIM_MAX_ATTEMPTS: u32 = 3;
+const LEGACY_OWNER_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Default)]
 struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
@@ -1977,14 +1980,35 @@ impl DownloadContext {
         let Some(db) = db else {
             return Ok(asset.asset_record_name_arc());
         };
-        if db
-            .claim_legacy_master_state_owner(library, asset.id(), asset.asset_record_name())
-            .await?
-        {
-            Ok(state_record_name)
-        } else {
-            Ok(asset.asset_record_name_arc())
+
+        for attempt in 1..=LEGACY_OWNER_CLAIM_MAX_ATTEMPTS {
+            match db
+                .claim_legacy_master_state_owner(library, asset.id(), asset.asset_record_name())
+                .await
+            {
+                Ok(true) => return Ok(state_record_name),
+                Ok(false) => return Ok(asset.asset_record_name_arc()),
+                Err(error) if attempt < LEGACY_OWNER_CLAIM_MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        library,
+                        master_record_name = asset.id(),
+                        asset_record_name = asset.asset_record_name(),
+                        attempt,
+                        error = %error,
+                        "Retrying legacy master state owner claim"
+                    );
+                    let delay =
+                        LEGACY_OWNER_CLAIM_RETRY_DELAY.saturating_mul(1u32 << (attempt - 1));
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
+
+        Err(crate::state::error::StateError::Invariant {
+            operation: "select_asset_state_record_name_for_download",
+            detail: "legacy owner claim retry loop ran no attempts".into(),
+        })
     }
 
     /// Check if an asset should be downloaded based on pre-loaded state.
@@ -10723,8 +10747,11 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
         config.file_match_policy = FileMatchPolicy::NameId7;
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        config.state_db = Some(db.clone());
         let legacy_asset = PhotoAsset::new(master_record.clone(), asset_a_record.clone());
         seed_existing_file_for_asset(&mut config, &first_passes[0], &legacy_asset).await;
+        db.fail_next_legacy_master_state_owner_claims(1);
         let config = Arc::new(config);
 
         let first = download_photos_full_with_token(
@@ -10739,6 +10766,11 @@ mod tests {
         assert!(matches!(first.outcome, DownloadOutcome::Success));
         assert_eq!(first.stats.downloaded, 0);
         assert_eq!(first.stats.skipped.by_excluded_album, 1);
+        assert_eq!(
+            db.remaining_legacy_master_state_owner_claim_failures(),
+            0,
+            "the first owner claim must hit the injected write failure"
+        );
         assert_eq!(
             config
                 .state_db
