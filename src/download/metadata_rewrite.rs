@@ -1418,6 +1418,94 @@ mod tests {
         );
     }
 
+    /// #682: a metadata-only drain must remove source fields that a prior kei
+    /// sidecar write established, then retire the marker only after that
+    /// updated sidecar lands.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn drain_clears_previously_owned_sidecar_fields() {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SIDECAR_CLEAR.jpg");
+        std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let initial = crate::test_helpers::TestAssetRecord::new("SIDECAR_CLEAR")
+            .filename("SIDECAR_CLEAR.jpg")
+            .metadata(AssetMetadata {
+                rating: Some(5),
+                description: Some("Old description".into()),
+                metadata_hash: Some("initial-hash".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&initial).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "SIDECAR_CLEAR",
+            "original",
+            &path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "SIDECAR_CLEAR", "original")
+            .await
+            .unwrap();
+
+        run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        let sidecar_path = dir.path().join("SIDECAR_CLEAR.jpg.xmp");
+        let initial_sidecar = std::fs::read_to_string(&sidecar_path).unwrap();
+        assert!(initial_sidecar.contains("Rating"));
+        assert!(initial_sidecar.contains("Old description"));
+
+        let cleared = crate::test_helpers::TestAssetRecord::new("SIDECAR_CLEAR")
+            .filename("SIDECAR_CLEAR.jpg")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("cleared-hash".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&cleared).await.unwrap();
+        db.record_metadata_write_failure("PrimarySync", "SIDECAR_CLEAR", "original")
+            .await
+            .unwrap();
+
+        let pass = run_pending(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(pass.applied, 1);
+        assert_eq!(pass.failed, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the marker retires after the cleared sidecar lands"
+        );
+        let cleared_sidecar = std::fs::read_to_string(&sidecar_path).unwrap();
+        assert!(!cleared_sidecar.contains("Old description"));
+        assert!(
+            !cleared_sidecar.contains("xmp:Rating"),
+            "the old rating and its ownership marker must both be gone"
+        );
+    }
+
     /// #707 review: a legacy row carries no checksum, so there is nothing to
     /// verify against and nothing to protect. The rewrite proceeds and
     /// establishes the baseline.
