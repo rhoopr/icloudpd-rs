@@ -22,7 +22,7 @@ use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 use super::filter::{
-    DerivedPath, DownloadTask, derive_expected_paths, determine_media_type,
+    DerivedPath, DownloadTask, FilterReason, derive_expected_paths, determine_media_type,
     extract_skip_candidates, is_asset_filtered,
 };
 use super::finalize::{
@@ -39,8 +39,8 @@ use super::planner::ADD_ASSET_ALBUM_MAX_RETRIES;
 use super::planner::add_asset_album_with_retry;
 use super::planner::{self, ExistingPathMatch, TaskPlanner};
 use super::{
-    DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome, DownloadReporting,
-    DownloadStore, metadata_rewrite, preload_download_context,
+    ClaimedLegacyMasterStates, DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome,
+    DownloadReporting, DownloadStore, metadata_rewrite, preload_download_context,
 };
 
 pub(super) use metadata_rewrite::MetadataFlags;
@@ -235,6 +235,8 @@ pub(super) struct StreamingResult {
     /// Per-pass recap fold; merged with the cleanup pass's recap before
     /// the friendly card renders.
     pub(super) recap: super::recap::RunRecap,
+    #[cfg(test)]
+    pub(super) printed_filenames: Vec<PathBuf>,
 }
 
 /// Threshold of auth errors before aborting the download pass for re-authentication.
@@ -1048,18 +1050,44 @@ where
     //
     pb.set_message(format!("{} \u{00b7} scanning...", config.pass_label()));
 
-    if controls.run_mode.only_print_filenames() {
-        // Load state DB context so we skip already-downloaded assets,
-        // matching the incremental path's behavior.
-        let download_ctx = match runtime.preloaded_download_ctx {
-            Some(ctx) => ctx,
-            None => preload_download_context(config).await,
-        };
+    // Select the durable child identity before any run mode performs state
+    // checks or path planning. Print-only and dry-run return before the real
+    // download producer starts, so normalizing only in that producer makes
+    // their paths disagree with a normal sync.
+    let download_ctx = match runtime.preloaded_download_ctx {
+        Some(ctx) => ctx,
+        None => preload_download_context(config).await,
+    };
+    let default_library = Arc::clone(&config.library);
+    let identity_download_ctx = Arc::clone(&download_ctx);
+    let identity_config = Arc::clone(config);
+    let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
+    let combined = combined.map(move |result| {
+        result.map(|asset| {
+            let library = asset.source_zone().unwrap_or(default_library.as_ref());
+            let state_record_name = if !matches!(
+                is_asset_filtered(&asset, identity_config.as_ref()),
+                Some(FilterReason::ExcludedAlbum)
+            ) {
+                identity_download_ctx.select_asset_state_record_name(
+                    library,
+                    &asset,
+                    &mut claimed_legacy_master_states,
+                )
+            } else {
+                identity_download_ctx.select_existing_asset_state_record_name(library, &asset)
+            };
+            asset.with_state_record_name(state_record_name)
+        })
+    });
 
+    if controls.run_mode.only_print_filenames() {
         tokio::pin!(combined);
         let mut enum_errors = 0usize;
         let mut task_planner = TaskPlanner::new();
         let mut shutdown_break = false;
+        #[cfg(test)]
+        let mut printed_filenames = Vec::new();
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
                 shutdown_break = true;
@@ -1113,6 +1141,8 @@ where
                         reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
                     )]
                     for task in &plan.tasks {
+                        #[cfg(test)]
+                        printed_filenames.push(task.download_path.clone());
                         println!("{}", task.download_path.display());
                     }
                 }
@@ -1127,6 +1157,8 @@ where
             // Same gate as dry-run — `--only-print-filenames` drains
             // the API stream and can clear the marker on a clean exit.
             enumeration_complete: !shutdown_break,
+            #[cfg(test)]
+            printed_filenames,
             ..StreamingResult::default()
         });
     }
@@ -1188,12 +1220,7 @@ where
     let state_db = config.state_db.clone();
     let mode = reporting.personality_mode;
 
-    // Pre-load download context for O(1) skip decisions
     let defer_metadata_drain = runtime.defer_metadata_drain;
-    let download_ctx = match runtime.preloaded_download_ctx {
-        Some(ctx) => ctx,
-        None => preload_download_context(config).await,
-    };
 
     // Start sync run tracking
     let sync_run_id = if let Some(db) = &state_db {
@@ -1316,6 +1343,7 @@ where
         let metadata_writers_enabled = MetadataFlags::from(config.as_ref()).has_any_write();
         let mut task_planner = TaskPlanner::new();
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
+        let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
         // Skipped-asset IDs accumulated across the producer run and
         // flushed to the DB in a single transaction at the end. This
         // collapses N UPDATE statements (one per fast-skip / on-disk
@@ -1413,7 +1441,7 @@ where
                 break;
             }
             match result {
-                Ok(asset) => {
+                Ok(mut asset) => {
                     if !seen_asset_record_names.insert(asset.asset_record_name_arc()) {
                         tracing::debug!(
                             asset_id = %asset.id(),
@@ -1430,26 +1458,58 @@ where
                     // context.
                     let mut metadata_refresh_attempted = false;
                     if let Some(db) = &producer_state_db {
-                        let library = effective_asset_library(&asset, config);
+                        let library = effective_asset_library(&asset, config).to_owned();
                         if let Err(e) =
-                            planner::upsert_asset_master_mapping(db.as_ref(), library, &asset).await
+                            planner::upsert_asset_master_mapping(db.as_ref(), &library, &asset)
+                                .await
                         {
                             state_write_failures_producer
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!(
                                 asset_id = %asset.id(),
                                 asset_record_name = %asset.asset_record_name(),
-                                library,
+                                library = %library,
                                 error = %e,
                                 "Failed to record asset/master mapping"
                             );
+                        }
+                        if !matches!(
+                            is_asset_filtered(&asset, config.as_ref()),
+                            Some(FilterReason::ExcludedAlbum)
+                        ) {
+                            match download_ctx
+                                .select_asset_state_record_name_for_download(
+                                    Some(db.as_ref()),
+                                    &library,
+                                    &asset,
+                                    &mut claimed_legacy_master_states,
+                                )
+                                .await
+                            {
+                                Ok(state_record_name) => {
+                                    asset = asset.with_state_record_name(state_record_name);
+                                }
+                                Err(e) => {
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(
+                                        asset_id = %asset.id(),
+                                        asset_record_name = %asset.asset_record_name(),
+                                        library = %library,
+                                        error = %e,
+                                        "Failed to claim legacy master state owner"
+                                    );
+                                    producer_pb.inc(1);
+                                    continue;
+                                }
+                            }
                         }
                         // Apply changed provider metadata before filtering and
                         // path planning, so a metadata-only edit reaches the
                         // catalogue even when the media task is filtered or
                         // skipped as already on disk.
                         let drift = download_ctx.has_provider_metadata_drift(
-                            library,
+                            &library,
                             asset.state_id(),
                             asset.metadata().metadata_hash.as_deref(),
                         );
@@ -1457,7 +1517,7 @@ where
                         // matches the provider, which drift alone cannot see.
                         let retry_marker = !drift
                             && download_ctx
-                                .has_downloaded_metadata_retry_marker(library, asset.state_id());
+                                .has_downloaded_metadata_retry_marker(&library, asset.state_id());
                         if config.refresh_metadata || drift || retry_marker {
                             metadata_refresh_attempted = true;
                             // A marker-only refresh must not queue more work:
@@ -1466,7 +1526,7 @@ where
                                 metadata_writers_enabled && (config.refresh_metadata || drift);
                             match db
                                 .refresh_downloaded_asset_metadata(
-                                    library,
+                                    &library,
                                     asset.state_id(),
                                     asset.metadata(),
                                     mark_for_rewrite,
@@ -1483,7 +1543,7 @@ where
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         tracing::warn!(
                                             asset_id = %asset.id(),
-                                            library,
+                                            library = %library,
                                             "Changed provider metadata matched no downloaded state row"
                                         );
                                     }
@@ -1493,7 +1553,7 @@ where
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(
                                         asset_id = %asset.id(),
-                                        library,
+                                        library = %library,
                                         error = %e,
                                         "Failed to refresh downloaded asset metadata"
                                     );
@@ -2308,6 +2368,8 @@ async fn finalize_streaming_download(
         videos_downloaded: consumer.videos_downloaded,
         recap: consumer.recap,
         url_expired_abort: consumer.url_expired_abort,
+        #[cfg(test)]
+        printed_filenames: Vec::new(),
     })
 }
 
@@ -3848,6 +3910,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 1000,
                                 asset_id: "ASSET_A".into(),
+                                asset_record_name: "ASSET_A".into(),
                                 library: "PrimarySync".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
@@ -3860,6 +3923,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 2000,
                                 asset_id: "ASSET_B".into(),
+                                asset_record_name: "ASSET_B".into(),
                                 library: "PrimarySync".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
@@ -3912,6 +3976,7 @@ mod tests {
                             created_local: chrono::Local::now(),
                             size: 500,
                             asset_id: "ASSET_C".into(),
+                            asset_record_name: "ASSET_C".into(),
                             library: "PrimarySync".into(),
                             metadata: Arc::new(MetadataPayload::default()),
                             version_size: VersionSizeKey::Original,
@@ -4795,6 +4860,7 @@ mod tests {
             download_path: download_path.clone(),
             checksum: checksum.into(),
             asset_id: "UNKNOWN_MEDIA".into(),
+            asset_record_name: "UNKNOWN_MEDIA".into(),
             library: "PrimarySync".into(),
             metadata: Arc::new(MetadataPayload::default()),
             size: body.len() as u64,
@@ -4876,6 +4942,7 @@ mod tests {
                 download_path: dir.path().join(format!("photo_{i}.jpg")),
                 checksum: checksum.clone().into(),
                 asset_id: format!("CIRCUIT_{i}").into(),
+                asset_record_name: format!("CIRCUIT_{i}").into(),
                 library: "PrimarySync".into(),
                 metadata: Arc::new(MetadataPayload::default()),
                 size: jpeg_body.len() as u64,
@@ -5122,6 +5189,132 @@ mod tests {
             err.to_string().contains("producer task crashed"),
             "Expected producer panic error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn print_and_dry_run_preserve_downloaded_child_identity() {
+        use base64::Engine as _;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/stream-mode-identity.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/stream-mode-identity.jpg", server.uri());
+        let make_asset = || {
+            PhotoAsset::new(
+                json!({
+                    "recordName": "STREAM_MODE_MASTER",
+                    "fields": {
+                        "filenameEnc": {"value": "stream-mode.jpg", "type": "STRING"},
+                        "itemType": {"value": "public.jpeg"},
+                        "resOriginalRes": {"value": {
+                            "size": body.len(),
+                            "downloadURL": url,
+                            "fileChecksum": checksum,
+                        }},
+                        "resOriginalFileType": {"value": "public.jpeg"},
+                    },
+                }),
+                json!({
+                    "recordName": "asset-STREAM_MODE_CHILD",
+                    "fields": {"assetDate": {"value": 1736899200000.0}},
+                }),
+            )
+        };
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let downloaded = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(make_asset())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("normal sync should download the child");
+        assert_eq!(downloaded.downloaded, 1);
+        let rows = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_ref(), "asset-STREAM_MODE_CHILD");
+
+        let printed = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(make_asset())]),
+            &config,
+            DownloadControls::new(
+                super::super::DownloadRunMode::PrintFilenames,
+                DownloadReporting::hidden(),
+            ),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("print-only sync should recognize the downloaded child");
+        assert!(
+            printed.printed_filenames.is_empty(),
+            "print-only must not emit collision paths for downloaded child state: {:?}",
+            printed.printed_filenames
+        );
+
+        let asset = make_asset();
+        let base_path = derive_expected_paths(&asset, config.as_ref())
+            .into_iter()
+            .next()
+            .expect("asset has an expected path")
+            .path;
+        let base_filename = base_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("expected path has a filename");
+        let expected_dry_run_path =
+            base_path.with_file_name(super::super::paths::insert_asset_identity_suffix(
+                base_filename,
+                asset.asset_record_name(),
+            ));
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let dry_run = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::dry_run_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("dry-run sync should plan the child identity");
+        assert_eq!(dry_run.downloaded, 1);
+        let dry_run_path = capture
+            .events()
+            .into_iter()
+            .find(|event| event.message() == Some("[DRY RUN] Would download"))
+            .and_then(|event| event.field("path").map(ToOwned::to_owned))
+            .expect("dry-run path event");
+        assert_eq!(dry_run_path, expected_dry_run_path.display().to_string());
     }
 
     #[tokio::test]

@@ -501,12 +501,10 @@ impl PhotoAsset {
 
     /// Local state/download identity for this asset.
     ///
-    /// Most CloudKit assets use their `CPLMaster.recordName` as kei's durable
-    /// state ID for compatibility with existing databases. When Apple exposes
-    /// multiple sibling `CPLAsset` records that share one master, additional
-    /// siblings need their own state rows, retry accounting, and path collision
-    /// suffixes, so the enumerator can override this to the sibling
-    /// `CPLAsset.recordName`.
+    /// The download pipeline normalizes this to `CPLAsset.recordName`, which
+    /// stays unique across sibling order and pagination changes. It can
+    /// preserve a compatible legacy `CPLMaster.recordName` when durable
+    /// mapping history identifies the child that owns that row.
     pub(crate) fn state_id(&self) -> &str {
         self.state_record_name
             .as_deref()

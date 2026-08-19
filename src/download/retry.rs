@@ -101,10 +101,14 @@ fn candidate_matches_durable_evidence(
 }
 
 fn select_legacy_candidate(
-    candidates: Vec<PhotoAsset>,
+    mut candidates: Vec<PhotoAsset>,
     targets: &[&PendingRetryTarget],
     evidence: &FxHashMap<PendingRetryTarget, PendingRetryEvidence>,
+    owner_asset_record_name: Option<&str>,
 ) -> LegacyCandidateSelection {
+    if let Some(owner) = owner_asset_record_name {
+        candidates.retain(|asset| asset.asset_record_name() == owner);
+    }
     if candidates.is_empty() {
         return LegacyCandidateSelection::Missing;
     }
@@ -406,6 +410,13 @@ pub(super) async fn build_pending_retry_download_tasks(
             )
         })
         .collect();
+    let legacy_master_state_owners: FxHashMap<String, String> = db
+        .get_legacy_master_state_owners()
+        .await?
+        .into_iter()
+        .filter(|(library, _, _)| library == config.library.as_ref())
+        .map(|(_, master_record_name, asset_record_name)| (master_record_name, asset_record_name))
+        .collect();
 
     let backfilled = db
         .backfill_asset_master_mappings_from_album_memberships()
@@ -643,8 +654,41 @@ pub(super) async fn build_pending_retry_download_tasks(
                 .filter(|target| target.asset_id.as_ref() == state_id)
                 .collect();
             let candidates = candidates_by_master.remove(&state_id).unwrap_or_default();
-            match select_legacy_candidate(candidates, &matching_targets, &pending_evidence) {
+            let persisted_owner = legacy_master_state_owners
+                .get(&state_id)
+                .map(String::as_str);
+            match select_legacy_candidate(
+                candidates,
+                &matching_targets,
+                &pending_evidence,
+                persisted_owner,
+            ) {
                 LegacyCandidateSelection::Selected(asset) => {
+                    if persisted_owner.is_none()
+                        && !db
+                            .claim_legacy_master_state_owner(
+                                &config.library,
+                                asset.id(),
+                                asset.asset_record_name(),
+                            )
+                            .await?
+                    {
+                        set_verification_for_state_id(
+                            db.as_ref(),
+                            &pending_targets,
+                            &state_id,
+                            AssetVerificationState::Unknown,
+                            "a different provider asset claimed the legacy master state",
+                        )
+                        .await?;
+                        tracing::warn!(
+                            library = %config.library,
+                            state_id,
+                            asset_record_name = %asset.asset_record_name(),
+                            "Pending asset retained: legacy master owner changed concurrently"
+                        );
+                        continue;
+                    }
                     db.upsert_asset_master_mapping(
                         &config.library,
                         asset.asset_record_name(),
@@ -802,6 +846,7 @@ mod tests {
             ],
             &[&target],
             &evidence,
+            None,
         );
 
         let LegacyCandidateSelection::Selected(selected) = selection else {
@@ -826,6 +871,7 @@ mod tests {
             ],
             &[&target],
             &evidence,
+            None,
         );
 
         assert!(matches!(
@@ -853,6 +899,7 @@ mod tests {
             )],
             &[&target],
             &evidence,
+            None,
         );
 
         assert!(matches!(
@@ -878,11 +925,38 @@ mod tests {
             ],
             &[&target],
             &evidence,
+            None,
         );
 
         assert!(matches!(
             selection,
             LegacyCandidateSelection::Ambiguous { matches: 2 }
         ));
+    }
+
+    #[test]
+    fn legacy_candidate_selection_uses_persisted_owner_to_resolve_matching_siblings() {
+        let record = TestAssetRecord::new("legacy-master")
+            .checksum("shared-checksum")
+            .size(300)
+            .build();
+        let target = PendingRetryTarget::from_record(&record);
+        let evidence =
+            FxHashMap::from_iter([(target.clone(), PendingRetryEvidence::from_record(&record))]);
+
+        let selection = select_legacy_candidate(
+            vec![
+                candidate("legacy-master", "asset-a", "shared-checksum", 300),
+                candidate("legacy-master", "asset-b", "shared-checksum", 300),
+            ],
+            &[&target],
+            &evidence,
+            Some("asset-b"),
+        );
+
+        let LegacyCandidateSelection::Selected(selected) = selection else {
+            panic!("persisted owner should resolve matching siblings");
+        };
+        assert_eq!(selected.asset_record_name(), "asset-b");
     }
 }
