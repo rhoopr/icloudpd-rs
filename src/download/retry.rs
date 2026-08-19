@@ -1,6 +1,6 @@
 //! Durable pending-retry identity resolution and targeted provider revalidation.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -8,8 +8,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    DownloadConfig, DownloadStore, DownloadTask, PENDING_RETRY_UNMATCHED_REASON, RetryTaskKey,
-    UrlRetrySource, build_pass_configs_resolving_deferred_excludes, filter, pipeline, planner,
+    DownloadConfig, DownloadStore, DownloadTask, PENDING_RETRY_UNMATCHED_REASON, RecordedLocalFile,
+    RetryTaskKey, UrlRetrySource, build_pass_configs_resolving_deferred_excludes, filter, pipeline,
+    planner,
 };
 use crate::icloud::photos::{PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::state::{AssetVerificationState, VersionSizeKey};
@@ -43,7 +44,7 @@ impl PendingRetryTarget {
 struct PendingRetryEvidence {
     checksum: Arc<str>,
     filename: Arc<str>,
-    local_path: Option<PathBuf>,
+    local_file: Option<RecordedLocalFile>,
     downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
     size_bytes: u64,
 }
@@ -53,15 +54,20 @@ impl PendingRetryEvidence {
         Self {
             checksum: Arc::from(record.checksum.as_ref()),
             filename: Arc::from(record.filename.as_ref()),
-            local_path: record.local_path.clone(),
+            local_file: record.local_path.clone().map(|path| RecordedLocalFile {
+                path,
+                local_checksum: record.local_checksum.as_deref().map(Into::into),
+                download_checksum: record.download_checksum.as_deref().map(Into::into),
+            }),
             downloaded_at: record.downloaded_at,
             size_bytes: record.size_bytes,
         }
     }
 
     fn local_path_under<'a>(&'a self, directory: &Path) -> Option<&'a Path> {
-        self.local_path
-            .as_deref()
+        self.local_file
+            .as_ref()
+            .map(|file| file.path.as_path())
             .filter(|path| path.starts_with(directory))
     }
 
@@ -69,11 +75,15 @@ impl PendingRetryEvidence {
         &'a self,
         directory: &Path,
     ) -> pipeline::PendingRetryLocalPath<'a> {
-        let Some(path) = self.local_path_under(directory) else {
+        let Some(file) = self
+            .local_file
+            .as_ref()
+            .filter(|file| file.path.starts_with(directory))
+        else {
             return pipeline::PendingRetryLocalPath::Unrecorded;
         };
         if self.downloaded_at.is_some() {
-            pipeline::PendingRetryLocalPath::Current(path)
+            pipeline::PendingRetryLocalPath::Current(file)
         } else {
             pipeline::PendingRetryLocalPath::Historical
         }

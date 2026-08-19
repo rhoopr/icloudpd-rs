@@ -764,6 +764,61 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
     .await?
 }
 
+/// The provider-size relationship required before a local file can be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalFileSizeExpectation {
+    /// The local file must not be shorter than the provider download.
+    AtLeastProvider(u64),
+    /// The local file must have the same size as the provider download.
+    ExactProvider(u64),
+}
+
+impl LocalFileSizeExpectation {
+    const fn accepts(self, actual_size: u64) -> bool {
+        match self {
+            Self::AtLeastProvider(provider_size) => {
+                provider_size == 0 || actual_size >= provider_size
+            }
+            Self::ExactProvider(provider_size) => actual_size == provider_size,
+        }
+    }
+}
+
+/// Return whether a local file satisfies its provider-size requirement.
+///
+/// Embedded metadata can legitimately change the final file size after kei
+/// verifies the provider download. When both stored checksums prove that kei
+/// changed the bytes, hash the current file and accept the size difference
+/// only when it still matches the recorded post-write checksum.
+///
+/// # Errors
+///
+/// Returns an error when checksum proof is required but the file cannot be
+/// read or hashed.
+#[must_use = "file-size validation determines whether existing bytes can be trusted"]
+pub(crate) async fn local_file_size_matches_state(
+    path: &Path,
+    actual_size: u64,
+    expectation: LocalFileSizeExpectation,
+    local_checksum: Option<&str>,
+    download_checksum: Option<&str>,
+) -> anyhow::Result<bool> {
+    if expectation.accepts(actual_size) {
+        return Ok(true);
+    }
+
+    let metadata_changed_download = matches!(
+        (local_checksum, download_checksum),
+        (Some(local), Some(download)) if local != download
+    );
+    if !metadata_changed_download {
+        return Ok(false);
+    }
+
+    let actual_checksum = compute_sha256(path).await?;
+    Ok(local_checksum == Some(actual_checksum.as_str()))
+}
+
 /// Decoded iCloud API checksum with its hash algorithm.
 ///
 /// Note: Apple's `fileChecksum` is an MMCS compound signature, not a
