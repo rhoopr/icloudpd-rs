@@ -331,7 +331,12 @@ async fn adopt_pending_on_disk_skip(
             asset,
             task_planner,
             &derived,
-            ctx.pending_file(library, asset.state_id(), derived.version_size),
+            ctx.pending_file_matching_checksum(
+                library,
+                asset.state_id(),
+                derived.version_size,
+                derived.checksum.as_ref(),
+            ),
         )
         .await
         {
@@ -516,7 +521,12 @@ async fn adopt_pending_on_disk_task(
         asset,
         task_planner,
         task,
-        ctx.pending_file(library, asset.state_id(), task.version_size),
+        ctx.pending_file_matching_checksum(
+            library,
+            asset.state_id(),
+            task.version_size,
+            task.checksum.as_ref(),
+        ),
     )
     .await
     {
@@ -540,7 +550,12 @@ async fn adopt_pending_on_disk_task(
             asset,
             task_planner,
             &derived,
-            ctx.pending_file(library, asset.state_id(), derived.version_size),
+            ctx.pending_file_matching_checksum(
+                library,
+                asset.state_id(),
+                derived.version_size,
+                derived.checksum.as_ref(),
+            ),
         )
         .await
         {
@@ -5775,8 +5790,16 @@ mod tests {
         assert_eq!(summary.failed, 0);
     }
 
-    #[tokio::test]
-    async fn producer_adopts_smaller_metadata_rewritten_pending_file() {
+    async fn run_producer_metadata_rewritten_pending_file(
+        pending_checksum: &str,
+    ) -> (
+        StreamingResult,
+        i64,
+        Arc<crate::state::SqliteStateDb>,
+        TempDir,
+        PathBuf,
+        String,
+    ) {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
         use crate::state::{SqliteStateDb, VersionSizeKey};
@@ -5819,7 +5842,7 @@ mod tests {
 
         let record = TestAssetRecord::new(asset.state_id())
             .library("SharedSync-abc")
-            .checksum("ck_metadata_rewritten_pending")
+            .checksum(pending_checksum)
             .filename("rewritten.jpg")
             .size(8)
             .build();
@@ -5849,7 +5872,7 @@ mod tests {
         let assets = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(
             metadata_rewritten_asset(),
         )]);
-        stream_and_download_from_stream(
+        let result = stream_and_download_from_stream(
             &client,
             assets,
             &config,
@@ -5859,12 +5882,28 @@ mod tests {
             StreamRuntime::new(None, None),
         )
         .await
-        .expect("sync must adopt metadata-rewritten pending file");
+        .expect("sync must process metadata-rewritten pending file");
+
+        (
+            result,
+            sync_started_at,
+            db,
+            dir,
+            target_path,
+            local_checksum,
+        )
+    }
+
+    #[tokio::test]
+    async fn producer_adopts_smaller_metadata_rewritten_pending_file() {
+        let (result, sync_started_at, db, _dir, target_path, local_checksum) =
+            run_producer_metadata_rewritten_pending_file("ck_metadata_rewritten_pending").await;
 
         assert_eq!(
             db.promote_pending_to_failed(sync_started_at).await.unwrap(),
             0
         );
+        assert!(result.failed.is_empty());
         assert_eq!(fs::read(&target_path).unwrap(), b"shorter");
         let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(downloaded.len(), 1);
@@ -5880,6 +5919,20 @@ mod tests {
             downloaded[0].download_checksum.as_deref(),
             Some("download-checksum-before-metadata")
         );
+    }
+
+    #[tokio::test]
+    async fn producer_does_not_adopt_metadata_rewritten_file_after_provider_change() {
+        let (result, _, db, _dir, target_path, _) =
+            run_producer_metadata_rewritten_pending_file("old-provider-checksum").await;
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(fs::read(&target_path).unwrap(), b"shorter");
+        assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].checksum.as_ref(), "ck_metadata_rewritten_pending");
     }
 
     #[tokio::test]

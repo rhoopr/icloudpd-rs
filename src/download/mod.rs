@@ -2229,6 +2229,24 @@ impl DownloadContext {
             .and_then(|versions| versions.get(version_size.as_str()))
     }
 
+    fn pending_file_matching_checksum(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        provider_checksum: &str,
+    ) -> Option<&RecordedLocalFile> {
+        let stored_checksum = self
+            .pending_checksums
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+            .and_then(|versions| versions.get(version_size.as_str()))?;
+        if stored_checksum.as_ref() != provider_checksum {
+            return None;
+        }
+        self.pending_file(library, asset_id, version_size)
+    }
+
     fn has_downloaded_without_metadata_hash(&self) -> bool {
         self.downloaded_without_metadata_hash
     }
