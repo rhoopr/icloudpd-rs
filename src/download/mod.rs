@@ -27,8 +27,8 @@ use pipeline::{
 };
 
 pub(crate) use filter::AssetGroupings;
-use filter::DownloadTask;
 pub(crate) use filter::determine_media_type;
+use filter::{DownloadTask, FilterReason, is_asset_filtered};
 #[cfg(test)]
 use retry::take_matching_pending_retry_tasks;
 use retry::{PendingRetryPlan, PendingRetryTarget, build_pending_retry_download_tasks};
@@ -1387,8 +1387,31 @@ type ClaimedLegacyMasterStates = FxHashSet<(Arc<str>, Arc<str>)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LegacyOwnerClaimMode {
+    ExistingOnly,
     ReadOnly,
     Persist,
+}
+
+/// Prevent a child excluded by every pass's album membership from claiming a
+/// mapping-less legacy row. Other filters still select identity because they
+/// apply to metadata refreshes even when no media task is planned.
+fn legacy_owner_claim_mode_for_configs<'a>(
+    requested: LegacyOwnerClaimMode,
+    asset: &PhotoAsset,
+    configs: impl IntoIterator<Item = &'a DownloadConfig>,
+) -> LegacyOwnerClaimMode {
+    if requested == LegacyOwnerClaimMode::ExistingOnly
+        || configs.into_iter().all(|config| {
+            matches!(
+                is_asset_filtered(asset, config),
+                Some(FilterReason::ExcludedAlbum)
+            )
+        })
+    {
+        LegacyOwnerClaimMode::ExistingOnly
+    } else {
+        requested
+    }
 }
 
 const LEGACY_OWNER_CLAIM_MAX_ATTEMPTS: u32 = 3;
@@ -1951,6 +1974,24 @@ impl DownloadContext {
         let use_legacy_master = self.should_use_legacy_master_state(library, asset)
             && claimed_legacy_master_states.insert((Arc::from(library), Arc::from(asset.id())));
         if use_legacy_master {
+            Arc::from(asset.id())
+        } else {
+            asset.asset_record_name_arc()
+        }
+    }
+
+    fn select_existing_asset_state_record_name(
+        &self,
+        library: &str,
+        asset: &PhotoAsset,
+    ) -> Arc<str> {
+        let has_persisted_owner = self
+            .legacy_master_state_owners
+            .as_ref()
+            .and_then(|libraries| libraries.get(library))
+            .and_then(|masters| masters.get(asset.id()))
+            .is_some();
+        if has_persisted_owner && self.should_use_legacy_master_state(library, asset) {
             Arc::from(asset.id())
         } else {
             asset.asset_record_name_arc()
@@ -6169,21 +6210,25 @@ impl IncrementalDeltaSummary {
         claim_mode: LegacyOwnerClaimMode,
     ) -> Option<PhotoAsset> {
         let library = asset.source_zone().unwrap_or(&config.library);
-        let selection = if claim_mode == LegacyOwnerClaimMode::Persist {
-            download_ctx
-                .select_asset_state_record_name_for_download(
-                    config.state_db.as_deref(),
-                    library,
-                    &asset,
-                    claimed_legacy_master_states,
-                )
-                .await
-        } else {
-            Ok(download_ctx.select_asset_state_record_name(
+        let selection = match claim_mode {
+            LegacyOwnerClaimMode::ExistingOnly => {
+                Ok(download_ctx.select_existing_asset_state_record_name(library, &asset))
+            }
+            LegacyOwnerClaimMode::ReadOnly => Ok(download_ctx.select_asset_state_record_name(
                 library,
                 &asset,
                 claimed_legacy_master_states,
-            ))
+            )),
+            LegacyOwnerClaimMode::Persist => {
+                download_ctx
+                    .select_asset_state_record_name_for_download(
+                        config.state_db.as_deref(),
+                        library,
+                        &asset,
+                        claimed_legacy_master_states,
+                    )
+                    .await
+            }
         };
         let state_record_name = match selection {
             Ok(state_record_name) => state_record_name,
@@ -6812,6 +6857,7 @@ struct IncrementalAssetHydrationContext<'a> {
     download_ctx: Option<&'a DownloadContext>,
     claimed_legacy_master_states: &'a mut ClaimedLegacyMasterStates,
     claim_mode: LegacyOwnerClaimMode,
+    pass_configs: &'a [Arc<DownloadConfig>],
 }
 
 async fn hydrate_missing_selected_relation_assets(
@@ -6894,6 +6940,17 @@ async fn hydrate_missing_selected_relation_assets(
             delta_summary
                 .persist_asset_mapping_for_asset(&asset, config)
                 .await;
+            let asset_record_name = asset.asset_record_name().to_string();
+            let pass_indices = pass_indices_by_asset.get(asset_record_name.as_str());
+            let claim_mode = legacy_owner_claim_mode_for_configs(
+                context.claim_mode,
+                &asset,
+                pass_indices
+                    .into_iter()
+                    .flat_map(|pass_indices| pass_indices.iter())
+                    .filter_map(|pass_index| context.pass_configs.get(*pass_index))
+                    .map(AsRef::as_ref),
+            );
             let asset = if let Some(download_ctx) = context.download_ctx {
                 let Some(asset) = delta_summary
                     .select_asset_state_identity(
@@ -6901,7 +6958,7 @@ async fn hydrate_missing_selected_relation_assets(
                         config,
                         download_ctx,
                         context.claimed_legacy_master_states,
-                        context.claim_mode,
+                        claim_mode,
                     )
                     .await
                 else {
@@ -6911,13 +6968,12 @@ async fn hydrate_missing_selected_relation_assets(
             } else {
                 asset
             };
-            let asset_record_name = asset.asset_record_name().to_string();
             hydrated_asset_record_names.insert(asset_record_name.clone());
             context
                 .asset_to_master
                 .insert(asset_record_name.clone(), asset.id().to_string());
             context.complete_delta_assets.push(asset.clone());
-            if let Some(pass_indices) = pass_indices_by_asset.get(asset_record_name.as_str()) {
+            if let Some(pass_indices) = pass_indices {
                 for pass_index in pass_indices {
                     context
                         .downloadable_assets
@@ -7005,13 +7061,18 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         for event in unpaired_asset_events {
             if let Some(mut asset) = event.asset {
                 if let Some(download_ctx) = download_ctx.as_deref() {
+                    let claim_mode = legacy_owner_claim_mode_for_configs(
+                        LegacyOwnerClaimMode::Persist,
+                        &asset,
+                        std::iter::once(config.as_ref()),
+                    );
                     let Some(selected_asset) = summary
                         .select_asset_state_identity(
                             asset,
                             &config,
                             download_ctx,
                             &mut claimed_legacy_master_states,
-                            LegacyOwnerClaimMode::Persist,
+                            claim_mode,
                         )
                         .await
                     else {
@@ -7284,6 +7345,7 @@ async fn download_photos_incremental_collecting_inner(
     } else {
         LegacyOwnerClaimMode::ReadOnly
     };
+    let pass_configs = build_pass_configs(passes, config);
 
     // Each asset is paired with its source pass index so both `{album}`
     // expansion and per-pass exclusion (notably, the unfiled pass's set
@@ -7358,13 +7420,18 @@ async fn download_photos_incremental_collecting_inner(
             let Some(asset) = event.asset.take() else {
                 continue;
             };
+            let claim_mode = legacy_owner_claim_mode_for_configs(
+                legacy_owner_claim_mode,
+                &asset,
+                pass_configs.iter().map(AsRef::as_ref),
+            );
             event.asset = delta_summary
                 .select_asset_state_identity(
                     asset,
                     config,
                     download_ctx,
                     &mut claimed_legacy_master_states,
-                    legacy_owner_claim_mode,
+                    claim_mode,
                 )
                 .await;
         }
@@ -7412,6 +7479,7 @@ async fn download_photos_incremental_collecting_inner(
             download_ctx: download_ctx.as_deref(),
             claimed_legacy_master_states: &mut claimed_legacy_master_states,
             claim_mode: legacy_owner_claim_mode,
+            pass_configs: &pass_configs,
         };
         hydrate_missing_selected_relation_assets(
             &change_events,
@@ -7595,7 +7663,6 @@ async fn download_photos_incremental_collecting_inner(
     // `changes/zone`, which can make those URLs expire before downloads
     // start on large album sets.
     let phase_started = Instant::now();
-    let pass_configs = build_pass_configs(passes, config);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
 
     for (asset, pass_index) in &downloadable_assets {
@@ -10729,9 +10796,9 @@ mod tests {
             .album_count(2)
             .query_page(
                 vec![
-                    asset_a_record.clone(),
-                    master_record.clone(),
                     asset_b_record.clone(),
+                    master_record.clone(),
+                    asset_a_record.clone(),
                 ],
                 Some("zone-token-first"),
             )
@@ -10789,7 +10856,7 @@ mod tests {
         let second_session = MockPhotosFlow::new()
             .album_count(2)
             .query_page(
-                vec![asset_b_record, master_record, asset_a_record],
+                vec![asset_a_record, master_record, asset_b_record],
                 Some("zone-token-second"),
             )
             .build();

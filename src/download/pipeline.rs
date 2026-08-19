@@ -22,7 +22,7 @@ use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 use super::filter::{
-    DerivedPath, DownloadTask, derive_expected_paths, determine_media_type,
+    DerivedPath, DownloadTask, FilterReason, derive_expected_paths, determine_media_type,
     extract_skip_candidates, is_asset_filtered,
 };
 use super::finalize::{
@@ -1060,15 +1060,23 @@ where
     };
     let default_library = Arc::clone(&config.library);
     let identity_download_ctx = Arc::clone(&download_ctx);
+    let identity_config = Arc::clone(config);
     let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
     let combined = combined.map(move |result| {
         result.map(|asset| {
             let library = asset.source_zone().unwrap_or(default_library.as_ref());
-            let state_record_name = identity_download_ctx.select_asset_state_record_name(
-                library,
-                &asset,
-                &mut claimed_legacy_master_states,
-            );
+            let state_record_name = if !matches!(
+                is_asset_filtered(&asset, identity_config.as_ref()),
+                Some(FilterReason::ExcludedAlbum)
+            ) {
+                identity_download_ctx.select_asset_state_record_name(
+                    library,
+                    &asset,
+                    &mut claimed_legacy_master_states,
+                )
+            } else {
+                identity_download_ctx.select_existing_asset_state_record_name(library, &asset)
+            };
             asset.with_state_record_name(state_record_name)
         })
     });
@@ -1465,30 +1473,35 @@ where
                                 "Failed to record asset/master mapping"
                             );
                         }
-                        match download_ctx
-                            .select_asset_state_record_name_for_download(
-                                Some(db.as_ref()),
-                                &library,
-                                &asset,
-                                &mut claimed_legacy_master_states,
-                            )
-                            .await
-                        {
-                            Ok(state_record_name) => {
-                                asset = asset.with_state_record_name(state_record_name);
-                            }
-                            Err(e) => {
-                                state_write_failures_producer
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(
-                                    asset_id = %asset.id(),
-                                    asset_record_name = %asset.asset_record_name(),
-                                    library = %library,
-                                    error = %e,
-                                    "Failed to claim legacy master state owner"
-                                );
-                                producer_pb.inc(1);
-                                continue;
+                        if !matches!(
+                            is_asset_filtered(&asset, config.as_ref()),
+                            Some(FilterReason::ExcludedAlbum)
+                        ) {
+                            match download_ctx
+                                .select_asset_state_record_name_for_download(
+                                    Some(db.as_ref()),
+                                    &library,
+                                    &asset,
+                                    &mut claimed_legacy_master_states,
+                                )
+                                .await
+                            {
+                                Ok(state_record_name) => {
+                                    asset = asset.with_state_record_name(state_record_name);
+                                }
+                                Err(e) => {
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(
+                                        asset_id = %asset.id(),
+                                        asset_record_name = %asset.asset_record_name(),
+                                        library = %library,
+                                        error = %e,
+                                        "Failed to claim legacy master state owner"
+                                    );
+                                    producer_pb.inc(1);
+                                    continue;
+                                }
                             }
                         }
                         // Apply changed provider metadata before filtering and
