@@ -39,6 +39,126 @@ use crate::fs_util::atomic_install;
 const KEI_XMP_NS: &str = "https://github.com/rhoopr/kei/ns/1.0/";
 #[cfg(feature = "xmp")]
 const KEI_XMP_PREFIX: &str = "kei";
+#[cfg(feature = "xmp")]
+const KEI_MANAGED_FIELDS: &str = "managedFields";
+
+#[cfg(feature = "xmp")]
+#[derive(Clone, Copy)]
+enum ManagedXmpField {
+    CreateDate,
+    ModifyDate,
+    DateTimeOriginal,
+    DateCreated,
+    Rating,
+    GpsLatitude,
+    GpsLongitude,
+    GpsAltitude,
+    GpsAltitudeRef,
+    Title,
+    Description,
+    Keywords,
+    People,
+    Hidden,
+    Archived,
+    MediaSubtype,
+    BurstId,
+}
+
+#[cfg(feature = "xmp")]
+const MANAGED_XMP_FIELDS: [ManagedXmpField; 17] = [
+    ManagedXmpField::CreateDate,
+    ManagedXmpField::ModifyDate,
+    ManagedXmpField::DateTimeOriginal,
+    ManagedXmpField::DateCreated,
+    ManagedXmpField::Rating,
+    ManagedXmpField::GpsLatitude,
+    ManagedXmpField::GpsLongitude,
+    ManagedXmpField::GpsAltitude,
+    ManagedXmpField::GpsAltitudeRef,
+    ManagedXmpField::Title,
+    ManagedXmpField::Description,
+    ManagedXmpField::Keywords,
+    ManagedXmpField::People,
+    ManagedXmpField::Hidden,
+    ManagedXmpField::Archived,
+    ManagedXmpField::MediaSubtype,
+    ManagedXmpField::BurstId,
+];
+
+#[cfg(feature = "xmp")]
+impl ManagedXmpField {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::CreateDate => "xmp:CreateDate",
+            Self::ModifyDate => "xmp:ModifyDate",
+            Self::DateTimeOriginal => "exif:DateTimeOriginal",
+            Self::DateCreated => "photoshop:DateCreated",
+            Self::Rating => "xmp:Rating",
+            Self::GpsLatitude => "exif:GPSLatitude",
+            Self::GpsLongitude => "exif:GPSLongitude",
+            Self::GpsAltitude => "exif:GPSAltitude",
+            Self::GpsAltitudeRef => "exif:GPSAltitudeRef",
+            Self::Title => "dc:title[x-default]",
+            Self::Description => "dc:description[x-default]",
+            Self::Keywords => "dc:subject",
+            Self::People => "iptcExt:PersonInImage",
+            Self::Hidden => "kei:hidden",
+            Self::Archived => "kei:archived",
+            Self::MediaSubtype => "kei:mediaSubtype",
+            Self::BurstId => "kei:burstId",
+        }
+    }
+
+    fn is_present(self, write: &MetadataWrite) -> bool {
+        match self {
+            Self::CreateDate | Self::ModifyDate | Self::DateTimeOriginal | Self::DateCreated => {
+                write.datetime.is_some()
+            }
+            Self::Rating => write.rating.is_some(),
+            Self::GpsLatitude | Self::GpsLongitude => write.gps.is_some(),
+            Self::GpsAltitude | Self::GpsAltitudeRef => {
+                write.gps.is_some_and(|gps| gps.altitude.is_some())
+            }
+            Self::Title => write.title.is_some(),
+            Self::Description => write.description.is_some(),
+            Self::Keywords => !write.keywords.is_empty(),
+            Self::People => !write.people.is_empty(),
+            Self::Hidden => write.is_hidden,
+            Self::Archived => write.is_archived,
+            Self::MediaSubtype => write.media_subtype.is_some(),
+            Self::BurstId => write.burst_id.is_some(),
+        }
+    }
+
+    fn delete(self, meta: &mut XmpMeta) -> xmp_toolkit::XmpResult<()> {
+        let (namespace, path) = match self {
+            Self::CreateDate => (xmp_ns::XMP, "CreateDate"),
+            Self::ModifyDate => (xmp_ns::XMP, "ModifyDate"),
+            Self::DateTimeOriginal => (xmp_ns::EXIF, "DateTimeOriginal"),
+            Self::DateCreated => (xmp_ns::PHOTOSHOP, "DateCreated"),
+            Self::Rating => (xmp_ns::XMP, "Rating"),
+            Self::GpsLatitude => (xmp_ns::EXIF, "GPSLatitude"),
+            Self::GpsLongitude => (xmp_ns::EXIF, "GPSLongitude"),
+            Self::GpsAltitude => (xmp_ns::EXIF, "GPSAltitude"),
+            Self::GpsAltitudeRef => (xmp_ns::EXIF, "GPSAltitudeRef"),
+            Self::Keywords => (xmp_ns::DC, "subject"),
+            Self::People => (xmp_ns::IPTC_EXT, "PersonInImage"),
+            Self::Hidden => (KEI_XMP_NS, "hidden"),
+            Self::Archived => (KEI_XMP_NS, "archived"),
+            Self::MediaSubtype => (KEI_XMP_NS, "mediaSubtype"),
+            Self::BurstId => (KEI_XMP_NS, "burstId"),
+            Self::Title => {
+                let path = XmpMeta::compose_lang_selector(xmp_ns::DC, "title", "x-default")?;
+                return meta.delete_property(xmp_ns::DC, &path);
+            }
+            Self::Description => {
+                let path = XmpMeta::compose_lang_selector(xmp_ns::DC, "description", "x-default")?;
+                return meta.delete_property(xmp_ns::DC, &path);
+            }
+        };
+        meta.delete_property(namespace, path)
+    }
+}
 
 #[cfg(feature = "xmp")]
 static INIT: Once = Once::new();
@@ -352,12 +472,12 @@ pub(crate) fn write_sidecar(
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<()> {
-    if write.is_empty() {
-        return Ok(());
-    }
     ensure_initialized();
 
     let Some(name) = media_path.file_name() else {
+        if write.is_empty() {
+            return Ok(());
+        }
         anyhow::bail!(
             "Cannot write an XMP sidecar because the media path has no filename: {}",
             media_path.display()
@@ -396,7 +516,10 @@ pub(crate) fn write_sidecar(
             });
         }
     };
-    apply_to_xmp(&mut meta, write)?;
+    if write.is_empty() && !meta.contains_property(KEI_XMP_NS, KEI_MANAGED_FIELDS) {
+        return Ok(());
+    }
+    apply_to_owned_sidecar(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
 
     std::fs::write(&tmp_path, &bytes).with_context(|| {
@@ -413,6 +536,57 @@ pub(crate) fn write_sidecar(
         )
     })?;
     tracing::debug!(path = %sidecar_path.display(), "Wrote XMP sidecar");
+    Ok(())
+}
+
+/// Apply a complete sidecar snapshot without deleting metadata that kei cannot
+/// prove it wrote. The ownership list records exact properties, so a later
+/// clear can remove only the values established by an earlier kei write.
+#[cfg(feature = "xmp")]
+fn apply_to_owned_sidecar(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpResult<()> {
+    let previous = meta
+        .property(KEI_XMP_NS, KEI_MANAGED_FIELDS)
+        .map(|value| value.value)
+        .unwrap_or_default();
+    let previous_tokens: Vec<&str> = previous
+        .split(',')
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    for field in MANAGED_XMP_FIELDS {
+        if previous_tokens.contains(&field.token()) && !field.is_present(write) {
+            field.delete(meta)?;
+        }
+    }
+
+    apply_to_xmp(meta, write)?;
+
+    let mut current_tokens: Vec<String> = previous_tokens
+        .into_iter()
+        .filter(|token| {
+            !MANAGED_XMP_FIELDS
+                .iter()
+                .any(|field| field.token() == *token)
+        })
+        .map(str::to_owned)
+        .collect();
+    current_tokens.extend(
+        MANAGED_XMP_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| field.is_present(write))
+            .map(|field| field.token().to_owned()),
+    );
+
+    if current_tokens.is_empty() {
+        meta.delete_property(KEI_XMP_NS, KEI_MANAGED_FIELDS)?;
+    } else {
+        meta.set_property(
+            KEI_XMP_NS,
+            KEI_MANAGED_FIELDS,
+            &XmpValue::new(current_tokens.join(",")),
+        )?;
+    }
     Ok(())
 }
 
@@ -1964,6 +2138,15 @@ mod tests {
 
     // ── Sidecar + format-dispatch tests ────────────────────────────────
 
+    fn read_sidecar_meta(media_path: &Path) -> XmpMeta {
+        let mut sidecar_path = media_path.as_os_str().to_os_string();
+        sidecar_path.push(".xmp");
+        fs::read_to_string(PathBuf::from(sidecar_path))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn is_embed_writable_path_recognises_supported_formats() {
         for ext in [
@@ -2059,6 +2242,162 @@ mod tests {
         assert!(!tmp.exists(), "temp sidecar file must be cleaned up");
 
         fs::remove_file(&sidecar).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_clears_only_fields_previously_owned_by_kei() {
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("owned.jpg");
+        let sidecar_path = dir.join("owned.jpg.xmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        const THIRD_PARTY_NS: &str = "https://example.invalid/xmp/third-party/";
+        ensure_initialized();
+        XmpMeta::register_namespace(THIRD_PARTY_NS, "thirdParty").unwrap();
+        let mut seed = XmpMeta::new().unwrap();
+        seed.set_property(
+            xmp_ns::DC,
+            "creator",
+            &XmpValue::new("User-Photographer".to_string()),
+        )
+        .unwrap();
+        seed.set_property(
+            THIRD_PARTY_NS,
+            "developSettings",
+            &XmpValue::new("opaque-user-data".to_string()),
+        )
+        .unwrap();
+        std::fs::write(&sidecar_path, seed.to_string().into_bytes()).unwrap();
+
+        let first = MetadataWrite {
+            datetime: Some("2024:06:15 10:00:00".into()),
+            rating: Some(5),
+            gps: Some(GpsCoords {
+                latitude: 37.7,
+                longitude: -122.4,
+                altitude: Some(10.0),
+            }),
+            title: Some("Owned title".into()),
+            description: Some("Owned description".into()),
+            keywords: vec!["vacation".into()],
+            people: vec!["Alice".into()],
+            is_hidden: true,
+            is_archived: true,
+            media_subtype: Some("portrait".into()),
+            burst_id: Some("burst-1".into()),
+        };
+        write_sidecar_with_default_suffix(&media_path, &first).unwrap();
+
+        let cleared = MetadataWrite {
+            datetime: first.datetime.clone(),
+            gps: Some(GpsCoords {
+                latitude: 37.7,
+                longitude: -122.4,
+                altitude: None,
+            }),
+            ..MetadataWrite::default()
+        };
+        write_sidecar_with_default_suffix(&media_path, &cleared).unwrap();
+
+        let meta = read_sidecar_meta(&media_path);
+        assert!(meta.contains_property(xmp_ns::XMP, "CreateDate"));
+        assert!(meta.contains_property(xmp_ns::EXIF, "GPSLatitude"));
+        for (namespace, property) in [
+            (xmp_ns::XMP, "Rating"),
+            (xmp_ns::EXIF, "GPSAltitude"),
+            (xmp_ns::EXIF, "GPSAltitudeRef"),
+            (xmp_ns::DC, "subject"),
+            (xmp_ns::IPTC_EXT, "PersonInImage"),
+            (KEI_XMP_NS, "hidden"),
+            (KEI_XMP_NS, "archived"),
+            (KEI_XMP_NS, "mediaSubtype"),
+            (KEI_XMP_NS, "burstId"),
+        ] {
+            assert!(
+                !meta.contains_property(namespace, property),
+                "cleared kei-owned property must be removed: {property}"
+            );
+        }
+        for property in ["title", "description"] {
+            let path = XmpMeta::compose_lang_selector(xmp_ns::DC, property, "x-default").unwrap();
+            assert!(
+                !meta.contains_property(xmp_ns::DC, &path),
+                "cleared kei-owned localized property must be removed: {property}"
+            );
+        }
+        let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
+        assert!(managed.contains("exif:GPSLatitude"));
+        assert!(!managed.contains("xmp:Rating"));
+        assert!(!managed.contains("exif:GPSAltitude"));
+        assert_eq!(
+            meta.property(THIRD_PARTY_NS, "developSettings")
+                .unwrap()
+                .value,
+            "opaque-user-data"
+        );
+        assert!(
+            std::fs::read_to_string(&sidecar_path)
+                .unwrap()
+                .contains("User-Photographer"),
+            "clearing kei-owned fields must preserve dc:creator"
+        );
+
+        fs::remove_file(&sidecar_path).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_preserves_unmarked_standard_fields_when_source_is_empty() {
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("legacy.jpg");
+        let sidecar_path = dir.join("legacy.jpg.xmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        ensure_initialized();
+        let mut seed = XmpMeta::new().unwrap();
+        seed.set_property_i32(xmp_ns::XMP, "Rating", &XmpValue::new(5))
+            .unwrap();
+        seed.set_localized_text(
+            xmp_ns::DC,
+            "description",
+            None,
+            "x-default",
+            "User description",
+        )
+        .unwrap();
+        std::fs::write(&sidecar_path, seed.to_string().into_bytes()).unwrap();
+
+        write_sidecar_with_default_suffix(
+            &media_path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".into()),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+
+        let meta = read_sidecar_meta(&media_path);
+        assert_eq!(
+            meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value,
+            5,
+            "an unmarked rating may belong to another application"
+        );
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "description", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "User description",
+            "an unmarked description may belong to the user"
+        );
+        let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
+        assert!(!managed.contains("xmp:Rating"));
+        assert!(!managed.contains("dc:description"));
+
+        fs::remove_file(&sidecar_path).ok();
         fs::remove_file(&media_path).ok();
     }
 
