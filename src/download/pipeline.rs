@@ -4547,6 +4547,16 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::state::DownloadContextStateStore for FailingDownloadStore {
+        async fn get_downloaded_file_records(
+            &self,
+        ) -> Result<Vec<crate::state::DownloadedFileRecord>, StateError> {
+            self.downloaded_state_loads.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ReportStateStore for FailingDownloadStore {
         #[cfg(test)]
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -4585,7 +4595,6 @@ mod tests {
             _offset: u64,
             _limit: u32,
         ) -> Result<Vec<AssetRecord>, StateError> {
-            self.downloaded_state_loads.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())
         }
 

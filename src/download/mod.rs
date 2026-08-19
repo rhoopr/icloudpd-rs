@@ -58,8 +58,8 @@ use crate::icloud::photos::{
 };
 use crate::retry::RetryConfig;
 use crate::state::{
-    DownloadStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore, SyncTokenStore,
-    VersionSizeKey,
+    DownloadContextStateStore, DownloadStateStore, MembershipStore, MetadataRewriteStore,
+    ReportStateStore, SyncTokenStore, VersionSizeKey,
 };
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
@@ -92,12 +92,18 @@ pub enum SyncMode {
 }
 
 pub(crate) trait DownloadStore:
-    DownloadStateStore + MembershipStore + MetadataRewriteStore + ReportStateStore + SyncTokenStore
+    DownloadContextStateStore
+    + DownloadStateStore
+    + MembershipStore
+    + MetadataRewriteStore
+    + ReportStateStore
+    + SyncTokenStore
 {
 }
 
 impl<T> DownloadStore for T where
-    T: DownloadStateStore
+    T: DownloadContextStateStore
+        + DownloadStateStore
         + MembershipStore
         + MetadataRewriteStore
         + ReportStateStore
@@ -1380,17 +1386,6 @@ struct RecordedLocalFile {
 type LibraryAssetVersionFileMap =
     FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, RecordedLocalFile>>>;
 
-/// Downloaded state retained while the remaining context queries finish.
-/// Keep this compact so paged loading does not retain full metadata records.
-#[derive(Debug)]
-struct DownloadedContextRecord {
-    library: Arc<str>,
-    id: Box<str>,
-    version_size: VersionSizeKey,
-    checksum: Box<str>,
-    file: Option<RecordedLocalFile>,
-}
-
 /// `library -> master_record_name -> asset_record_names`. Full enumeration
 /// uses this durable family history to keep a legacy master-keyed state row
 /// attached to the same child when CloudKit changes record order or page
@@ -1501,59 +1496,13 @@ struct DownloadContext {
     downloaded_without_metadata_hash: bool,
 }
 
-const DOWNLOAD_CONTEXT_PAGE_SIZE: u32 = 1_000;
-
-async fn load_downloaded_records<D>(
-    db: &D,
-) -> std::result::Result<Vec<DownloadedContextRecord>, crate::state::error::StateError>
-where
-    D: ReportStateStore + ?Sized,
-{
-    let mut records = Vec::new();
-    let mut offset = 0u64;
-    loop {
-        let page = db
-            .get_downloaded_page(offset, DOWNLOAD_CONTEXT_PAGE_SIZE)
-            .await?;
-        let page_len = page.len();
-        records.extend(page.into_iter().map(|record| {
-            let crate::state::AssetRecord {
-                library,
-                id,
-                version_size,
-                checksum,
-                local_path,
-                local_checksum,
-                download_checksum,
-                ..
-            } = record;
-            DownloadedContextRecord {
-                library,
-                id,
-                version_size,
-                checksum,
-                file: local_path.map(|path| RecordedLocalFile {
-                    path,
-                    local_checksum: local_checksum.map(String::into_boxed_str),
-                    download_checksum: download_checksum.map(String::into_boxed_str),
-                }),
-            }
-        }));
-        if page_len < DOWNLOAD_CONTEXT_PAGE_SIZE as usize {
-            break;
-        }
-        offset = offset.saturating_add(u64::from(DOWNLOAD_CONTEXT_PAGE_SIZE));
-    }
-    Ok(records)
-}
-
 impl DownloadContext {
     /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
     async fn load<D>(db: &D, retry_only: bool) -> Self
     where
-        D: DownloadStateStore + MetadataRewriteStore + ReportStateStore + ?Sized,
+        D: DownloadContextStateStore + DownloadStateStore + MetadataRewriteStore + ?Sized,
     {
         let known_ids_fut = async {
             if retry_only {
@@ -1577,7 +1526,7 @@ impl DownloadContext {
             legacy_owner_rows,
         ) = tokio::join!(
             async {
-                load_downloaded_records(db).await.unwrap_or_else(|e| {
+                db.get_downloaded_file_records().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load downloaded records from state DB");
                     Default::default()
                 })
@@ -1634,15 +1583,17 @@ impl DownloadContext {
         let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in downloaded_records {
-            let DownloadedContextRecord {
+            let crate::state::DownloadedFileRecord {
                 library,
                 id,
                 version_size,
                 checksum,
-                file,
+                local_path,
+                local_checksum,
+                download_checksum,
             } = record;
-            let lib = intern_id(&mut interner, library.to_string());
-            let id = intern_id(&mut interner, id.to_string());
+            let lib = intern_id(&mut interner, library);
+            let id = intern_id(&mut interner, id);
             let version_size: Box<str> = version_size.as_str().into();
             downloaded_ids
                 .entry(Arc::clone(&lib))
@@ -1655,14 +1606,21 @@ impl DownloadContext {
                 .or_default()
                 .entry(Arc::clone(&id))
                 .or_default()
-                .insert(version_size.clone(), checksum);
-            if let Some(file) = file {
+                .insert(version_size.clone(), checksum.into_boxed_str());
+            if let Some(path) = local_path {
                 downloaded_files
                     .entry(lib)
                     .or_default()
                     .entry(id)
                     .or_default()
-                    .insert(version_size, file);
+                    .insert(
+                        version_size,
+                        RecordedLocalFile {
+                            path,
+                            local_checksum: local_checksum.map(String::into_boxed_str),
+                            download_checksum: download_checksum.map(String::into_boxed_str),
+                        },
+                    );
             }
         }
 
