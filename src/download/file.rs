@@ -110,6 +110,25 @@ pub(super) struct DownloadOpts {
     /// API-reported file size. When set, verifies total bytes written match,
     /// catching truncation even when the CDN omits `Content-Length`.
     pub expected_size: Option<u64>,
+    /// Final-path publication policy selected by retry planning.
+    pub publication: FinalPublication,
+}
+
+/// Exact bytes that retry planning authorized the publisher to replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExistingFileFingerprint {
+    pub(super) size: u64,
+    pub(super) sha256: [u8; 32],
+}
+
+/// Final-path behavior for a verified `.part` file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum FinalPublication {
+    /// Preserve the global no-overwrite contract.
+    #[default]
+    NoReplace,
+    /// Replace only the exact truncated bytes authorized by retry planning.
+    ReplaceTruncated(ExistingFileFingerprint),
 }
 
 /// Side-channel observers / throttles that ride along with a download call
@@ -163,7 +182,7 @@ pub(super) async fn download_file_with_mode<C: DownloadClient>(
             }
         },
         || async {
-            Box::pin(attempt_download(
+            Box::pin(attempt_download_with_publication(
                 client,
                 url,
                 download_path,
@@ -172,6 +191,7 @@ pub(super) async fn download_file_with_mode<C: DownloadClient>(
                 opts.expected_size,
                 limits.bandwidth_limiter,
                 limits.shutdown_token,
+                opts.publication,
             ))
             .await
         },
@@ -194,6 +214,7 @@ const STALE_PART_FILE_SECS: u64 = 3600;
 /// If a .part file already exists, sends a Range request to resume from where
 /// it left off. Falls back to a fresh download if the server doesn't support
 /// Range or returns an unexpected status.
+#[cfg(test)]
 async fn attempt_download<C: DownloadClient>(
     client: &C,
     url: &str,
@@ -203,6 +224,35 @@ async fn attempt_download<C: DownloadClient>(
     expected_size: Option<u64>,
     bandwidth_limiter: Option<&BandwidthLimiter>,
     shutdown_token: Option<&CancellationToken>,
+) -> Result<u64, DownloadError> {
+    attempt_download_with_publication(
+        client,
+        url,
+        download_path,
+        part_path,
+        skip_rename,
+        expected_size,
+        bandwidth_limiter,
+        shutdown_token,
+        FinalPublication::NoReplace,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "publication is a safety policy kept explicit at the file landing boundary"
+)]
+async fn attempt_download_with_publication<C: DownloadClient>(
+    client: &C,
+    url: &str,
+    download_path: &Path,
+    part_path: &Path,
+    skip_rename: bool,
+    expected_size: Option<u64>,
+    bandwidth_limiter: Option<&BandwidthLimiter>,
+    shutdown_token: Option<&CancellationToken>,
+    publication: FinalPublication,
 ) -> Result<u64, DownloadError> {
     let path_str = download_path.display().to_string();
 
@@ -477,7 +527,7 @@ async fn attempt_download<C: DownloadClient>(
     }
 
     if !skip_rename {
-        rename_part_to_final(part_path, download_path).await?;
+        publish_part_to_final(part_path, download_path, publication).await?;
     }
 
     Ok(bytes_written)
@@ -486,10 +536,24 @@ async fn attempt_download<C: DownloadClient>(
 /// Rename a `.part` file to its final destination, handling the case where
 /// a concurrent download already placed the final file. If the destination
 /// exists, the redundant `.part` file is removed instead of overwriting.
+#[cfg(test)]
 pub(super) async fn rename_part_to_final(
     part_path: &Path,
     final_path: &Path,
 ) -> anyhow::Result<()> {
+    publish_part_to_final(part_path, final_path, FinalPublication::NoReplace).await
+}
+
+/// Publish a verified `.part` file according to the task's explicit policy.
+pub(super) async fn publish_part_to_final(
+    part_path: &Path,
+    final_path: &Path,
+    publication: FinalPublication,
+) -> anyhow::Result<()> {
+    if let FinalPublication::ReplaceTruncated(expected) = publication {
+        return replace_truncated_file(part_path, final_path, expected).await;
+    }
+
     match publish_part_no_replace(part_path, final_path).await {
         Ok(PublishResult::Published) => {
             // ext4 default `data=ordered` does not guarantee directory
@@ -525,6 +589,108 @@ pub(super) async fn rename_part_to_final(
             )
         }),
     }
+}
+
+async fn replace_truncated_file(
+    part_path: &Path,
+    final_path: &Path,
+    expected: ExistingFileFingerprint,
+) -> anyhow::Result<()> {
+    let current = fingerprint_regular_file(final_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Could not verify truncated repair target {}",
+                final_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        current == expected,
+        "Refusing to replace {} because its bytes changed after repair planning",
+        final_path.display()
+    );
+
+    let replacement = fingerprint_regular_file(part_path)
+        .await
+        .with_context(|| format!("Could not verify replacement file {}", part_path.display()))?;
+    let displaced_path = exchange_repair_files(part_path, final_path).await?;
+    let displaced = match fingerprint_regular_file(&displaced_path).await {
+        Ok(displaced) => displaced,
+        Err(error) => {
+            let restored = restore_repair_target_if_unchanged(
+                part_path,
+                final_path,
+                &displaced_path,
+                replacement,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Could not restore {} after displaced-target verification failed: {error:#}",
+                    final_path.display()
+                )
+            })?;
+            let disposition = if restored {
+                "the original target was restored".to_string()
+            } else {
+                format!(
+                    "the displaced entry remains at {}",
+                    displaced_path.display()
+                )
+            };
+            return Err(error).with_context(|| {
+                format!(
+                    "Could not verify displaced repair target {}; {disposition}",
+                    final_path.display()
+                )
+            });
+        }
+    };
+    if displaced != expected {
+        let restored =
+            restore_repair_target_if_unchanged(part_path, final_path, &displaced_path, replacement)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Could not restore {} after its bytes changed during repair publication",
+                        final_path.display()
+                    )
+                })?;
+        if restored {
+            anyhow::bail!(
+                "Refusing to replace {} because its bytes changed during repair publication; the original target was restored",
+                final_path.display()
+            );
+        }
+        anyhow::bail!(
+            "Refusing to replace {} because its bytes changed during repair publication; the displaced bytes remain at {}",
+            final_path.display(),
+            displaced_path.display()
+        );
+    }
+
+    if let Err(error) = fs::remove_file(&displaced_path).await {
+        tracing::warn!(
+            path = %displaced_path.display(),
+            %error,
+            "Failed to remove displaced truncated file after verified replacement"
+        );
+    }
+    crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
+    Ok(())
+}
+
+async fn restore_repair_target_if_unchanged(
+    part_path: &Path,
+    final_path: &Path,
+    displaced_path: &Path,
+    replacement: ExistingFileFingerprint,
+) -> anyhow::Result<bool> {
+    if fingerprint_regular_file(final_path).await.ok() == Some(replacement) {
+        restore_exchanged_repair_files(part_path, final_path, displaced_path).await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,6 +767,20 @@ async fn publish_part_no_replace(
 
 #[cfg(target_os = "linux")]
 fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    renameat2_blocking(part_path, final_path, libc::RENAME_NOREPLACE)
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_exchange_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    renameat2_blocking(part_path, final_path, libc::RENAME_EXCHANGE)
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_blocking(
+    part_path: &Path,
+    final_path: &Path,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -610,8 +790,8 @@ fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // SAFETY: both path arguments are valid NUL-terminated C strings, AT_FDCWD
     // asks the kernel to resolve them from the current working directory when
-    // they are relative, and RENAME_NOREPLACE is the documented no-overwrite
-    // flag. No Rust references are shared with the kernel after the call.
+    // they are relative, and callers pass one documented renameat2 flag. No
+    // Rust references are shared with the kernel after the call.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -619,7 +799,7 @@ fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io
             part_c.as_ptr(),
             libc::AT_FDCWD,
             final_c.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            flags,
         )
     };
     if rc == 0 {
@@ -627,6 +807,29 @@ fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn exchange_repair_files(part_path: &Path, final_path: &Path) -> std::io::Result<PathBuf> {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || renameat2_exchange_blocking(&part, &final_path_buf))
+        .await
+        .map_err(std::io::Error::other)??;
+    Ok(part_path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+async fn restore_exchanged_repair_files(
+    part_path: &Path,
+    final_path: &Path,
+    _displaced_path: &Path,
+) -> std::io::Result<()> {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || renameat2_exchange_blocking(&part, &final_path_buf))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 #[cfg(target_os = "linux")]
@@ -645,6 +848,68 @@ async fn publish_part_no_replace(
     publish_part_by_hard_link(part_path, final_path)
         .await
         .or_else(|link_err| destination_exists_or(link_err, final_path))
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exchange_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let part = CString::new(part_path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let final_path = CString::new(final_path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: both paths are valid NUL-terminated C strings and RENAME_SWAP
+    // atomically exchanges two existing directory entries on macOS.
+    let rc = unsafe { libc::renamex_np(part.as_ptr(), final_path.as_ptr(), libc::RENAME_SWAP) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn exchange_repair_files(part_path: &Path, final_path: &Path) -> std::io::Result<PathBuf> {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || rename_exchange_blocking(&part, &final_path_buf))
+        .await
+        .map_err(std::io::Error::other)??;
+    Ok(part_path.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+async fn restore_exchanged_repair_files(
+    part_path: &Path,
+    final_path: &Path,
+    _displaced_path: &Path,
+) -> std::io::Result<()> {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || rename_exchange_blocking(&part, &final_path_buf))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+async fn exchange_repair_files(_part_path: &Path, _final_path: &Path) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic truncated-file replacement is unsupported on this platform",
+    ))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+async fn restore_exchanged_repair_files(
+    _part_path: &Path,
+    _final_path: &Path,
+    _displaced_path: &Path,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic truncated-file replacement is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -722,6 +987,99 @@ fn move_file_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io
     }
 }
 
+#[cfg(windows)]
+fn replace_file_with_backup_blocking(
+    final_path: &Path,
+    replacement_path: &Path,
+    backup_path: &Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+
+    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let final_path = nul_terminated(final_path)?;
+    let replacement = nul_terminated(replacement_path)?;
+    let backup = nul_terminated(backup_path)?;
+    // SAFETY: every path is a valid NUL-terminated Windows string. The final
+    // path exists, the replacement is the verified `.part` file, and Windows
+    // atomically moves the displaced bytes to the distinct backup path.
+    let rc = unsafe {
+        ReplaceFileW(
+            final_path.as_ptr(),
+            replacement.as_ptr(),
+            backup.as_ptr(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn repair_backup_path(part_path: &Path) -> PathBuf {
+    let mut name = part_path.as_os_str().to_os_string();
+    name.push(".repair-backup");
+    PathBuf::from(name)
+}
+
+#[cfg(windows)]
+async fn exchange_repair_files(part_path: &Path, final_path: &Path) -> std::io::Result<PathBuf> {
+    let backup_path = repair_backup_path(part_path);
+    if fs::try_exists(&backup_path).await? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("repair backup already exists at {}", backup_path.display()),
+        ));
+    }
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    let backup = backup_path.clone();
+    tokio::task::spawn_blocking(move || {
+        replace_file_with_backup_blocking(&final_path_buf, &part, &backup)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    Ok(backup_path)
+}
+
+#[cfg(windows)]
+async fn restore_exchanged_repair_files(
+    part_path: &Path,
+    final_path: &Path,
+    displaced_path: &Path,
+) -> std::io::Result<()> {
+    if fs::try_exists(part_path).await? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("repair part path changed at {}", part_path.display()),
+        ));
+    }
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    let displaced = displaced_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        replace_file_with_backup_blocking(&final_path_buf, &displaced, &part)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Result<PublishResult> {
     if final_path.try_exists().unwrap_or(false) {
         Ok(PublishResult::DestinationExists)
@@ -735,12 +1093,19 @@ fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Res
 /// Used for `local_checksum` / `download_checksum` in the state DB and
 /// by `verify --checksums` for integrity checks.
 pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    let fingerprint = fingerprint_file(path).await?;
+    Ok(data_encoding::HEXLOWER.encode(&fingerprint.sha256))
+}
+
+/// Read one file handle to capture the size and SHA-256 of the same bytes.
+pub(super) async fn fingerprint_file(path: &Path) -> anyhow::Result<ExistingFileFingerprint> {
     use anyhow::Context;
     use sha2::{Digest, Sha256};
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(&path)
             .with_context(|| format!("Could not open {} for SHA-256", path.display()))?;
+        let mut size = 0_u64;
         let mut sha256 = Sha256::new();
         // 64 KiB reduces read() syscalls ~8x vs 8 KiB on multi-GB videos
         // without meaningful RSS impact on the blocking pool.
@@ -753,15 +1118,45 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
             if n == 0 {
                 break;
             }
+            size = size
+                .checked_add(n as u64)
+                .with_context(|| format!("Could not size {} for SHA-256", path.display()))?;
             #[allow(
                 clippy::indexing_slicing,
                 reason = "`n` is bounded by buf.len() because read() returns bytes written"
             )]
             sha256.update(&buf[..n]);
         }
-        Ok(format!("{:x}", sha256.finalize()))
+        Ok(ExistingFileFingerprint {
+            size,
+            sha256: sha256.finalize().into(),
+        })
     })
     .await?
+}
+
+/// Fingerprint a repair entry and reject links or special files.
+pub(super) async fn fingerprint_regular_file(
+    path: &Path,
+) -> anyhow::Result<ExistingFileFingerprint> {
+    let before = fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("Could not inspect repair file {}", path.display()))?;
+    anyhow::ensure!(
+        before.file_type().is_file(),
+        "Repair path is not a regular file: {}",
+        path.display()
+    );
+    let fingerprint = fingerprint_file(path).await?;
+    let after = fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("Could not recheck repair file {}", path.display()))?;
+    anyhow::ensure!(
+        after.file_type().is_file(),
+        "Repair path changed away from a regular file: {}",
+        path.display()
+    );
+    Ok(fingerprint)
 }
 
 /// The provider-size relationship required before a local file can be used.
@@ -2536,6 +2931,7 @@ mod tests {
                 DownloadOpts {
                     skip_rename: false,
                     expected_size: Some(body.len() as u64),
+                    publication: FinalPublication::NoReplace,
                 },
                 DownloadLimits {
                     shutdown_token: Some(&shutdown_token),
@@ -2601,6 +2997,7 @@ mod tests {
             DownloadOpts {
                 skip_rename: false,
                 expected_size: Some(body.len() as u64),
+                publication: FinalPublication::NoReplace,
             },
             DownloadLimits::default(),
             crate::personality::Mode::Off,
@@ -2705,6 +3102,7 @@ mod tests {
             DownloadOpts {
                 skip_rename: false,
                 expected_size: None,
+                publication: FinalPublication::NoReplace,
             },
             DownloadLimits::default(),
             crate::personality::Mode::Off,
@@ -2936,6 +3334,7 @@ mod tests {
                 DownloadOpts {
                     skip_rename: false,
                     expected_size: None,
+                    publication: FinalPublication::NoReplace,
                 },
                 DownloadLimits::default(),
                 crate::personality::Mode::Off,
@@ -3093,6 +3492,7 @@ mod tests {
                 DownloadOpts {
                     skip_rename: false,
                     expected_size: None,
+                    publication: FinalPublication::NoReplace,
                 },
                 DownloadLimits::default(),
                 crate::personality::Mode::Off,
@@ -3150,6 +3550,7 @@ mod tests {
                 DownloadOpts {
                     skip_rename: false,
                     expected_size: Some(8),
+                    publication: FinalPublication::NoReplace,
                 },
                 DownloadLimits::default(),
                 crate::personality::Mode::Off,
@@ -3235,6 +3636,7 @@ mod tests {
                 DownloadOpts {
                     skip_rename: false,
                     expected_size: None,
+                    publication: FinalPublication::NoReplace,
                 },
                 DownloadLimits::default(),
                 crate::personality::Mode::Off,
@@ -3319,6 +3721,7 @@ mod tests {
                 DownloadOpts {
                     skip_rename: false,
                     expected_size: None,
+                    publication: FinalPublication::NoReplace,
                 },
                 DownloadLimits::default(),
                 crate::personality::Mode::Off,
@@ -3394,6 +3797,7 @@ mod tests {
                 DownloadOpts {
                     skip_rename: false,
                     expected_size: Some(body_size as u64),
+                    publication: FinalPublication::NoReplace,
                 },
                 DownloadLimits {
                     bandwidth_limiter: Some(&limiter),
@@ -3554,6 +3958,101 @@ mod tests {
             tokio::fs::read(&final_path).await.unwrap(),
             b"existing",
             "existing final file must not be replaced by duplicate .part bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_truncated_publish_replaces_only_expected_bytes() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&final_path, b"bad").await.unwrap();
+        tokio::fs::write(&part, b"verified replacement")
+            .await
+            .unwrap();
+        let expected = fingerprint_file(&final_path).await.unwrap();
+
+        publish_part_to_final(
+            &part,
+            &final_path,
+            FinalPublication::ReplaceTruncated(expected),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !part.exists(),
+            "displaced truncated bytes should be removed"
+        );
+        assert_eq!(
+            tokio::fs::read(&final_path).await.unwrap(),
+            b"verified replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_truncated_publish_refuses_changed_target() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&final_path, b"bad").await.unwrap();
+        let expected = fingerprint_file(&final_path).await.unwrap();
+        tokio::fs::write(&final_path, b"user replacement")
+            .await
+            .unwrap();
+        tokio::fs::write(&part, b"verified replacement")
+            .await
+            .unwrap();
+
+        let error = publish_part_to_final(
+            &part,
+            &final_path,
+            FinalPublication::ReplaceTruncated(expected),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("bytes changed"), "{error}");
+        assert_eq!(
+            tokio::fs::read(&final_path).await.unwrap(),
+            b"user replacement"
+        );
+        assert_eq!(
+            tokio::fs::read(&part).await.unwrap(),
+            b"verified replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_truncated_publish_refuses_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let underlying = dir.path().join("underlying.jpg");
+        let final_path = dir.path().join("photo.jpg");
+        let part = dir.path().join("photo.part");
+        tokio::fs::write(&underlying, b"bad").await.unwrap();
+        symlink(&underlying, &final_path).unwrap();
+        tokio::fs::write(&part, b"verified replacement")
+            .await
+            .unwrap();
+        let expected = fingerprint_file(&final_path).await.unwrap();
+
+        let error = publish_part_to_final(
+            &part,
+            &final_path,
+            FinalPublication::ReplaceTruncated(expected),
+        )
+        .await
+        .unwrap_err();
+
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("regular file"), "{error_chain}");
+        assert_eq!(tokio::fs::read_link(&final_path).await.unwrap(), underlying);
+        assert_eq!(
+            tokio::fs::read(&part).await.unwrap(),
+            b"verified replacement"
         );
     }
 

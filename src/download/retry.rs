@@ -3,14 +3,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     DownloadConfig, DownloadStore, DownloadTask, PENDING_RETRY_UNMATCHED_REASON, RecordedLocalFile,
-    RetryTaskKey, UrlRetrySource, build_pass_configs_resolving_deferred_excludes, filter, pipeline,
-    planner,
+    RetryTaskKey, UrlRetrySource, build_pass_configs_resolving_deferred_excludes, file, filter,
+    pipeline, planner,
 };
 use crate::icloud::photos::{PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::state::{AssetVerificationState, VersionSizeKey};
@@ -47,6 +47,7 @@ struct PendingRetryEvidence {
     local_file: Option<RecordedLocalFile>,
     downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
     size_bytes: u64,
+    last_error: Option<Arc<str>>,
 }
 
 impl PendingRetryEvidence {
@@ -61,7 +62,54 @@ impl PendingRetryEvidence {
             }),
             downloaded_at: record.downloaded_at,
             size_bytes: record.size_bytes,
+            last_error: record.last_error.as_deref().map(Into::into),
         }
+    }
+
+    async fn truncated_repair_fingerprint(
+        &self,
+        enabled: bool,
+    ) -> Result<Option<file::ExistingFileFingerprint>> {
+        if !enabled
+            || self.last_error.as_deref() != Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+            || self.downloaded_at.is_none()
+        {
+            return Ok(None);
+        }
+        let Some(local_file) = &self.local_file else {
+            return Ok(None);
+        };
+        match tokio::fs::symlink_metadata(&local_file.path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not inspect truncated repair path {}",
+                        local_file.path.display()
+                    )
+                });
+            }
+        }
+        let fingerprint = file::fingerprint_regular_file(&local_file.path).await?;
+        if self.size_bytes == 0 || fingerprint.size >= self.size_bytes {
+            return Ok(None);
+        }
+
+        let metadata_changed_download = matches!(
+            (
+                local_file.local_checksum.as_deref(),
+                local_file.download_checksum.as_deref()
+            ),
+            (Some(local), Some(download)) if local != download
+        );
+        if metadata_changed_download {
+            let actual_checksum = data_encoding::HEXLOWER.encode(&fingerprint.sha256);
+            if local_file.local_checksum.as_deref() == Some(actual_checksum.as_str()) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(fingerprint))
     }
 
     fn local_path_under<'a>(&'a self, directory: &Path) -> Option<&'a Path> {
@@ -240,30 +288,49 @@ impl PendingRetryPlanning<'_> {
                 !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
             }) {
                 let target = PendingRetryTarget::from_task(&task);
-                if let Some(local_path) = self
-                    .pending_evidence
-                    .get(&target)
-                    .and_then(|evidence| evidence.local_path_under(&pass_config.directory))
+                if let Some(evidence) = self.pending_evidence.get(&target)
+                    && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
                 {
-                    let Some(retry_path) = self
-                        .task_planner
-                        .resolve_recorded_retry_path(
-                            local_path,
-                            &task.download_path,
-                            task.size,
-                            &task.asset_id,
-                        )
-                        .await
-                    else {
-                        tracing::warn!(
-                            asset_id = %task.asset_id,
-                            version_size = %task.version_size.as_str(),
-                            path = %local_path.display(),
-                            "Could not choose a safe sibling for the recorded retry path; retaining pending work"
-                        );
-                        continue;
-                    };
-                    task.download_path = retry_path;
+                    if let Some(fingerprint) = evidence
+                        .truncated_repair_fingerprint(pass_config.repair_truncated)
+                        .await?
+                    {
+                        if !self
+                            .task_planner
+                            .claim_recorded_repair_path(local_path, &task.download_path, task.size)
+                            .await
+                        {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                version_size = %task.version_size.as_str(),
+                                path = %local_path.display(),
+                                "Could not reserve the recorded truncated path; retaining pending work"
+                            );
+                            continue;
+                        }
+                        task.download_path = local_path.to_path_buf();
+                        task.publication = file::FinalPublication::ReplaceTruncated(fingerprint);
+                    } else {
+                        let Some(retry_path) = self
+                            .task_planner
+                            .resolve_recorded_retry_path(
+                                local_path,
+                                &task.download_path,
+                                task.size,
+                                &task.asset_id,
+                            )
+                            .await
+                        else {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                version_size = %task.version_size.as_str(),
+                                path = %local_path.display(),
+                                "Could not choose a safe sibling for the recorded retry path; retaining pending work"
+                            );
+                            continue;
+                        };
+                        task.download_path = retry_path;
+                    }
                 }
                 retry_tasks.push(task);
             }
@@ -968,5 +1035,55 @@ mod tests {
             panic!("persisted owner should resolve matching siblings");
         };
         assert_eq!(selected.asset_record_name(), "asset-b");
+    }
+
+    #[tokio::test]
+    async fn truncated_repair_requires_marker_and_rejects_intact_metadata_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        tokio::fs::write(&path, b"short metadata bytes")
+            .await
+            .unwrap();
+        let actual_checksum = file::compute_sha256(&path).await.unwrap();
+        let mut evidence = PendingRetryEvidence {
+            checksum: Arc::from("provider-checksum"),
+            filename: Arc::from("photo.jpg"),
+            local_file: Some(RecordedLocalFile {
+                path,
+                local_checksum: Some(actual_checksum.into()),
+                download_checksum: Some("pre-metadata-checksum".into()),
+            }),
+            downloaded_at: Some(chrono::Utc::now()),
+            size_bytes: 100,
+            last_error: Some(Arc::from(crate::commands::reconcile::FILE_TRUNCATED_REASON)),
+        };
+
+        assert!(
+            evidence
+                .truncated_repair_fingerprint(true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        evidence.local_file.as_mut().unwrap().local_checksum =
+            Some("expected-intact-checksum".into());
+        evidence.last_error = None;
+        assert!(
+            evidence
+                .truncated_repair_fingerprint(true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        evidence.last_error = Some(Arc::from(crate::commands::reconcile::FILE_TRUNCATED_REASON));
+        assert!(
+            evidence
+                .truncated_repair_fingerprint(true)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

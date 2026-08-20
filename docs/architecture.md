@@ -176,6 +176,14 @@ write or resume .part
   -> finalize SQLite state
 ```
 
+`kei sync --repair-truncated` is the only media-replacement path. Pending
+retry planning requires the durable reconcile truncation marker, confirms the
+recorded file is still truncated, and fingerprints its bytes. After the new
+download and configured metadata writes pass, the file owner atomically
+exchanges the verified `.part` file with that exact fingerprint. A changed
+target is restored or retained and the state row stays failed. All other
+downloads keep no-overwrite publication.
+
 A file may be safe on disk while its state write is still a cycle failure. Do
 not weaken deferred state-write handling or infer that a visible final file
 means the database transition succeeded.
@@ -250,7 +258,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
-| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs` | Publishing a completed `.part` file never replaces an existing final file. |
+| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |

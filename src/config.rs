@@ -400,6 +400,7 @@ pub struct RuntimeConfig {
     pub dry_run: bool,
     pub only_print_filenames: bool,
     pub refresh_metadata: bool,
+    pub repair_truncated: bool,
 }
 
 /// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
@@ -1586,6 +1587,7 @@ impl Config {
                 dry_run: sync.dry_run,
                 only_print_filenames: sync.only_print_filenames,
                 refresh_metadata: sync.refresh_metadata,
+                repair_truncated: sync.repair_truncated,
             },
         })
     }

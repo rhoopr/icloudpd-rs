@@ -270,6 +270,14 @@ pub struct SyncArgs {
     )]
     pub refresh_metadata: bool,
 
+    /// Replace a recorded local file only when reconcile marked it truncated.
+    /// The replacement is verified before it atomically takes the recorded path.
+    #[arg(
+        long,
+        conflicts_with_all = ["dry_run", "only_print_filenames", "refresh_metadata"]
+    )]
+    pub repair_truncated: bool,
+
     /// Test-only durable config overrides used by unit tests that exercise
     /// resolver internals without rebuilding TOML snippets.
     #[cfg(test)]
@@ -1505,6 +1513,27 @@ mod tests {
             panic!("expected Sync command");
         };
         assert!(sync.refresh_metadata);
+    }
+
+    #[test]
+    fn sync_repair_truncated_parses_to_struct_field() {
+        let Command::Sync { sync, .. } = Cli::try_parse_from(["kei", "sync", "--repair-truncated"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected Sync command");
+        };
+        assert!(sync.repair_truncated);
+    }
+
+    #[test]
+    fn sync_repair_truncated_rejects_non_download_modes() {
+        for conflicting in ["--dry-run", "--only-print-filenames", "--refresh-metadata"] {
+            assert!(
+                Cli::try_parse_from(["kei", "sync", "--repair-truncated", conflicting]).is_err(),
+                "{conflicting} must conflict with --repair-truncated"
+            );
+        }
     }
 
     #[test]
