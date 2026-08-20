@@ -1,9 +1,11 @@
-use std::fmt::Write;
+use std::fmt::{Display, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use base64::Engine;
-use chrono::{DateTime, Local};
+#[cfg(test)]
+use chrono::Local;
+use chrono::{DateTime, TimeZone};
 use rustc_hash::FxHashMap;
 
 /// Sentinel folder-structure value that disables the date-based directory
@@ -102,12 +104,15 @@ pub(crate) fn truncate_library_zone(zone_name: &str) -> &str {
 /// legacy Python-style `"{:%Y/%m/%d}"` wrapper is also accepted. The custom
 /// `{album}` token is expanded to the album name before strftime processing.
 /// The special value `"none"` (case-insensitive) disables date-based folders.
-pub(crate) fn local_download_dir(
+pub(crate) fn local_download_dir<Tz: TimeZone>(
     directory: &Path,
     folder_structure: &str,
-    created_date: &DateTime<Local>,
+    created_date: &DateTime<Tz>,
     album_name: Option<&str>,
-) -> PathBuf {
+) -> PathBuf
+where
+    Tz::Offset: Display,
+{
     if folder_structure.eq_ignore_ascii_case(NO_DATE_STRUCTURE) {
         return directory.to_path_buf();
     }
@@ -134,13 +139,16 @@ pub(crate) fn local_download_dir(
 /// legacy Python-style `"{:%Y/%m/%d}"` wrapper is also accepted. The custom
 /// `{album}` token is expanded to the album name before strftime processing.
 /// The special value `"none"` (case-insensitive) disables date-based folders.
-pub(crate) fn local_download_path(
+pub(crate) fn local_download_path<Tz: TimeZone>(
     directory: &Path,
     folder_structure: &str,
-    created_date: &DateTime<Local>,
+    created_date: &DateTime<Tz>,
     filename: &str,
     album_name: Option<&str>,
-) -> PathBuf {
+) -> PathBuf
+where
+    Tz::Offset: Display,
+{
     local_download_dir(directory, folder_structure, created_date, album_name)
         .join(clean_filename(filename).as_ref())
 }

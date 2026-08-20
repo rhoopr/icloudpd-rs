@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A failed catalogue refresh now preserves the previous zone checkpoint instead of advancing past a provider edit that was never stored. ([#707])
 - Metadata rewrite failures are now reported when a sync downloads nothing. A metadata-only edit cycle transfers no media, so a failed sidecar or EXIF write was previously invisible in the sync result. ([#707])
 - An embedded metadata rewrite now records the hash of the file it leaves on disk, keeping the pre-rewrite hash as the provider download checksum, so `kei verify --checksums` and `kei reconcile` read an intentional edit as intact rather than corrupted or truncated. A file that no longer matches its recorded checksum keeps its marker and is left untouched for those commands to report. ([#707])
+- Capture times now resolve from Apple's per-asset timezone offset when it is usable, so date filters, date-based folders, embedded EXIF, and XMP sidecars use the capture-local calendar date and timestamp. Assets without a usable offset retain the backup host's local rendering, preserving the previous behaviour and icloudpd-compatible paths. Existing files are not moved, and a later full sync downloads an affected asset into its capture-local folder while leaving the earlier copy in place. A date-only `skip_created_before` or `skip_created_after` makes that full sync the next one because the bound's capture-date semantics change the config hashes. `kei sync --refresh-metadata` rewrites XMP sidecars in full. For a timestamp already present in a file, it adds the capture offset only where the timestamp reads as capture-local. When embedded datetime output is configured, a file with no capture timestamp receives one, with the offset when Apple supplied it. (fixes [#703])
+
+[#703]: https://github.com/rhoopr/kei/issues/703
 
 ## [0.23.1] - 2026-08-16
 

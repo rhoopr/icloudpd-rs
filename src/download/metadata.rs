@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, FixedOffset, NaiveDateTime};
 #[cfg(not(feature = "xmp"))]
 use little_exif::exif_tag::ExifTag;
 #[cfg(not(feature = "xmp"))]
@@ -40,6 +41,11 @@ const KEI_XMP_NS: &str = "https://github.com/rhoopr/kei/ns/1.0/";
 #[cfg(feature = "xmp")]
 const KEI_XMP_PREFIX: &str = "kei";
 #[cfg(feature = "xmp")]
+const EXIF_EX_XMP_NS: &str = "http://cipa.jp/exif/1.0/";
+#[cfg(feature = "xmp")]
+const EXIF_EX_XMP_PREFIX: &str = "exifEX";
+
+#[cfg(feature = "xmp")]
 const KEI_MANAGED_FIELDS: &str = "managedFields";
 
 #[cfg(feature = "xmp")]
@@ -49,6 +55,7 @@ enum ManagedXmpField {
     ModifyDate,
     DateTimeOriginal,
     DateCreated,
+    OffsetTimeOriginal,
     Rating,
     GpsLatitude,
     GpsLongitude,
@@ -65,11 +72,12 @@ enum ManagedXmpField {
 }
 
 #[cfg(feature = "xmp")]
-const MANAGED_XMP_FIELDS: [ManagedXmpField; 17] = [
+const MANAGED_XMP_FIELDS: [ManagedXmpField; 18] = [
     ManagedXmpField::CreateDate,
     ManagedXmpField::ModifyDate,
     ManagedXmpField::DateTimeOriginal,
     ManagedXmpField::DateCreated,
+    ManagedXmpField::OffsetTimeOriginal,
     ManagedXmpField::Rating,
     ManagedXmpField::GpsLatitude,
     ManagedXmpField::GpsLongitude,
@@ -93,6 +101,7 @@ impl ManagedXmpField {
             Self::ModifyDate => "xmp:ModifyDate",
             Self::DateTimeOriginal => "exif:DateTimeOriginal",
             Self::DateCreated => "photoshop:DateCreated",
+            Self::OffsetTimeOriginal => "exifEX:OffsetTimeOriginal",
             Self::Rating => "xmp:Rating",
             Self::GpsLatitude => "exif:GPSLatitude",
             Self::GpsLongitude => "exif:GPSLongitude",
@@ -114,6 +123,7 @@ impl ManagedXmpField {
             Self::CreateDate | Self::ModifyDate | Self::DateTimeOriginal | Self::DateCreated => {
                 write.datetime.is_some()
             }
+            Self::OffsetTimeOriginal => write.offset_time_original.is_some(),
             Self::Rating => write.rating.is_some(),
             Self::GpsLatitude | Self::GpsLongitude => write.gps.is_some(),
             Self::GpsAltitude | Self::GpsAltitudeRef => {
@@ -136,6 +146,7 @@ impl ManagedXmpField {
             Self::ModifyDate => (xmp_ns::XMP, "ModifyDate"),
             Self::DateTimeOriginal => (xmp_ns::EXIF, "DateTimeOriginal"),
             Self::DateCreated => (xmp_ns::PHOTOSHOP, "DateCreated"),
+            Self::OffsetTimeOriginal => (EXIF_EX_XMP_NS, "OffsetTimeOriginal"),
             Self::Rating => (xmp_ns::XMP, "Rating"),
             Self::GpsLatitude => (xmp_ns::EXIF, "GPSLatitude"),
             Self::GpsLongitude => (xmp_ns::EXIF, "GPSLongitude"),
@@ -169,9 +180,10 @@ static HEIF_EMBED_DISABLED_WARNING: Once = Once::new();
 fn ensure_initialized() {
     INIT.call_once(|| {
         // Registering the same namespace twice is fine; XMP Toolkit returns
-        // the existing prefix. Ignore the Result — even a failure here only
-        // disables the kei: fields, and standard XMP continues to work.
+        // the existing prefix. Ignore failures so standard XMP output still
+        // works if a custom namespace cannot be registered.
         let _ = XmpMeta::register_namespace(KEI_XMP_NS, KEI_XMP_PREFIX);
+        let _ = XmpMeta::register_namespace(EXIF_EX_XMP_NS, EXIF_EX_XMP_PREFIX);
     });
 }
 
@@ -180,7 +192,52 @@ fn ensure_initialized() {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExifProbe {
     pub(crate) datetime_original: Option<String>,
+    pub(crate) offset_time_original: Option<String>,
+    pub(crate) has_other_datetime_offset: bool,
     pub(crate) has_gps: bool,
+}
+
+impl ExifProbe {
+    pub(crate) fn has_any_datetime_offset(&self) -> bool {
+        self.offset_time_original.is_some() || self.has_other_datetime_offset
+    }
+
+    /// True when the capture timestamp already in the file renders
+    /// `created_local`, and carries no zone that contradicts it.
+    ///
+    /// A resolved offset may only join a timestamp that satisfies this. A file
+    /// written before capture-local resolution holds a wall clock in the
+    /// backup host's timezone, so pairing Apple's offset with it would assert
+    /// an instant the asset never had.
+    pub(crate) fn denotes_capture_time(&self, created_local: &DateTime<FixedOffset>) -> bool {
+        let Some(existing) = self.datetime_original.as_deref() else {
+            return false;
+        };
+        let Some((wall_clock, zone)) = parse_capture_timestamp(existing) else {
+            return false;
+        };
+        wall_clock == created_local.naive_local()
+            && zone.is_none_or(|zone| zone == *created_local.offset())
+    }
+}
+
+/// Split a capture timestamp into its wall clock and the zone it names, if
+/// any. XMP holds ISO 8601 and the native EXIF block holds
+/// `YYYY:MM:DD HH:MM:SS`, so both forms reach the probe, and either may arrive
+/// padded with whitespace or trailing NULs.
+fn parse_capture_timestamp(value: &str) -> Option<(NaiveDateTime, Option<FixedOffset>)> {
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if let Ok(zoned) = DateTime::parse_from_rfc3339(value) {
+        return Some((zoned.naive_local(), Some(*zoned.offset())));
+    }
+    [
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    .into_iter()
+    .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+    .map(|wall_clock| (wall_clock, None))
 }
 
 /// Read the existing XMP / EXIF state of a media file.
@@ -260,10 +317,18 @@ fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
     let datetime_original = meta
         .property(xmp_ns::EXIF, "DateTimeOriginal")
         .map(|v| v.value);
+    let offset_time_original = meta
+        .property(EXIF_EX_XMP_NS, "OffsetTimeOriginal")
+        .map(|v| v.value);
+    let has_other_datetime_offset = ["OffsetTimeDigitized", "OffsetTime"]
+        .iter()
+        .any(|path| meta.contains_property(EXIF_EX_XMP_NS, path));
     let has_gps = meta.contains_property(xmp_ns::EXIF, "GPSLatitude")
         || meta.contains_property(xmp_ns::EXIF, "GPSLongitude");
     ExifProbe {
         datetime_original,
+        offset_time_original,
+        has_other_datetime_offset,
         has_gps,
     }
 }
@@ -286,6 +351,21 @@ fn probe_exif_native(path: &Path) -> ExifProbe {
             ExifTag::DateTimeOriginal(s) => Some(s.clone()),
             _ => None,
         });
+    let offset_time_original = meta
+        .get_tag(&ExifTag::OffsetTimeOriginal(String::new()))
+        .next()
+        .and_then(|tag| match tag {
+            ExifTag::OffsetTimeOriginal(s) => Some(s.clone()),
+            _ => None,
+        });
+    let has_other_datetime_offset = meta
+        .get_tag(&ExifTag::OffsetTimeDigitized(String::new()))
+        .next()
+        .is_some()
+        || meta
+            .get_tag(&ExifTag::OffsetTime(String::new()))
+            .next()
+            .is_some();
     let has_gps = meta
         .get_tag(&ExifTag::GPSLatitude(Vec::new()))
         .next()
@@ -296,6 +376,8 @@ fn probe_exif_native(path: &Path) -> ExifProbe {
             .is_some();
     ExifProbe {
         datetime_original,
+        offset_time_original,
+        has_other_datetime_offset,
         has_gps,
     }
 }
@@ -314,6 +396,10 @@ pub(crate) struct GpsCoords {
 pub(crate) struct MetadataWrite {
     /// `"YYYY:MM:DD HH:MM:SS"` EXIF-style datetime string.
     pub(crate) datetime: Option<String>,
+    /// EXIF `OffsetTimeOriginal`, formatted as `+HH:MM` or `-HH:MM`.
+    pub(crate) offset_time_original: Option<String>,
+    /// Remove offset tags before writing a replacement timestamp.
+    pub(crate) clear_datetime_offsets: bool,
     pub(crate) rating: Option<u8>,
     pub(crate) gps: Option<GpsCoords>,
     pub(crate) title: Option<String>,
@@ -331,6 +417,8 @@ pub(crate) struct MetadataWrite {
 impl MetadataWrite {
     pub(crate) fn is_empty(&self) -> bool {
         self.datetime.is_none()
+            && self.offset_time_original.is_none()
+            && !self.clear_datetime_offsets
             && self.rating.is_none()
             && self.gps.is_none()
             && self.title.is_none()
@@ -704,6 +792,21 @@ fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) 
         metadata.set_tag(ExifTag::CreateDate(dt.clone()));
         metadata.set_tag(ExifTag::ModifyDate(dt.clone()));
     }
+    if write.clear_datetime_offsets {
+        metadata.remove_tag(ExifTag::OffsetTimeOriginal(String::new()));
+        metadata.remove_tag(ExifTag::OffsetTimeDigitized(String::new()));
+        metadata.remove_tag(ExifTag::OffsetTime(String::new()));
+    }
+    if let Some(offset) = &write.offset_time_original {
+        metadata.set_tag(ExifTag::OffsetTimeOriginal(offset.clone()));
+        if write.datetime.is_some() {
+            // CreateDate and ModifyDate carry their own offset tags. They
+            // share this offset only when this pass wrote all three
+            // timestamps from the same capture-local instant.
+            metadata.set_tag(ExifTag::OffsetTimeDigitized(offset.clone()));
+            metadata.set_tag(ExifTag::OffsetTime(offset.clone()));
+        }
+    }
     if let Some(desc) = &write.description {
         metadata.set_tag(ExifTag::ImageDescription(desc.clone()));
     }
@@ -815,19 +918,47 @@ const fn windows_rating_percent(rating: u16) -> u16 {
 /// through here so the two paths produce identical XMP content.
 #[cfg(feature = "xmp")]
 fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpResult<()> {
+    if write.clear_datetime_offsets {
+        for path in ["OffsetTimeOriginal", "OffsetTimeDigitized", "OffsetTime"] {
+            meta.delete_property(EXIF_EX_XMP_NS, path)?;
+        }
+    }
     if let Some(dt) = &write.datetime {
         // XMP uses ISO 8601; our stored form is EXIF-style "YYYY:MM:DD HH:MM:SS".
         // Convert for XMP, keep a local EXIF copy so XMP Toolkit's reconciler
         // writes the native block too on formats that have one.
         let iso = exif_datetime_to_iso(dt);
-        meta.set_property(xmp_ns::XMP, "CreateDate", &XmpValue::new(iso.clone()))?;
-        meta.set_property(xmp_ns::XMP, "ModifyDate", &XmpValue::new(iso.clone()))?;
+        let iso_with_offset = write
+            .offset_time_original
+            .as_ref()
+            .map_or_else(|| iso.clone(), |offset| format!("{iso}{offset}"));
+        meta.set_property(
+            xmp_ns::XMP,
+            "CreateDate",
+            &XmpValue::new(iso_with_offset.clone()),
+        )?;
+        meta.set_property(
+            xmp_ns::XMP,
+            "ModifyDate",
+            &XmpValue::new(iso_with_offset.clone()),
+        )?;
         meta.set_property(
             xmp_ns::EXIF,
             "DateTimeOriginal",
-            &XmpValue::new(iso.clone()),
+            &XmpValue::new(iso_with_offset.clone()),
         )?;
-        meta.set_property(xmp_ns::PHOTOSHOP, "DateCreated", &XmpValue::new(iso))?;
+        meta.set_property(
+            xmp_ns::PHOTOSHOP,
+            "DateCreated",
+            &XmpValue::new(iso_with_offset),
+        )?;
+    }
+    if let Some(offset) = &write.offset_time_original {
+        meta.set_property(
+            EXIF_EX_XMP_NS,
+            "OffsetTimeOriginal",
+            &XmpValue::new(offset.clone()),
+        )?;
     }
 
     if let Some(r) = write.rating {
@@ -1224,6 +1355,79 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    #[cfg(feature = "xmp")]
+    #[test]
+    fn xmp_datetime_includes_capture_offset() {
+        let packet = build_xmp_packet(&MetadataWrite {
+            datetime: Some("2026:02:01 09:31:59".to_string()),
+            offset_time_original: Some("+11:00".to_string()),
+            ..MetadataWrite::default()
+        })
+        .unwrap();
+        let meta = std::str::from_utf8(&packet)
+            .unwrap()
+            .parse::<XmpMeta>()
+            .unwrap();
+        assert_eq!(
+            meta.property(super::EXIF_EX_XMP_NS, "OffsetTimeOriginal")
+                .unwrap()
+                .value,
+            "+11:00"
+        );
+        let probe = super::probe_from_meta(&meta);
+        assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
+        assert!(meta.property(xmp_ns::EXIF, "OffsetTimeOriginal").is_none());
+        assert_eq!(
+            meta.property(xmp_ns::EXIF, "DateTimeOriginal")
+                .unwrap()
+                .value,
+            "2026-02-01T09:31:59+11:00"
+        );
+    }
+
+    /// An offset names the zone of one specific timestamp. Replacing the
+    /// timestamp orphans every offset already in the file, so they have to go
+    /// before the resolved one lands, or a stale zone qualifies a capture time
+    /// it never described.
+    #[cfg(feature = "xmp")]
+    #[test]
+    fn xmp_write_clears_offsets_orphaned_from_a_replaced_timestamp() {
+        ensure_initialized();
+        let mut meta = XmpMeta::new().unwrap();
+        for property in ["OffsetTimeOriginal", "OffsetTimeDigitized", "OffsetTime"] {
+            meta.set_property(
+                super::EXIF_EX_XMP_NS,
+                property,
+                &XmpValue::new("+02:00".to_string()),
+            )
+            .unwrap();
+        }
+
+        super::apply_to_xmp(
+            &mut meta,
+            &MetadataWrite {
+                datetime: Some("2026:02:01 09:31:59".to_string()),
+                offset_time_original: Some("+11:00".to_string()),
+                clear_datetime_offsets: true,
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            meta.property(super::EXIF_EX_XMP_NS, "OffsetTimeOriginal")
+                .unwrap()
+                .value,
+            "+11:00"
+        );
+        for property in ["OffsetTimeDigitized", "OffsetTime"] {
+            assert!(
+                !meta.contains_property(super::EXIF_EX_XMP_NS, property),
+                "{property} must not survive to qualify a timestamp it never described"
+            );
+        }
+    }
+
     #[test]
     fn apply_metadata_rating_roundtrips() {
         let dir = test_tmp_dir("meta_tests");
@@ -1393,6 +1597,8 @@ mod tests {
             &path,
             &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
+                offset_time_original: None,
+                clear_datetime_offsets: false,
                 rating: Some(5),
                 gps: Some(GpsCoords {
                     latitude: 1.0,
@@ -2273,6 +2479,8 @@ mod tests {
 
         let first = MetadataWrite {
             datetime: Some("2024:06:15 10:00:00".into()),
+            offset_time_original: Some("+10:00".into()),
+            clear_datetime_offsets: false,
             rating: Some(5),
             gps: Some(GpsCoords {
                 latitude: 37.7,
@@ -2306,6 +2514,7 @@ mod tests {
         assert!(meta.contains_property(xmp_ns::EXIF, "GPSLatitude"));
         for (namespace, property) in [
             (xmp_ns::XMP, "Rating"),
+            (EXIF_EX_XMP_NS, "OffsetTimeOriginal"),
             (xmp_ns::EXIF, "GPSAltitude"),
             (xmp_ns::EXIF, "GPSAltitudeRef"),
             (xmp_ns::DC, "subject"),
@@ -2330,6 +2539,7 @@ mod tests {
         let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
         assert!(managed.contains("exif:GPSLatitude"));
         assert!(!managed.contains("xmp:Rating"));
+        assert!(!managed.contains("exifEX:OffsetTimeOriginal"));
         assert!(!managed.contains("exif:GPSAltitude"));
         assert_eq!(
             meta.property(THIRD_PARTY_NS, "developSettings")
@@ -2612,6 +2822,7 @@ mod native_tests {
             probe.datetime_original.as_deref(),
             Some("2024:06:15 10:00:00")
         );
+        assert_eq!(probe.offset_time_original, None);
         assert!(probe.has_gps);
 
         let metadata = Metadata::new_from_path(&path).unwrap();
@@ -2651,6 +2862,136 @@ mod native_tests {
             probe.datetime_original.as_deref(),
             Some("2024:06:15 10:00:00")
         );
+    }
+
+    #[test]
+    fn native_write_pairs_every_datetime_with_its_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_jpeg(dir.path(), "native-offset.jpg");
+
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2026:02:01 09:31:59".to_string()),
+                offset_time_original: Some("+11:00".to_string()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+
+        let probe = probe_exif(&path).unwrap();
+        assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
+        assert!(probe.has_other_datetime_offset);
+
+        let metadata = Metadata::new_from_path(&path).unwrap();
+        for template in [
+            ExifTag::OffsetTimeOriginal(String::new()),
+            ExifTag::OffsetTimeDigitized(String::new()),
+            ExifTag::OffsetTime(String::new()),
+        ] {
+            let written = metadata
+                .get_tag(&template)
+                .next()
+                .and_then(|tag| match tag {
+                    ExifTag::OffsetTimeOriginal(s)
+                    | ExifTag::OffsetTimeDigitized(s)
+                    | ExifTag::OffsetTime(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            assert_eq!(
+                written,
+                Some("+11:00"),
+                "EXIF tag 0x{:04x} must carry the capture offset",
+                template.as_u16()
+            );
+        }
+
+        // Without a timestamp write, CreateDate and ModifyDate keep whatever
+        // the file already held, so only the verified DateTimeOriginal gets an
+        // offset.
+        let lone = fresh_jpeg(dir.path(), "native-lone-offset.jpg");
+        apply_metadata(
+            &lone,
+            &MetadataWrite {
+                offset_time_original: Some("+11:00".to_string()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+
+        let metadata = Metadata::new_from_path(&lone).unwrap();
+        assert!(
+            metadata
+                .get_tag(&ExifTag::OffsetTimeOriginal(String::new()))
+                .next()
+                .is_some()
+        );
+        for template in [
+            ExifTag::OffsetTimeDigitized(String::new()),
+            ExifTag::OffsetTime(String::new()),
+        ] {
+            assert!(
+                metadata.get_tag(&template).next().is_none(),
+                "EXIF tag 0x{:04x} must not claim an offset for a timestamp this pass did not write",
+                template.as_u16()
+            );
+        }
+    }
+
+    /// A camera can leave offset tags behind without the capture timestamp
+    /// they qualified. Writing a resolved timestamp over that state has to
+    /// drop them first, or the file ends up claiming a zone that describes
+    /// nothing in it.
+    #[test]
+    fn native_write_clears_offsets_orphaned_from_a_replaced_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_jpeg(dir.path(), "native-orphaned-offset.jpg");
+
+        let mut seed = Metadata::new();
+        seed.set_tag(ExifTag::OffsetTimeOriginal("+02:00".to_string()));
+        seed.set_tag(ExifTag::OffsetTimeDigitized("+02:00".to_string()));
+        seed.set_tag(ExifTag::OffsetTime("+02:00".to_string()));
+        seed.write_to_file(&path).unwrap();
+
+        let seeded = probe_exif(&path).unwrap();
+        assert_eq!(seeded.datetime_original, None);
+        assert!(seeded.has_any_datetime_offset());
+
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2026:02:01 09:31:59".to_string()),
+                clear_datetime_offsets: true,
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+
+        let probe = probe_exif(&path).unwrap();
+        assert_eq!(
+            probe.datetime_original.as_deref(),
+            Some("2026:02:01 09:31:59")
+        );
+        assert!(
+            !probe.has_any_datetime_offset(),
+            "a stale offset must not survive to qualify the replacement timestamp"
+        );
+
+        let metadata = Metadata::new_from_path(&path).unwrap();
+        for template in [
+            ExifTag::OffsetTimeOriginal(String::new()),
+            ExifTag::OffsetTimeDigitized(String::new()),
+            ExifTag::OffsetTime(String::new()),
+        ] {
+            assert!(
+                metadata.get_tag(&template).next().is_none(),
+                "EXIF tag 0x{:04x} must be cleared",
+                template.as_u16()
+            );
+        }
     }
 
     #[test]

@@ -241,11 +241,13 @@ pub struct SyncArgs {
     #[arg(long)]
     pub no_progress_bar: bool,
 
-    /// Skip assets created before this ISO date or interval (e.g., 2025-01-02 or 20d)
+    /// Skip assets before this cutoff. Date-only values compare the capture-local calendar date;
+    /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
     #[arg(long)]
     pub skip_created_before: Option<String>,
 
-    /// Skip assets created after this ISO date or interval (e.g., 2025-01-02 or 20d)
+    /// Skip assets after this cutoff. Date-only values compare the capture-local calendar date;
+    /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
     #[arg(long)]
     pub skip_created_after: Option<String>,
 

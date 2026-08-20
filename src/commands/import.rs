@@ -2878,7 +2878,8 @@ mod wiremock_tests {
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
         // 2025-06-01 cutoff; asset is dated 2025-01-14, so it must be filtered.
-        config.skip_created_before = chrono::DateTime::from_timestamp(1_748_736_000, 0);
+        config.skip_created_before = chrono::DateTime::from_timestamp(1_748_736_000, 0)
+            .map(crate::config::CreatedDateFilter::Instant);
         stage_expected(&asset.to_photo_asset(), &base_config(&dl));
 
         let db = open_db(&tmp).await;

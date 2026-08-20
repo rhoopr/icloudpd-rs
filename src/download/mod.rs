@@ -701,13 +701,6 @@ impl SkipBreakdown {
     }
 }
 
-/// Truncate a `DateTime<Utc>` to midnight so that relative date intervals
-/// (e.g. `20d` → `now - 20 days`) produce a stable hash within the same
-/// calendar day.
-fn truncate_date_to_day(dt: Option<DateTime<Utc>>) -> Option<chrono::NaiveDate> {
-    dt.map(|d| d.date_naive())
-}
-
 /// Hash an `Option<NaiveDate>` with a tag byte for `None`/`Some` and the
 /// "YYYY-MM-DD" Display representation for the date value.
 fn hash_optional_date(hasher: &mut sha2::Sha256, date: Option<chrono::NaiveDate>) {
@@ -784,8 +777,8 @@ struct SharedHashFields<'a> {
     alternative: bool,
     raw_policy: RawPolicy,
     keep_unicode_in_filenames: bool,
-    skip_created_before: Option<DateTime<Utc>>,
-    skip_created_after: Option<DateTime<Utc>>,
+    skip_created_before: Option<crate::config::CreatedDateFilter>,
+    skip_created_after: Option<crate::config::CreatedDateFilter>,
     force_resolution: bool,
     media: crate::config::MediaSelection,
     live_photo_mode: LivePhotoMode,
@@ -818,8 +811,8 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     // Dates are truncated to day precision before hashing so that relative
     // intervals like "20d" (resolved to now-minus-20-days at parse time)
     // produce a stable hash across consecutive runs on the same day.
-    hash_optional_date(hasher, truncate_date_to_day(f.skip_created_before));
-    hash_optional_date(hasher, truncate_date_to_day(f.skip_created_after));
+    hash_optional_created_date_filter(hasher, f.skip_created_before);
+    hash_optional_created_date_filter(hasher, f.skip_created_after);
     hasher.update([u8::from(f.force_resolution)]);
     hasher.update([u8::from(f.media.photos)]);
     hasher.update([u8::from(f.media.videos)]);
@@ -834,6 +827,27 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     sorted_excludes.sort_unstable();
     for pattern in &sorted_excludes {
         hash_bytes(hasher, pattern.as_bytes());
+    }
+}
+
+fn hash_optional_created_date_filter(
+    hasher: &mut sha2::Sha256,
+    filter: Option<crate::config::CreatedDateFilter>,
+) {
+    use crate::config::CreatedDateFilter;
+    use sha2::Digest;
+
+    match filter {
+        None => hash_optional_date(hasher, None),
+        Some(CreatedDateFilter::Instant(boundary)) => {
+            // Preserve the pre-capture-date hash shape for instant cutoffs.
+            hash_optional_date(hasher, Some(boundary.date_naive()));
+        }
+        Some(CreatedDateFilter::CaptureDate(boundary)) => {
+            // A distinct tag invalidates only filters whose semantics changed.
+            hasher.update([2]);
+            hasher.update(boundary.to_string().as_bytes());
+        }
     }
 }
 
@@ -909,11 +923,11 @@ pub(crate) fn sync_coverage_fingerprint_json(
     let skip_created_before = config
         .filters
         .skip_created_before
-        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
+        .map(crate::config::CreatedDateFilter::fingerprint);
     let skip_created_after = config
         .filters
         .skip_created_after
-        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
+        .map(crate::config::CreatedDateFilter::fingerprint);
     let mut filename_exclude: Vec<&str> = config
         .download
         .filename_exclude
@@ -1032,15 +1046,6 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     use sha2::{Digest, Sha256};
 
     let live_resolution = config.photos.live_resolution.to_asset_version_size();
-    let skip_created_before = config
-        .filters
-        .skip_created_before
-        .map(|d| d.with_timezone(&chrono::Utc));
-    let skip_created_after = config
-        .filters
-        .skip_created_after
-        .map(|d| d.with_timezone(&chrono::Utc));
-
     let mut hasher = Sha256::new();
     hasher.update([ENUMERATION_SAFETY_HASH_VERSION]);
     hasher.update([config.photos.resolution as u8]);
@@ -1048,8 +1053,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hasher.update([u8::from(config.photos.edited)]);
     hasher.update([u8::from(config.photos.alternative)]);
     hasher.update([config.photos.raw_policy as u8]);
-    hash_optional_date(&mut hasher, truncate_date_to_day(skip_created_before));
-    hash_optional_date(&mut hasher, truncate_date_to_day(skip_created_after));
+    hash_optional_created_date_filter(&mut hasher, config.filters.skip_created_before);
+    hash_optional_created_date_filter(&mut hasher, config.filters.skip_created_after);
     hasher.update([u8::from(config.photos.force_resolution)]);
     hasher.update([u8::from(config.filters.media.photos)]);
     hasher.update([u8::from(config.filters.media.videos)]);
@@ -1100,8 +1105,8 @@ pub(crate) struct DownloadConfig {
     pub(crate) folder_structure_smart_folders: Arc<str>,
     pub(crate) resolution: crate::types::PhotoResolution,
     pub(crate) media: crate::config::MediaSelection,
-    pub(crate) skip_created_before: Option<DateTime<Utc>>,
-    pub(crate) skip_created_after: Option<DateTime<Utc>>,
+    pub(crate) skip_created_before: Option<crate::config::CreatedDateFilter>,
+    pub(crate) skip_created_after: Option<crate::config::CreatedDateFilter>,
     pub(crate) metadata: crate::config::MetadataConfig,
     pub(crate) refresh_metadata: bool,
     pub(crate) repair_truncated: bool,
@@ -3052,8 +3057,7 @@ async fn build_recent_frontier(
         }
         let asset = item?;
         let created = asset.created();
-        if config
-            .skip_created_before
+        if enumeration_created_lower_bound(config)
             .map(|boundary| created < boundary)
             .unwrap_or(false)
         {
@@ -3068,6 +3072,15 @@ async fn build_recent_frontier(
     }))
 }
 
+/// Convert a capture-local date lower bound into a conservative UTC
+/// enumeration bound.  Capture offsets can move the local midnight by almost
+/// a day, so stopping at the unadjusted UTC midnight could omit valid assets.
+fn enumeration_created_lower_bound(config: &DownloadConfig) -> Option<DateTime<Utc>> {
+    config
+        .skip_created_before
+        .map(crate::config::CreatedDateFilter::conservative_utc_lower_bound)
+}
+
 fn stream_created_lower_bound(
     config: &DownloadConfig,
     frontier: Option<&RecentFrontier>,
@@ -3075,7 +3088,7 @@ fn stream_created_lower_bound(
     frontier
         .and_then(|frontier| frontier.oldest_created)
         .into_iter()
-        .chain(config.skip_created_before)
+        .chain(enumeration_created_lower_bound(config))
         .max()
 }
 
@@ -8272,7 +8285,7 @@ mod tests {
             library: Arc::from("PrimarySync"),
             metadata: Arc::new(filter::MetadataPayload::default()),
             size: 1024,
-            created_local: chrono::Local::now(),
+            created_local: chrono::Local::now().fixed_offset(),
             version_size,
             media_type: crate::state::MediaType::Photo,
         }
@@ -10280,8 +10293,9 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.enum_config_hash = Some(Arc::from("hash-pr3"));
-        config.skip_created_after =
-            Some(DateTime::from_timestamp_millis(1_699_999_999_000).expect("valid timestamp"));
+        config.skip_created_after = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::from_timestamp_millis(1_699_999_999_000).expect("valid timestamp"),
+        ));
         let on_disk_asset = PhotoAsset::new(on_disk_records[0].clone(), on_disk_records[1].clone());
         seed_existing_file_for_asset(&mut config, &passes[0], &on_disk_asset).await;
 
@@ -12105,11 +12119,11 @@ mod tests {
         let mut config1 = test_config();
         config1.skip_created_before = None;
         let mut config2 = test_config();
-        config2.skip_created_before = Some(
+        config2.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
             DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-        );
+        ));
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -12121,14 +12135,31 @@ mod tests {
         let mut config1 = test_config();
         config1.skip_created_after = None;
         let mut config2 = test_config();
-        config2.skip_created_after = Some(
+        config2.skip_created_after = Some(crate::config::CreatedDateFilter::Instant(
             DateTime::parse_from_rfc3339("2024-12-31T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-        );
+        ));
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_distinguishes_capture_date_from_instant() {
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
+        let mut instant = test_config();
+        instant.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            date.and_time(chrono::NaiveTime::MIN).and_utc(),
+        ));
+        let mut capture_date = instant.clone();
+        capture_date.skip_created_before =
+            Some(crate::config::CreatedDateFilter::CaptureDate(date));
+
+        assert_ne!(
+            hash_download_config(&instant),
+            hash_download_config(&capture_date)
         );
     }
 
@@ -14147,7 +14178,9 @@ mod tests {
         config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Full;
         config.recent = Some(300);
-        config.skip_created_before = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
+        config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            Utc.timestamp_opt(1_800_000_000, 0).unwrap(),
+        ));
         let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
         let expected_path = filter::expected_paths_for(&asset, &config)
             .into_iter()
@@ -14233,7 +14266,9 @@ mod tests {
         config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Full;
         config.recent = Some(300);
-        config.skip_created_before = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
+        config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            Utc.timestamp_opt(1_800_000_000, 0).unwrap(),
+        ));
 
         let result = download_photos_with_sync(
             &Client::new(),
@@ -14457,7 +14492,9 @@ mod tests {
             zone_sync_token: "zone-token-prev".to_string(),
         };
         config.recent = Some(300);
-        config.skip_created_before = Some(Utc.timestamp_opt(1_746_994_800, 0).unwrap());
+        config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            Utc.timestamp_opt(1_746_994_800, 0).unwrap(),
+        ));
 
         download_photos_with_sync(
             &Client::new(),
@@ -17534,16 +17571,16 @@ mod tests {
         config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
         config.raw_policy = RawPolicy::PreferJpeg;
         config.keep_unicode_in_filenames = true;
-        config.skip_created_before = Some(
+        config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
             DateTime::parse_from_rfc3339("2020-06-15T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-        );
-        config.skip_created_after = Some(
+        ));
+        config.skip_created_after = Some(crate::config::CreatedDateFilter::Instant(
             DateTime::parse_from_rfc3339("2024-12-31T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-        );
+        ));
         config.recent = Some(500);
         config.force_resolution = true;
         config.media.videos = false;
@@ -18289,8 +18326,9 @@ mod tests {
     #[test]
     fn skip_created_before_runs_skip_pass_count_fetch() {
         let mut config = test_config();
-        config.skip_created_before =
-            Some(DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp"));
+        config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp"),
+        ));
 
         assert!(
             should_skip_pass_count_fetch(&config),
@@ -18300,10 +18338,44 @@ mod tests {
     }
 
     #[test]
+    fn stream_created_lower_bound_uses_the_stricter_date_or_recent_frontier() {
+        let capture_date = chrono::NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
+        let date_bound =
+            capture_date.and_time(chrono::NaiveTime::MIN).and_utc() - chrono::Duration::days(1);
+        let mut config = test_config();
+        config.skip_created_before =
+            Some(crate::config::CreatedDateFilter::CaptureDate(capture_date));
+
+        for (name, frontier_bound, expected) in [
+            (
+                "date bound",
+                date_bound - chrono::Duration::hours(1),
+                date_bound,
+            ),
+            (
+                "recent frontier",
+                date_bound + chrono::Duration::hours(1),
+                date_bound + chrono::Duration::hours(1),
+            ),
+        ] {
+            let frontier = RecentFrontier {
+                asset_ids: Arc::new(FxHashSet::default()),
+                oldest_created: Some(frontier_bound),
+            };
+            assert_eq!(
+                stream_created_lower_bound(&config, Some(&frontier)),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn skip_created_after_runs_keep_pass_count_fetch() {
         let mut config = test_config();
-        config.skip_created_after =
-            Some(DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp"));
+        config.skip_created_after = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp"),
+        ));
 
         assert!(
             !should_skip_pass_count_fetch(&config),
@@ -18538,8 +18610,9 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
-        config.skip_created_before =
-            Some(DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"));
+        config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"),
+        ));
         for asset in newer_assets.iter().map(recent_scope_photo_asset) {
             seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
         }
@@ -18592,8 +18665,9 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
-        config.skip_created_before =
-            Some(DateTime::from_timestamp_millis(1_699_000_000_000).expect("valid test timestamp"));
+        config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::from_timestamp_millis(1_699_000_000_000).expect("valid test timestamp"),
+        ));
         for asset in newer_assets.iter().map(recent_scope_photo_asset) {
             seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
         }
@@ -18632,8 +18706,9 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
-        config.skip_created_after =
-            Some(DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"));
+        config.skip_created_after = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"),
+        ));
         for asset in older_assets.iter().map(recent_scope_photo_asset) {
             seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
         }

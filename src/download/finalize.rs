@@ -347,7 +347,7 @@ mod tests {
             library: Arc::from(LIBRARY),
             metadata: Arc::new(MetadataPayload::default()),
             size: 12,
-            created_local: Local::now(),
+            created_local: Local::now().fixed_offset(),
             version_size: VersionSizeKey::Original,
             media_type: MediaType::Photo,
         }

@@ -129,6 +129,38 @@ Only producer-dispatched work becomes pending through `upsert_seen`. Filtered
 or skipped assets must not be left as retryable work unless a dedicated state
 transition owns that result.
 
+Asset dates used for filtering, path rendering, file metadata, and sidecars are
+resolved from Apple's UTC instant plus the asset's `timeZoneOffset` when that
+offset is usable. Missing or invalid offsets retain host-local rendering,
+preserving the previous path and metadata behaviour. Date-only lower bounds
+use a conservative UTC enumeration bound and then apply the exact resolved
+calendar-date filter, so enumeration safety does not depend on the backup host
+timezone.
+
+Capture-local path rendering does not change the download config hash, so a
+sync that sees no other drift stays incremental and never re-enumerates an
+already-downloaded asset. A date-only created bound is hashed under its own
+tag in both the download config hash and the eligibility-config hash, so it
+drifts like any other eligibility field. For an asset carrying a usable
+offset, a path derived under host-local rendering is not a current derived
+path, so a full sweep forwards that asset and downloads it into its
+capture-local folder. The earlier copy stays where it is: kei never deletes
+local media, and no command removes a file that no longer matches a derived
+path. `import-existing` adopts through the same derivation. Assets without a
+usable offset retain host-local paths and remain compatible with icloudpd's
+date-folder layout.
+
+Existing embedded and sidecar timestamps are repaired only through the
+explicit `sync --refresh-metadata` flow, which is bounded by the same
+no-overwrite probe gate as any other embedded write. An offset tag names the
+zone of one specific timestamp, so the embed path attaches it only to a
+timestamp it writes in the same pass, or to an existing one the probe proves
+already renders the capture-local instant. When writing a timestamp into a
+file that has orphaned datetime offsets, the writer clears those offsets before
+installing the timestamp and its resolved offset. Attaching an offset to a
+wall clock left by host-local rendering would assert an instant the asset never
+had.
+
 ### Durable pending retry
 
 Failed and pending rows are not recovered by replaying the entire provider

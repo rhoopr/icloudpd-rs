@@ -538,6 +538,13 @@ impl PhotoAsset {
         self.asset_date()
     }
 
+    /// Capture-local time reconstructed from Apple's instant and offset.
+    ///
+    /// Missing or invalid offsets retain host-local rendering.
+    pub(crate) fn created_local(&self) -> DateTime<chrono::FixedOffset> {
+        self.metadata().capture_local(self.created())
+    }
+
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
             .and_then(f64_to_millis_datetime)

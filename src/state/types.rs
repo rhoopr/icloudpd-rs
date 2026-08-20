@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, Utc};
 
 use crate::types::AssetVersionSize;
 
@@ -282,6 +282,22 @@ impl AssetMetadata {
     pub fn refresh_hash(&mut self) {
         self.metadata_hash = Some(self.compute_hash());
     }
+
+    /// Return Apple's offset when it can be represented by chrono.
+    pub(crate) fn valid_timezone_offset(&self) -> Option<FixedOffset> {
+        self.timezone_offset.and_then(FixedOffset::east_opt)
+    }
+
+    /// Resolve an asset instant to its capture-local wall clock.
+    ///
+    /// Missing or invalid offsets retain the host-local rendering used when
+    /// Apple supplies no capture timezone.
+    pub(crate) fn capture_local(&self, created_at: DateTime<Utc>) -> DateTime<FixedOffset> {
+        self.valid_timezone_offset().map_or_else(
+            || created_at.with_timezone(&Local).fixed_offset(),
+            |offset| created_at.with_timezone(&offset),
+        )
+    }
 }
 
 fn hash_opt(hasher: &mut sha2::Sha256, tag: &str, value: Option<&str>) {
@@ -548,6 +564,7 @@ pub struct SyncSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::mem::size_of;
 
     #[test]
@@ -707,6 +724,45 @@ mod tests {
         }
         .compute_hash();
         assert_ne!(base, with_gps);
+    }
+
+    #[test]
+    fn test_asset_metadata_hash_changes_with_timezone_offset() {
+        let base = AssetMetadata::default().compute_hash();
+        let with_offset = AssetMetadata {
+            timezone_offset: Some(39_600),
+            ..AssetMetadata::default()
+        }
+        .compute_hash();
+        assert_ne!(base, with_offset);
+    }
+
+    #[test]
+    fn capture_local_uses_asset_offset_or_host_local_fallback() {
+        let created_at = Utc.with_ymd_and_hms(2025, 2, 1, 2, 0, 0).unwrap();
+        let expected_host_local = created_at.with_timezone(&Local).fixed_offset();
+
+        for metadata in [
+            AssetMetadata::default(),
+            AssetMetadata {
+                timezone_offset: Some(i32::MAX),
+                ..AssetMetadata::default()
+            },
+        ] {
+            let resolved = metadata.capture_local(created_at);
+            assert_eq!(resolved.naive_local(), expected_host_local.naive_local());
+            assert_eq!(resolved.offset(), expected_host_local.offset());
+        }
+
+        let offset = FixedOffset::east_opt(50_400).unwrap();
+        let metadata = AssetMetadata {
+            timezone_offset: Some(offset.local_minus_utc()),
+            ..AssetMetadata::default()
+        };
+        let resolved = metadata.capture_local(created_at);
+        let expected = created_at.with_timezone(&offset);
+        assert_eq!(resolved.naive_local(), expected.naive_local());
+        assert_eq!(resolved.offset(), expected.offset());
     }
 
     #[test]

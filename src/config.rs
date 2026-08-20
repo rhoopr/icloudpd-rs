@@ -3,7 +3,7 @@ use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoResolution,
     LogLevel, PhotoResolution, RawPolicy,
 };
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -298,8 +298,8 @@ pub struct DownloadSettings {
 pub struct FilterConfig {
     pub selection: crate::selection::Selection,
     pub media: MediaSelection,
-    pub skip_created_before: Option<DateTime<Local>>,
-    pub skip_created_after: Option<DateTime<Local>>,
+    pub skip_created_before: Option<CreatedDateFilter>,
+    pub skip_created_after: Option<CreatedDateFilter>,
     pub recent: Option<u32>,
     pub recent_scope: crate::cli::RecentScope,
     pub persistent_recent: Option<crate::cli::RecentLimit>,
@@ -308,6 +308,115 @@ pub struct FilterConfig {
     pub persistent_skip_created_after: Option<String>,
     pub skip_videos: bool,
     pub skip_photos: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatedDateFilter {
+    Instant(DateTime<Utc>),
+    CaptureDate(NaiveDate),
+}
+
+impl CreatedDateFilter {
+    pub(crate) fn excludes_before(
+        self,
+        created_at: DateTime<Utc>,
+        capture_date: NaiveDate,
+    ) -> bool {
+        match self {
+            Self::Instant(boundary) => created_at < boundary,
+            Self::CaptureDate(boundary) => capture_date < boundary,
+        }
+    }
+
+    pub(crate) fn excludes_after(self, created_at: DateTime<Utc>, capture_date: NaiveDate) -> bool {
+        match self {
+            Self::Instant(boundary) => created_at > boundary,
+            Self::CaptureDate(boundary) => capture_date > boundary,
+        }
+    }
+
+    /// True when the two bounds admit no asset at all, whatever capture
+    /// offset it carries.
+    ///
+    /// Bounds of the same form compare exactly. A capture date names a span of
+    /// instants rather than one, because the filter compares each asset's
+    /// capture-local date, so a mixed window is judged against the widest span
+    /// `FixedOffset` admits. Reporting a workable window as impossible would
+    /// be worse than staying quiet about a narrow contradictory one.
+    pub(crate) fn is_strictly_after(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Instant(before), Self::Instant(after)) => before > after,
+            (Self::CaptureDate(before), Self::CaptureDate(after)) => before > after,
+            (Self::CaptureDate(before), Self::Instant(after)) => {
+                Self::earliest_instant_on(before) > after
+            }
+            (Self::Instant(before), Self::CaptureDate(after)) => {
+                Self::first_instant_after(after).is_some_and(|end| before >= end)
+            }
+        }
+    }
+
+    /// Widest offset `chrono::FixedOffset` accepts, in seconds. A capture-local
+    /// calendar day therefore spans this much beyond the UTC day on each side.
+    const WIDEST_OFFSET_SECONDS: i64 = 86_399;
+
+    /// Earliest instant an asset can carry and still fall on `date` in
+    /// capture-local time.
+    fn earliest_instant_on(date: NaiveDate) -> DateTime<Utc> {
+        date.and_time(chrono::NaiveTime::MIN).and_utc()
+            - chrono::Duration::seconds(Self::WIDEST_OFFSET_SECONDS)
+    }
+
+    /// First instant that can no longer fall on `date` in capture-local time.
+    /// `None` only at the end of the representable calendar, where declining
+    /// to warn is the safe answer.
+    fn first_instant_after(date: NaiveDate) -> Option<DateTime<Utc>> {
+        Some(
+            date.succ_opt()?.and_time(chrono::NaiveTime::MIN).and_utc()
+                + chrono::Duration::seconds(Self::WIDEST_OFFSET_SECONDS),
+        )
+    }
+
+    /// Midnight UTC on a capture date, or the instant itself.
+    fn comparable_instant(self) -> DateTime<Utc> {
+        match self {
+            Self::Instant(boundary) => boundary,
+            Self::CaptureDate(boundary) => boundary.and_time(chrono::NaiveTime::MIN).and_utc(),
+        }
+    }
+
+    pub(crate) fn conservative_utc_lower_bound(self) -> DateTime<Utc> {
+        match self {
+            Self::Instant(boundary) => boundary,
+            Self::CaptureDate(_) => self.comparable_instant() - chrono::Duration::days(1),
+        }
+    }
+
+    /// Durable identity used by the config and coverage hashes. Keep it
+    /// separate from [`std::fmt::Display`], so rewording a diagnostic cannot
+    /// invalidate every user's incremental state.
+    pub(crate) fn fingerprint(self) -> String {
+        match self {
+            Self::Instant(boundary) => boundary.to_rfc3339(),
+            Self::CaptureDate(boundary) => format!("capture-date:{boundary}"),
+        }
+    }
+}
+
+/// Diagnostic rendering only. Each bound names its form, because the two forms
+/// compare differently and a message about a contradictory window is only
+/// readable once the reader knows which one they gave.
+impl std::fmt::Display for CreatedDateFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Instant(boundary) => write!(
+                f,
+                "instant {}",
+                boundary.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            Self::CaptureDate(boundary) => write!(f, "capture date {boundary}"),
+        }
+    }
 }
 
 impl FilterConfig {
@@ -1401,20 +1510,20 @@ impl Config {
 
         let skip_created_before = skip_created_before_str
             .as_deref()
-            .map(parse_date_or_interval)
+            .map(parse_created_date_filter)
             .transpose()?;
         let skip_created_after = skip_created_after_str
             .as_deref()
-            .map(parse_date_or_interval)
+            .map(parse_created_date_filter)
             .transpose()?;
 
         if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after)
-            && before >= after
+            && before.is_strictly_after(*after)
         {
             tracing::warn!(
-                before = %before.format("%Y-%m-%d"),
-                after = %after.format("%Y-%m-%d"),
-                "skip-created-before >= skip-created-after, no assets can match",
+                %before,
+                %after,
+                "skip-created-before is after skip-created-after, no assets can match",
             );
         }
 
@@ -1994,30 +2103,24 @@ pub(crate) fn persist_first_run_config(
     Ok(())
 }
 
-/// Parse a human-friendly date spec into a concrete timestamp.
-///
-/// Supports three formats to match the Python CLI's behavior:
-/// - Relative interval: `"20d"` (20 days ago from now)
-/// - ISO date: `"2025-01-02"` (midnight local time)
-/// - ISO datetime: `"2025-01-02T14:30:00"` (local time)
-pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
+/// Parse a date-only capture boundary, host-local datetime, or relative interval.
+pub(crate) fn parse_created_date_filter(s: &str) -> anyhow::Result<CreatedDateFilter> {
     if let Some(days_str) = s.strip_suffix('d')
         && let Ok(days) = days_str.parse::<u64>()
     {
         let days = i64::try_from(days)
             .map_err(|_e| anyhow::anyhow!("Date interval '{s}' is too large"))?;
-        return Ok(Local::now() - chrono::Duration::days(days));
+        return Ok(CreatedDateFilter::Instant(
+            Utc::now() - chrono::Duration::days(days),
+        ));
     }
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        && let Some(naive_dt) = date.and_hms_opt(0, 0, 0)
-        && let Some(dt) = naive_dt.and_local_timezone(Local).single()
-    {
-        return Ok(dt);
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(CreatedDateFilter::CaptureDate(date));
     }
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
         && let Some(local) = dt.and_local_timezone(Local).single()
     {
-        return Ok(local);
+        return Ok(CreatedDateFilter::Instant(local.with_timezone(&Utc)));
     }
     anyhow::bail!(
         "Could not parse '{s}' as a date. Use a date like 2025-01-02, a datetime like 2025-01-02T14:30:00, or an interval like 20d."
@@ -2286,18 +2389,92 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_date_iso() {
-        let dt = parse_date_or_interval("2025-01-15").unwrap();
+    fn test_parse_date_marks_calendar_boundaries() {
         assert_eq!(
-            dt.date_naive(),
-            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap()
+            parse_created_date_filter("2025-01-15").unwrap(),
+            CreatedDateFilter::CaptureDate(NaiveDate::from_ymd_opt(2025, 1, 15).unwrap())
+        );
+        assert!(matches!(
+            parse_created_date_filter("2025-01-15T00:00:00").unwrap(),
+            CreatedDateFilter::Instant(_)
+        ));
+    }
+
+    #[test]
+    fn date_only_filter_bound_is_host_timezone_independent() {
+        assert_eq!(
+            parse_created_date_filter("2025-01-15")
+                .unwrap()
+                .fingerprint(),
+            "capture-date:2025-01-15"
+        );
+    }
+
+    /// The contradictory-window warning reads back to whoever wrote the
+    /// config, so each bound has to name the form it took rather than leaning
+    /// on Rust's derived `Debug`.
+    #[test]
+    fn filter_bounds_render_their_form_for_diagnostics() {
+        assert_eq!(
+            CreatedDateFilter::CaptureDate(NaiveDate::from_ymd_opt(2025, 6, 1).unwrap())
+                .to_string(),
+            "capture date 2025-06-01"
+        );
+        assert_eq!(
+            CreatedDateFilter::Instant(
+                NaiveDate::from_ymd_opt(2025, 1, 1)
+                    .unwrap()
+                    .and_time(chrono::NaiveTime::MIN)
+                    .and_utc()
+            )
+            .to_string(),
+            "instant 2025-01-01T00:00:00Z"
         );
     }
 
     #[test]
+    fn conservative_utc_lower_bound_covers_filter_forms_and_maximum_offsets() {
+        let capture_date = NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
+        let utc_midnight = capture_date.and_time(chrono::NaiveTime::MIN).and_utc();
+        let instant = utc_midnight + chrono::Duration::hours(6);
+
+        for (name, filter, expected) in [
+            (
+                "capture date",
+                CreatedDateFilter::CaptureDate(capture_date),
+                utc_midnight - chrono::Duration::days(1),
+            ),
+            ("instant", CreatedDateFilter::Instant(instant), instant),
+        ] {
+            assert_eq!(filter.conservative_utc_lower_bound(), expected, "{name}");
+        }
+
+        let lower_bound =
+            CreatedDateFilter::CaptureDate(capture_date).conservative_utc_lower_bound();
+        for (name, offset_seconds, expected_clearance) in [
+            ("UTC+14", 50_400, chrono::Duration::hours(10)),
+            ("chrono east limit", 86_399, chrono::Duration::seconds(1)),
+        ] {
+            let offset = chrono::FixedOffset::east_opt(offset_seconds).unwrap();
+            let asset_utc = capture_date
+                .and_time(chrono::NaiveTime::MIN)
+                .and_local_timezone(offset)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(asset_utc - lower_bound, expected_clearance, "{name}");
+            assert!(asset_utc >= lower_bound, "{name} asset was truncated");
+        }
+    }
+
+    #[test]
     fn test_parse_datetime_iso() {
-        let dt = parse_date_or_interval("2025-06-15T14:30:00").unwrap();
-        let naive = dt.naive_local();
+        let CreatedDateFilter::Instant(dt) =
+            parse_created_date_filter("2025-06-15T14:30:00").unwrap()
+        else {
+            panic!("datetime must resolve to an instant");
+        };
+        let naive = dt.with_timezone(&Local).naive_local();
         assert_eq!(naive.date(), NaiveDate::from_ymd_opt(2025, 6, 15).unwrap());
         assert_eq!(
             naive.time(),
@@ -2307,9 +2484,11 @@ mod tests {
 
     #[test]
     fn test_parse_interval_days() {
-        let before = chrono::Local::now();
-        let dt = parse_date_or_interval("10d").unwrap();
-        let after = chrono::Local::now();
+        let before = Utc::now();
+        let CreatedDateFilter::Instant(dt) = parse_created_date_filter("10d").unwrap() else {
+            panic!("relative interval must resolve to an instant");
+        };
+        let after = Utc::now();
         let expected = before - chrono::Duration::days(10);
         assert!(dt >= expected - chrono::Duration::seconds(1));
         assert!(dt <= after - chrono::Duration::days(10) + chrono::Duration::seconds(1));
@@ -2317,14 +2496,14 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_date() {
-        assert!(parse_date_or_interval("not-a-date").is_err());
-        assert!(parse_date_or_interval("").is_err());
+        assert!(parse_created_date_filter("not-a-date").is_err());
+        assert!(parse_created_date_filter("").is_err());
     }
 
     #[test]
     fn test_parse_negative_interval_rejected() {
-        assert!(parse_date_or_interval("-5d").is_err());
-        assert!(parse_date_or_interval("-1d").is_err());
+        assert!(parse_created_date_filter("-5d").is_err());
+        assert!(parse_created_date_filter("-1d").is_err());
     }
 
     // ── TOML parsing tests ──────────────────────────────────────────
@@ -5134,13 +5313,13 @@ mod tests {
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         let before = cfg.filters.skip_created_before.unwrap();
         assert_eq!(
-            before.date_naive(),
-            NaiveDate::from_ymd_opt(2023, 6, 1).unwrap()
+            before,
+            CreatedDateFilter::CaptureDate(NaiveDate::from_ymd_opt(2023, 6, 1).unwrap())
         );
         let after = cfg.filters.skip_created_after.unwrap();
         assert_eq!(
-            after.date_naive(),
-            NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()
+            after,
+            CreatedDateFilter::CaptureDate(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap())
         );
     }
 
@@ -5158,8 +5337,10 @@ mod tests {
             Some(&toml),
         )
         .unwrap();
-        let before = cfg.filters.skip_created_before.unwrap();
-        let expected = chrono::Local::now() - chrono::Duration::days(30);
+        let CreatedDateFilter::Instant(before) = cfg.filters.skip_created_before.unwrap() else {
+            panic!("day interval must resolve to an instant");
+        };
+        let expected = chrono::Utc::now() - chrono::Duration::days(30);
         assert!((before - expected).num_seconds().abs() < 2);
     }
 
@@ -6659,7 +6840,7 @@ mod tests {
 
     #[test]
     fn test_contradictory_date_filter_succeeds() {
-        // before >= after is a warning, not an error -- Config::build should succeed
+        // A contradictory window is a warning, not an error.
         let mut sync = default_sync();
         sync.skip_created_before = Some("2025-06-01".to_string());
         sync.skip_created_after = Some("2025-01-01".to_string());
@@ -6669,7 +6850,67 @@ mod tests {
             "Contradictory date filters should warn, not error"
         );
         let cfg = cfg.unwrap();
-        assert!(cfg.filters.skip_created_before >= cfg.filters.skip_created_after);
+        assert!(
+            cfg.filters
+                .skip_created_before
+                .unwrap()
+                .is_strictly_after(cfg.filters.skip_created_after.unwrap())
+        );
+    }
+
+    #[test]
+    fn contradictory_window_detection_spans_date_and_instant_bounds() {
+        let june = CreatedDateFilter::CaptureDate(
+            NaiveDate::from_ymd_opt(2025, 6, 1).expect("valid date"),
+        );
+        let january = CreatedDateFilter::Instant(
+            NaiveDate::from_ymd_opt(2025, 1, 1)
+                .expect("valid date")
+                .and_time(chrono::NaiveTime::MIN)
+                .and_utc(),
+        );
+
+        assert!(!june.is_strictly_after(june), "one capture day is a window");
+        assert!(june.is_strictly_after(january));
+        assert!(!january.is_strictly_after(june));
+
+        // An asset sitting exactly on an instant bound satisfies both
+        // predicates, so equal instants are a window too.
+        assert!(!january.is_strictly_after(january));
+
+        // A capture date spans the instants any offset can map onto it, so a
+        // mixed window under a day apart still admits assets. Reporting one of
+        // these as impossible would contradict what the filter actually does.
+        let capture_day = NaiveDate::from_ymd_opt(2025, 2, 1).expect("valid date");
+        let instant_at = |year, month, day, hour| {
+            CreatedDateFilter::Instant(
+                NaiveDate::from_ymd_opt(year, month, day)
+                    .expect("valid date")
+                    .and_hms_opt(hour, 0, 0)
+                    .expect("valid time")
+                    .and_utc(),
+            )
+        };
+
+        // 2025-02-01T20:00Z is 2025-02-01 locally at UTC+00.
+        assert!(
+            !instant_at(2025, 2, 1, 20)
+                .is_strictly_after(CreatedDateFilter::CaptureDate(capture_day)),
+            "a same-day capture-local asset matches this window"
+        );
+        // 2025-01-31T20:00Z is 2025-02-01 locally at UTC+14.
+        assert!(
+            !CreatedDateFilter::CaptureDate(capture_day)
+                .is_strictly_after(instant_at(2025, 1, 31, 20)),
+            "an eastward offset pulls this asset onto the capture day"
+        );
+
+        // The diagnostic still fires once no offset can bridge the gap.
+        assert!(
+            instant_at(2025, 6, 1, 0).is_strictly_after(CreatedDateFilter::CaptureDate(
+                NaiveDate::from_ymd_opt(2025, 1, 1).expect("valid date")
+            ))
+        );
     }
 
     #[test]
@@ -6960,8 +7201,10 @@ mod tests {
         );
         // The cutoff should be ~30 days ago; give it a wide window to avoid
         // flakiness on slow CI.
-        let cutoff = cfg.filters.skip_created_before.unwrap();
-        let now = chrono::Local::now();
+        let CreatedDateFilter::Instant(cutoff) = cfg.filters.skip_created_before.unwrap() else {
+            panic!("recent day window must resolve to an instant");
+        };
+        let now = chrono::Utc::now();
         let delta = now.signed_duration_since(cutoff);
         assert!(
             delta.num_days() >= 29 && delta.num_days() <= 31,

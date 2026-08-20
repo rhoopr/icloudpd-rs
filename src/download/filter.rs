@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, FixedOffset, Local};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::icloud::photos::VersionsMap;
@@ -50,8 +50,8 @@ pub(crate) trait PathDerivationSource {
     fn folder_structure(&self) -> &str;
     fn resolution(&self) -> crate::types::PhotoResolution;
     fn media(&self) -> &crate::config::MediaSelection;
-    fn skip_created_before(&self) -> Option<DateTime<chrono::Utc>>;
-    fn skip_created_after(&self) -> Option<DateTime<chrono::Utc>>;
+    fn skip_created_before(&self) -> Option<crate::config::CreatedDateFilter>;
+    fn skip_created_after(&self) -> Option<crate::config::CreatedDateFilter>;
     fn live_photo_mode(&self) -> LivePhotoMode;
     fn live_resolution(&self) -> AssetVersionSize;
     fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy;
@@ -80,8 +80,8 @@ pub(crate) struct PathDerivationConfig {
     pub(crate) folder_structure_smart_folders: Arc<str>,
     pub(crate) resolution: crate::types::PhotoResolution,
     pub(crate) media: crate::config::MediaSelection,
-    pub(crate) skip_created_before: Option<DateTime<chrono::Utc>>,
-    pub(crate) skip_created_after: Option<DateTime<chrono::Utc>>,
+    pub(crate) skip_created_before: Option<crate::config::CreatedDateFilter>,
+    pub(crate) skip_created_after: Option<crate::config::CreatedDateFilter>,
     pub(crate) live_photo_mode: LivePhotoMode,
     pub(crate) live_resolution: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
@@ -205,11 +205,11 @@ impl PathDerivationSource for PathDerivationConfig {
         &self.media
     }
 
-    fn skip_created_before(&self) -> Option<DateTime<chrono::Utc>> {
+    fn skip_created_before(&self) -> Option<crate::config::CreatedDateFilter> {
         self.skip_created_before
     }
 
-    fn skip_created_after(&self) -> Option<DateTime<chrono::Utc>> {
+    fn skip_created_after(&self) -> Option<crate::config::CreatedDateFilter> {
         self.skip_created_after
     }
 
@@ -279,11 +279,11 @@ impl PathDerivationSource for DownloadConfig {
         &self.media
     }
 
-    fn skip_created_before(&self) -> Option<DateTime<chrono::Utc>> {
+    fn skip_created_before(&self) -> Option<crate::config::CreatedDateFilter> {
         self.skip_created_before
     }
 
-    fn skip_created_after(&self) -> Option<DateTime<chrono::Utc>> {
+    fn skip_created_after(&self) -> Option<crate::config::CreatedDateFilter> {
         self.skip_created_after
     }
 
@@ -416,6 +416,8 @@ impl std::borrow::Borrow<str> for NormalizedPath {
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
 pub(super) struct MetadataPayload {
+    /// Source capture offset in seconds from UTC, when valid.
+    pub(super) timezone_offset: Option<i32>,
     /// 1-5 star rating (mapped from `AssetMetadata::rating` or `is_favorite`).
     pub(super) rating: Option<u8>,
     /// GPS latitude in decimal degrees, WGS84.
@@ -460,6 +462,7 @@ impl MetadataPayload {
             })
             .unwrap_or_default();
         Self {
+            timezone_offset: meta.timezone_offset,
             rating: meta.rating,
             latitude: meta.latitude,
             longitude: meta.longitude,
@@ -554,7 +557,7 @@ pub(super) struct DownloadTask {
     // 8-byte primitives
     pub(super) size: u64,
     // DateTime
-    pub(super) created_local: DateTime<Local>,
+    pub(super) created_local: DateTime<FixedOffset>,
     // 1-byte enum
     /// Version size key for state tracking.
     pub(super) version_size: VersionSizeKey,
@@ -580,7 +583,7 @@ impl DownloadTask {
                 .unwrap_or("")
                 .to_string(),
             bytes: self.size,
-            created_local: self.created_local,
+            created_local: self.created_local.with_timezone(&Local),
         }
     }
 }
@@ -718,16 +721,17 @@ pub(crate) fn is_asset_filtered(
         return Some(FilterReason::LivePhoto);
     }
     let created_utc = asset.created();
+    let created_local = asset.created_local();
     if let Some(before) = config.skip_created_before()
-        && created_utc < before
+        && before.excludes_before(created_utc, created_local.date_naive())
     {
-        tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
+        tracing::debug!(asset_id = %asset.id(), date = %created_local, "Skipping (before date range)");
         return Some(FilterReason::DateRange);
     }
     if let Some(after) = config.skip_created_after()
-        && created_utc > after
+        && after.excludes_after(created_utc, created_local.date_naive())
     {
-        tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
+        tracing::debug!(asset_id = %asset.id(), date = %created_local, "Skipping (after date range)");
         return Some(FilterReason::DateRange);
     }
     // Only check filename exclusion when the asset has a real filename.
@@ -913,7 +917,7 @@ fn usable_asset_base_filename(
 /// derivation.
 pub(super) struct DerivationContext<'a> {
     pub(super) base_filename: String,
-    pub(super) created_local: DateTime<Local>,
+    pub(super) created_local: DateTime<FixedOffset>,
     pub(super) versions: VersionsView<'a>,
 }
 
@@ -930,7 +934,7 @@ impl<'a> DerivationContext<'a> {
         };
         Self {
             base_filename,
-            created_local: asset.created().with_timezone(&Local),
+            created_local: asset.created_local(),
             versions: apply_raw_policy(asset.versions(), config.raw_policy()),
         }
     }
@@ -1391,7 +1395,7 @@ pub(super) async fn pre_ensure_asset_dir(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) {
-    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+    let created_local = asset.created_local();
     let parent = paths::local_download_dir(
         &config.directory,
         &config.folder_structure,
@@ -1442,7 +1446,7 @@ impl PathResolution {
 #[derive(Debug)]
 struct ResolveContext<'a> {
     config: &'a DownloadConfig,
-    created_local: &'a DateTime<Local>,
+    created_local: &'a DateTime<FixedOffset>,
     claimed_paths: &'a FxHashMap<NormalizedPath, u64>,
     dir_cache: &'a mut paths::DirCache,
 }
@@ -1902,7 +1906,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use chrono::Utc;
     use rustc_hash::FxHashSet;
 
     #[cfg(unix)]
@@ -2025,8 +2028,10 @@ mod tests {
             .build()
     }
 
-    fn date_time(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).expect("test date").into()
+    fn date_time(s: &str) -> crate::config::CreatedDateFilter {
+        crate::config::CreatedDateFilter::Instant(
+            DateTime::parse_from_rfc3339(s).expect("test date").into(),
+        )
     }
 
     fn no_config_change(_: &mut DownloadConfig) {}
@@ -2112,6 +2117,56 @@ mod tests {
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
+    }
+
+    #[test]
+    fn capture_local_date_filters_and_paths_cover_boundaries_and_fallbacks() {
+        let check = |asset_date: f64,
+                     offset: Option<i32>,
+                     boundary: &str,
+                     expected_filter: Option<FilterReason>| {
+            let mut builder = TestPhotoAsset::new("TIMEZONE_CASE")
+                .filename("photo.jpg")
+                .asset_date(asset_date);
+            if let Some(offset) = offset {
+                builder = builder.timezone_offset(offset);
+            }
+            let asset = builder.build();
+            let boundary = boundary.parse().unwrap();
+            let mut config = test_config();
+            config.skip_created_before =
+                Some(crate::config::CreatedDateFilter::CaptureDate(boundary));
+            config.skip_created_after =
+                Some(crate::config::CreatedDateFilter::CaptureDate(boundary));
+
+            assert_eq!(is_asset_filtered(&asset, &config), expected_filter);
+            if expected_filter.is_none() {
+                let tasks = filter_asset_fresh(&asset, &config);
+                assert_eq!(tasks.len(), 1);
+                let expected_path = format!("{}/photo.JPG", boundary.format("%Y/%m/%d"));
+                assert!(
+                    tasks[0].download_path.ends_with(&expected_path),
+                    "{}",
+                    tasks[0].download_path.display()
+                );
+            }
+        };
+
+        check(1_769_898_719_000.0, Some(39_600), "2026-02-01", None);
+        check(1_767_227_400_000.0, Some(-3_600), "2025-12-31", None);
+        check(
+            1_769_898_719_000.0,
+            Some(39_600),
+            "2026-01-31",
+            Some(FilterReason::DateRange),
+        );
+        let host_boundary = DateTime::from_timestamp_millis(1_736_899_200_000)
+            .unwrap()
+            .with_timezone(&Local)
+            .date_naive()
+            .to_string();
+        check(1_736_899_200_000.0, None, &host_boundary, None);
+        check(1_736_899_200_000.0, Some(i32::MAX), &host_boundary, None);
     }
 
     #[test]
@@ -3513,28 +3568,28 @@ mod tests {
         let natural_heic = paths::local_download_path(
             &config.directory,
             &config.folder_structure,
-            &asset.created().with_timezone(&Local),
+            &asset.created_local(),
             "FullSizeRender.HEIC",
             None,
         );
         let deduped_heic = paths::local_download_path(
             &config.directory,
             &config.folder_structure,
-            &asset.created().with_timezone(&Local),
+            &asset.created_local(),
             "FullSizeRender-2067405.HEIC",
             None,
         );
         let natural_mov = paths::local_download_path(
             &config.directory,
             &config.folder_structure,
-            &asset.created().with_timezone(&Local),
+            &asset.created_local(),
             "FullSizeRender_HEVC.MOV",
             None,
         );
         let paired_mov = paths::local_download_path(
             &config.directory,
             &config.folder_structure,
-            &asset.created().with_timezone(&Local),
+            &asset.created_local(),
             "FullSizeRender-2067405_HEVC.MOV",
             None,
         );
