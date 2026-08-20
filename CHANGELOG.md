@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Headless foreground login and one-shot sync now exit immediately with auth code 3 when 2FA needs operator action. The error prints the `kei login get-code` and `kei login submit-code <CODE>` flow. Watch and service processes keep their durable wait-and-resume behavior. `kei password set` now accepts password-file and password-command sources, and fails before prompting when stdin is not a terminal. ([#698])
+- Embedded XMP writes for HEIC, HEIF, and AVIF files now use a byte-preserving item-map writer. Unsupported layouts fail the metadata write without replacing the media file. ([#558])
 - A filtered sibling can no longer displace the child that owns a legacy master-keyed state row on the next sync. kei records the owner before planning downloads and reuses it during full sync, incremental sync, and pending retry. ([#721], fixes [#691])
 - A metadata-only iCloud edit (favourite, rating, keywords, caption, GPS) on an unchanged file now refreshes the catalogue during full enumeration and single-pass incremental sync. Changed provider metadata is applied before filtering and path planning, so the refresh reaches every downloaded version of the asset even when its media task is skipped as already on disk or excluded by a filter. The catalogue row and the rewrite marker commit together, so a queued sidecar or EXIF rewrite reads the corrected values instead of replaying stale ones, and no media is re-downloaded. ([#707], refs [#674])
 - A failed catalogue refresh now preserves the previous zone checkpoint instead of advancing past a provider edit that was never stored. ([#707])
@@ -50,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#721]: https://github.com/rhoopr/kei/pull/721
 [#725]: https://github.com/rhoopr/kei/issues/725
 [#742]: https://github.com/rhoopr/kei/issues/742
+[#558]: https://github.com/rhoopr/kei/issues/558
 [#691]: https://github.com/rhoopr/kei/issues/691
 [@mmenanno]: https://github.com/mmenanno
 

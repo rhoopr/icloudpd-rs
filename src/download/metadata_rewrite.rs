@@ -989,6 +989,24 @@ mod tests {
 
     #[cfg(feature = "xmp")]
     #[test]
+    fn plan_metadata_write_skips_datetime_for_heif_native_exif() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.heic");
+        let probe = crate::download::metadata::probe_exif(&path).expect("sample HEIC probe");
+        let write = plan_metadata_write(
+            MetadataFlags::DATETIME,
+            &MetadataPayload::default(),
+            &now_local(),
+            &probe,
+        );
+
+        assert!(
+            write.datetime.is_none(),
+            "native HEIF DateTimeOriginal must suppress the derived datetime write"
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[test]
     fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
         let payload = rich_payload();
         let dir = tempfile::tempdir().unwrap();
@@ -1075,42 +1093,10 @@ mod tests {
         assert_eq!(files, 1, "disabled metadata options created another file");
     }
 
-    #[cfg(all(feature = "xmp", target_os = "linux"))]
-    #[test]
-    fn disabled_heif_embed_reads_only_routing_header() {
-        const INNER_RUN: &str = "KEI_TEST_HEIF_EMBED_READ_BUDGET_INNER";
-        const FIXTURE_LEN: u64 = 32 * 1024 * 1024;
-        const READ_BUDGET: u64 = 4096;
-
-        if std::env::var_os(INNER_RUN).is_none() {
-            let output = std::process::Command::new(
-                std::env::current_exe().expect("current unit-test executable"),
-            )
-            .arg("disabled_heif_embed_reads_only_routing_header")
-            .arg("--test-threads=1")
-            .env(INNER_RUN, "1")
-            .output()
-            .expect("run isolated HEIF read-budget regression");
-            assert!(
-                output.status.success(),
-                "isolated HEIF read-budget regression failed:\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-
-        fn process_read_chars() -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .expect("read process I/O counters")
-                .lines()
-                .find_map(|line| line.strip_prefix("rchar:"))
-                .map(str::trim)
-                .expect("rchar process I/O counter")
-                .parse()
-                .expect("numeric rchar process I/O counter")
-        }
-
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn enabled_heif_embed_failure_preserves_invalid_media() {
+        const FIXTURE_LEN: u64 = 1024 * 1024;
         let dir = tempfile::tempdir().expect("metadata temp dir");
         let photo_path = dir.path().join("large.heic");
         let mut file = std::fs::File::create(&photo_path).expect("create sparse HEIF fixture");
@@ -1120,33 +1106,36 @@ mod tests {
             .expect("extend sparse HEIF fixture");
         drop(file);
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("metadata test runtime");
-        let before = process_read_chars();
-        let outcome = runtime.block_on(write_download_metadata(MetadataWriteRequest {
+        let outcome = write_download_metadata(MetadataWriteRequest {
             final_path: &photo_path,
             embed_path: Some(&photo_path),
             sidecar_path: None,
-            payload: Arc::new(MetadataPayload::default()),
+            payload: Arc::new(MetadataPayload {
+                rating: Some(5),
+                ..MetadataPayload::default()
+            }),
             created_local: now_local(),
-            flags: MetadataFlags::DATETIME,
+            flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
             temp_suffix: ".metadata-test",
-        }));
-        let bytes_read = process_read_chars().saturating_sub(before);
+        })
+        .await;
 
-        assert!(!outcome.any_failed());
+        assert!(outcome.any_failed());
         assert_eq!(
             std::fs::metadata(&photo_path)
                 .expect("stat sparse HEIF fixture")
                 .len(),
             FIXTURE_LEN,
-            "disabled embedding must leave the HEIF file unchanged"
+            "a failed HEIF embed must leave the media length unchanged"
         );
-        assert!(
-            bytes_read <= READ_BUDGET,
-            "disabled HEIF embedding read {bytes_read} bytes; expected only the routing header within a {READ_BUDGET}-byte process I/O budget"
+        assert_eq!(
+            std::fs::read(&photo_path)
+                .expect("read sparse HEIF fixture")
+                .get(..24),
+            Some(b"\0\0\0\x18ftypheic\0\0\0\0heicmif1".as_slice()),
+            "a failed HEIF embed must leave the routing header unchanged"
         );
+        assert!(!dir.path().join("large.heic.metadata-test").exists());
     }
 
     /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). XMP Toolkit can write
@@ -1789,6 +1778,81 @@ mod tests {
         assert_eq!(std::fs::read(&photo_path).unwrap(), before);
         assert!(!dir.path().join("grouping_read_failure.jpg.xmp").exists());
         assert_eq!(db.get_pending_metadata_rewrites(1).await.unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_pending_applies_heic_rating_and_records_rewrite_checksums() {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("rewrite_target.heic");
+        let source = include_bytes!("../../tests/data/sample.heic");
+        std::fs::write(&photo_path, source).unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let seeded_checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("REWRITE_HEIC")
+            .filename("rewrite_target.heic")
+            .checksum("rewrite_heic_ck")
+            .size(source.len() as u64)
+            .metadata(AssetMetadata {
+                rating: Some(5),
+                metadata_hash: Some("heic_hash".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE_HEIC",
+            "original",
+            &photo_path,
+            &seeded_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_HEIC", "original")
+            .await
+            .unwrap();
+
+        let pass = run_pending(
+            &db,
+            MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(pass.applied, 1);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let bytes = std::fs::read(&photo_path).unwrap();
+        let xmp = crate::download::heif::extract_xmp_bytes(&bytes).expect("HEIC XMP");
+        let meta: xmp_toolkit::XmpMeta = std::str::from_utf8(&xmp).unwrap().parse().unwrap();
+        assert_eq!(
+            meta.property_i32(xmp_toolkit::xmp_ns::XMP, "Rating")
+                .unwrap()
+                .value,
+            5
+        );
+
+        let (local_checksum, download_checksum) = stored_checksums(&db).await;
+        assert_ne!(local_checksum.as_deref(), Some(seeded_checksum.as_str()));
+        assert_eq!(download_checksum.as_deref(), Some(seeded_checksum.as_str()));
+        assert!(
+            !photo_path
+                .with_file_name("rewrite_target.heic.meta-tmp")
+                .exists()
+        );
     }
 
     /// If the on-disk file has vanished between tagging and the rewrite

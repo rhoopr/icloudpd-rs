@@ -1018,14 +1018,12 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
     });
 }
 
-/// [metadata].embed_xmp on a HEIC file: embedded HEIC writes are temporarily
-/// skipped because the previous mp4-atom writer could corrupt Apple HEIC item
-/// graphs. Sync should still succeed and leave the downloaded HEIC usable;
-/// sidecars remain the supported HEIC metadata export path.
+/// [metadata].embed_xmp on a HEIC file uses the byte-preserving embedded XMP
+/// writer.  Sync should still succeed and leave the downloaded HEIC usable.
 #[cfg(feature = "xmp")]
 #[test]
 #[ignore]
-fn sync_embed_xmp_on_heic_skips_embedded_write() {
+fn sync_embed_xmp_on_heic_writes_embedded_xmp() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -1037,7 +1035,7 @@ fn sync_embed_xmp_on_heic_skips_embedded_write() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                metadata: "embed_xmp = true\n",
+                metadata: "embed_xmp = true\nset_exif_rating = true\n",
                 ..SyncToml::default()
             },
         )

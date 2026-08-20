@@ -92,8 +92,8 @@ console = "0.16"
 
 # XMP metadata via Adobe's XMP Toolkit (vendored C++ source).
 # Handles JPEG, PNG, TIFF, MP4, MOV, PSD, PDF, and more via XMPFiles.
-# Does NOT handle HEIC - the bundled XMPFiles has no HEIF handler. Embedded
-# HEIC writes are temporarily skipped while the replacement writer is spiked.
+# Does NOT handle HEIC - the bundled XMPFiles has no HEIF handler.  HEIC
+# containers use kei's byte-preserving XMP item writer instead.
 # Optional (behind the `xmp` feature, default-on) so platforms without a
 # working C++ toolchain for the vendored sources can opt out. See #256.
 xmp_toolkit = { version = "1", optional = true }
@@ -103,9 +103,9 @@ xmp_toolkit = { version = "1", optional = true }
 little_exif = "0.6"
 
 # ISO-BMFF (MP4 / HEIF / HEIC) atom parsing. HEIC's XMP packet lives in a
-# `mime`-type item inside the `meta` box; mp4-atom is currently used for
-# reading existing packets and for test-only fixtures while embedded HEIC
-# writes are disabled.
+# `mime`-type item inside the `meta` box; mp4-atom reads existing packets and
+# remains test-only for fixture construction because production HEIC writes
+# preserve raw item-graph bytes.
 #
 # Pinned because kei depends on specific HEIF fixes included in 0.11.0:
 #   - #123  `uri ` infe-item support for iOS 17+ HEICs (kei #274)

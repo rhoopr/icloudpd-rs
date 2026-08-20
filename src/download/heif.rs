@@ -1,14 +1,20 @@
-//! ISO-BMFF helpers for reading XMP from HEIC / HEIF / AVIF files.
+//! ISO-BMFF helpers for reading and safely updating XMP in HEIC / HEIF / AVIF
+//! files.
 //!
 //! Adobe's XMP Toolkit has no HEIF handler, so kei reads HEIF item metadata
-//! directly via [`mp4_atom`]. Embedded HEIC writes are temporarily disabled
-//! because the previous mp4-atom-backed writer could lossy-round-trip Apple
-//! item graphs.
-//!
-//! The old insertion code remains compiled for unit tests so existing parser
-//! fixtures can still seed XMP packets while the replacement writer is spiked.
+//! directly via [`mp4_atom`].  The writer below edits only the XMP item map and
+//! raw box headers.  All other boxes and payloads are copied byte-for-byte.
 
-#[cfg(test)]
+#![allow(
+    clippy::map_err_ignore,
+    reason = "Malformed untrusted bytes are reduced to stable typed layout errors at this boundary."
+)]
+#![allow(
+    clippy::type_complexity,
+    reason = "The parser returns a fixed group of layout coordinates used together for one rewrite."
+)]
+
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -47,6 +53,12 @@ pub(crate) enum HeifError {
         #[source]
         source: mp4_atom::Error,
     },
+
+    #[error("Could not safely rewrite HEIC XMP: {reason}")]
+    InvalidLayout { reason: &'static str },
+
+    #[error("HEIC XMP rewrite value does not fit in {field}")]
+    ValueOverflow { field: &'static str },
 
     #[cfg(test)]
     #[error("Could not find a top-level HEIC `meta` box after scanning {input_len} bytes")]
@@ -523,6 +535,1628 @@ pub(crate) fn extract_xmp_strict(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifEr
     Ok(None)
 }
 
+/// Resolve the TIFF payload from the HEIF `Exif` item associated with the
+/// primary image.
+///
+/// HEIF prefixes an Exif item with a four-byte big-endian offset from the end
+/// of that field to the TIFF header.  Only construction-method-0 items are
+/// supported because their extents address file bytes directly.
+pub(crate) fn extract_exif_tiff_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifError> {
+    let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes)?;
+    let iinf_layout = parse_iinf(bytes, iinf)?;
+    let Some(exif_item_id) =
+        select_exif_item_id(bytes, iref, primary_item_id, &iinf_layout.exif_item_ids)?
+    else {
+        return Ok(None);
+    };
+    let iloc_layout = parse_iloc(bytes, iloc)?;
+    let item = iloc_layout
+        .items
+        .iter()
+        .find(|item| item.item_id == exif_item_id)
+        .ok_or_else(|| invalid_layout("Exif item has no iloc entry"))?;
+    if item.construction_method != 0 {
+        return Err(invalid_layout(
+            "Exif item uses an unsupported construction method",
+        ));
+    }
+    let extents = resolve_item_extents(bytes, item)?;
+    if extents.is_empty() {
+        return Err(invalid_layout("Exif item has no extents"));
+    }
+    let payload_len = extents.iter().try_fold(0usize, |total, extent| {
+        total
+            .checked_add(extent.len())
+            .filter(|length| *length <= bytes.len())
+            .ok_or_else(|| invalid_layout("Exif item payload is too large"))
+    })?;
+    let mut payload = Vec::with_capacity(payload_len);
+    for extent in extents {
+        payload.extend_from_slice(extent);
+    }
+    let offset = payload
+        .get(..4)
+        .ok_or_else(|| invalid_layout("Exif item offset is truncated"))?;
+    let offset = usize::try_from(u32::from_be_bytes(
+        offset
+            .try_into()
+            .map_err(|_| invalid_layout("Exif item offset is invalid"))?,
+    ))
+    .map_err(|_| invalid_layout("Exif item offset is too large"))?;
+    let tiff_start = 4usize
+        .checked_add(offset)
+        .ok_or_else(|| invalid_layout("Exif TIFF offset overflows"))?;
+    let tiff = payload
+        .get(tiff_start..)
+        .ok_or_else(|| invalid_layout("Exif TIFF offset is outside the item"))?;
+    Ok(Some(tiff.to_vec()))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawBox {
+    start: usize,
+    size: usize,
+    header_size: usize,
+    kind: [u8; 4],
+}
+
+impl RawBox {
+    fn body_start(self) -> usize {
+        self.start + self.header_size
+    }
+
+    fn end(self) -> usize {
+        self.start + self.size
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IlocExtent {
+    offset_pos: Option<usize>,
+    length_pos: Option<usize>,
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IlocItem {
+    item_id: u32,
+    construction_method: u8,
+    base_offset_pos: Option<usize>,
+    base_offset: u64,
+    extents: Vec<IlocExtent>,
+}
+
+#[derive(Debug, Clone)]
+struct IlocLayout {
+    version: u8,
+    offset_size: u8,
+    length_size: u8,
+    base_offset_size: u8,
+    index_size: u8,
+    count_pos: usize,
+    count_size: usize,
+    items: Vec<IlocItem>,
+}
+
+#[derive(Debug)]
+struct IinfLayout {
+    version: u8,
+    count_pos: usize,
+    count_size: usize,
+    max_item_id: u32,
+    xmp_item_id: Option<u32>,
+    exif_item_ids: Vec<u32>,
+    item_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XmpLocation {
+    item_id: u32,
+    extent_start: usize,
+    extent_length: usize,
+}
+
+fn invalid_layout(reason: &'static str) -> HeifError {
+    HeifError::InvalidLayout { reason }
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The initial get proves the fixed eight-byte header before its size and type fields are sliced."
+)]
+fn parse_raw_box(bytes: &[u8], start: usize) -> Result<RawBox, HeifError> {
+    let header = bytes
+        .get(start..start.saturating_add(8))
+        .ok_or_else(|| invalid_layout("truncated ISO-BMFF box header"))?;
+    let size32 = u32::from_be_bytes(
+        header[0..4]
+            .try_into()
+            .map_err(|_| invalid_layout("invalid ISO-BMFF box size"))?,
+    );
+    let kind = header[4..8]
+        .try_into()
+        .map_err(|_| invalid_layout("invalid ISO-BMFF box type"))?;
+    let (header_size, size) = match size32 {
+        0 => {
+            return Err(invalid_layout(
+                "ISO-BMFF box has no explicit size and cannot be rewritten",
+            ));
+        }
+        1 => {
+            let large = bytes
+                .get(start + 8..start + 16)
+                .ok_or_else(|| invalid_layout("truncated large ISO-BMFF box header"))?;
+            let size = u64::from_be_bytes(
+                large
+                    .try_into()
+                    .map_err(|_| invalid_layout("invalid large ISO-BMFF box size"))?,
+            );
+            let size =
+                usize::try_from(size).map_err(|_| invalid_layout("ISO-BMFF box is too large"))?;
+            (16, size)
+        }
+        size => (8, size as usize),
+    };
+    if size < header_size {
+        return Err(invalid_layout("ISO-BMFF box is smaller than its header"));
+    }
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| invalid_layout("ISO-BMFF box end overflows"))?;
+    if end > bytes.len() {
+        return Err(invalid_layout("ISO-BMFF box extends past the file"));
+    }
+    Ok(RawBox {
+        start,
+        size,
+        header_size,
+        kind,
+    })
+}
+
+fn scan_raw_boxes(bytes: &[u8], start: usize, end: usize) -> Result<Vec<RawBox>, HeifError> {
+    if start > end || end > bytes.len() {
+        return Err(invalid_layout("invalid ISO-BMFF box range"));
+    }
+    let mut boxes = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let atom = parse_raw_box(bytes, cursor)?;
+        if atom.end() > end {
+            return Err(invalid_layout(
+                "nested ISO-BMFF box extends past its parent",
+            ));
+        }
+        boxes.push(atom);
+        cursor = atom.end();
+    }
+    if cursor != end {
+        return Err(invalid_layout(
+            "nested ISO-BMFF boxes leave a trailing fragment",
+        ));
+    }
+    Ok(boxes)
+}
+
+fn box_with_body(kind: [u8; 4], body: &[u8]) -> Result<Vec<u8>, HeifError> {
+    let size = body
+        .len()
+        .checked_add(8)
+        .ok_or_else(|| invalid_layout("rewritten ISO-BMFF box size overflows"))?;
+    let size =
+        u32::try_from(size).map_err(|_| invalid_layout("rewritten ISO-BMFF box is too large"))?;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(&kind);
+    out.extend_from_slice(body);
+    Ok(out)
+}
+
+fn patch_box_size(box_bytes: &mut [u8]) -> Result<(), HeifError> {
+    let size = u32::try_from(box_bytes.len())
+        .map_err(|_| invalid_layout("rewritten ISO-BMFF box is too large"))?;
+    let size_bytes = box_bytes
+        .get_mut(..4)
+        .ok_or_else(|| invalid_layout("rewritten ISO-BMFF box has no size field"))?;
+    size_bytes.copy_from_slice(&size.to_be_bytes());
+    Ok(())
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser proves the body range, and the explicit minimum lengths prove each fixed iinf field."
+)]
+fn parse_iinf(bytes: &[u8], iinf: RawBox) -> Result<IinfLayout, HeifError> {
+    let body = &bytes[iinf.body_start()..iinf.end()];
+    if body.len() < 6 {
+        return Err(invalid_layout("iinf box is truncated"));
+    }
+    let version = body[0];
+    let (count_pos, count_size, count) = match version {
+        0 => (4, 2, u16::from_be_bytes([body[4], body[5]]) as u32),
+        1 => {
+            if body.len() < 8 {
+                return Err(invalid_layout("iinf version 1 box is truncated"));
+            }
+            (
+                4,
+                4,
+                u32::from_be_bytes(
+                    body.get(4..8)
+                        .ok_or_else(|| invalid_layout("iinf entry count is truncated"))?
+                        .try_into()
+                        .map_err(|_| invalid_layout("invalid iinf entry count"))?,
+                ),
+            )
+        }
+        _ => return Err(invalid_layout("unsupported iinf version")),
+    };
+    let entry_start = count_pos + count_size;
+    let entries = scan_raw_boxes(body, entry_start, body.len())?;
+    if entries.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        return Err(invalid_layout(
+            "iinf entry count does not match its contents",
+        ));
+    }
+    let mut max_item_id = 0u32;
+    let mut xmp_item_id = None;
+    let mut exif_item_ids = Vec::new();
+    let mut item_ids = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        if entry.kind != *b"infe" {
+            return Err(invalid_layout("iinf contains a non-infe entry"));
+        }
+        let entry_body = &body[entry.body_start()..entry.end()];
+        let (item_id, item_type, content_type) = parse_infe(entry_body)?;
+        if !item_ids.insert(item_id) {
+            return Err(invalid_layout("iinf contains duplicate item IDs"));
+        }
+        max_item_id = max_item_id.max(item_id);
+        if item_type == Some(*b"mime")
+            && content_type.as_deref() == Some("application/rdf+xml")
+            && xmp_item_id.replace(item_id).is_some()
+        {
+            return Err(invalid_layout("HEIC contains multiple XMP items"));
+        }
+        if item_type == Some(*b"Exif") {
+            exif_item_ids.push(item_id);
+        }
+    }
+    Ok(IinfLayout {
+        version,
+        count_pos,
+        count_size,
+        max_item_id,
+        xmp_item_id,
+        exif_item_ids,
+        item_ids: item_ids.into_iter().collect(),
+    })
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The explicit version-specific minimum lengths prove each fixed infe field before access."
+)]
+fn parse_infe(body: &[u8]) -> Result<(u32, Option<[u8; 4]>, Option<String>), HeifError> {
+    if body.len() < 8 {
+        return Err(invalid_layout("infe box is truncated"));
+    }
+    let version = body[0];
+    let (item_id, type_pos) = match version {
+        0 => (u16::from_be_bytes([body[4], body[5]]) as u32, None),
+        1 => return Err(invalid_layout("unsupported infe version 1")),
+        2 => (u16::from_be_bytes([body[4], body[5]]) as u32, Some(8)),
+        3 => {
+            if body.len() < 14 {
+                return Err(invalid_layout("infe version 3 box is truncated"));
+            }
+            (
+                u32::from_be_bytes(
+                    body.get(4..8)
+                        .ok_or_else(|| invalid_layout("infe item id is truncated"))?
+                        .try_into()
+                        .map_err(|_| invalid_layout("invalid infe item id"))?,
+                ),
+                Some(10),
+            )
+        }
+        _ => return Err(invalid_layout("unsupported infe version")),
+    };
+    let Some(type_pos) = type_pos else {
+        return Ok((item_id, None, None));
+    };
+    let item_type = body
+        .get(type_pos..type_pos + 4)
+        .ok_or_else(|| invalid_layout("infe item type is truncated"))?
+        .try_into()
+        .map_err(|_| invalid_layout("invalid infe item type"))?;
+    let mut cursor = type_pos + 4;
+    skip_c_string(body, &mut cursor)?;
+    let content_type = if item_type == *b"mime" {
+        Some(read_c_string(body, &mut cursor)?.to_string())
+    } else if item_type == *b"uri " {
+        let _ = read_c_string(body, &mut cursor)?;
+        None
+    } else {
+        None
+    };
+    Ok((item_id, Some(item_type), content_type))
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The terminator position comes from iterating the same slice, so the string range is in bounds."
+)]
+fn read_c_string<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, HeifError> {
+    let rest = bytes
+        .get(*cursor..)
+        .ok_or_else(|| invalid_layout("unterminated HEIC item string"))?;
+    let end = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| invalid_layout("unterminated HEIC item string"))?;
+    let value = std::str::from_utf8(&rest[..end])
+        .map_err(|_| invalid_layout("HEIC item string is not UTF-8"))?;
+    *cursor += end + 1;
+    Ok(value)
+}
+
+fn skip_c_string(bytes: &[u8], cursor: &mut usize) -> Result<(), HeifError> {
+    let _ = read_c_string(bytes, cursor)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser proves the body range, and the explicit minimum lengths prove each fixed iloc field."
+)]
+fn parse_iloc(bytes: &[u8], iloc: RawBox) -> Result<IlocLayout, HeifError> {
+    let body = &bytes[iloc.body_start()..iloc.end()];
+    if body.len() < 8 {
+        return Err(invalid_layout("iloc box is truncated"));
+    }
+    let version = body[0];
+    if version > 2 {
+        return Err(invalid_layout("unsupported iloc version"));
+    }
+    let offset_size = body[4] >> 4;
+    let length_size = body[4] & 0x0f;
+    let base_offset_size = body[5] >> 4;
+    let index_size = if version == 0 { 0 } else { body[5] & 0x0f };
+    for size in [offset_size, length_size, base_offset_size, index_size] {
+        if !matches!(size, 0 | 4 | 8) {
+            return Err(invalid_layout("iloc uses a reserved field width"));
+        }
+    }
+    let (count_pos, count_size, count) = if version == 2 {
+        if body.len() < 10 {
+            return Err(invalid_layout("iloc version 2 box is truncated"));
+        }
+        (
+            6,
+            4,
+            u32::from_be_bytes(
+                body.get(6..10)
+                    .ok_or_else(|| invalid_layout("iloc item count is truncated"))?
+                    .try_into()
+                    .map_err(|_| invalid_layout("invalid iloc item count"))?,
+            ) as u64,
+        )
+    } else {
+        (6, 2, u16::from_be_bytes([body[6], body[7]]) as u64)
+    };
+    let count =
+        usize::try_from(count).map_err(|_| invalid_layout("iloc item count is too large"))?;
+    // Every item occupies at least its id, the optional construction and
+    // reserved fields, the data-reference index, its base offset, and the
+    // extent count.  Reject a count that cannot be backed by the remaining
+    // body so a crafted iloc cannot force a large speculative allocation.
+    let item_id_size = if version == 2 { 4u8 } else { 2 };
+    let min_item_bytes = usize::from(item_id_size)
+        + usize::from(if version == 0 { 0u8 } else { 2 })
+        + 2
+        + usize::from(base_offset_size)
+        + 2;
+    let body_after_count = body.len() - (count_pos + count_size);
+    if count > body_after_count / min_item_bytes {
+        return Err(invalid_layout("iloc item count exceeds its box body"));
+    }
+    let mut cursor = count_pos + count_size;
+    let mut items = Vec::with_capacity(count);
+    let mut item_ids = HashSet::with_capacity(count);
+    for _ in 0..count {
+        let item_id = u32::try_from(read_uint(body, &mut cursor, item_id_size)?)
+            .map_err(|_| invalid_layout("iloc item ID is too large"))?;
+        if !item_ids.insert(item_id) {
+            return Err(invalid_layout("iloc contains duplicate item IDs"));
+        }
+        let construction_method = if version == 0 {
+            0
+        } else {
+            let packed = read_uint(body, &mut cursor, 2)?;
+            (packed & 0x0f) as u8
+        };
+        let _data_reference_index = read_uint(body, &mut cursor, 2)?;
+        let base_offset_pos = if base_offset_size == 0 {
+            None
+        } else {
+            Some(cursor)
+        };
+        let base_offset = read_uint(body, &mut cursor, base_offset_size)?;
+        let extent_count = read_uint(body, &mut cursor, 2)?;
+        let extent_count = usize::try_from(extent_count)
+            .map_err(|_| invalid_layout("iloc extent count is too large"))?;
+        // Each extent occupies its optional index plus its offset and length
+        // fields (index_size is zero for version 0).  When all three widths are
+        // zero the extents carry no bytes, so more than one is meaningless;
+        // otherwise reject a count the remaining body cannot hold before
+        // allocating for it.
+        let min_extent_bytes =
+            usize::from(index_size) + usize::from(offset_size) + usize::from(length_size);
+        let max_extents = match min_extent_bytes {
+            0 => 1,
+            unit => (body.len() - cursor) / unit,
+        };
+        if extent_count > max_extents {
+            return Err(invalid_layout("iloc extent count exceeds its box body"));
+        }
+        let mut extents = Vec::with_capacity(extent_count);
+        for _ in 0..extent_count {
+            if version != 0 {
+                let _ = read_uint(body, &mut cursor, index_size)?;
+            }
+            let offset_pos = if offset_size == 0 { None } else { Some(cursor) };
+            let offset = read_uint(body, &mut cursor, offset_size)?;
+            let length_pos = if length_size == 0 { None } else { Some(cursor) };
+            let length = read_uint(body, &mut cursor, length_size)?;
+            extents.push(IlocExtent {
+                offset_pos,
+                length_pos,
+                offset,
+                length,
+            });
+        }
+        items.push(IlocItem {
+            item_id,
+            construction_method,
+            base_offset_pos,
+            base_offset,
+            extents,
+        });
+    }
+    if cursor != body.len() {
+        return Err(invalid_layout("iloc contains an unparsed tail"));
+    }
+    Ok(IlocLayout {
+        version,
+        offset_size,
+        length_size,
+        base_offset_size,
+        index_size,
+        count_pos,
+        count_size,
+        items,
+    })
+}
+
+fn read_uint(bytes: &[u8], cursor: &mut usize, width: u8) -> Result<u64, HeifError> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Ok(0);
+    }
+    let end = cursor
+        .checked_add(width)
+        .ok_or_else(|| invalid_layout("HEIC integer position overflows"))?;
+    let value = match width {
+        2 => u16::from_be_bytes(
+            bytes
+                .get(*cursor..end)
+                .ok_or_else(|| invalid_layout("truncated HEIC integer"))?
+                .try_into()
+                .map_err(|_| invalid_layout("invalid HEIC integer"))?,
+        ) as u64,
+        4 => u32::from_be_bytes(
+            bytes
+                .get(*cursor..end)
+                .ok_or_else(|| invalid_layout("truncated HEIC integer"))?
+                .try_into()
+                .map_err(|_| invalid_layout("invalid HEIC integer"))?,
+        ) as u64,
+        8 => u64::from_be_bytes(
+            bytes
+                .get(*cursor..end)
+                .ok_or_else(|| invalid_layout("truncated HEIC integer"))?
+                .try_into()
+                .map_err(|_| invalid_layout("invalid HEIC integer"))?,
+        ),
+        _ => return Err(invalid_layout("unsupported HEIC integer width")),
+    };
+    *cursor = end;
+    Ok(value)
+}
+
+fn write_uint(bytes: &mut [u8], pos: usize, width: u8, value: u64) -> Result<(), HeifError> {
+    let width = usize::from(width);
+    if width == 0 {
+        if value == 0 {
+            return Ok(());
+        }
+        return Err(invalid_layout(
+            "non-zero value cannot use a zero-width field",
+        ));
+    }
+    let end = pos
+        .checked_add(width)
+        .ok_or_else(|| invalid_layout("HEIC integer position overflows"))?;
+    let dst = bytes
+        .get_mut(pos..end)
+        .ok_or_else(|| invalid_layout("HEIC integer field is truncated"))?;
+    match width {
+        2 => {
+            let value = u16::try_from(value).map_err(|_| HeifError::ValueOverflow {
+                field: "16-bit HEIC field",
+            })?;
+            dst.copy_from_slice(&value.to_be_bytes());
+        }
+        4 => {
+            let value = u32::try_from(value).map_err(|_| HeifError::ValueOverflow {
+                field: "32-bit HEIC field",
+            })?;
+            dst.copy_from_slice(&value.to_be_bytes());
+        }
+        8 => dst.copy_from_slice(&value.to_be_bytes()),
+        _ => return Err(invalid_layout("unsupported HEIC integer width")),
+    }
+    Ok(())
+}
+
+fn find_meta_layout(
+    bytes: &[u8],
+) -> Result<(RawBox, RawBox, RawBox, Option<RawBox>, u32, usize), HeifError> {
+    let top = scan_raw_boxes(bytes, 0, bytes.len())?;
+    let meta = top
+        .iter()
+        .copied()
+        .find(|atom| atom.kind == *b"meta")
+        .ok_or_else(|| invalid_layout("HEIC has no top-level meta box"))?;
+    const MAX_REWRITE_META_BYTES: usize = 8 * 1024 * 1024;
+    if meta.size > MAX_REWRITE_META_BYTES {
+        return Err(invalid_layout(
+            "HEIC meta box is too large to rewrite safely",
+        ));
+    }
+    if meta.header_size != 8 {
+        return Err(invalid_layout("large-size meta boxes are unsupported"));
+    }
+    let body_start = meta.body_start();
+    let body_end = meta.end();
+    let prefix_size = if bytes
+        .get(body_start + 8..body_start + 12)
+        .is_some_and(|kind| kind == b"hdlr")
+    {
+        4
+    } else if bytes
+        .get(body_start + 4..body_start + 8)
+        .is_some_and(|kind| kind == b"hdlr")
+    {
+        0
+    } else {
+        return Err(invalid_layout("HEIC meta box has no handler box"));
+    };
+    let children = scan_raw_boxes(bytes, body_start + prefix_size, body_end)?;
+    let iinf = children
+        .iter()
+        .copied()
+        .find(|atom| atom.kind == *b"iinf")
+        .ok_or_else(|| invalid_layout("HEIC meta box has no iinf box"))?;
+    let iloc = children
+        .iter()
+        .copied()
+        .find(|atom| atom.kind == *b"iloc")
+        .ok_or_else(|| invalid_layout("HEIC meta box has no iloc box"))?;
+    let iref = children.iter().copied().find(|atom| atom.kind == *b"iref");
+    let pitm = children
+        .iter()
+        .copied()
+        .find(|atom| atom.kind == *b"pitm")
+        .ok_or_else(|| invalid_layout("HEIC meta box has no primary item"))?;
+    let primary_item_id = parse_primary_item_id(bytes, pitm)?;
+    if iinf.header_size != 8 || iloc.header_size != 8 {
+        return Err(invalid_layout(
+            "large-size iinf or iloc boxes are unsupported",
+        ));
+    }
+    if let Some(iref) = iref
+        && iref.header_size != 8
+    {
+        return Err(invalid_layout("large-size iref boxes are unsupported"));
+    }
+    Ok((meta, iinf, iloc, iref, primary_item_id, prefix_size))
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser proves the body range, and the six-byte minimum proves the version-0 pitm fields."
+)]
+fn parse_primary_item_id(bytes: &[u8], pitm: RawBox) -> Result<u32, HeifError> {
+    let body = &bytes[pitm.body_start()..pitm.end()];
+    if body.len() < 6 {
+        return Err(invalid_layout("pitm box is truncated"));
+    }
+    match body[0] {
+        0 => Ok(u32::from(u16::from_be_bytes([body[4], body[5]]))),
+        1 => {
+            let item_id = body
+                .get(4..8)
+                .ok_or_else(|| invalid_layout("pitm version 1 box is truncated"))?;
+            Ok(u32::from_be_bytes(
+                item_id
+                    .try_into()
+                    .map_err(|_| invalid_layout("invalid pitm item id"))?,
+            ))
+        }
+        _ => Err(invalid_layout("unsupported pitm version")),
+    }
+}
+
+fn resolve_item_extents<'a>(bytes: &'a [u8], item: &IlocItem) -> Result<Vec<&'a [u8]>, HeifError> {
+    let mut resolved = Vec::with_capacity(item.extents.len());
+    for extent in &item.extents {
+        let start = item
+            .base_offset
+            .checked_add(extent.offset)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| invalid_layout("HEIC item offset overflows"))?;
+        let length = usize::try_from(extent.length)
+            .map_err(|_| invalid_layout("HEIC item extent is too large"))?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| invalid_layout("HEIC item extent overflows"))?;
+        let data = bytes
+            .get(start..end)
+            .ok_or_else(|| invalid_layout("HEIC item extent is outside the file"))?;
+        resolved.push(data);
+    }
+    Ok(resolved)
+}
+
+fn opaque_meta_sub_boxes(bytes: &[u8]) -> Result<Vec<([u8; 4], usize, usize)>, HeifError> {
+    let (meta, _, _, _, _, prefix_size) = find_meta_layout(bytes)?;
+    let children = scan_raw_boxes(bytes, meta.body_start() + prefix_size, meta.end())?;
+    Ok(children
+        .into_iter()
+        .filter(|child| !matches!(&child.kind, b"iinf" | b"iloc" | b"iref"))
+        .map(|child| (child.kind, child.start, child.end()))
+        .collect())
+}
+
+/// Verify that a rewritten HEIF preserves every non-XMP item payload and every
+/// opaque `meta` sub-box byte-for-byte.
+///
+/// The writer may update `iinf`, `iloc`, and `iref`, and may replace or append
+/// the XMP payload.  Any other difference is unsafe because it can redirect or
+/// damage image data while leaving the XMP item readable.
+pub(crate) fn validate_rewrite_preserves_non_xmp_items(
+    input: &[u8],
+    rewritten: &[u8],
+) -> Result<(), HeifError> {
+    let (_, input_iinf, input_iloc, _, _, _) = find_meta_layout(input)?;
+    let input_iinf_layout = parse_iinf(input, input_iinf)?;
+    let input_iloc_layout = parse_iloc(input, input_iloc)?;
+    let (_, rewritten_iinf, rewritten_iloc, _, _, _) = find_meta_layout(rewritten)?;
+    let rewritten_iinf_layout = parse_iinf(rewritten, rewritten_iinf)?;
+    let rewritten_iloc_layout = parse_iloc(rewritten, rewritten_iloc)?;
+
+    let input_items = input_iloc_layout
+        .items
+        .iter()
+        .filter(|item| {
+            item.construction_method == 0 && Some(item.item_id) != input_iinf_layout.xmp_item_id
+        })
+        .collect::<Vec<_>>();
+    let rewritten_items = rewritten_iloc_layout
+        .items
+        .iter()
+        .filter(|item| {
+            item.construction_method == 0 && Some(item.item_id) != rewritten_iinf_layout.xmp_item_id
+        })
+        .collect::<Vec<_>>();
+    if input_items.len() != rewritten_items.len() {
+        return Err(invalid_layout(
+            "HEIC rewrite changed the construction-method-0 item set",
+        ));
+    }
+    for input_item in input_items {
+        let rewritten_item = rewritten_items
+            .iter()
+            .find(|item| item.item_id == input_item.item_id)
+            .ok_or_else(|| invalid_layout("HEIC rewrite removed a non-XMP item"))?;
+        let input_extents = resolve_item_extents(input, input_item)?;
+        let rewritten_extents = resolve_item_extents(rewritten, rewritten_item)?;
+        if input_extents.len() != rewritten_extents.len()
+            || input_extents
+                .iter()
+                .zip(&rewritten_extents)
+                .any(|(before, after)| before != after)
+        {
+            return Err(invalid_layout(
+                "HEIC rewrite changed a non-XMP item payload",
+            ));
+        }
+    }
+
+    let input_meta = opaque_meta_sub_boxes(input)?;
+    let rewritten_meta = opaque_meta_sub_boxes(rewritten)?;
+    if input_meta.len() != rewritten_meta.len() {
+        return Err(invalid_layout(
+            "HEIC rewrite changed the opaque meta sub-box set",
+        ));
+    }
+    for ((input_kind, input_start, input_end), (rewritten_kind, rewritten_start, rewritten_end)) in
+        input_meta.iter().zip(&rewritten_meta)
+    {
+        if input_kind != rewritten_kind
+            || input.get(*input_start..*input_end)
+                != rewritten.get(*rewritten_start..*rewritten_end)
+        {
+            return Err(invalid_layout(
+                "HEIC rewrite changed an opaque meta sub-box",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_insertion_layout(bytes: &[u8]) -> Result<(), HeifError> {
+    let top = scan_raw_boxes(bytes, 0, bytes.len())?;
+    for atom in top {
+        let allowed = atom.kind == *b"ftyp"
+            || atom.kind == *b"meta"
+            || atom.kind == *b"mdat"
+            || atom.kind == *b"free"
+            || atom.kind == *b"wide";
+        if !allowed {
+            return Err(invalid_layout(
+                "HEIC insertion refuses top-level boxes with unhandled file offsets",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse insertion when a construction-method-0 item's data overlaps the
+/// `meta` box.  Insertion grows `meta` and relocates everything after it, so an
+/// item whose bytes fall inside the region being rewritten cannot be preserved
+/// or safely repointed.  Such a layout is malformed; fail closed and leave the
+/// file untouched rather than emit a file whose item points at changed bytes.
+fn reject_meta_overlapping_items(layout: &IlocLayout, meta: RawBox) -> Result<(), HeifError> {
+    let meta_start = meta.start as u64;
+    let meta_end = meta.end() as u64;
+    for item in &layout.items {
+        if item.construction_method != 0 {
+            continue;
+        }
+        for extent in &item.extents {
+            let start = item
+                .base_offset
+                .checked_add(extent.offset)
+                .ok_or_else(|| invalid_layout("HEIC item offset overflows"))?;
+            let end = start
+                .checked_add(extent.length)
+                .ok_or_else(|| invalid_layout("HEIC item extent overflows"))?;
+            if start < meta_end && meta_start < end {
+                return Err(invalid_layout(
+                    "HEIC item data overlaps the meta box and cannot be rewritten",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn make_infe(item_id: u32) -> Result<Vec<u8>, HeifError> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[if item_id <= u16::MAX as u32 { 2 } else { 3 }, 0, 0, 0]);
+    if item_id <= u16::MAX as u32 {
+        let item_id = u16::try_from(item_id)
+            .map_err(|_| invalid_layout("HEIC item ID does not fit infe version 2"))?;
+        body.extend_from_slice(&item_id.to_be_bytes());
+    } else {
+        body.extend_from_slice(&item_id.to_be_bytes());
+    }
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(b"mime");
+    body.extend_from_slice(b"XMP\0");
+    body.extend_from_slice(b"application/rdf+xml\0");
+    body.push(0);
+    box_with_body(*b"infe", &body)
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser proves the iinf body range before it is copied for a bounded field update."
+)]
+fn append_iinf_entry(
+    bytes: &[u8],
+    iinf: RawBox,
+    count_pos: usize,
+    count_size: usize,
+    item_id: u32,
+) -> Result<Vec<u8>, HeifError> {
+    let body = &bytes[iinf.body_start()..iinf.end()];
+    let entry = make_infe(item_id)?;
+    let mut new_body = body.to_vec();
+    let mut count_cursor = count_pos;
+    let count_size =
+        u8::try_from(count_size).map_err(|_| invalid_layout("iinf count width is too large"))?;
+    let count = read_uint(new_body.as_slice(), &mut count_cursor, count_size)?;
+    let new_count = count
+        .checked_add(1)
+        .ok_or_else(|| invalid_layout("iinf entry count overflows"))?;
+    write_uint(&mut new_body, count_pos, count_size, new_count)?;
+    new_body.extend_from_slice(&entry);
+    box_with_body(iinf.kind, &new_body)
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser and version-specific size checks prove every iref child field before direct access."
+)]
+fn cdsc_sources_for_target(
+    bytes: &[u8],
+    iref: RawBox,
+    target_item_id: u32,
+) -> Result<Vec<u32>, HeifError> {
+    let body = &bytes[iref.body_start()..iref.end()];
+    if body.len() < 4 {
+        return Err(invalid_layout("iref box is truncated"));
+    }
+    let version = body[0];
+    let children = scan_raw_boxes(body, 4, body.len())?;
+    let mut sources = Vec::new();
+    for child in children {
+        if child.kind != *b"cdsc" {
+            continue;
+        }
+        let child_body = &body[child.body_start()..child.end()];
+        let (from_item_id, count_pos, id_width) = match version {
+            0 => {
+                if child_body.len() < 4 {
+                    return Err(invalid_layout("iref child is truncated"));
+                }
+                (
+                    u32::from(u16::from_be_bytes([child_body[0], child_body[1]])),
+                    2,
+                    2,
+                )
+            }
+            1 => {
+                if child_body.len() < 6 {
+                    return Err(invalid_layout("iref version 1 child is truncated"));
+                }
+                (
+                    u32::from_be_bytes(
+                        child_body[0..4]
+                            .try_into()
+                            .map_err(|_| invalid_layout("invalid iref source item ID"))?,
+                    ),
+                    4,
+                    4,
+                )
+            }
+            _ => return Err(invalid_layout("unsupported iref version")),
+        };
+        let count = usize::from(u16::from_be_bytes(
+            child_body[count_pos..count_pos + 2]
+                .try_into()
+                .map_err(|_| invalid_layout("invalid iref reference count"))?,
+        ));
+        let expected_len = count_pos
+            .checked_add(2)
+            .and_then(|length| length.checked_add(count.checked_mul(id_width)?))
+            .ok_or_else(|| invalid_layout("iref reference list overflows"))?;
+        if child_body.len() != expected_len {
+            return Err(invalid_layout("iref reference list is inconsistent"));
+        }
+        for index in 0..count {
+            let start = count_pos + 2 + index * id_width;
+            let to_item_id = if id_width == 2 {
+                u32::from(u16::from_be_bytes([
+                    child_body[start],
+                    child_body[start + 1],
+                ]))
+            } else {
+                u32::from_be_bytes(
+                    child_body[start..start + id_width]
+                        .try_into()
+                        .map_err(|_| invalid_layout("invalid iref target item ID"))?,
+                )
+            };
+            if to_item_id == target_item_id {
+                sources.push(from_item_id);
+                break;
+            }
+        }
+    }
+    Ok(sources)
+}
+
+fn select_exif_item_id(
+    bytes: &[u8],
+    iref: Option<RawBox>,
+    primary_item_id: u32,
+    exif_item_ids: &[u32],
+) -> Result<Option<u32>, HeifError> {
+    match exif_item_ids {
+        [] => Ok(None),
+        [item_id] => Ok(Some(*item_id)),
+        _ => {
+            let Some(iref) = iref else {
+                return Err(invalid_layout(
+                    "multiple Exif items have no primary-image association",
+                ));
+            };
+            let associated = cdsc_sources_for_target(bytes, iref, primary_item_id)?;
+            let mut matches = exif_item_ids
+                .iter()
+                .copied()
+                .filter(|item_id| associated.contains(item_id));
+            let Some(item_id) = matches.next() else {
+                return Err(invalid_layout(
+                    "multiple Exif items have no primary-image association",
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(invalid_layout(
+                    "multiple Exif items describe the primary image",
+                ));
+            }
+            Ok(Some(item_id))
+        }
+    }
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser and version-specific size checks prove every iref child field before direct access."
+)]
+fn append_cdsc_reference(
+    bytes: &[u8],
+    iref: RawBox,
+    xmp_item_id: u32,
+    primary_item_id: u32,
+    known_item_ids: &[u32],
+) -> Result<Vec<u8>, HeifError> {
+    let body = &bytes[iref.body_start()..iref.end()];
+    if body.len() < 4 {
+        return Err(invalid_layout("iref box is truncated"));
+    }
+    let version = body[0];
+    let children = scan_raw_boxes(body, 4, body.len())?;
+    let known_item_ids: HashSet<u32> = known_item_ids.iter().copied().collect();
+    for child in children {
+        let child_body = &body[child.body_start()..child.end()];
+        let (from_item_id, count_pos, id_width) = match version {
+            0 => {
+                if child_body.len() < 4 {
+                    return Err(invalid_layout("iref child is truncated"));
+                }
+                (
+                    u32::from(u16::from_be_bytes([child_body[0], child_body[1]])),
+                    2,
+                    2,
+                )
+            }
+            1 => {
+                if child_body.len() < 6 {
+                    return Err(invalid_layout("iref version 1 child is truncated"));
+                }
+                (
+                    u32::from_be_bytes(
+                        child_body[0..4]
+                            .try_into()
+                            .map_err(|_| invalid_layout("invalid iref source item ID"))?,
+                    ),
+                    4,
+                    4,
+                )
+            }
+            _ => return Err(invalid_layout("unsupported iref version")),
+        };
+        let count = u16::from_be_bytes(
+            child_body[count_pos..count_pos + 2]
+                .try_into()
+                .map_err(|_| invalid_layout("invalid iref reference count"))?,
+        ) as usize;
+        let expected_len = count_pos
+            .checked_add(2)
+            .and_then(|len| len.checked_add(count.checked_mul(id_width)?))
+            .ok_or_else(|| invalid_layout("iref reference list overflows"))?;
+        if child_body.len() != expected_len {
+            return Err(invalid_layout("iref reference list is inconsistent"));
+        }
+        if !known_item_ids.contains(&from_item_id) {
+            return Err(invalid_layout("iref source item ID is absent from iinf"));
+        }
+        for index in 0..count {
+            let start = count_pos + 2 + index * id_width;
+            let to_item_id = if id_width == 2 {
+                u32::from(u16::from_be_bytes([
+                    child_body[start],
+                    child_body[start + 1],
+                ]))
+            } else {
+                u32::from_be_bytes(
+                    child_body[start..start + id_width]
+                        .try_into()
+                        .map_err(|_| invalid_layout("invalid iref target item ID"))?,
+                )
+            };
+            if !known_item_ids.contains(&to_item_id) {
+                return Err(invalid_layout("iref target item ID is absent from iinf"));
+            }
+        }
+    }
+    let mut new_body = body.to_vec();
+    let mut cdsc_body = Vec::new();
+    match version {
+        0 => {
+            let xmp_item_id = u16::try_from(xmp_item_id).map_err(|_| HeifError::ValueOverflow {
+                field: "16-bit cdsc source item id",
+            })?;
+            let primary_item_id =
+                u16::try_from(primary_item_id).map_err(|_| HeifError::ValueOverflow {
+                    field: "16-bit cdsc target item id",
+                })?;
+            cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
+            cdsc_body.extend_from_slice(&1u16.to_be_bytes());
+            cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
+        }
+        1 => {
+            cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
+            cdsc_body.extend_from_slice(&1u16.to_be_bytes());
+            cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
+        }
+        _ => return Err(invalid_layout("unsupported iref version")),
+    }
+    new_body.extend_from_slice(&box_with_body(*b"cdsc", &cdsc_body)?);
+    box_with_body(iref.kind, &new_body)
+}
+
+/// Build a fresh `iref` box carrying a single `cdsc` reference from the new XMP
+/// item to the primary image.  Used when a file has no `iref` of its own so
+/// insertion can still associate the descriptive XMP with the image, the way
+/// Apple's own writer does, rather than refusing the file and leaving a retry
+/// marker that never resolves.  Version 0 encodes 16-bit ids; version 1 is used
+/// when either id exceeds 16 bits.
+fn synthesise_cdsc_iref(xmp_item_id: u32, primary_item_id: u32) -> Result<Vec<u8>, HeifError> {
+    let mut cdsc_body = Vec::new();
+    let version = if xmp_item_id <= u32::from(u16::MAX) && primary_item_id <= u32::from(u16::MAX) {
+        let xmp_item_id = u16::try_from(xmp_item_id)
+            .map_err(|_| invalid_layout("XMP item ID does not fit iref version 0"))?;
+        let primary_item_id = u16::try_from(primary_item_id)
+            .map_err(|_| invalid_layout("primary item ID does not fit iref version 0"))?;
+        cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
+        cdsc_body.extend_from_slice(&1u16.to_be_bytes());
+        cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
+        0u8
+    } else {
+        cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
+        cdsc_body.extend_from_slice(&1u16.to_be_bytes());
+        cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
+        1u8
+    };
+    let mut body = vec![version, 0, 0, 0];
+    body.extend_from_slice(&box_with_body(*b"cdsc", &cdsc_body)?);
+    box_with_body(*b"iref", &body)
+}
+
+fn locate_xmp(
+    bytes: &[u8],
+    iinf: RawBox,
+    iloc: RawBox,
+) -> Result<
+    (
+        Option<XmpLocation>,
+        Option<u32>,
+        u32,
+        u8,
+        usize,
+        usize,
+        Vec<u32>,
+    ),
+    HeifError,
+> {
+    let iinf_layout = parse_iinf(bytes, iinf)?;
+    let iloc_layout = parse_iloc(bytes, iloc)?;
+    let mut max_item_id = iinf_layout.max_item_id;
+    for item in &iloc_layout.items {
+        if !iinf_layout.item_ids.contains(&item.item_id) {
+            return Err(invalid_layout("iloc contains an item ID absent from iinf"));
+        }
+        max_item_id = max_item_id.max(item.item_id);
+    }
+    let xmp = iinf_layout.xmp_item_id.and_then(|item_id| {
+        iloc_layout
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)
+            .and_then(|item| {
+                let extent = item.extents.first()?;
+                let start = item.base_offset.checked_add(extent.offset)?;
+                let start = usize::try_from(start).ok()?;
+                let length = usize::try_from(extent.length).ok()?;
+                let end = start.checked_add(length)?;
+                if item.construction_method == 0 && end <= bytes.len() {
+                    Some(XmpLocation {
+                        item_id,
+                        extent_start: start,
+                        extent_length: length,
+                    })
+                } else {
+                    None
+                }
+            })
+    });
+    Ok((
+        xmp,
+        iinf_layout.xmp_item_id,
+        max_item_id,
+        iinf_layout.version,
+        iinf_layout.count_pos,
+        iinf_layout.count_size,
+        iinf_layout.item_ids,
+    ))
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser proves the iloc body range, and the single-extent check proves the accessed entry."
+)]
+fn rewrite_existing_iloc(
+    bytes: &[u8],
+    iloc: RawBox,
+    layout: &IlocLayout,
+    item_id: u32,
+    new_offset: u64,
+    new_length: u64,
+) -> Result<Vec<u8>, HeifError> {
+    let body = &bytes[iloc.body_start()..iloc.end()];
+    let mut new_body = body.to_vec();
+    let item = layout
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)
+        .ok_or_else(|| invalid_layout("XMP item has no iloc entry"))?;
+    if item.construction_method != 0 || item.extents.len() != 1 {
+        return Err(invalid_layout("XMP item uses an unsupported iloc layout"));
+    }
+    let extent = &item.extents[0];
+    if let Some(pos) = extent.offset_pos {
+        let offset = new_offset
+            .checked_sub(item.base_offset)
+            .ok_or_else(|| invalid_layout("XMP iloc offset is below its base offset"))?;
+        write_uint(&mut new_body, pos, layout.offset_size, offset)?;
+    } else if let Some(pos) = item.base_offset_pos {
+        write_uint(&mut new_body, pos, layout.base_offset_size, new_offset)?;
+    } else if new_offset != 0 {
+        return Err(invalid_layout("XMP iloc has no writable offset field"));
+    }
+    if let Some(pos) = extent.length_pos {
+        write_uint(&mut new_body, pos, layout.length_size, new_length)?;
+    } else if new_length != 0 {
+        return Err(invalid_layout("XMP iloc has no writable length field"));
+    }
+    box_with_body(iloc.kind, &new_body)
+}
+
+fn xmp_extent_is_shared(
+    layout: &IlocLayout,
+    item_id: u32,
+    extent_start: u64,
+    extent_length: u64,
+) -> bool {
+    let Some(extent_end) = extent_start.checked_add(extent_length) else {
+        return true;
+    };
+    layout.items.iter().any(|item| {
+        item.item_id != item_id
+            && item.construction_method == 0
+            && item.extents.iter().any(|extent| {
+                let Some(start) = item.base_offset.checked_add(extent.offset) else {
+                    return true;
+                };
+                let Some(end) = start.checked_add(extent.length) else {
+                    return true;
+                };
+                start < extent_end && extent_start < end
+            })
+    })
+}
+
+fn extent_is_within_mdat_payload(
+    bytes: &[u8],
+    extent_start: usize,
+    extent_length: usize,
+) -> Result<bool, HeifError> {
+    let extent_end = extent_start
+        .checked_add(extent_length)
+        .ok_or_else(|| invalid_layout("existing XMP extent overflows"))?;
+    Ok(scan_raw_boxes(bytes, 0, bytes.len())?
+        .into_iter()
+        .filter(|atom| atom.kind == *b"mdat")
+        .any(|atom| atom.body_start() <= extent_start && extent_end <= atom.end()))
+}
+
+fn make_new_iloc_entry(
+    layout: &IlocLayout,
+    item_id: u32,
+    data_offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, HeifError> {
+    let id_width = if layout.version == 2 { 4 } else { 2 };
+    let mut entry = Vec::new();
+    write_uint_vec(&mut entry, id_width, u64::from(item_id))?;
+    if layout.version != 0 {
+        write_uint_vec(&mut entry, 2, 0)?;
+    }
+    write_uint_vec(&mut entry, 2, 0)?;
+    // The item's file position must land in whichever field can hold it: the
+    // extent offset when present, otherwise the base offset.  Writing it to a
+    // zero-width field would silently drop it and point the item at offset 0.
+    let (base_value, offset_value) = if layout.offset_size != 0 {
+        (0, data_offset)
+    } else if layout.base_offset_size != 0 {
+        (data_offset, 0)
+    } else {
+        return Err(invalid_layout("XMP iloc cannot represent a file offset"));
+    };
+    write_uint_vec(&mut entry, layout.base_offset_size, base_value)?;
+    write_uint_vec(&mut entry, 2, 1)?;
+    if layout.version != 0 {
+        write_uint_vec(&mut entry, layout.index_size, 0)?;
+    }
+    write_uint_vec(&mut entry, layout.offset_size, offset_value)?;
+    write_uint_vec(&mut entry, layout.length_size, length)?;
+    Ok(entry)
+}
+
+fn write_uint_vec(bytes: &mut Vec<u8>, width: u8, value: u64) -> Result<(), HeifError> {
+    match width {
+        0 => {
+            if value != 0 {
+                return Err(invalid_layout(
+                    "non-zero value cannot use a zero-width field",
+                ));
+            }
+        }
+        2 => bytes.extend_from_slice(
+            &u16::try_from(value)
+                .map_err(|_| HeifError::ValueOverflow {
+                    field: "16-bit HEIC field",
+                })?
+                .to_be_bytes(),
+        ),
+        4 => bytes.extend_from_slice(
+            &u32::try_from(value)
+                .map_err(|_| HeifError::ValueOverflow {
+                    field: "32-bit HEIC field",
+                })?
+                .to_be_bytes(),
+        ),
+        8 => bytes.extend_from_slice(&value.to_be_bytes()),
+        _ => return Err(invalid_layout("unsupported HEIC integer width")),
+    }
+    Ok(())
+}
+
+/// Whether an extent's absolute start sits at or past the boundary where the
+/// appended metadata begins, so it must move with the shift.  An offset that
+/// overflows `u64` is treated as past the boundary; the shift below uses
+/// `checked_add` and rejects an offset it cannot represent rather than writing
+/// a wrapped value.
+fn extent_at_or_past_boundary(base_offset: u64, extent_offset: u64, boundary: u64) -> bool {
+    extent_offset
+        .checked_add(base_offset)
+        .is_none_or(|absolute| absolute >= boundary)
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "The raw-box parser proves the iloc body range before the validated field positions are updated."
+)]
+fn append_iloc_entry(
+    bytes: &[u8],
+    iloc: RawBox,
+    layout: &IlocLayout,
+    item_id: u32,
+    data_offset: u64,
+    length: u64,
+    delta: u64,
+    shift_boundary: u64,
+) -> Result<Vec<u8>, HeifError> {
+    let body = &bytes[iloc.body_start()..iloc.end()];
+    let mut new_body = body.to_vec();
+    for item in &layout.items {
+        if item.construction_method != 0 {
+            continue;
+        }
+        let shifted = item
+            .extents
+            .iter()
+            .map(|extent| {
+                extent_at_or_past_boundary(item.base_offset, extent.offset, shift_boundary)
+            })
+            .collect::<Vec<_>>();
+        if shifted.iter().any(|shift| *shift) {
+            if shifted.iter().all(|shift| *shift) {
+                if let Some(pos) = item.base_offset_pos {
+                    write_uint(
+                        &mut new_body,
+                        pos,
+                        layout.base_offset_size,
+                        item.base_offset
+                            .checked_add(delta)
+                            .ok_or_else(|| invalid_layout("HEIC iloc base offset overflows"))?,
+                    )?;
+                } else if item
+                    .extents
+                    .iter()
+                    .any(|extent| extent.offset_pos.is_none())
+                {
+                    return Err(invalid_layout("HEIC iloc offset cannot be shifted safely"));
+                } else {
+                    for extent in &item.extents {
+                        let shifted_offset = extent
+                            .offset
+                            .checked_add(delta)
+                            .ok_or_else(|| invalid_layout("HEIC iloc offset overflows"))?;
+                        if let Some(pos) = extent.offset_pos {
+                            write_uint(&mut new_body, pos, layout.offset_size, shifted_offset)?;
+                        }
+                    }
+                }
+            } else if item
+                .extents
+                .iter()
+                .any(|extent| extent.offset_pos.is_none())
+            {
+                return Err(invalid_layout("HEIC iloc extents shift inconsistently"));
+            } else {
+                for extent in &item.extents {
+                    if extent_at_or_past_boundary(item.base_offset, extent.offset, shift_boundary)
+                        && let Some(pos) = extent.offset_pos
+                    {
+                        let shifted_offset = extent
+                            .offset
+                            .checked_add(delta)
+                            .ok_or_else(|| invalid_layout("HEIC iloc offset overflows"))?;
+                        write_uint(&mut new_body, pos, layout.offset_size, shifted_offset)?;
+                    }
+                }
+            }
+        }
+    }
+    let mut count_cursor = layout.count_pos;
+    let count_size = u8::try_from(layout.count_size)
+        .map_err(|_| invalid_layout("iloc count width is too large"))?;
+    let count = read_uint(&new_body, &mut count_cursor, count_size)?;
+    write_uint(
+        &mut new_body,
+        layout.count_pos,
+        count_size,
+        count
+            .checked_add(1)
+            .ok_or_else(|| invalid_layout("iloc item count overflows"))?,
+    )?;
+    new_body.extend_from_slice(&make_new_iloc_entry(layout, item_id, data_offset, length)?);
+    box_with_body(iloc.kind, &new_body)
+}
+
+/// Rewrite an XMP packet without decoding or re-encoding the surrounding
+/// HEIC item graph.  Existing packets are replaced in place when possible;
+/// otherwise only the XMP iloc entry is repointed to an appended mdat.  Files
+/// without XMP receive one new item, one new location, and a `cdsc` reference
+/// to the primary image, synthesising an `iref` box when the file has none.
+/// Every unrelated box and payload is copied unchanged.
+///
+/// Insertion is limited to files whose top-level boxes have no unhandled
+/// absolute offsets.  Existing-XMP updates do not grow `meta` and can append
+/// after otherwise unsupported top-level boxes.  The complete rewritten file
+/// is materialised before it is written to `writer`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "All rewrite ranges come from validated box boundaries and checked XMP extent arithmetic."
+)]
+pub(crate) fn rewrite_xmp<W: Write>(
+    input: &[u8],
+    xmp: &[u8],
+    mut writer: W,
+) -> Result<(), HeifError> {
+    if !is_heif_content(input) {
+        return Err(invalid_layout("input is not a HEIF-family file"));
+    }
+    let (meta, iinf, iloc, iref, primary_item_id, prefix_size) = find_meta_layout(input)?;
+    let iloc_layout = parse_iloc(input, iloc)?;
+    let (
+        existing,
+        xmp_item_id,
+        max_item_id,
+        iinf_version,
+        iinf_count_pos,
+        iinf_count_size,
+        iinf_item_ids,
+    ) = locate_xmp(input, iinf, iloc)?;
+
+    reject_meta_overlapping_items(&iloc_layout, meta)?;
+    for item in &iloc_layout.items {
+        if item.construction_method == 0 {
+            let _ = resolve_item_extents(input, item)?;
+        }
+    }
+
+    if let Some(location) = existing {
+        let item = iloc_layout
+            .items
+            .iter()
+            .find(|item| item.item_id == location.item_id)
+            .ok_or_else(|| invalid_layout("XMP item has no iloc entry"))?;
+        if item.extents.len() != 1 {
+            return Err(invalid_layout("XMP item uses multiple iloc extents"));
+        }
+        let end = location
+            .extent_start
+            .checked_add(location.extent_length)
+            .ok_or_else(|| invalid_layout("existing XMP extent overflows"))?;
+        if end > input.len() {
+            return Err(invalid_layout("existing XMP extent is outside the file"));
+        }
+        let shared = xmp_extent_is_shared(
+            &iloc_layout,
+            location.item_id,
+            u64::try_from(location.extent_start)
+                .map_err(|_| invalid_layout("existing XMP offset overflows"))?,
+            u64::try_from(location.extent_length)
+                .map_err(|_| invalid_layout("existing XMP length overflows"))?,
+        );
+        let in_mdat =
+            extent_is_within_mdat_payload(input, location.extent_start, location.extent_length)?;
+        if xmp.len() <= location.extent_length && !shared && in_mdat {
+            let mut output = input.to_vec();
+            output[location.extent_start..location.extent_start + xmp.len()].copy_from_slice(xmp);
+            output[location.extent_start + xmp.len()..end].fill(b' ');
+            writer.write_all(&output)?;
+            return Ok(());
+        }
+        let new_data_offset = u64::try_from(input.len())
+            .ok()
+            .and_then(|len| len.checked_add(8))
+            .ok_or_else(|| invalid_layout("new XMP offset overflows"))?;
+        let new_iloc = rewrite_existing_iloc(
+            input,
+            iloc,
+            &iloc_layout,
+            location.item_id,
+            new_data_offset,
+            u64::try_from(xmp.len()).map_err(|_| invalid_layout("XMP packet is too large"))?,
+        )?;
+        let mut output = Vec::new();
+        output.extend_from_slice(&input[..iloc.start]);
+        output.extend_from_slice(&new_iloc);
+        output.extend_from_slice(&input[iloc.end()..]);
+        output.extend_from_slice(&box_with_body(*b"mdat", xmp)?);
+        writer.write_all(&output)?;
+        return Ok(());
+    }
+
+    if xmp_item_id.is_some() {
+        return Err(invalid_layout(
+            "existing XMP item uses an unsupported iloc layout",
+        ));
+    }
+    ensure_insertion_layout(input)?;
+    let new_item_id = max_item_id
+        .checked_add(1)
+        .ok_or_else(|| invalid_layout("no free HEIC item id remains"))?;
+    if iinf_version == 0 && new_item_id > u16::MAX as u32 && iloc_layout.version != 2 {
+        return Err(invalid_layout(
+            "new XMP item id does not fit this HEIC item map",
+        ));
+    }
+    let new_iinf = append_iinf_entry(input, iinf, iinf_count_pos, iinf_count_size, new_item_id)?;
+    let (new_iref, old_iref_size) = match iref {
+        Some(iref) => (
+            append_cdsc_reference(input, iref, new_item_id, primary_item_id, &iinf_item_ids)?,
+            iref.size,
+        ),
+        None => (synthesise_cdsc_iref(new_item_id, primary_item_id)?, 0),
+    };
+    let old_meta_len = meta.size;
+    let xmp_length =
+        u64::try_from(xmp.len()).map_err(|_| invalid_layout("XMP packet is too large"))?;
+    let placeholder_iloc = append_iloc_entry(
+        input,
+        iloc,
+        &iloc_layout,
+        new_item_id,
+        u64::try_from(input.len())
+            .ok()
+            .and_then(|len| len.checked_add(8))
+            .ok_or_else(|| invalid_layout("new XMP offset overflows"))?,
+        xmp_length,
+        0,
+        u64::try_from(meta.end()).map_err(|_| invalid_layout("HEIC meta offset overflows"))?,
+    )?;
+    let new_meta_len = old_meta_len
+        .checked_add(new_iinf.len())
+        .and_then(|len| len.checked_sub(iinf.size))
+        .and_then(|len| len.checked_add(new_iref.len()))
+        .and_then(|len| len.checked_sub(old_iref_size))
+        .and_then(|len| len.checked_add(placeholder_iloc.len()))
+        .and_then(|len| len.checked_sub(iloc.size))
+        .ok_or_else(|| invalid_layout("new HEIC meta size overflows"))?;
+    let delta = u64::try_from(new_meta_len)
+        .ok()
+        .and_then(|new_len| {
+            u64::try_from(old_meta_len)
+                .ok()
+                .and_then(|old_len| new_len.checked_sub(old_len))
+        })
+        .ok_or_else(|| invalid_layout("new HEIC meta size is invalid"))?;
+    let data_offset = u64::try_from(input.len())
+        .ok()
+        .and_then(|len| len.checked_add(delta))
+        .and_then(|len| len.checked_add(8))
+        .ok_or_else(|| invalid_layout("new XMP offset overflows"))?;
+    let new_iloc = append_iloc_entry(
+        input,
+        iloc,
+        &iloc_layout,
+        new_item_id,
+        data_offset,
+        xmp_length,
+        delta,
+        u64::try_from(meta.end()).map_err(|_| invalid_layout("HEIC meta offset overflows"))?,
+    )?;
+    let new_meta_len = old_meta_len
+        .checked_add(new_iinf.len())
+        .and_then(|len| len.checked_sub(iinf.size))
+        .and_then(|len| len.checked_add(new_iref.len()))
+        .and_then(|len| len.checked_sub(old_iref_size))
+        .and_then(|len| len.checked_add(new_iloc.len()))
+        .and_then(|len| len.checked_sub(iloc.size))
+        .ok_or_else(|| invalid_layout("new HEIC meta size overflows"))?;
+    let mut meta_bytes = Vec::with_capacity(new_meta_len);
+    meta_bytes.extend_from_slice(&input[meta.start..meta.body_start() + prefix_size]);
+    let children = scan_raw_boxes(input, meta.body_start() + prefix_size, meta.end())?;
+    for child in children {
+        if child.start == iinf.start {
+            meta_bytes.extend_from_slice(&new_iinf);
+            if iref.is_none() {
+                meta_bytes.extend_from_slice(&new_iref);
+            }
+        } else if iref.is_some_and(|existing| existing.start == child.start) {
+            meta_bytes.extend_from_slice(&new_iref);
+        } else if child.start == iloc.start {
+            meta_bytes.extend_from_slice(&new_iloc);
+        } else {
+            meta_bytes.extend_from_slice(&input[child.start..child.end()]);
+        }
+    }
+    patch_box_size(&mut meta_bytes)?;
+    if meta_bytes.len() != new_meta_len {
+        return Err(invalid_layout("rewritten HEIC meta size is inconsistent"));
+    }
+    let mut output = Vec::new();
+    output.extend_from_slice(&input[..meta.start]);
+    output.extend_from_slice(&meta_bytes);
+    output.extend_from_slice(&input[meta.end()..]);
+    output.extend_from_slice(&box_with_body(*b"mdat", xmp)?);
+    writer.write_all(&output)?;
+    Ok(())
+}
+
 /// Pull the iinf + iloc out of a `meta` box body and resolve the XMP extent
 /// against the original file bytes. Walks the meta sub-boxes by header only
 /// and decodes only `iinf` and `iloc`, so a hostile sub-atom (e.g. a nested
@@ -711,19 +2345,62 @@ fn iinf_entry_count(body: &[u8], version: u8) -> Option<u32> {
     }
 }
 
-/// Surgically insert (or replace) the XMP `mime` item inside a HEIC file,
-/// streaming the rewrite to `writer`.
+/// Fuzz-only driver that exercises [`rewrite_xmp`] with a fixed XMP marker and
+/// asserts the writer's safety contract, rather than merely that it does not
+/// crash.  A rejected rewrite must emit nothing.  An accepted rewrite must keep
+/// the container HEIF, make the written packet readable again, preserve every
+/// non-XMP item payload, and preserve opaque `meta` sub-boxes byte-for-byte.
+/// Compiled only for the fuzz harness; absent from production builds.
+#[cfg(feature = "__fuzz_internals")]
+pub(crate) fn fuzz_rewrite_xmp_preserves(input: &[u8]) {
+    const MARKER: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>3</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+    let mut output = Vec::new();
+    match rewrite_xmp(input, MARKER, &mut output) {
+        Err(_) => assert!(
+            output.is_empty(),
+            "a rejected HEIC rewrite must not emit bytes"
+        ),
+        Ok(()) => {
+            assert!(
+                is_heif_content(&output),
+                "writer output must remain HEIF content"
+            );
+            assert_eq!(
+                fuzz_extract_xmp(&output)
+                    .as_deref()
+                    .map(<[u8]>::trim_ascii_end),
+                Some(MARKER),
+                "the written XMP packet must be locatable and round-trip"
+            );
+            let validation = validate_rewrite_preserves_non_xmp_items(input, &output);
+            assert!(
+                validation.is_ok(),
+                "accepted rewrite must preserve non-XMP items and opaque meta sub-boxes: {validation:?}"
+            );
+        }
+    }
+}
+
+/// Extract the XMP packet through the writer-side parser, for the fuzz safety
+/// check.  Independent of the mp4-atom read path so item ids above `u16` and
+/// iloc version 2 are covered.
+#[cfg(feature = "__fuzz_internals")]
+fn fuzz_extract_xmp(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (_, iinf, iloc, _, _, _) = find_meta_layout(bytes).ok()?;
+    let (location, _, _, _, _, _, _) = locate_xmp(bytes, iinf, iloc).ok()?;
+    let location = location?;
+    let end = location.extent_start.checked_add(location.extent_length)?;
+    bytes.get(location.extent_start..end).map(<[u8]>::to_vec)
+}
+
+/// Legacy typed-atom XMP writer retained for parser fixture tests.
 ///
-/// The HEIC container is ISO-BMFF — a sequence of top-level atoms. XMP lives
+/// The HEIC container is ISO-BMFF, a sequence of top-level atoms.  XMP lives
 /// inside the `meta` atom as an item with `item_type = "mime"` and
-/// `content_type = "application/rdf+xml"`. We append the XMP bytes as a new
+/// `content_type = "application/rdf+xml"`.  This helper appends the XMP bytes as a new
 /// trailing `mdat` (construction_method 0, file-absolute offsets), so the
 /// encoded image bytes in the original `mdat` stay byte-for-byte identical
 /// even after `meta` grows.
-///
-/// Writing to a `Write` (typically `BufWriter<File>`) rather than returning
-/// a `Vec<u8>` eliminates one full-file-sized allocation on the metadata-
-/// embed path — meaningful for large ProRAW HEICs under high concurrency.
 #[cfg(test)]
 #[allow(
     clippy::indexing_slicing,
@@ -1807,6 +3484,319 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_xmp_preserves_real_heic_image_data_and_is_idempotent() {
+        let input = include_bytes!("../../tests/data/sample.heic");
+        let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>5</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut first = Vec::new();
+        rewrite_xmp(input, xmp, &mut first).expect("real HEIC XMP insertion");
+        assert!(is_heif_content(&first));
+        assert_eq!(extract_xmp_bytes(&first).as_deref(), Some(xmp.as_slice()));
+        let (_, image_data) = find_mdat(input).expect("source image mdat");
+        let (rewritten_image_start, rewritten_image_data) =
+            find_mdat(&first).expect("rewritten image mdat");
+        assert_eq!(Some(image_data), Some(rewritten_image_data));
+        let iloc = decode_iloc_from_heic(&first).expect("rewritten iloc");
+        let image_item = iloc
+            .item_locations
+            .iter()
+            .find(|item| item.item_id == 1)
+            .expect("source image item");
+        let image_offset = image_item
+            .base_offset
+            .saturating_add(image_item.extents[0].offset);
+        assert_eq!(
+            image_offset,
+            rewritten_image_start + 8,
+            "rewritten image item must still point at the image mdat"
+        );
+        assert!(
+            cdsc_references(input)
+                .into_iter()
+                .all(|reference| cdsc_references(&first).contains(&reference)),
+            "pre-existing cdsc associations must remain intact"
+        );
+        let (xmp_item_id, primary_item_id) = xmp_and_primary_item_ids(&first);
+        assert!(
+            cdsc_references(&first).contains(&(xmp_item_id, primary_item_id)),
+            "new XMP item must describe the primary image through cdsc"
+        );
+
+        let mut second = Vec::new();
+        rewrite_xmp(&first, xmp, &mut second).expect("repeat HEIC XMP insertion");
+        assert_eq!(
+            second, first,
+            "repeating the same XMP update must be byte-idempotent"
+        );
+
+        let changed = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>3</xmp:Rating><dc:description xmlns:dc='http://purl.org/dc/elements/1.1/'>changed</dc:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut third = Vec::new();
+        rewrite_xmp(&first, changed, &mut third).expect("changed HEIC XMP update");
+        assert_eq!(
+            extract_xmp_bytes(&third).as_deref(),
+            Some(changed.as_slice())
+        );
+        assert_eq!(Some(image_data), find_mdat(&third).map(|(_, data)| data));
+    }
+
+    #[test]
+    fn fuzz_seeds_reach_existing_xmp_replacement_paths() {
+        const MARKER: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>3</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let fits = include_bytes!("../../fuzz/seeds/heif_rewrite/replacement-fits");
+        let grows = include_bytes!("../../fuzz/seeds/heif_rewrite/replacement-grows");
+
+        let mut replaced_in_place = Vec::new();
+        rewrite_xmp(fits, MARKER, &mut replaced_in_place).expect("fitting replacement seed");
+        assert_eq!(
+            replaced_in_place.len(),
+            fits.len(),
+            "fitting seed must take the in-place replacement path"
+        );
+
+        let mut replaced_by_append = Vec::new();
+        rewrite_xmp(grows, MARKER, &mut replaced_by_append).expect("growing replacement seed");
+        assert!(
+            replaced_by_append.len() > grows.len(),
+            "growing seed must repoint XMP to an appended mdat"
+        );
+    }
+
+    #[test]
+    fn rewrite_xmp_appends_when_existing_extent_includes_mdat_header() {
+        const MARKER: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>3</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut input = include_bytes!("../../fuzz/seeds/heif_rewrite/replacement-fits").to_vec();
+        let (_, iinf, iloc, _, _, _) = find_meta_layout(&input).unwrap();
+        let (location, xmp_item_id, _, _, _, _, _) = locate_xmp(&input, iinf, iloc).unwrap();
+        let location = location.expect("seed XMP location");
+        let layout = parse_iloc(&input, iloc).unwrap();
+        let item = layout
+            .items
+            .iter()
+            .find(|item| Some(item.item_id) == xmp_item_id)
+            .expect("seed XMP item");
+        let iloc_body = &mut input[iloc.body_start()..iloc.end()];
+        if let Some(base_offset_pos) = item.base_offset_pos {
+            write_uint(iloc_body, base_offset_pos, layout.base_offset_size, 0).unwrap();
+        }
+        write_uint(
+            iloc_body,
+            item.extents[0].offset_pos.expect("XMP extent offset"),
+            layout.offset_size,
+            u64::try_from(location.extent_start - 8).unwrap(),
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MARKER, &mut output).expect("safe append replacement");
+
+        assert!(
+            output.len() > input.len(),
+            "an XMP extent that includes an mdat header must not be changed in place"
+        );
+        assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MARKER));
+        validate_rewrite_preserves_non_xmp_items(&input, &output)
+            .expect("append replacement must preserve protected bytes");
+    }
+
+    #[test]
+    fn rewrite_xmp_rejects_malformed_heic_without_writing() {
+        let input = &include_bytes!("../../tests/data/sample.heic")[..input_len()];
+        let mut output = Vec::new();
+        let result = rewrite_xmp(input, b"<x:xmpmeta/>", &mut output);
+        assert!(result.is_err());
+        assert!(output.is_empty());
+
+        fn input_len() -> usize {
+            include_bytes!("../../tests/data/sample.heic").len() - 3
+        }
+    }
+
+    #[test]
+    fn rewrite_xmp_rejects_insertion_when_top_level_offsets_are_unhandled() {
+        let mut input = include_bytes!("../../tests/data/sample.heic").to_vec();
+        input.extend_from_slice(&8u32.to_be_bytes());
+        input.extend_from_slice(b"moov");
+
+        let mut output = Vec::new();
+        let result = rewrite_xmp(&input, b"<x:xmpmeta/>", &mut output);
+        assert!(result.is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn rewrite_xmp_rejects_orphan_iloc_item_id() {
+        let mut atoms = Vec::new();
+        let mut cursor: &[u8] = include_bytes!("../../tests/data/sample.heic");
+        while let Some(atom) = Any::decode_maybe(&mut cursor).expect("sample HEIC") {
+            atoms.push(atom);
+        }
+        let meta = atoms
+            .iter_mut()
+            .find_map(|atom| match atom {
+                Any::Meta(meta) => Some(meta),
+                _ => None,
+            })
+            .expect("sample meta");
+        meta.get_mut::<Iloc>()
+            .expect("sample iloc")
+            .item_locations
+            .push(ItemLocation {
+                item_id: 999,
+                construction_method: 0,
+                data_reference_index: 0,
+                base_offset: 0,
+                extents: vec![ItemLocationExtent {
+                    item_reference_index: 0,
+                    offset: 0,
+                    length: 0,
+                }],
+            });
+        let mut input = Vec::new();
+        for atom in atoms {
+            atom.encode(&mut input).expect("encode malformed fixture");
+        }
+
+        let mut output = Vec::new();
+        let result = rewrite_xmp(&input, b"<x:xmpmeta/>", &mut output);
+        assert!(result.is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn rewrite_xmp_existing_item_can_append_after_unhandled_top_level_box() {
+        let seed = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF/></x:xmpmeta>";
+        let mut seeded = Vec::new();
+        insert_xmp(
+            include_bytes!("../../tests/data/sample.heic"),
+            seed,
+            &mut seeded,
+        )
+        .expect("seed XMP");
+        seeded.extend_from_slice(&8u32.to_be_bytes());
+        seeded.extend_from_slice(b"moov");
+
+        let replacement =
+            b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>5</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut output = Vec::new();
+        rewrite_xmp(&seeded, replacement, &mut output).expect("existing XMP append");
+        assert_eq!(
+            extract_xmp_bytes(&output).as_deref(),
+            Some(replacement.as_slice())
+        );
+        assert!(
+            output
+                .windows(8)
+                .any(|window| window == [0, 0, 0, 8, b'm', b'o', b'o', b'v'])
+        );
+    }
+
+    #[test]
+    fn rewrite_xmp_is_readable_by_independent_heif_tools_when_available() {
+        use std::process::Command;
+
+        let ffprobe = Command::new("ffprobe").arg("-version").output();
+        if ffprobe.is_err() {
+            eprintln!("ffprobe unavailable; skipping independent HEIF reader check");
+            return;
+        }
+        let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>5</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let dir = tempfile::tempdir().expect("reader fixture directory");
+        let source_path = dir.path().join("source.heic");
+        std::fs::write(&source_path, include_bytes!("../../tests/data/sample.heic"))
+            .expect("write source reader fixture");
+        let source_probe = Command::new("ffprobe")
+            .args(["-v", "error"])
+            .arg(&source_path)
+            .output()
+            .expect("run ffprobe on source");
+        if !source_probe.status.success() {
+            eprintln!(
+                "ffprobe cannot read the repository HEIC fixture; skipping independent reader check"
+            );
+            return;
+        }
+
+        let mut output = Vec::new();
+        rewrite_xmp(
+            include_bytes!("../../tests/data/sample.heic"),
+            xmp,
+            &mut output,
+        )
+        .expect("real HEIC rewrite");
+        let path = dir.path().join("rewritten.heic");
+        std::fs::write(&path, &output).expect("write reader fixture");
+
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=format_name",
+                "-of",
+                "default=nw=1:nk=1",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run ffprobe");
+        assert!(
+            probe.status.success(),
+            "ffprobe must accept rewritten HEIC: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert!(
+            !probe.stdout.is_empty(),
+            "ffprobe must identify the rewritten HEIF container"
+        );
+
+        if Command::new("exiftool").arg("-ver").output().is_ok() {
+            let rating = Command::new("exiftool")
+                .args(["-s3", "-XMP:Rating"])
+                .arg(&path)
+                .output()
+                .expect("run exiftool");
+            assert!(
+                rating.status.success(),
+                "exiftool must accept rewritten HEIC: {}",
+                String::from_utf8_lossy(&rating.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&rating.stdout).trim(), "5");
+        }
+    }
+
+    fn xmp_and_primary_item_ids(bytes: &[u8]) -> (u32, u32) {
+        let (_, iinf, _, _, primary_item_id, _) = find_meta_layout(bytes).unwrap();
+        let iinf_layout = parse_iinf(bytes, iinf).unwrap();
+        (iinf_layout.xmp_item_id.unwrap(), primary_item_id)
+    }
+
+    fn cdsc_references(bytes: &[u8]) -> Vec<(u32, u32)> {
+        let (_, _, _, Some(iref), _, _) = find_meta_layout(bytes).unwrap() else {
+            return Vec::new();
+        };
+        let body = &bytes[iref.body_start()..iref.end()];
+        let version = body[0];
+        scan_raw_boxes(body, 4, body.len())
+            .unwrap()
+            .into_iter()
+            .filter(|child| child.kind == *b"cdsc")
+            .filter_map(|child| {
+                let child_body = &body[child.body_start()..child.end()];
+                if version == 0 && child_body.len() >= 6 {
+                    Some((
+                        u32::from(u16::from_be_bytes([child_body[0], child_body[1]])),
+                        u32::from(u16::from_be_bytes([child_body[4], child_body[5]])),
+                    ))
+                } else if version == 1 && child_body.len() >= 10 {
+                    let from = u32::from_be_bytes(child_body[0..4].try_into().ok()?);
+                    let to = u32::from_be_bytes(child_body[6..10].try_into().ok()?);
+                    Some((from, to))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
     fn insert_xmp_twice_retains_only_latest() {
         let heic = include_bytes!("../../tests/data/sample.heic");
         let first = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><first/></x:xmpmeta>";
@@ -2071,5 +4061,802 @@ mod tests {
             pos += sz;
         }
         None
+    }
+
+    const MATRIX_XMP: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>4</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+
+    /// One HEIF item for [`build_heic`].  `data` is placed in the top-level
+    /// `mdat` for construction method 0; construction methods 1 and 2 leave it
+    /// empty and use `offset`/`length` verbatim.
+    struct ItemSpec {
+        item_id: u32,
+        item_type: [u8; 4],
+        infe_version: u8,
+        construction_method: u8,
+        data: Vec<u8>,
+        offset: u64,
+        length: u64,
+    }
+
+    /// A hand-built HEIF file covering layout shapes the real `sample.heic`
+    /// fixture cannot express: grid/dimg derivation, construction methods 1
+    /// and 2, item ids above `u16`, and files with no `iref`.
+    struct HeicSpec {
+        iloc_version: u8,
+        offset_size: u8,
+        length_size: u8,
+        base_offset_size: u8,
+        index_size: u8,
+        primary_id: u32,
+        items: Vec<ItemSpec>,
+        idat: Option<Vec<u8>>,
+        iref_children: Vec<Vec<u8>>,
+    }
+
+    fn sbox(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(body.len() + 8);
+        out.extend_from_slice(&u32::try_from(body.len() + 8).unwrap().to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn write_width(buf: &mut Vec<u8>, width: u8, value: u64) {
+        match width {
+            0 => {}
+            2 => buf.extend_from_slice(&u16::try_from(value).unwrap().to_be_bytes()),
+            4 => buf.extend_from_slice(&u32::try_from(value).unwrap().to_be_bytes()),
+            8 => buf.extend_from_slice(&value.to_be_bytes()),
+            _ => panic!("unsupported field width"),
+        }
+    }
+
+    /// A version-0 single-item-type reference box (`dimg`, `thmb`, ...) with
+    /// 16-bit ids, matching the shapes `append_cdsc_reference` validates.
+    fn ref_box(kind: &[u8; 4], from: u16, to: &[u16]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&from.to_be_bytes());
+        body.extend_from_slice(&u16::try_from(to.len()).unwrap().to_be_bytes());
+        for target in to {
+            body.extend_from_slice(&target.to_be_bytes());
+        }
+        sbox(kind, &body)
+    }
+
+    fn build_heic(spec: &HeicSpec) -> Vec<u8> {
+        let ftyp = {
+            let mut body = Vec::new();
+            body.extend_from_slice(b"heic");
+            body.extend_from_slice(&0u32.to_be_bytes());
+            body.extend_from_slice(b"mif1");
+            sbox(b"ftyp", &body)
+        };
+
+        let build_meta = |mdat_data_start: u64| -> Vec<u8> {
+            let hdlr = {
+                let mut body = vec![0u8, 0, 0, 0, 0, 0, 0, 0];
+                body.extend_from_slice(b"pict");
+                body.extend_from_slice(&[0u8; 12]);
+                body.push(0);
+                sbox(b"hdlr", &body)
+            };
+            let pitm = if spec.primary_id <= u32::from(u16::MAX) {
+                let mut body = vec![0u8, 0, 0, 0];
+                body.extend_from_slice(&(spec.primary_id as u16).to_be_bytes());
+                sbox(b"pitm", &body)
+            } else {
+                let mut body = vec![1u8, 0, 0, 0];
+                body.extend_from_slice(&spec.primary_id.to_be_bytes());
+                sbox(b"pitm", &body)
+            };
+            let iinf = {
+                let mut body = vec![0u8, 0, 0, 0];
+                body.extend_from_slice(&u16::try_from(spec.items.len()).unwrap().to_be_bytes());
+                for item in &spec.items {
+                    let mut entry = vec![item.infe_version, 0, 0, 0];
+                    if item.infe_version == 3 {
+                        entry.extend_from_slice(&item.item_id.to_be_bytes());
+                    } else {
+                        entry.extend_from_slice(&(item.item_id as u16).to_be_bytes());
+                    }
+                    entry.extend_from_slice(&0u16.to_be_bytes());
+                    entry.extend_from_slice(&item.item_type);
+                    entry.push(0);
+                    body.extend_from_slice(&sbox(b"infe", &entry));
+                }
+                sbox(b"iinf", &body)
+            };
+            let iloc = {
+                let mut body = vec![spec.iloc_version, 0, 0, 0];
+                body.push((spec.offset_size << 4) | spec.length_size);
+                body.push((spec.base_offset_size << 4) | spec.index_size);
+                if spec.iloc_version == 2 {
+                    body.extend_from_slice(&u32::try_from(spec.items.len()).unwrap().to_be_bytes());
+                } else {
+                    body.extend_from_slice(&u16::try_from(spec.items.len()).unwrap().to_be_bytes());
+                }
+                let mut cm0_cursor = mdat_data_start;
+                for item in &spec.items {
+                    if spec.iloc_version == 2 {
+                        body.extend_from_slice(&item.item_id.to_be_bytes());
+                    } else {
+                        body.extend_from_slice(&(item.item_id as u16).to_be_bytes());
+                    }
+                    if spec.iloc_version > 0 {
+                        body.extend_from_slice(&u16::from(item.construction_method).to_be_bytes());
+                    }
+                    body.extend_from_slice(&0u16.to_be_bytes());
+                    let (base, offset, length) = if item.construction_method == 0 {
+                        let base = cm0_cursor;
+                        cm0_cursor += item.data.len() as u64;
+                        (base, 0u64, item.data.len() as u64)
+                    } else {
+                        (0u64, item.offset, item.length)
+                    };
+                    write_width(&mut body, spec.base_offset_size, base);
+                    body.extend_from_slice(&1u16.to_be_bytes());
+                    if spec.iloc_version > 0 {
+                        write_width(&mut body, spec.index_size, 0);
+                    }
+                    write_width(&mut body, spec.offset_size, offset);
+                    write_width(&mut body, spec.length_size, length);
+                }
+                sbox(b"iloc", &body)
+            };
+            let iref = if spec.iref_children.is_empty() {
+                None
+            } else {
+                let mut body = vec![0u8, 0, 0, 0];
+                for child in &spec.iref_children {
+                    body.extend_from_slice(child);
+                }
+                Some(sbox(b"iref", &body))
+            };
+            let idat = spec.idat.as_ref().map(|data| sbox(b"idat", data));
+
+            let mut meta_body = vec![0u8, 0, 0, 0];
+            meta_body.extend_from_slice(&hdlr);
+            meta_body.extend_from_slice(&pitm);
+            meta_body.extend_from_slice(&iinf);
+            meta_body.extend_from_slice(&iloc);
+            if let Some(iref) = &iref {
+                meta_body.extend_from_slice(iref);
+            }
+            if let Some(idat) = &idat {
+                meta_body.extend_from_slice(idat);
+            }
+            sbox(b"meta", &meta_body)
+        };
+
+        let placeholder = build_meta(0);
+        let mdat_data_start = ftyp.len() as u64 + placeholder.len() as u64 + 8;
+        let meta = build_meta(mdat_data_start);
+        assert_eq!(
+            meta.len(),
+            placeholder.len(),
+            "meta size must not depend on offset values"
+        );
+
+        let mut mdat_data = Vec::new();
+        for item in &spec.items {
+            if item.construction_method == 0 {
+                mdat_data.extend_from_slice(&item.data);
+            }
+        }
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        if !mdat_data.is_empty() {
+            file.extend_from_slice(&sbox(b"mdat", &mdat_data));
+        }
+        file
+    }
+
+    /// Resolve a construction-method-0 item's payload bytes through kei's raw
+    /// iloc parser.  Used to prove image bytes survive a rewrite and that
+    /// shifted offsets still point at the same data.
+    fn resolve_item_data(bytes: &[u8], item_id: u32) -> Vec<u8> {
+        let (_, _, iloc, _, _, _) = find_meta_layout(bytes).expect("meta layout");
+        let layout = parse_iloc(bytes, iloc).expect("iloc");
+        let item = layout
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)
+            .expect("item present");
+        assert_eq!(
+            item.construction_method, 0,
+            "resolver handles construction method 0 only"
+        );
+        let mut out = Vec::new();
+        for extent in &item.extents {
+            let start = usize::try_from(item.base_offset + extent.offset).unwrap();
+            let length = usize::try_from(extent.length).unwrap();
+            out.extend_from_slice(&bytes[start..start + length]);
+        }
+        out
+    }
+
+    /// Extract the XMP packet through kei's own writer-side parser rather than
+    /// the mp4-atom read path, so item ids above `u16` and iloc version 2 are
+    /// covered too.
+    fn extract_xmp_raw(bytes: &[u8]) -> Option<Vec<u8>> {
+        let (_, iinf, iloc, _, _, _) = find_meta_layout(bytes).ok()?;
+        let (location, _, _, _, _, _, _) = locate_xmp(bytes, iinf, iloc).ok()?;
+        let location = location?;
+        Some(bytes[location.extent_start..location.extent_start + location.extent_length].to_vec())
+    }
+
+    fn meta_child_bytes(bytes: &[u8], kind: &[u8; 4]) -> Option<Vec<u8>> {
+        let (meta, _, _, _, _, prefix) = find_meta_layout(bytes).ok()?;
+        let children = scan_raw_boxes(bytes, meta.body_start() + prefix, meta.end()).ok()?;
+        children
+            .iter()
+            .find(|child| child.kind == *kind)
+            .map(|child| bytes[child.start..child.end()].to_vec())
+    }
+
+    #[test]
+    fn parse_iloc_rejects_item_count_exceeding_body() {
+        let mut body = vec![0u8, 0, 0, 0];
+        body.push(0x44);
+        body.push(0x00);
+        body.extend_from_slice(&u16::MAX.to_be_bytes());
+        let boxed = sbox(b"iloc", &body);
+        let raw = parse_raw_box(&boxed, 0).expect("iloc header");
+        let err = parse_iloc(&boxed, raw).unwrap_err();
+        assert!(
+            matches!(err, HeifError::InvalidLayout { reason } if reason.contains("item count")),
+            "a count with no backing bytes must be refused, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_iloc_rejects_extent_count_exceeding_body() {
+        let mut body = vec![0u8, 0, 0, 0];
+        body.push(0x44);
+        body.push(0x00);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&u16::MAX.to_be_bytes());
+        let boxed = sbox(b"iloc", &body);
+        let raw = parse_raw_box(&boxed, 0).expect("iloc header");
+        let err = parse_iloc(&boxed, raw).unwrap_err();
+        assert!(
+            matches!(err, HeifError::InvalidLayout { reason } if reason.contains("extent count")),
+            "an extent count with no backing bytes must be refused, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_xmp_inserts_into_grid_dimg_layout() {
+        let grid_header = vec![0u8, 0, 1, 1, 0, 0x40, 0, 0x40];
+        let spec = HeicSpec {
+            iloc_version: 1,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![
+                ItemSpec {
+                    item_id: 1,
+                    item_type: *b"grid",
+                    infe_version: 2,
+                    construction_method: 1,
+                    data: Vec::new(),
+                    offset: 0,
+                    length: grid_header.len() as u64,
+                },
+                ItemSpec {
+                    item_id: 2,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: (0u8..40).collect(),
+                    offset: 0,
+                    length: 0,
+                },
+                ItemSpec {
+                    item_id: 3,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: (40u8..96).collect(),
+                    offset: 0,
+                    length: 0,
+                },
+            ],
+            idat: Some(grid_header.clone()),
+            iref_children: vec![ref_box(b"dimg", 1, &[2, 3])],
+        };
+        let input = build_heic(&spec);
+        assert!(is_heif_content(&input));
+
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("grid layout insertion");
+
+        assert_eq!(resolve_item_data(&input, 2), resolve_item_data(&output, 2));
+        assert_eq!(resolve_item_data(&input, 3), resolve_item_data(&output, 3));
+        assert_eq!(
+            meta_child_bytes(&input, b"idat"),
+            meta_child_bytes(&output, b"idat"),
+            "construction-method-1 grid header must survive"
+        );
+        assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
+        let dimg = ref_box(b"dimg", 1, &[2, 3]);
+        assert!(
+            output.windows(dimg.len()).any(|window| window == dimg),
+            "existing dimg reference must be copied unchanged"
+        );
+        let (xmp_id, _) = xmp_and_primary_item_ids(&output);
+        assert!(cdsc_references(&output).contains(&(xmp_id, 1)));
+
+        let mut again = Vec::new();
+        rewrite_xmp(&output, MATRIX_XMP, &mut again).expect("grid layout idempotent");
+        assert_eq!(
+            again, output,
+            "repeated grid rewrite must be byte-idempotent"
+        );
+    }
+
+    #[test]
+    fn rewrite_xmp_preserves_construction_method_two_item() {
+        let spec = HeicSpec {
+            iloc_version: 1,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![
+                ItemSpec {
+                    item_id: 1,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: (0u8..48).collect(),
+                    offset: 0,
+                    length: 0,
+                },
+                ItemSpec {
+                    item_id: 2,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method: 2,
+                    data: Vec::new(),
+                    offset: 0,
+                    length: 16,
+                },
+            ],
+            idat: None,
+            iref_children: vec![ref_box(b"dimg", 1, &[2])],
+        };
+        let input = build_heic(&spec);
+
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("construction-method-2 insertion");
+
+        assert_eq!(resolve_item_data(&input, 1), resolve_item_data(&output, 1));
+        assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
+
+        let before = parse_iloc(&input, find_meta_layout(&input).unwrap().2).unwrap();
+        let after = parse_iloc(&output, find_meta_layout(&output).unwrap().2).unwrap();
+        let item_before = before.items.iter().find(|item| item.item_id == 2).unwrap();
+        let item_after = after.items.iter().find(|item| item.item_id == 2).unwrap();
+        assert_eq!(
+            (
+                item_before.construction_method,
+                item_before.base_offset,
+                item_before.extents[0].offset,
+                item_before.extents[0].length,
+            ),
+            (
+                item_after.construction_method,
+                item_after.base_offset,
+                item_after.extents[0].offset,
+                item_after.extents[0].length,
+            ),
+            "construction-method-2 item must be copied without shifting"
+        );
+    }
+
+    #[test]
+    fn rewrite_xmp_synthesises_iref_when_absent() {
+        let spec = HeicSpec {
+            iloc_version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![ItemSpec {
+                item_id: 1,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (0u8..32).collect(),
+                offset: 0,
+                length: 0,
+            }],
+            idat: None,
+            iref_children: Vec::new(),
+        };
+        let input = build_heic(&spec);
+        assert!(
+            find_meta_layout(&input).unwrap().3.is_none(),
+            "fixture must have no iref"
+        );
+
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("insertion synthesises an iref");
+
+        assert_eq!(resolve_item_data(&input, 1), resolve_item_data(&output, 1));
+        assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
+        assert!(
+            find_meta_layout(&output).unwrap().3.is_some(),
+            "insertion must synthesise an iref"
+        );
+        let (xmp_id, primary) = xmp_and_primary_item_ids(&output);
+        assert_eq!(primary, 1);
+        assert!(
+            cdsc_references(&output).contains(&(xmp_id, 1)),
+            "synthesised iref must carry a cdsc from the XMP item to the primary"
+        );
+
+        let mut again = Vec::new();
+        rewrite_xmp(&output, MATRIX_XMP, &mut again).expect("idempotent synthesised iref");
+        assert_eq!(again, output);
+    }
+
+    #[test]
+    fn rewrite_xmp_refuses_item_data_overlapping_meta() {
+        let spec = HeicSpec {
+            iloc_version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![ItemSpec {
+                item_id: 1,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (0u8..32).collect(),
+                offset: 0,
+                length: 0,
+            }],
+            idat: None,
+            iref_children: Vec::new(),
+        };
+        let mut input = build_heic(&spec);
+        let (meta, _, iloc, _, _, _) = find_meta_layout(&input).unwrap();
+        let layout = parse_iloc(&input, iloc).unwrap();
+        let base_pos = iloc.body_start() + layout.items[0].base_offset_pos.unwrap();
+        let inside_meta = u32::try_from(meta.start + 40).unwrap();
+        input[base_pos..base_pos + 4].copy_from_slice(&inside_meta.to_be_bytes());
+
+        let mut output = Vec::new();
+        let result = rewrite_xmp(&input, MATRIX_XMP, &mut output);
+        assert!(
+            result.is_err(),
+            "an item whose data overlaps the meta box must be refused"
+        );
+        assert!(output.is_empty(), "a refused rewrite must not emit bytes");
+    }
+
+    #[test]
+    fn rewrite_xmp_refuses_existing_xmp_data_overlapping_meta() {
+        let mut input = Vec::new();
+        rewrite_xmp(
+            include_bytes!("../../tests/data/sample.heic"),
+            b"<x:xmpmeta>existing packet padding</x:xmpmeta>",
+            &mut input,
+        )
+        .expect("seed existing XMP");
+        let (meta, iinf, iloc, _, _, prefix_size) = find_meta_layout(&input).unwrap();
+        let children = scan_raw_boxes(&input, meta.body_start() + prefix_size, meta.end()).unwrap();
+        let iprp = children
+            .iter()
+            .find(|child| child.kind == *b"iprp")
+            .expect("sample HEIC iprp");
+        let (_, xmp_item_id, _, _, _, _, _) = locate_xmp(&input, iinf, iloc).unwrap();
+        let layout = parse_iloc(&input, iloc).unwrap();
+        let xmp_item = layout
+            .items
+            .iter()
+            .find(|item| Some(item.item_id) == xmp_item_id)
+            .expect("seeded XMP iloc item");
+        let inside_iprp = u64::try_from(iprp.body_start() + 16).unwrap();
+        let iloc_body = &mut input[iloc.body_start()..iloc.end()];
+        if let Some(base_offset_pos) = xmp_item.base_offset_pos {
+            write_uint(iloc_body, base_offset_pos, layout.base_offset_size, 0).unwrap();
+        }
+        write_uint(
+            iloc_body,
+            xmp_item.extents[0]
+                .offset_pos
+                .expect("XMP extent offset field"),
+            layout.offset_size,
+            inside_iprp,
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        let result = rewrite_xmp(&input, b"<x:xmpmeta>short</x:xmpmeta>", &mut output);
+
+        assert!(
+            matches!(result, Err(HeifError::InvalidLayout { reason }) if reason.contains("overlaps the meta box")),
+            "an existing XMP extent inside meta must be refused, got {result:?}"
+        );
+        assert!(output.is_empty(), "a refused rewrite must not emit bytes");
+    }
+
+    #[test]
+    fn validate_rewrite_rejects_changed_non_xmp_payload_and_opaque_meta() {
+        let input = include_bytes!("../../tests/data/sample.heic");
+        let mut rewritten = Vec::new();
+        rewrite_xmp(input, MATRIX_XMP, &mut rewritten).expect("sample HEIC rewrite");
+        validate_rewrite_preserves_non_xmp_items(input, &rewritten)
+            .expect("writer output must preserve protected bytes");
+
+        let (_, _, iloc, _, _, _) = find_meta_layout(&rewritten).unwrap();
+        let layout = parse_iloc(&rewritten, iloc).unwrap();
+        let image = layout
+            .items
+            .iter()
+            .find(|item| item.item_id == 1)
+            .expect("primary image item");
+        let image_start = usize::try_from(
+            image.base_offset + image.extents.first().expect("image extent").offset,
+        )
+        .unwrap();
+        let mut changed_payload = rewritten.clone();
+        changed_payload[image_start] ^= 1;
+        assert!(
+            validate_rewrite_preserves_non_xmp_items(input, &changed_payload).is_err(),
+            "changed image payload must fail validation"
+        );
+
+        let (meta, _, _, _, _, prefix_size) = find_meta_layout(&rewritten).unwrap();
+        let children =
+            scan_raw_boxes(&rewritten, meta.body_start() + prefix_size, meta.end()).unwrap();
+        let iprp = children
+            .iter()
+            .find(|child| child.kind == *b"iprp")
+            .expect("sample HEIC iprp");
+        let mut changed_meta = rewritten.clone();
+        changed_meta[iprp.body_start()] ^= 1;
+        assert!(
+            validate_rewrite_preserves_non_xmp_items(input, &changed_meta).is_err(),
+            "changed opaque meta bytes must fail validation"
+        );
+    }
+
+    #[test]
+    fn extract_exif_tiff_bytes_resolves_sample_item() {
+        let tiff = extract_exif_tiff_bytes(include_bytes!("../../tests/data/sample.heic"))
+            .expect("sample HEIC item map")
+            .expect("sample HEIC Exif item");
+        assert!(
+            tiff.starts_with(b"MM\0*") || tiff.starts_with(b"II*\0"),
+            "resolved Exif item must start with a TIFF header"
+        );
+    }
+
+    #[test]
+    fn multiple_exif_items_do_not_block_xmp_rewrite() {
+        let spec = HeicSpec {
+            iloc_version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![
+                ItemSpec {
+                    item_id: 1,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: (0u8..32).collect(),
+                    offset: 0,
+                    length: 0,
+                },
+                ItemSpec {
+                    item_id: 2,
+                    item_type: *b"Exif",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: b"\0\0\0\0MM\0*".to_vec(),
+                    offset: 0,
+                    length: 0,
+                },
+                ItemSpec {
+                    item_id: 3,
+                    item_type: *b"Exif",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: b"\0\0\0\0II*\0".to_vec(),
+                    offset: 0,
+                    length: 0,
+                },
+            ],
+            idat: None,
+            iref_children: vec![ref_box(b"cdsc", 2, &[1]), ref_box(b"cdsc", 3, &[1])],
+        };
+        let input = build_heic(&spec);
+        let mut output = Vec::new();
+
+        rewrite_xmp(&input, MATRIX_XMP, &mut output)
+            .expect("multiple Exif items must not block an unrelated XMP rewrite");
+        assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
+    }
+
+    #[test]
+    fn exif_probe_selects_item_associated_with_primary_image() {
+        let spec = HeicSpec {
+            iloc_version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![
+                ItemSpec {
+                    item_id: 1,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: (0u8..32).collect(),
+                    offset: 0,
+                    length: 0,
+                },
+                ItemSpec {
+                    item_id: 2,
+                    item_type: *b"Exif",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: b"\0\0\0\0MM\0*".to_vec(),
+                    offset: 0,
+                    length: 0,
+                },
+                ItemSpec {
+                    item_id: 3,
+                    item_type: *b"Exif",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: b"\0\0\0\0II*\0".to_vec(),
+                    offset: 0,
+                    length: 0,
+                },
+            ],
+            idat: None,
+            iref_children: vec![ref_box(b"cdsc", 3, &[1])],
+        };
+        let input = build_heic(&spec);
+
+        assert_eq!(
+            extract_exif_tiff_bytes(&input).unwrap().as_deref(),
+            Some(b"II*\0".as_slice())
+        );
+    }
+
+    #[test]
+    fn rewrite_xmp_refuses_zero_sized_child_box() {
+        let spec = HeicSpec {
+            iloc_version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![ItemSpec {
+                item_id: 1,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (0u8..32).collect(),
+                offset: 0,
+                length: 0,
+            }],
+            idat: None,
+            iref_children: Vec::new(),
+        };
+        let mut input = build_heic(&spec);
+        let (_, iinf, _, _, _, _) = find_meta_layout(&input).unwrap();
+        let entries = scan_raw_boxes(&input, iinf.body_start() + 6, iinf.end()).unwrap();
+        let infe_start = entries[0].start;
+        input[infe_start..infe_start + 4].copy_from_slice(&0u32.to_be_bytes());
+
+        let mut output = Vec::new();
+        let result = rewrite_xmp(&input, MATRIX_XMP, &mut output);
+        assert!(
+            result.is_err(),
+            "a box with no explicit size cannot be appended after and must be refused"
+        );
+        assert!(output.is_empty(), "a refused rewrite must not emit bytes");
+    }
+
+    #[test]
+    fn rewrite_xmp_inserts_with_item_ids_above_u16() {
+        let big_id = 70_000u32;
+        let spec = HeicSpec {
+            iloc_version: 2,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: big_id,
+            items: vec![ItemSpec {
+                item_id: big_id,
+                item_type: *b"hvc1",
+                infe_version: 3,
+                construction_method: 0,
+                data: (0u8..64).collect(),
+                offset: 0,
+                length: 0,
+            }],
+            idat: None,
+            iref_children: Vec::new(),
+        };
+        let input = build_heic(&spec);
+        assert!(is_heif_content(&input));
+
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("item ids above u16 insertion");
+
+        assert_eq!(
+            resolve_item_data(&input, big_id),
+            resolve_item_data(&output, big_id)
+        );
+        assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
+        let (xmp_id, primary) = xmp_and_primary_item_ids(&output);
+        assert!(
+            xmp_id > u32::from(u16::MAX),
+            "new item id must exceed u16 to exercise infe v3 and iloc v2"
+        );
+        assert_eq!(primary, big_id);
+        assert!(cdsc_references(&output).contains(&(xmp_id, big_id)));
+    }
+
+    #[test]
+    fn rewrite_xmp_inserts_with_base_offset_only_iloc() {
+        let spec = HeicSpec {
+            iloc_version: 0,
+            offset_size: 0,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items: vec![ItemSpec {
+                item_id: 1,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (0u8..48).collect(),
+                offset: 0,
+                length: 0,
+            }],
+            idat: None,
+            iref_children: Vec::new(),
+        };
+        let input = build_heic(&spec);
+
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("base-offset-only insertion");
+
+        assert_eq!(resolve_item_data(&input, 1), resolve_item_data(&output, 1));
+        assert_eq!(
+            extract_xmp_raw(&output).as_deref(),
+            Some(MATRIX_XMP),
+            "the new XMP item must resolve through the base offset, not offset 0"
+        );
+
+        let mut again = Vec::new();
+        rewrite_xmp(&output, MATRIX_XMP, &mut again).expect("base-offset-only idempotent");
+        assert_eq!(again, output);
     }
 }

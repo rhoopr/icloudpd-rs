@@ -267,6 +267,15 @@ recovery work needed after that checkpoint is durable.
 
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
+HEIF-family embedded XMP updates use the byte-preserving item-map writer and
+reject layouts that cannot be changed without re-encoding unknown item-graph
+data. The HEIF probe reads both XMP and the standalone Exif item before
+planning datetime or GPS writes. New XMP items receive a `cdsc` reference to
+the primary image, and insertion rejects top-level boxes whose absolute offsets
+are not adjusted. Before publication, validation confirms that every
+construction-method-0 non-XMP item and every opaque `meta` sub-box remains
+byte-identical.
+
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active
 and pending repair state. A normal sync hydrates stale downloaded rows in
