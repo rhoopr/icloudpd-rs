@@ -53,6 +53,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "heif_rewrite"
+path = "fuzz_targets/heif_rewrite.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "xmp_packet"
 path = "fuzz_targets/xmp_packet.rs"
 test = false

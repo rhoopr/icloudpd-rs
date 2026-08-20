@@ -1792,6 +1792,14 @@ pub mod __fuzz {
         crate::download::heif::is_heif_content(bytes)
     }
 
+    /// Drive the byte-preserving HEIC XMP writer over arbitrary bytes and
+    /// assert its safety contract: a rejected rewrite emits nothing, and an
+    /// accepted rewrite keeps the container HEIF, round-trips the written
+    /// packet, and preserves every non-XMP item's payload.
+    pub fn heif_rewrite_xmp_preserves(bytes: &[u8]) {
+        crate::download::heif::fuzz_rewrite_xmp_preserves(bytes);
+    }
+
     /// Run the three `state` enum string parsers on the same input. They're
     /// inherent `from_str` methods, not the `FromStr` trait, returning
     /// `Option<Self>`.
