@@ -984,6 +984,99 @@ impl PhotosSession for MockPhotosSession {
     }
 }
 
+// ── Source EXIF GPS fixtures ────────────────────────────────────────
+
+/// Facts that `exif_with_source_gps` yields once read and composed.
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_DATETIME: &str = "2024-06-15T10:20:30.125Z";
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_SPEED: &str = "12345/100";
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_SPEED_REF: &str = "K";
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_H_POSITIONING_ERROR: &str = "3/2";
+
+/// EXIF `uR64` rational from a numerator and denominator.
+#[cfg(feature = "xmp")]
+pub fn ur64(nominator: u32, denominator: u32) -> little_exif::rational::uR64 {
+    little_exif::rational::uR64 {
+        nominator,
+        denominator,
+    }
+}
+
+/// EXIF metadata carrying the standard source GPS facts: GPSDateStamp
+/// 2024:06:15, GPSTimeStamp 10:20:30.125, GPSSpeedRef K, GPSSpeed 123.45,
+/// GPSHPositioningError 1.5.
+#[cfg(feature = "xmp")]
+pub fn exif_with_source_gps() -> little_exif::metadata::Metadata {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::metadata::Metadata;
+
+    let mut metadata = Metadata::new();
+    metadata.set_tag(ExifTag::GPSDateStamp("2024:06:15".into()));
+    metadata.set_tag(ExifTag::GPSTimeStamp(vec![
+        ur64(10, 1),
+        ur64(20, 1),
+        ur64(30_125, 1_000),
+    ]));
+    metadata.set_tag(ExifTag::GPSSpeedRef("K".into()));
+    metadata.set_tag(ExifTag::GPSSpeed(vec![ur64(12_345, 100)]));
+    metadata.set_tag(ExifTag::GPSHPositioningError(vec![ur64(3, 2)]));
+    metadata
+}
+
+/// The standard source GPS EXIF without a `GPSTimeStamp`, so a date alone
+/// cannot compose a timestamp.
+#[cfg(feature = "xmp")]
+pub fn source_gps_without_time_stamp() -> little_exif::metadata::Metadata {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::metadata::Metadata;
+
+    let mut metadata = Metadata::new();
+    metadata.set_tag(ExifTag::GPSDateStamp("2024:06:15".into()));
+    metadata.set_tag(ExifTag::GPSSpeedRef("K".into()));
+    metadata.set_tag(ExifTag::GPSSpeed(vec![ur64(12_345, 100)]));
+    metadata.set_tag(ExifTag::GPSHPositioningError(vec![ur64(3, 2)]));
+    metadata
+}
+
+/// Minimal JPEG (SOI + APP0 JFIF + EOI) carrying the standard source GPS EXIF.
+#[cfg(feature = "xmp")]
+pub fn minimal_jpeg_with_source_gps() -> Vec<u8> {
+    let mut bytes = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+    exif_with_source_gps()
+        .write_to_vec(&mut bytes, little_exif::filetype::FileExtension::JPEG)
+        .expect("write source GPS EXIF into minimal JPEG");
+    bytes
+}
+
+/// Structurally valid `ftyp`-only HEIC with no `meta` box, so it carries no
+/// EXIF item. Readers must treat it as media with no source GPS, not an error.
+#[cfg(feature = "xmp")]
+pub fn heif_ftyp_without_meta_bytes() -> Vec<u8> {
+    vec![
+        0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'h', b'e', b'i',
+        b'c', b'm', b'i', b'f', b'1',
+    ]
+}
+
+/// Asserts an XMP packet carries the standard source GPS facts with the values
+/// `exif_with_source_gps` yields.
+#[cfg(feature = "xmp")]
+pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
+    use xmp_toolkit::xmp_ns;
+
+    let text = |name: &str| meta.property(xmp_ns::EXIF, name).expect(name).value;
+    assert_eq!(text("GPSDateTime"), SOURCE_GPS_DATETIME);
+    assert_eq!(text("GPSSpeedRef"), SOURCE_GPS_SPEED_REF);
+    assert_eq!(text("GPSSpeed"), SOURCE_GPS_SPEED);
+    assert_eq!(text("GPSHPositioningError"), SOURCE_GPS_H_POSITIONING_ERROR);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

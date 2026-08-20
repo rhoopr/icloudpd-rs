@@ -16,15 +16,11 @@ use std::sync::Once;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDateTime};
-#[cfg(not(feature = "xmp"))]
 use little_exif::exif_tag::ExifTag;
-#[cfg(not(feature = "xmp"))]
 use little_exif::filetype::FileExtension;
 #[cfg(not(feature = "xmp"))]
 use little_exif::ifd::ExifTagGroup;
-#[cfg(not(feature = "xmp"))]
 use little_exif::metadata::Metadata;
-#[cfg(not(feature = "xmp"))]
 use little_exif::rational::uR64;
 #[cfg(feature = "xmp")]
 use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, XmpValue, xmp_ns};
@@ -56,6 +52,10 @@ enum ManagedXmpField {
     DateTimeOriginal,
     DateCreated,
     OffsetTimeOriginal,
+    GpsDateTime,
+    GpsSpeed,
+    GpsSpeedRef,
+    GpsHPositioningError,
     Rating,
     GpsLatitude,
     GpsLongitude,
@@ -72,12 +72,16 @@ enum ManagedXmpField {
 }
 
 #[cfg(feature = "xmp")]
-const MANAGED_XMP_FIELDS: [ManagedXmpField; 18] = [
+const MANAGED_XMP_FIELDS: [ManagedXmpField; 22] = [
     ManagedXmpField::CreateDate,
     ManagedXmpField::ModifyDate,
     ManagedXmpField::DateTimeOriginal,
     ManagedXmpField::DateCreated,
     ManagedXmpField::OffsetTimeOriginal,
+    ManagedXmpField::GpsDateTime,
+    ManagedXmpField::GpsSpeed,
+    ManagedXmpField::GpsSpeedRef,
+    ManagedXmpField::GpsHPositioningError,
     ManagedXmpField::Rating,
     ManagedXmpField::GpsLatitude,
     ManagedXmpField::GpsLongitude,
@@ -102,6 +106,10 @@ impl ManagedXmpField {
             Self::DateTimeOriginal => "exif:DateTimeOriginal",
             Self::DateCreated => "photoshop:DateCreated",
             Self::OffsetTimeOriginal => "exifEX:OffsetTimeOriginal",
+            Self::GpsDateTime => "exif:GPSDateTime",
+            Self::GpsSpeed => "exif:GPSSpeed",
+            Self::GpsSpeedRef => "exif:GPSSpeedRef",
+            Self::GpsHPositioningError => "exif:GPSHPositioningError",
             Self::Rating => "xmp:Rating",
             Self::GpsLatitude => "exif:GPSLatitude",
             Self::GpsLongitude => "exif:GPSLongitude",
@@ -124,6 +132,10 @@ impl ManagedXmpField {
                 write.datetime.is_some()
             }
             Self::OffsetTimeOriginal => write.offset_time_original.is_some(),
+            Self::GpsDateTime => write.gps_datetime.is_some(),
+            Self::GpsSpeed => write.gps_speed.is_some(),
+            Self::GpsSpeedRef => write.gps_speed_ref.is_some(),
+            Self::GpsHPositioningError => write.gps_h_positioning_error.is_some(),
             Self::Rating => write.rating.is_some(),
             Self::GpsLatitude | Self::GpsLongitude => write.gps.is_some(),
             Self::GpsAltitude | Self::GpsAltitudeRef => {
@@ -147,6 +159,10 @@ impl ManagedXmpField {
             Self::DateTimeOriginal => (xmp_ns::EXIF, "DateTimeOriginal"),
             Self::DateCreated => (xmp_ns::PHOTOSHOP, "DateCreated"),
             Self::OffsetTimeOriginal => (EXIF_EX_XMP_NS, "OffsetTimeOriginal"),
+            Self::GpsDateTime => (xmp_ns::EXIF, "GPSDateTime"),
+            Self::GpsSpeed => (xmp_ns::EXIF, "GPSSpeed"),
+            Self::GpsSpeedRef => (xmp_ns::EXIF, "GPSSpeedRef"),
+            Self::GpsHPositioningError => (xmp_ns::EXIF, "GPSHPositioningError"),
             Self::Rating => (xmp_ns::XMP, "Rating"),
             Self::GpsLatitude => (xmp_ns::EXIF, "GPSLatitude"),
             Self::GpsLongitude => (xmp_ns::EXIF, "GPSLongitude"),
@@ -333,6 +349,195 @@ fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
     }
 }
 
+#[cfg(feature = "xmp")]
+pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
+    let extension_type = source_file_type_from_extension(path);
+    if path.extension().is_some() && extension_type.is_none() {
+        return Ok(SourceGpsMetadata::default());
+    }
+
+    let mut head = [0_u8; 12];
+    let bytes_read = std::fs::File::open(path)
+        .and_then(|mut file| {
+            use std::io::Read;
+            file.read(&mut head)
+        })
+        .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
+    let file_type = source_file_type(head.get(..bytes_read).unwrap_or_default());
+    let Some(file_type) = file_type else {
+        return Ok(SourceGpsMetadata::default());
+    };
+
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
+    // An absent or unreadable EXIF block is normal: many HEIC, AVIF and PNG
+    // files carry no EXIF, and a truncated media file cannot yield one. The
+    // sidecar still carries the CloudKit payload, so a parse failure degrades
+    // to no source GPS rather than suppressing the whole sidecar and stranding
+    // a retry marker.
+    let Ok(metadata) = Metadata::new_from_vec(&bytes, file_type) else {
+        return Ok(SourceGpsMetadata::default());
+    };
+    Ok(source_gps_from_exif(&metadata))
+}
+
+#[cfg(feature = "xmp")]
+fn source_file_type_from_extension(path: &Path) -> Option<FileExtension> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| match extension.to_ascii_lowercase().as_str() {
+            "heic" | "heif" | "hif" | "avif" => Some(FileExtension::HEIF),
+            "jpg" | "jpeg" => Some(FileExtension::JPEG),
+            "tif" | "tiff" => Some(FileExtension::TIFF),
+            "png" => Some(FileExtension::PNG {
+                as_zTXt_chunk: true,
+            }),
+            _ => None,
+        })
+}
+
+#[cfg(feature = "xmp")]
+fn source_file_type(bytes: &[u8]) -> Option<FileExtension> {
+    if heif::is_heif_content(bytes) {
+        return Some(FileExtension::HEIF);
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some(FileExtension::JPEG);
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Some(FileExtension::TIFF);
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(FileExtension::PNG {
+            as_zTXt_chunk: true,
+        });
+    }
+    None
+}
+
+#[cfg(feature = "xmp")]
+fn source_gps_from_exif(metadata: &Metadata) -> SourceGpsMetadata {
+    let gps_datetime = source_gps_datetime(metadata);
+    let speed = first_rational(metadata, ExifTag::GPSSpeed(Vec::new()));
+    let speed_ref = first_string(metadata, ExifTag::GPSSpeedRef(String::new()))
+        .map(|value| value.trim_matches('\0').trim().to_ascii_uppercase())
+        .filter(|value| matches!(value.as_str(), "K" | "M" | "N"));
+    // A speed without a unit is unusable, and `first_rational` guarantees a
+    // non-zero denominator.
+    let speed = match (speed, speed_ref.as_ref()) {
+        (Some(value), Some(_)) => Some(value),
+        (Some(_), None) => {
+            tracing::warn!("Source EXIF GPSSpeedRef is missing or unsupported");
+            None
+        }
+        (None, _) => None,
+    };
+    let speed_ref = speed.as_ref().and(speed_ref);
+    let horizontal_positioning_error =
+        first_rational(metadata, ExifTag::GPSHPositioningError(Vec::new()));
+    SourceGpsMetadata {
+        datetime: gps_datetime,
+        speed,
+        speed_ref,
+        horizontal_positioning_error,
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn first_rational(metadata: &Metadata, requested: ExifTag) -> Option<XmpRational> {
+    metadata.get_tag(&requested).next().and_then(|tag| {
+        let values = match tag {
+            ExifTag::GPSSpeed(values) | ExifTag::GPSHPositioningError(values) => values,
+            _ => return None,
+        };
+        values.first().and_then(XmpRational::from_exif)
+    })
+}
+
+#[cfg(feature = "xmp")]
+fn first_string(metadata: &Metadata, requested: ExifTag) -> Option<String> {
+    metadata
+        .get_tag(&requested)
+        .next()
+        .and_then(|tag| match tag {
+            ExifTag::GPSSpeedRef(value) => Some(value.clone()),
+            ExifTag::GPSDateStamp(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+/// `uR64` is a pair of `u32`, so a non-zero denominator always yields a finite
+/// non-negative quotient.
+#[cfg(feature = "xmp")]
+fn rational_to_f64(value: &uR64) -> Option<f64> {
+    if value.denominator == 0 {
+        return None;
+    }
+    Some(f64::from(value.nominator) / f64::from(value.denominator))
+}
+
+#[cfg(feature = "xmp")]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "validated GPS hour, minute, and second ranges make these conversions bounded and non-negative"
+)]
+fn source_gps_datetime(metadata: &Metadata) -> Option<String> {
+    let date = first_string(metadata, ExifTag::GPSDateStamp(String::new()))?;
+    let date = chrono::NaiveDate::parse_from_str(date.trim_matches('\0').trim(), "%Y:%m:%d")
+        .ok()
+        .or_else(|| {
+            tracing::warn!("Source EXIF GPSDateStamp is malformed");
+            None
+        })?;
+    let time_tag = metadata
+        .get_tag(&ExifTag::GPSTimeStamp(Vec::new()))
+        .next()?;
+    let ExifTag::GPSTimeStamp(times) = time_tag else {
+        return None;
+    };
+    let [hour_value, minute_value, seconds_value] = times.as_slice() else {
+        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
+        return None;
+    };
+    let Some(hour) = rational_to_f64(hour_value) else {
+        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
+        return None;
+    };
+    let Some(minute) = rational_to_f64(minute_value) else {
+        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
+        return None;
+    };
+    let Some(seconds) = rational_to_f64(seconds_value) else {
+        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
+        return None;
+    };
+    if hour.fract() != 0.0
+        || minute.fract() != 0.0
+        || !(0.0..=23.0).contains(&hour)
+        || !(0.0..=59.0).contains(&minute)
+        || !(0.0..60.0).contains(&seconds)
+    {
+        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
+        return None;
+    }
+    let whole_seconds = seconds.trunc() as u32;
+    let nanos = ((seconds.fract() * 1_000_000_000.0).round() as u32).min(999_999_999);
+    let fraction = if nanos == 0 {
+        String::new()
+    } else {
+        format!(".{nanos:09}").trim_end_matches('0').to_string()
+    };
+    Some(format!(
+        "{}T{:02}:{:02}:{:02}{}Z",
+        date.format("%Y-%m-%d"),
+        hour as u32,
+        minute as u32,
+        whole_seconds,
+        fraction
+    ))
+}
+
 #[cfg(not(feature = "xmp"))]
 fn probe_exif_native(path: &Path) -> ExifProbe {
     let Ok(input) = std::fs::read(path) else {
@@ -390,6 +595,35 @@ pub(crate) struct GpsCoords {
     pub(crate) altitude: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XmpRational {
+    numerator: u32,
+    denominator: u32,
+}
+
+#[cfg(feature = "xmp")]
+impl XmpRational {
+    fn from_exif(value: &uR64) -> Option<Self> {
+        (value.denominator != 0).then_some(Self {
+            numerator: value.nominator,
+            denominator: value.denominator,
+        })
+    }
+
+    fn encode(&self) -> String {
+        format!("{}/{}", self.numerator, self.denominator)
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SourceGpsMetadata {
+    pub(crate) datetime: Option<String>,
+    pub(crate) speed: Option<XmpRational>,
+    pub(crate) speed_ref: Option<String>,
+    pub(crate) horizontal_positioning_error: Option<XmpRational>,
+}
+
 /// Bundle of every field the writer knows how to embed. Empty / default
 /// fields are skipped.
 #[derive(Debug, Default, Clone)]
@@ -400,6 +634,14 @@ pub(crate) struct MetadataWrite {
     pub(crate) offset_time_original: Option<String>,
     /// Remove offset tags before writing a replacement timestamp.
     pub(crate) clear_datetime_offsets: bool,
+    /// GPS fix timestamp in ISO 8601 UTC form.
+    pub(crate) gps_datetime: Option<String>,
+    /// GPS receiver speed as an XMP rational in the units named by `gps_speed_ref`.
+    pub(crate) gps_speed: Option<XmpRational>,
+    /// GPS receiver speed units: K, M, or N.
+    pub(crate) gps_speed_ref: Option<String>,
+    /// Horizontal positioning error in metres as an XMP rational.
+    pub(crate) gps_h_positioning_error: Option<XmpRational>,
     pub(crate) rating: Option<u8>,
     pub(crate) gps: Option<GpsCoords>,
     pub(crate) title: Option<String>,
@@ -419,6 +661,10 @@ impl MetadataWrite {
         self.datetime.is_none()
             && self.offset_time_original.is_none()
             && !self.clear_datetime_offsets
+            && self.gps_datetime.is_none()
+            && self.gps_speed.is_none()
+            && self.gps_speed_ref.is_none()
+            && self.gps_h_positioning_error.is_none()
             && self.rating.is_none()
             && self.gps.is_none()
             && self.title.is_none()
@@ -961,6 +1207,28 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
         )?;
     }
 
+    if let Some(dt) = &write.gps_datetime {
+        meta.set_property(xmp_ns::EXIF, "GPSDateTime", &XmpValue::new(dt.clone()))?;
+    }
+
+    if let Some(speed) = &write.gps_speed {
+        meta.set_property(xmp_ns::EXIF, "GPSSpeed", &XmpValue::new(speed.encode()))?;
+    }
+    if let Some(speed_ref) = &write.gps_speed_ref {
+        meta.set_property(
+            xmp_ns::EXIF,
+            "GPSSpeedRef",
+            &XmpValue::new(speed_ref.clone()),
+        )?;
+    }
+    if let Some(error) = &write.gps_h_positioning_error {
+        meta.set_property(
+            xmp_ns::EXIF,
+            "GPSHPositioningError",
+            &XmpValue::new(error.encode()),
+        )?;
+    }
+
     if let Some(r) = write.rating {
         meta.set_property_i32(xmp_ns::XMP, "Rating", &XmpValue::new(i32::from(r.min(5))))?;
     }
@@ -1153,9 +1421,22 @@ mod tests {
         super::write_sidecar(path, write, ".meta-tmp")
     }
 
+    fn xmp_rational(numerator: u32, denominator: u32) -> XmpRational {
+        XmpRational {
+            numerator,
+            denominator,
+        }
+    }
+
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    use crate::test_helpers::{
+        SOURCE_GPS_DATETIME, SOURCE_GPS_H_POSITIONING_ERROR, SOURCE_GPS_SPEED,
+        SOURCE_GPS_SPEED_REF, exif_with_source_gps, heif_ftyp_without_meta_bytes,
+        minimal_jpeg_with_source_gps, source_gps_without_time_stamp, ur64,
+    };
 
     fn test_tmp_dir(subdir: &str) -> PathBuf {
         std::env::temp_dir().join("claude").join(subdir)
@@ -1281,6 +1562,210 @@ mod tests {
             0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
             0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
         ]
+    }
+
+    #[test]
+    fn source_gps_omits_absent_heic_fixture_fields() {
+        let path = Path::new("tests/data/sample.heic");
+        let gps = read_source_gps(path).expect("sample HEIC source metadata");
+        assert_eq!(gps, SourceGpsMetadata::default());
+    }
+
+    #[test]
+    fn source_gps_skips_unsupported_media_before_reading_it() {
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let path = dir.path().join("video.mov");
+        let gps = read_source_gps(&path).expect("unsupported media should be ignored");
+        assert_eq!(gps, SourceGpsMetadata::default());
+    }
+
+    #[test]
+    fn source_gps_degrades_unparsable_media_to_empty() {
+        // A recognised format whose bytes cannot yield an EXIF block must
+        // degrade to no source GPS rather than an error, so the sidecar is
+        // still written from the CloudKit payload and no retry marker is
+        // stranded. Covers a truncated JPEG, an EXIF-less PNG, an `ftyp`-only
+        // HEIC, and a TIFF recognised by extension and magic. The TIFF row is
+        // the format-detection path DNG downloads exercise.
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("truncated.jpg", vec![0xFF, 0xD8, 0xFF]),
+            (
+                "no-exif.png",
+                vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+            ),
+            ("ftyp-only.heic", heif_ftyp_without_meta_bytes()),
+            (
+                "recognised.tif",
+                vec![b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00],
+            ),
+        ];
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        for (name, bytes) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write case media");
+            let gps = read_source_gps(&path).expect("unparsable media must not error");
+            assert_eq!(gps, SourceGpsMetadata::default(), "{name}");
+        }
+    }
+
+    fn assert_standard_source_gps(gps: &SourceGpsMetadata) {
+        assert_eq!(gps.datetime.as_deref(), Some(SOURCE_GPS_DATETIME));
+        assert_eq!(
+            gps.speed.as_ref().map(XmpRational::encode).as_deref(),
+            Some(SOURCE_GPS_SPEED)
+        );
+        assert_eq!(gps.speed_ref.as_deref(), Some(SOURCE_GPS_SPEED_REF));
+        assert_eq!(
+            gps.horizontal_positioning_error
+                .as_ref()
+                .map(XmpRational::encode)
+                .as_deref(),
+            Some(SOURCE_GPS_H_POSITIONING_ERROR)
+        );
+    }
+
+    #[test]
+    fn source_gps_composes_utc_timestamps() {
+        assert_standard_source_gps(&source_gps_from_exif(&exif_with_source_gps()));
+        // A whole-second GPS timestamp renders without a fractional part.
+        let mut metadata = exif_with_source_gps();
+        metadata.set_tag(ExifTag::GPSTimeStamp(vec![
+            ur64(11, 1),
+            ur64(22, 1),
+            ur64(33, 1),
+        ]));
+        let gps = source_gps_from_exif(&metadata);
+        assert_eq!(gps.datetime.as_deref(), Some("2024-06-15T11:22:33Z"));
+    }
+
+    #[test]
+    fn source_gps_reads_exif_from_media_path() {
+        // `read_source_gps` recovers the same facts from JPEG and HEIC media,
+        // exercising both magic-byte detections through the public reader.
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let mut heic = std::fs::read("tests/data/sample.heic").expect("read sample HEIC");
+        exif_with_source_gps()
+            .write_to_vec(&mut heic, FileExtension::HEIF)
+            .expect("write HEIC EXIF");
+        for (name, bytes) in [
+            ("source.jpg", minimal_jpeg_with_source_gps()),
+            ("source.heic", heic),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write source media");
+            assert_standard_source_gps(&read_source_gps(&path).expect("read source EXIF"));
+        }
+    }
+
+    #[test]
+    fn source_gps_omits_malformed_timestamp_variants() {
+        // A valid date with a malformed GPSTimeStamp, or a malformed date,
+        // yields no GPS datetime while the other source fields survive. One
+        // row per rejection branch: bad date, wrong arity, a non-rational
+        // hour, minute, or second, and an out-of-range hour.
+        let bad = |n: u32| ur64(n, 0);
+        let cases: [(&str, Option<&str>, Vec<uR64>); 6] = [
+            (
+                "malformed date",
+                Some("not-a-date"),
+                vec![ur64(10, 1), ur64(20, 1), ur64(30, 1)],
+            ),
+            ("wrong arity", None, vec![ur64(10, 1), ur64(20, 1)]),
+            (
+                "non-rational hour",
+                None,
+                vec![bad(10), ur64(20, 1), ur64(30, 1)],
+            ),
+            (
+                "non-rational minute",
+                None,
+                vec![ur64(10, 1), bad(20), ur64(30, 1)],
+            ),
+            (
+                "non-rational seconds",
+                None,
+                vec![ur64(10, 1), ur64(20, 1), bad(30)],
+            ),
+            (
+                "hour out of range",
+                None,
+                vec![ur64(25, 1), ur64(20, 1), ur64(30, 1)],
+            ),
+        ];
+        for (name, date, times) in cases {
+            let mut metadata = exif_with_source_gps();
+            if let Some(date) = date {
+                metadata.set_tag(ExifTag::GPSDateStamp(date.into()));
+            }
+            metadata.set_tag(ExifTag::GPSTimeStamp(times));
+            let gps = source_gps_from_exif(&metadata);
+            assert_eq!(gps.datetime, None, "{name}");
+            assert_eq!(
+                gps.speed.as_ref().map(XmpRational::encode).as_deref(),
+                Some(SOURCE_GPS_SPEED),
+                "{name}"
+            );
+            assert_eq!(
+                gps.speed_ref.as_deref(),
+                Some(SOURCE_GPS_SPEED_REF),
+                "{name}"
+            );
+        }
+
+        // A date with no GPSTimeStamp at all cannot compose a timestamp.
+        let gps = source_gps_from_exif(&source_gps_without_time_stamp());
+        assert_eq!(gps.datetime, None);
+        assert_eq!(
+            gps.speed.as_ref().map(XmpRational::encode).as_deref(),
+            Some(SOURCE_GPS_SPEED)
+        );
+    }
+
+    #[test]
+    fn source_gps_omits_unsupported_speed_ref_and_malformed_error() {
+        let mut metadata = exif_with_source_gps();
+        // An unsupported speed unit drops both the speed and the unit.
+        metadata.set_tag(ExifTag::GPSSpeedRef("Y".into()));
+        // A zero-denominator positioning error is dropped.
+        metadata.set_tag(ExifTag::GPSHPositioningError(vec![ur64(1, 0)]));
+
+        let gps = source_gps_from_exif(&metadata);
+        assert_eq!(gps.speed, None);
+        assert_eq!(gps.speed_ref, None);
+        assert_eq!(gps.horizontal_positioning_error, None);
+    }
+
+    #[test]
+    fn source_gps_field_readers_reject_mismatched_tag_types() {
+        let metadata = exif_with_source_gps();
+        // `first_rational` decodes only rational GPS tags; a string tag is None.
+        assert_eq!(
+            first_rational(&metadata, ExifTag::GPSDateStamp(String::new())),
+            None
+        );
+        // `first_string` decodes only string GPS tags; a rational tag is None.
+        assert_eq!(first_string(&metadata, ExifTag::GPSSpeed(Vec::new())), None);
+    }
+
+    #[test]
+    fn gps_datetime_serialises_as_typed_xmp_date() {
+        // The sidecar-write test proves the GPS property values reach XMP. This
+        // pins the packet-level detail that GPSDateTime is a typed XMP date, not
+        // plain text, so downstream tools read it as a date.
+        let gps = source_gps_from_exif(&exif_with_source_gps());
+        let packet = build_xmp_packet(&MetadataWrite {
+            gps_datetime: gps.datetime,
+            ..MetadataWrite::default()
+        })
+        .expect("XMP packet");
+        let meta = std::str::from_utf8(&packet)
+            .expect("XMP UTF-8")
+            .parse::<XmpMeta>()
+            .expect("parse XMP packet");
+        assert!(
+            meta.property_date(xmp_ns::EXIF, "GPSDateTime").is_some(),
+            "GPSDateTime must be serialised as an XMP date"
+        );
     }
 
     fn fresh_jpeg(dir: &Path, name: &str) -> PathBuf {
@@ -1613,6 +2098,7 @@ mod tests {
                 is_archived: true,
                 media_subtype: Some("live_photo".into()),
                 burst_id: None,
+                ..MetadataWrite::default()
             },
         )
         .unwrap();
@@ -1787,17 +2273,6 @@ mod tests {
         path
     }
 
-    fn heif_ftyp_without_meta() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&24u32.to_be_bytes());
-        bytes.extend_from_slice(b"ftyp");
-        bytes.extend_from_slice(b"heic");
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes.extend_from_slice(b"heic");
-        bytes.extend_from_slice(b"mif1");
-        bytes
-    }
-
     fn assert_heif_embed_skip_preserves(path: &Path, write: &MetadataWrite) {
         let original = fs::read(path).unwrap();
         apply_metadata_with_default_suffix(path, write).expect("HEIC metadata skip should succeed");
@@ -1954,7 +2429,7 @@ mod tests {
         let dir = test_tmp_dir("meta_heic_tests");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("missing_meta.heic");
-        let original = heif_ftyp_without_meta();
+        let original = heif_ftyp_without_meta_bytes();
         fs::write(&path, &original).unwrap();
 
         assert_heif_embed_skip_preserves(
@@ -2481,6 +2956,10 @@ mod tests {
             datetime: Some("2024:06:15 10:00:00".into()),
             offset_time_original: Some("+10:00".into()),
             clear_datetime_offsets: false,
+            gps_datetime: Some("2024-06-15T10:00:01Z".into()),
+            gps_speed: Some(xmp_rational(25, 2)),
+            gps_speed_ref: Some("K".into()),
+            gps_h_positioning_error: Some(xmp_rational(13, 4)),
             rating: Some(5),
             gps: Some(GpsCoords {
                 latitude: 37.7,
@@ -2515,6 +2994,10 @@ mod tests {
         for (namespace, property) in [
             (xmp_ns::XMP, "Rating"),
             (EXIF_EX_XMP_NS, "OffsetTimeOriginal"),
+            (xmp_ns::EXIF, "GPSDateTime"),
+            (xmp_ns::EXIF, "GPSSpeed"),
+            (xmp_ns::EXIF, "GPSSpeedRef"),
+            (xmp_ns::EXIF, "GPSHPositioningError"),
             (xmp_ns::EXIF, "GPSAltitude"),
             (xmp_ns::EXIF, "GPSAltitudeRef"),
             (xmp_ns::DC, "subject"),
@@ -2540,6 +3023,10 @@ mod tests {
         assert!(managed.contains("exif:GPSLatitude"));
         assert!(!managed.contains("xmp:Rating"));
         assert!(!managed.contains("exifEX:OffsetTimeOriginal"));
+        assert!(!managed.contains("exif:GPSDateTime"));
+        assert!(!managed.contains("exif:GPSSpeed"));
+        assert!(!managed.contains("exif:GPSSpeedRef"));
+        assert!(!managed.contains("exif:GPSHPositioningError"));
         assert!(!managed.contains("exif:GPSAltitude"));
         assert_eq!(
             meta.property(THIRD_PARTY_NS, "developSettings")
@@ -2570,6 +3057,22 @@ mod tests {
         let mut seed = XmpMeta::new().unwrap();
         seed.set_property_i32(xmp_ns::XMP, "Rating", &XmpValue::new(5))
             .unwrap();
+        seed.set_property(
+            xmp_ns::EXIF,
+            "GPSDateTime",
+            &XmpValue::new("2024-06-15T10:00:01Z".to_string()),
+        )
+        .unwrap();
+        seed.set_property(xmp_ns::EXIF, "GPSSpeed", &XmpValue::new("25/2".to_string()))
+            .unwrap();
+        seed.set_property(xmp_ns::EXIF, "GPSSpeedRef", &XmpValue::new("K".to_string()))
+            .unwrap();
+        seed.set_property(
+            xmp_ns::EXIF,
+            "GPSHPositioningError",
+            &XmpValue::new("13/4".to_string()),
+        )
+        .unwrap();
         seed.set_localized_text(
             xmp_ns::DC,
             "description",
@@ -2595,6 +3098,17 @@ mod tests {
             5,
             "an unmarked rating may belong to another application"
         );
+        for property in [
+            "GPSDateTime",
+            "GPSSpeed",
+            "GPSSpeedRef",
+            "GPSHPositioningError",
+        ] {
+            assert!(
+                meta.contains_property(xmp_ns::EXIF, property),
+                "an unmarked GPS property may belong to another application: {property}"
+            );
+        }
         assert_eq!(
             meta.localized_text(xmp_ns::DC, "description", None, "x-default")
                 .unwrap()
@@ -2606,6 +3120,10 @@ mod tests {
         let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
         assert!(!managed.contains("xmp:Rating"));
         assert!(!managed.contains("dc:description"));
+        assert!(!managed.contains("exif:GPSDateTime"));
+        assert!(!managed.contains("exif:GPSSpeed"));
+        assert!(!managed.contains("exif:GPSSpeedRef"));
+        assert!(!managed.contains("exif:GPSHPositioningError"));
 
         fs::remove_file(&sidecar_path).ok();
         fs::remove_file(&media_path).ok();
