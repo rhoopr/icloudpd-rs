@@ -14,7 +14,10 @@ pub mod types;
 
 #[cfg(test)]
 pub use db::ImportedRecord;
-pub(crate) use db::{AssetVerificationState, CheckpointTransition, ScopedDbSyncToken};
+pub(crate) use db::{
+    AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
+    ScopedDbSyncToken,
+};
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,
     SqliteStateDb, SyncTokenStore,

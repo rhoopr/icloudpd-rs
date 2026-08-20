@@ -64,6 +64,24 @@ pub struct ImportedRecord {
     pub imported_mtime: Option<i64>,
 }
 
+/// Compact downloaded-state projection used to preload sync decisions.
+#[derive(Debug)]
+pub(crate) struct DownloadedFileRecord {
+    pub(crate) library: String,
+    pub(crate) id: String,
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) checksum: String,
+    pub(crate) local_path: Option<PathBuf>,
+    pub(crate) local_checksum: Option<String>,
+    pub(crate) download_checksum: Option<String>,
+}
+
+/// State operation used only to preload the download context.
+#[async_trait]
+pub(crate) trait DownloadContextStateStore: Send + Sync {
+    async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError>;
+}
+
 /// Live album-membership row keyed by CloudKit asset record name.
 ///
 /// Album relation records refer to `PhotoAsset::asset_record_name()`, while
@@ -2163,6 +2181,39 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_downloaded_file_records(
+        &self,
+    ) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        self.with_conn("get_downloaded_file_records", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT library, id, version_size, checksum, local_path, \
+                            local_checksum, download_checksum \
+                     FROM assets WHERE status = 'downloaded'",
+                )
+                .map_err(|e| StateError::query("get_downloaded_file_records", e))?;
+
+            stmt.query_map([], |row| {
+                let version_size: String = row.get(2)?;
+                let local_path: Option<String> = row.get(4)?;
+                Ok(DownloadedFileRecord {
+                    library: row.get(0)?,
+                    id: row.get(1)?,
+                    version_size: VersionSizeKey::from_str(&version_size)
+                        .unwrap_or(VersionSizeKey::Original),
+                    checksum: row.get(3)?,
+                    local_path: local_path.map(PathBuf::from),
+                    local_checksum: row.get(5)?,
+                    download_checksum: row.get(6)?,
+                })
+            })
+            .map_err(|e| StateError::query("get_downloaded_file_records", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StateError::query("get_downloaded_file_records", e))
+        })
+        .await
+    }
+
     /// Assets that still hold `status = 'downloaded'` rows after the provider
     /// reported them deleted. Soft deletion flips every version of an asset
     /// together, so this is keyed by asset rather than by version.
@@ -4223,6 +4274,13 @@ impl SyncTokenStore for SqliteStateDb {
 
     async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
         SqliteStateDb::list_interrupted_enumerations(self).await
+    }
+}
+
+#[async_trait]
+impl DownloadContextStateStore for SqliteStateDb {
+    async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        SqliteStateDb::get_downloaded_file_records(self).await
     }
 }
 
@@ -6384,6 +6442,46 @@ mod tests {
             "PENDING_1".to_string(),
             "original".to_string()
         )));
+    }
+
+    #[tokio::test]
+    async fn downloaded_file_records_return_compact_skip_evidence() {
+        let dir = test_dir();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("DOWNLOADED")
+            .checksum("provider-checksum")
+            .filename("downloaded.jpg")
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let path = dir.path().join("downloaded.jpg");
+        db.mark_downloaded(
+            "PrimarySync",
+            "DOWNLOADED",
+            "original",
+            &path,
+            "local-checksum",
+            Some("download-checksum"),
+        )
+        .await
+        .unwrap();
+        db.upsert_seen(&TestAssetRecord::new("PENDING").build())
+            .await
+            .unwrap();
+
+        let records = db.get_downloaded_file_records().await.unwrap();
+
+        assert_eq!(records.len(), 1);
+        let downloaded = &records[0];
+        assert_eq!(downloaded.library, "PrimarySync");
+        assert_eq!(downloaded.id, "DOWNLOADED");
+        assert_eq!(downloaded.version_size, VersionSizeKey::Original);
+        assert_eq!(downloaded.checksum, "provider-checksum");
+        assert_eq!(downloaded.local_path.as_deref(), Some(path.as_path()));
+        assert_eq!(downloaded.local_checksum.as_deref(), Some("local-checksum"));
+        assert_eq!(
+            downloaded.download_checksum.as_deref(),
+            Some("download-checksum")
+        );
     }
 
     #[tokio::test]

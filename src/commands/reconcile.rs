@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::cli;
 use crate::config;
+use crate::download::file::{LocalFileSizeExpectation, local_file_size_matches_state};
 use crate::state;
 use crate::state::{ReportStateStore, VersionSizeKey};
 
@@ -128,20 +129,15 @@ pub(crate) async fn classify_local_drift(
     };
 
     let actual_size = metadata.len();
-    if size_bytes > 0 && actual_size < size_bytes {
-        let metadata_changed_download = matches!(
-            (&local_checksum, &download_checksum),
-            (Some(local), Some(download)) if local != download
-        );
-        if metadata_changed_download {
-            // The provider size describes the pre-metadata download. Prove
-            // the smaller current file still matches kei's post-write bytes
-            // before treating the size difference as local damage.
-            let actual_checksum = crate::download::file::compute_sha256(&local_path).await?;
-            if local_checksum.as_deref() == Some(actual_checksum.as_str()) {
-                return Ok((None, false));
-            }
-        }
+    if !local_file_size_matches_state(
+        &local_path,
+        actual_size,
+        LocalFileSizeExpectation::AtLeastProvider(size_bytes),
+        local_checksum.as_deref(),
+        download_checksum.as_deref(),
+    )
+    .await?
+    {
         return Ok((
             Some(LocalDriftAsset {
                 library,

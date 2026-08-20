@@ -21,6 +21,7 @@ use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
+use super::file::{LocalFileSizeExpectation, local_file_size_matches_state};
 use super::filter::{
     DerivedPath, DownloadTask, FilterReason, derive_expected_paths, determine_media_type,
     extract_skip_candidates, is_asset_filtered,
@@ -40,7 +41,8 @@ use super::planner::add_asset_album_with_retry;
 use super::planner::{self, ExistingPathMatch, TaskPlanner};
 use super::{
     ClaimedLegacyMasterStates, DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome,
-    DownloadReporting, DownloadStore, metadata_rewrite, preload_download_context,
+    DownloadReporting, DownloadStore, RecordedLocalFile, metadata_rewrite,
+    preload_download_context,
 };
 
 pub(super) use metadata_rewrite::MetadataFlags;
@@ -323,7 +325,21 @@ async fn adopt_pending_on_disk_skip(
         if !pending_versions.contains(version_size) {
             continue;
         }
-        match adopt_pending_derived_path(db, library, asset, task_planner, &derived).await {
+        match adopt_pending_derived_path(
+            db,
+            library,
+            asset,
+            task_planner,
+            &derived,
+            ctx.pending_file_matching_checksum(
+                library,
+                asset.state_id(),
+                derived.version_size,
+                derived.checksum.as_ref(),
+            ),
+        )
+        .await
+        {
             Some(PendingOnDiskAdoption::Adopted(_)) => {}
             Some(PendingOnDiskAdoption::StateWriteFailed(_)) => {
                 summary.state_write_failures += 1;
@@ -372,7 +388,7 @@ pub(super) struct PendingRetryFileEvidence<'a> {
 
 pub(super) enum PendingRetryLocalPath<'a> {
     Unrecorded,
-    Current(&'a Path),
+    Current(&'a RecordedLocalFile),
     Historical,
 }
 
@@ -388,7 +404,8 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
         return PendingRetryAdoption::NotFound;
     }
 
-    if let PendingRetryLocalPath::Current(local_path) = evidence.local_path {
+    if let PendingRetryLocalPath::Current(recorded_file) = evidence.local_path {
+        let local_path = &recorded_file.path;
         let recorded_filename_matches = local_path
             .file_name()
             .and_then(|filename| filename.to_str())
@@ -405,8 +422,15 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
         }) {
             let mut recorded_task = task.clone();
             recorded_task.download_path = local_path.to_path_buf();
-            if let Some(adoption) =
-                adopt_pending_task_path(db, config, asset, task_planner, &recorded_task).await
+            if let Some(adoption) = adopt_pending_task_path(
+                db,
+                config,
+                asset,
+                task_planner,
+                &recorded_task,
+                Some(recorded_file),
+            )
+            .await
             {
                 return adoption.into();
             }
@@ -428,6 +452,7 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
                 task_planner,
                 &derived,
                 local_path,
+                Some(recorded_file),
             )
             .await
             {
@@ -442,7 +467,8 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
             && task.checksum.as_ref() == evidence.checksum
             && task.size == evidence.size
     }) {
-        if let Some(adoption) = adopt_pending_task_path(db, config, asset, task_planner, task).await
+        if let Some(adoption) =
+            adopt_pending_task_path(db, config, asset, task_planner, task, None).await
         {
             return adoption.into();
         }
@@ -463,6 +489,7 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
             asset,
             task_planner,
             &derived,
+            None,
         )
         .await
         {
@@ -488,7 +515,21 @@ async fn adopt_pending_on_disk_task(
         return None;
     }
 
-    if let Some(adoption) = adopt_pending_task_path(db, config, asset, task_planner, task).await {
+    if let Some(adoption) = adopt_pending_task_path(
+        db,
+        config,
+        asset,
+        task_planner,
+        task,
+        ctx.pending_file_matching_checksum(
+            library,
+            asset.state_id(),
+            task.version_size,
+            task.checksum.as_ref(),
+        ),
+    )
+    .await
+    {
         return Some(adoption);
     }
 
@@ -503,8 +544,20 @@ async fn adopt_pending_on_disk_task(
         }) {
             continue;
         }
-        if let Some(adoption) =
-            adopt_pending_derived_path(db, library, asset, task_planner, &derived).await
+        if let Some(adoption) = adopt_pending_derived_path(
+            db,
+            library,
+            asset,
+            task_planner,
+            &derived,
+            ctx.pending_file_matching_checksum(
+                library,
+                asset.state_id(),
+                derived.version_size,
+                derived.checksum.as_ref(),
+            ),
+        )
+        .await
         {
             return Some(adoption);
         }
@@ -513,17 +566,77 @@ async fn adopt_pending_on_disk_task(
     None
 }
 
+fn path_matches_recorded_file(path: &Path, recorded_path: &Path) -> bool {
+    if path == recorded_path {
+        return true;
+    }
+    if path.parent() != recorded_path.parent() {
+        return false;
+    }
+
+    match (
+        path.file_name().and_then(|name| name.to_str()),
+        recorded_path.file_name().and_then(|name| name.to_str()),
+    ) {
+        (Some(path), Some(recorded)) => filenames_match_ampm_equivalent(path, recorded),
+        _ => false,
+    }
+}
+
+async fn pending_file_size_allows_adoption(
+    asset: &PhotoAsset,
+    version_size: &str,
+    path: &Path,
+    actual_size: u64,
+    provider_size: u64,
+    recorded_file: Option<&RecordedLocalFile>,
+) -> bool {
+    let recorded_file =
+        recorded_file.filter(|recorded| path_matches_recorded_file(path, &recorded.path));
+    let result = local_file_size_matches_state(
+        path,
+        actual_size,
+        LocalFileSizeExpectation::ExactProvider(provider_size),
+        recorded_file.and_then(|recorded| recorded.local_checksum.as_deref()),
+        recorded_file.and_then(|recorded| recorded.download_checksum.as_deref()),
+    )
+    .await;
+    match result {
+        Ok(matches) => matches,
+        Err(error) => {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size,
+                path = %path.display(),
+                error = %error,
+                "Failed to verify size-divergent pending file"
+            );
+            false
+        }
+    }
+}
+
 async fn adopt_pending_task_path(
     db: &dyn DownloadStore,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     task_planner: &mut TaskPlanner,
     task: &DownloadTask,
+    recorded_file: Option<&RecordedLocalFile>,
 ) -> Option<PendingOnDiskAdoption> {
     let version_size = task.version_size.as_str();
     let (existing_path, existing_size) =
         task_planner.existing_path_with_size(&task.download_path)?;
-    if existing_size != task.size {
+    if !pending_file_size_allows_adoption(
+        asset,
+        version_size,
+        &existing_path,
+        existing_size,
+        task.size,
+        recorded_file,
+    )
+    .await
+    {
         return None;
     }
 
@@ -553,8 +666,18 @@ async fn adopt_pending_derived_path(
     asset: &PhotoAsset,
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
+    recorded_file: Option<&RecordedLocalFile>,
 ) -> Option<PendingOnDiskAdoption> {
-    adopt_pending_derived_path_at(db, library, asset, task_planner, derived, &derived.path).await
+    adopt_pending_derived_path_at(
+        db,
+        library,
+        asset,
+        task_planner,
+        derived,
+        &derived.path,
+        recorded_file,
+    )
+    .await
 }
 
 async fn adopt_pending_derived_path_at(
@@ -564,10 +687,20 @@ async fn adopt_pending_derived_path_at(
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
     path: &Path,
+    recorded_file: Option<&RecordedLocalFile>,
 ) -> Option<PendingOnDiskAdoption> {
     let version_size = derived.version_size.as_str();
     let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
-    if existing_size != derived.size {
+    if !pending_file_size_allows_adoption(
+        asset,
+        version_size,
+        &existing_path,
+        existing_size,
+        derived.size,
+        recorded_file,
+    )
+    .await
+    {
         return None;
     }
 
@@ -635,25 +768,46 @@ async fn mark_pending_downloaded_from_existing_path(
     Some(PendingOnDiskAdoption::Adopted(existing_path))
 }
 
-fn state_path_size_allows_skip(
+async fn state_path_size_allows_skip(
     asset: &PhotoAsset,
     version_size: VersionSizeKey,
     path: &Path,
     on_disk_size: u64,
     expected_size: u64,
+    recorded_file: &RecordedLocalFile,
 ) -> bool {
-    if expected_size > 0 && on_disk_size < expected_size {
-        tracing::warn!(
-            asset_id = %asset.id(),
-            version_size = %version_size.as_str(),
-            path = %path.display(),
-            on_disk_size,
-            expected_size,
-            "State path is smaller than expected; re-downloading instead of skipping"
-        );
-        return false;
+    let result = local_file_size_matches_state(
+        path,
+        on_disk_size,
+        LocalFileSizeExpectation::AtLeastProvider(expected_size),
+        recorded_file.local_checksum.as_deref(),
+        recorded_file.download_checksum.as_deref(),
+    )
+    .await;
+    match result {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size = %version_size.as_str(),
+                path = %path.display(),
+                on_disk_size,
+                expected_size,
+                "State path is smaller than expected; re-downloading instead of skipping"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size = %version_size.as_str(),
+                path = %path.display(),
+                error = %error,
+                "Failed to verify size-divergent state path; re-downloading instead of skipping"
+            );
+            false
+        }
     }
-    true
 }
 
 fn stored_path_matches_current_collision_family(
@@ -744,15 +898,15 @@ fn filenames_match_ampm_equivalent(a: &str, b: &str) -> bool {
     a == b || super::paths::normalize_ampm(a) == super::paths::normalize_ampm(b)
 }
 
-pub(super) fn state_confirmed_current_path_exists(
+pub(super) async fn state_confirmed_current_path_exists(
     ctx: &DownloadContext,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     task: &DownloadTask,
     task_planner: &mut TaskPlanner,
 ) -> Option<PathBuf> {
-    let stored_path =
-        ctx.downloaded_local_path(&task.library, &task.asset_id, task.version_size)?;
+    let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
+    let stored_path = &recorded_file.path;
     let derived_paths = derive_expected_paths(asset, config);
 
     for derived in &derived_paths {
@@ -764,14 +918,17 @@ pub(super) fn state_confirmed_current_path_exists(
         else {
             continue;
         };
-        if existing_path == stored_path {
+        if existing_path.as_path() == stored_path.as_path() {
             if state_path_size_allows_skip(
                 asset,
                 derived.version_size,
                 &existing_path,
                 existing_size,
                 derived.size,
-            ) {
+                recorded_file,
+            )
+            .await
+            {
                 return Some(existing_path);
             }
             return None;
@@ -798,7 +955,10 @@ pub(super) fn state_confirmed_current_path_exists(
             &existing_path,
             existing_size,
             derived.size,
-        ) {
+            recorded_file,
+        )
+        .await
+        {
             return Some(existing_path);
         }
         return None;
@@ -1762,6 +1922,7 @@ where
                                                 &task,
                                                 &mut task_planner,
                                             )
+                                            .await
                                         {
                                             disposition = disposition.max(AssetDisposition::OnDisk);
                                             tracing::debug!(
@@ -4197,7 +4358,7 @@ mod tests {
         calls: AtomicUsize,
         successes: AtomicUsize,
         failed_calls: AtomicUsize,
-        downloaded_id_loads: AtomicUsize,
+        downloaded_state_loads: AtomicUsize,
         track_failed_calls: bool,
         fail_complete_sync_run: bool,
     }
@@ -4209,7 +4370,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 successes: AtomicUsize::new(0),
                 failed_calls: AtomicUsize::new(0),
-                downloaded_id_loads: AtomicUsize::new(0),
+                downloaded_state_loads: AtomicUsize::new(0),
                 track_failed_calls: false,
                 fail_complete_sync_run: false,
             }
@@ -4235,8 +4396,8 @@ mod tests {
             self.calls.load(Ordering::Relaxed)
         }
 
-        fn downloaded_id_load_count(&self) -> usize {
-            self.downloaded_id_loads.load(Ordering::Relaxed)
+        fn downloaded_state_load_count(&self) -> usize {
+            self.downloaded_state_loads.load(Ordering::Relaxed)
         }
 
         fn failed_call_count(&self) -> usize {
@@ -4314,7 +4475,6 @@ mod tests {
         async fn get_downloaded_ids(
             &self,
         ) -> Result<HashSet<(String, String, String)>, StateError> {
-            self.downloaded_id_loads.fetch_add(1, Ordering::Relaxed);
             Ok(HashSet::new())
         }
 
@@ -4387,6 +4547,16 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::state::DownloadContextStateStore for FailingDownloadStore {
+        async fn get_downloaded_file_records(
+            &self,
+        ) -> Result<Vec<crate::state::DownloadedFileRecord>, StateError> {
+            self.downloaded_state_loads.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ReportStateStore for FailingDownloadStore {
         #[cfg(test)]
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -4425,7 +4595,7 @@ mod tests {
             _offset: u64,
             _limit: u32,
         ) -> Result<Vec<AssetRecord>, StateError> {
-            unimplemented!()
+            Ok(Vec::new())
         }
 
         async fn start_sync_run_at(
@@ -5627,6 +5797,151 @@ mod tests {
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 0);
+    }
+
+    async fn run_producer_metadata_rewritten_pending_file(
+        pending_checksum: &str,
+    ) -> (
+        StreamingResult,
+        i64,
+        Arc<crate::state::SqliteStateDb>,
+        TempDir,
+        PathBuf,
+        String,
+    ) {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::{SqliteStateDb, VersionSizeKey};
+        use crate::test_helpers::TestAssetRecord;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn metadata_rewritten_asset() -> PhotoAsset {
+            TestPhotoAsset::new("METADATA_REWRITTEN_PENDING")
+                .filename("rewritten.jpg")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(8)
+                .orig_url("https://p01.icloud-content.com/rewritten.jpg")
+                .orig_checksum("ck_metadata_rewritten_pending")
+                .build()
+                .with_source_zone(Arc::from("SharedSync-abc"))
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset = metadata_rewritten_asset();
+        let target_path = crate::download::filter::expected_paths_for(&asset, config.as_ref())
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&target_path, b"shorter").unwrap();
+        let local_checksum = crate::download::file::compute_sha256(&target_path)
+            .await
+            .expect("hash metadata-rewritten file");
+
+        let record = TestAssetRecord::new(asset.state_id())
+            .library("SharedSync-abc")
+            .checksum(pending_checksum)
+            .filename("rewritten.jpg")
+            .size(8)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "SharedSync-abc",
+            asset.state_id(),
+            VersionSizeKey::Original.as_str(),
+            &target_path,
+            &local_checksum,
+            Some("download-checksum-before-metadata"),
+        )
+        .await
+        .unwrap();
+        db.mark_failed(
+            "SharedSync-abc",
+            asset.state_id(),
+            VersionSizeKey::Original.as_str(),
+            "prior false truncation",
+        )
+        .await
+        .unwrap();
+        db.prepare_for_retry(Some("SharedSync-abc")).await.unwrap();
+
+        let client = reqwest::Client::new();
+        let sync_started_at = chrono::Utc::now().timestamp();
+        let assets = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(
+            metadata_rewritten_asset(),
+        )]);
+        let result = stream_and_download_from_stream(
+            &client,
+            assets,
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must process metadata-rewritten pending file");
+
+        (
+            result,
+            sync_started_at,
+            db,
+            dir,
+            target_path,
+            local_checksum,
+        )
+    }
+
+    #[tokio::test]
+    async fn producer_adopts_smaller_metadata_rewritten_pending_file() {
+        let (result, sync_started_at, db, _dir, target_path, local_checksum) =
+            run_producer_metadata_rewritten_pending_file("ck_metadata_rewritten_pending").await;
+
+        assert_eq!(
+            db.promote_pending_to_failed(sync_started_at).await.unwrap(),
+            0
+        );
+        assert!(result.failed.is_empty());
+        assert_eq!(fs::read(&target_path).unwrap(), b"shorter");
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(target_path.as_path())
+        );
+        assert_eq!(
+            downloaded[0].local_checksum.as_deref(),
+            Some(local_checksum.as_str())
+        );
+        assert_eq!(
+            downloaded[0].download_checksum.as_deref(),
+            Some("download-checksum-before-metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn producer_does_not_adopt_metadata_rewritten_file_after_provider_change() {
+        let (result, _, db, _dir, target_path, _) =
+            run_producer_metadata_rewritten_pending_file("old-provider-checksum").await;
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(fs::read(&target_path).unwrap(), b"shorter");
+        assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].checksum.as_ref(), "ck_metadata_rewritten_pending");
     }
 
     #[tokio::test]
@@ -6928,13 +7243,7 @@ mod tests {
         assert_eq!(&*failed[0].id, "DELETED");
     }
 
-    /// Metadata embedding can legitimately change the local byte size after
-    /// the downloaded bytes were verified. A later sync must use the DB row's
-    /// asset identity and recorded path to skip that current-path file instead
-    /// of treating it as a same-name/different-size collision and downloading
-    /// a `-<size>` duplicate.
-    #[tokio::test]
-    async fn metadata_mutated_downloaded_file_is_not_size_dedup_redownloaded() {
+    async fn assert_metadata_mutated_downloaded_file_is_not_redownloaded(on_disk_size: usize) {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
         use crate::state::SqliteStateDb;
@@ -6972,7 +7281,10 @@ mod tests {
             None,
         );
         fs::create_dir_all(target_path.parent().unwrap()).unwrap();
-        fs::write(&target_path, vec![0u8; 1500]).unwrap();
+        fs::write(&target_path, vec![0u8; on_disk_size]).unwrap();
+        let local_checksum = crate::download::file::compute_sha256(&target_path)
+            .await
+            .expect("hash metadata-mutated file");
 
         let record = crate::test_helpers::TestAssetRecord::new("METADATA_MUTATED")
             .checksum("ck_metadata_mutated")
@@ -6985,7 +7297,7 @@ mod tests {
             "METADATA_MUTATED",
             "original",
             &target_path,
-            "local_checksum_after_metadata_write",
+            &local_checksum,
             Some("download_checksum_before_metadata_write"),
         )
         .await
@@ -7019,6 +7331,19 @@ mod tests {
             failed.is_empty(),
             "metadata-mutated downloaded file should remain downloaded, not failed"
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_mutated_downloaded_file_is_not_size_dedup_redownloaded() {
+        assert_metadata_mutated_downloaded_file_is_not_redownloaded(1500).await;
+    }
+
+    /// Metadata embedding can legitimately make the local file smaller after
+    /// the downloaded bytes were verified. A later sync must prove the current
+    /// bytes from the DB row instead of downloading a `-<size>` duplicate.
+    #[tokio::test]
+    async fn smaller_metadata_mutated_downloaded_file_is_not_redownloaded() {
+        assert_metadata_mutated_downloaded_file_is_not_redownloaded(1200).await;
     }
 
     fn identity_suffixed_path_for(bare_path: &Path, asset_id: &str) -> PathBuf {
@@ -8033,9 +8358,9 @@ mod tests {
         let config = Arc::new(raw_config);
         let preloaded = preload_download_context(&config).await;
         assert_eq!(
-            db.downloaded_id_load_count(),
+            db.downloaded_state_load_count(),
             1,
-            "preload should read downloaded IDs once"
+            "preload should read downloaded state once"
         );
 
         let client = reqwest::Client::new();
@@ -8053,7 +8378,7 @@ mod tests {
         .expect("empty stream should complete");
 
         assert_eq!(
-            db.downloaded_id_load_count(),
+            db.downloaded_state_load_count(),
             1,
             "stream should reuse the preloaded context instead of reloading the DB"
         );

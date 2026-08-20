@@ -4631,6 +4631,15 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl state::DownloadContextStateStore for FailingMetadataSetDb {
+        async fn get_downloaded_file_records(
+            &self,
+        ) -> Result<Vec<state::DownloadedFileRecord>, state::error::StateError> {
+            self.inner.get_downloaded_file_records().await
+        }
+    }
+
+    #[async_trait::async_trait]
     impl state::ReportStateStore for FailingMetadataSetDb {
         async fn get_failed(
             &self,

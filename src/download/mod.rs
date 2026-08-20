@@ -58,8 +58,8 @@ use crate::icloud::photos::{
 };
 use crate::retry::RetryConfig;
 use crate::state::{
-    DownloadStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore, SyncTokenStore,
-    VersionSizeKey,
+    DownloadContextStateStore, DownloadStateStore, MembershipStore, MetadataRewriteStore,
+    ReportStateStore, SyncTokenStore, VersionSizeKey,
 };
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
@@ -92,12 +92,18 @@ pub enum SyncMode {
 }
 
 pub(crate) trait DownloadStore:
-    DownloadStateStore + MembershipStore + MetadataRewriteStore + ReportStateStore + SyncTokenStore
+    DownloadContextStateStore
+    + DownloadStateStore
+    + MembershipStore
+    + MetadataRewriteStore
+    + ReportStateStore
+    + SyncTokenStore
 {
 }
 
 impl<T> DownloadStore for T where
-    T: DownloadStateStore
+    T: DownloadContextStateStore
+        + DownloadStateStore
         + MembershipStore
         + MetadataRewriteStore
         + ReportStateStore
@@ -1368,10 +1374,17 @@ type LibraryAssetAttemptCounts = FxHashMap<Arc<str>, FxHashMap<Arc<str>, u32>>;
 type LibraryAssetVersionValueMap =
     FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>>;
 
-/// `library -> asset_id -> (version_size -> local_path)`. Used to confirm
-/// state-backed skips still point at the currently configured path.
-type LibraryAssetVersionPathMap =
-    FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, PathBuf>>>;
+/// Durable local-file evidence for a state-backed skip or pending adoption.
+#[derive(Debug)]
+struct RecordedLocalFile {
+    path: PathBuf,
+    local_checksum: Option<Box<str>>,
+    download_checksum: Option<Box<str>>,
+}
+
+/// `library -> asset_id -> (version_size -> recorded local-file evidence)`.
+type LibraryAssetVersionFileMap =
+    FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, RecordedLocalFile>>>;
 
 /// `library -> master_record_name -> asset_record_names`. Full enumeration
 /// uses this durable family history to keep a legacy master-keyed state row
@@ -1427,10 +1440,10 @@ struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> checksum).
     /// Used to detect checksum changes (CloudKit asset updated) without DB queries.
     downloaded_checksums: LibraryAssetVersionValueMap,
-    /// Nested map: `library` -> `asset_id` -> (`version_size` -> local_path).
+    /// Nested map: `library` -> `asset_id` -> (`version_size` -> local file).
     /// Used to validate path-aware filesystem skips after state says the
     /// remote bytes are unchanged.
-    downloaded_local_paths: LibraryAssetVersionPathMap,
+    downloaded_files: LibraryAssetVersionFileMap,
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> metadata_hash).
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS
     /// edit, etc.) when file bytes are unchanged but CloudKit has newer
@@ -1460,6 +1473,9 @@ struct DownloadContext {
     /// to retain a compatible legacy master-keyed retry without merging a
     /// different sibling into it.
     pending_checksums: LibraryAssetVersionValueMap,
+    /// Current recorded local files for pending rows. A provider checksum
+    /// change clears `downloaded_at`, so historical paths are excluded.
+    pending_files: LibraryAssetVersionFileMap,
     /// Provider identity families recorded before this pipeline started.
     /// `None` disables legacy adoption after a mapping query failure. The
     /// snapshot intentionally excludes mappings discovered during the current
@@ -1486,7 +1502,7 @@ impl DownloadContext {
     /// on round-trip latency across them.
     async fn load<D>(db: &D, retry_only: bool) -> Self
     where
-        D: DownloadStateStore + MetadataRewriteStore + ?Sized,
+        D: DownloadContextStateStore + DownloadStateStore + MetadataRewriteStore + ?Sized,
     {
         let known_ids_fut = async {
             if retry_only {
@@ -1499,10 +1515,8 @@ impl DownloadContext {
             }
         };
         let (
-            ids,
+            downloaded_records,
             soft_deleted,
-            checksums,
-            paths,
             hashes,
             markers,
             pending,
@@ -1512,26 +1526,14 @@ impl DownloadContext {
             legacy_owner_rows,
         ) = tokio::join!(
             async {
-                db.get_downloaded_ids().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
+                db.get_downloaded_file_records().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load downloaded records from state DB");
                     Default::default()
                 })
             },
             async {
                 db.get_soft_deleted_downloaded_ids().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load soft-deleted assets from state DB");
-                    Default::default()
-                })
-            },
-            async {
-                db.get_downloaded_checksums().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load checksums from state DB");
-                    Default::default()
-                })
-            },
-            async {
-                db.get_downloaded_local_paths().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load downloaded local paths from state DB");
                     Default::default()
                 })
             },
@@ -1578,15 +1580,48 @@ impl DownloadContext {
         let mut interner: FxHashSet<Arc<str>> = FxHashSet::default();
 
         let mut downloaded_ids: LibraryAssetVersionSet = FxHashMap::default();
-        for (library, asset_id, version_size) in ids {
+        let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
+        let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
+        for record in downloaded_records {
+            let crate::state::DownloadedFileRecord {
+                library,
+                id,
+                version_size,
+                checksum,
+                local_path,
+                local_checksum,
+                download_checksum,
+            } = record;
             let lib = intern_id(&mut interner, library);
-            let id = intern_id(&mut interner, asset_id);
+            let id = intern_id(&mut interner, id);
+            let version_size: Box<str> = version_size.as_str().into();
             downloaded_ids
-                .entry(lib)
+                .entry(Arc::clone(&lib))
                 .or_default()
-                .entry(id)
+                .entry(Arc::clone(&id))
                 .or_default()
-                .insert(version_size.into_boxed_str());
+                .insert(version_size.clone());
+            downloaded_checksums
+                .entry(Arc::clone(&lib))
+                .or_default()
+                .entry(Arc::clone(&id))
+                .or_default()
+                .insert(version_size.clone(), checksum.into_boxed_str());
+            if let Some(path) = local_path {
+                downloaded_files
+                    .entry(lib)
+                    .or_default()
+                    .entry(id)
+                    .or_default()
+                    .insert(
+                        version_size,
+                        RecordedLocalFile {
+                            path,
+                            local_checksum: local_checksum.map(String::into_boxed_str),
+                            download_checksum: download_checksum.map(String::into_boxed_str),
+                        },
+                    );
+            }
         }
 
         let mut soft_deleted_ids: LibraryAssetSet = FxHashMap::default();
@@ -1594,30 +1629,6 @@ impl DownloadContext {
             let lib = intern_id(&mut interner, library);
             let id = intern_id(&mut interner, asset_id);
             soft_deleted_ids.entry(lib).or_default().insert(id);
-        }
-
-        let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
-        for ((library, asset_id, version_size), checksum) in checksums {
-            let lib = intern_id(&mut interner, library);
-            let id = intern_id(&mut interner, asset_id);
-            downloaded_checksums
-                .entry(lib)
-                .or_default()
-                .entry(id)
-                .or_default()
-                .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
-        }
-
-        let mut downloaded_local_paths: LibraryAssetVersionPathMap = FxHashMap::default();
-        for ((library, asset_id, version_size), path) in paths {
-            let lib = intern_id(&mut interner, library);
-            let id = intern_id(&mut interner, asset_id);
-            downloaded_local_paths
-                .entry(lib)
-                .or_default()
-                .entry(id)
-                .or_default()
-                .insert(version_size.into_boxed_str(), path);
         }
 
         let mut downloaded_metadata_hashes: LibraryAssetVersionValueMap = FxHashMap::default();
@@ -1650,10 +1661,23 @@ impl DownloadContext {
         let mut pending_ids: LibraryAssetVersionSet = FxHashMap::default();
         let mut pending_filenames: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut pending_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
+        let mut pending_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in pending {
-            let lib = intern_id(&mut interner, record.library.to_string());
-            let id = intern_id(&mut interner, record.id.to_string());
-            let version_size: Box<str> = record.version_size.as_str().into();
+            let crate::state::AssetRecord {
+                library,
+                id,
+                version_size,
+                checksum,
+                filename,
+                local_path,
+                local_checksum,
+                download_checksum,
+                downloaded_at,
+                ..
+            } = record;
+            let lib = intern_id(&mut interner, library.to_string());
+            let id = intern_id(&mut interner, id.to_string());
+            let version_size: Box<str> = version_size.as_str().into();
             pending_ids
                 .entry(Arc::clone(&lib))
                 .or_default()
@@ -1665,16 +1689,30 @@ impl DownloadContext {
                 .or_default()
                 .entry(Arc::clone(&id))
                 .or_default()
-                .insert(
-                    version_size.clone(),
-                    record.filename.to_string().into_boxed_str(),
-                );
+                .insert(version_size.clone(), filename);
             pending_checksums
-                .entry(lib)
+                .entry(Arc::clone(&lib))
                 .or_default()
-                .entry(id)
+                .entry(Arc::clone(&id))
                 .or_default()
-                .insert(version_size, record.checksum.to_string().into_boxed_str());
+                .insert(version_size.clone(), checksum);
+            if downloaded_at.is_some()
+                && let Some(path) = local_path
+            {
+                pending_files
+                    .entry(lib)
+                    .or_default()
+                    .entry(id)
+                    .or_default()
+                    .insert(
+                        version_size,
+                        RecordedLocalFile {
+                            path,
+                            local_checksum: local_checksum.map(String::into_boxed_str),
+                            download_checksum: download_checksum.map(String::into_boxed_str),
+                        },
+                    );
+            }
         }
 
         let asset_master_mappings = mapping_rows
@@ -1733,13 +1771,14 @@ impl DownloadContext {
         Self {
             downloaded_ids,
             downloaded_checksums,
-            downloaded_local_paths,
+            downloaded_files,
             downloaded_metadata_hashes,
             metadata_retry_markers,
             soft_deleted_ids,
             pending_ids,
             pending_filenames,
             pending_checksums,
+            pending_files,
             asset_master_mappings,
             legacy_master_state_owners,
             known_ids,
@@ -2124,17 +2163,46 @@ impl DownloadContext {
         if trust_state { Some(false) } else { None }
     }
 
-    fn downloaded_local_path(
+    fn downloaded_file(
         &self,
         library: &str,
         asset_id: &str,
         version_size: VersionSizeKey,
-    ) -> Option<&Path> {
-        self.downloaded_local_paths
+    ) -> Option<&RecordedLocalFile> {
+        self.downloaded_files
             .get(library)
             .and_then(|m| m.get(asset_id))
             .and_then(|versions| versions.get(version_size.as_str()))
-            .map(PathBuf::as_path)
+    }
+
+    fn pending_file(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+    ) -> Option<&RecordedLocalFile> {
+        self.pending_files
+            .get(library)
+            .and_then(|m| m.get(asset_id))
+            .and_then(|versions| versions.get(version_size.as_str()))
+    }
+
+    fn pending_file_matching_checksum(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        provider_checksum: &str,
+    ) -> Option<&RecordedLocalFile> {
+        let stored_checksum = self
+            .pending_checksums
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+            .and_then(|versions| versions.get(version_size.as_str()))?;
+        if stored_checksum.as_ref() != provider_checksum {
+            return None;
+        }
+        self.pending_file(library, asset_id, version_size)
     }
 
     fn has_downloaded_without_metadata_hash(&self) -> bool {
@@ -7690,8 +7758,10 @@ async fn download_photos_incremental_collecting_inner(
         }
 
         let mut state_skipped = 0usize;
-        plan.tasks.retain(|task| {
-            match download_ctx.should_download_fast(
+        let planned_tasks = std::mem::take(&mut plan.tasks);
+        plan.tasks.reserve(planned_tasks.len());
+        for task in planned_tasks {
+            let keep = match download_ctx.should_download_fast(
                 &task.library,
                 &task.asset_id,
                 task.version_size,
@@ -7702,21 +7772,27 @@ async fn download_photos_incremental_collecting_inner(
                     state_skipped = state_skipped.saturating_add(1);
                     false
                 }
-                None if state_confirmed_current_path_exists(
-                    &download_ctx,
-                    effective_config,
-                    asset,
-                    task,
-                    &mut task_planner,
-                )
-                .is_some() =>
-                {
-                    state_skipped = state_skipped.saturating_add(1);
-                    false
+                None => {
+                    let exists = state_confirmed_current_path_exists(
+                        &download_ctx,
+                        effective_config,
+                        asset,
+                        &task,
+                        &mut task_planner,
+                    )
+                    .await
+                    .is_some();
+                    if exists {
+                        state_skipped = state_skipped.saturating_add(1);
+                    }
+                    !exists
                 }
-                Some(true) | None => true,
+                Some(true) => true,
+            };
+            if keep {
+                plan.tasks.push(task);
             }
-        });
+        }
         skip_breakdown.by_state = skip_breakdown.by_state.saturating_add(state_skipped);
 
         for task in &plan.tasks {
@@ -12801,6 +12877,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn targeted_retry_adopts_smaller_metadata_rewritten_recorded_file() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+
+        let mut records = incremental_photo_records_with_url(
+            "METADATA_REWRITTEN_RETRY",
+            "rewritten.jpg",
+            "https://p01.icloud-content.com/rewritten.jpg",
+            8,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!("ck_metadata_rewritten_retry");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let recorded_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .expect("asset should derive a path")
+            .path;
+        tokio::fs::create_dir_all(recorded_path.parent().expect("recorded path parent"))
+            .await
+            .expect("create recorded path parent");
+        tokio::fs::write(&recorded_path, b"shorter")
+            .await
+            .expect("seed metadata-rewritten file");
+        let local_checksum = file::compute_sha256(&recorded_path)
+            .await
+            .expect("hash metadata-rewritten file");
+
+        let record = TestAssetRecord::new(asset.state_id())
+            .filename("rewritten.jpg")
+            .checksum("ck_metadata_rewritten_retry")
+            .size(8)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            asset.state_id(),
+            VersionSizeKey::Original.as_str(),
+            &recorded_path,
+            &local_checksum,
+            Some("download-checksum-before-metadata"),
+        )
+        .await
+        .expect("seed metadata-rewritten state");
+        db.mark_failed(
+            "PrimarySync",
+            asset.state_id(),
+            VersionSizeKey::Original.as_str(),
+            "prior false truncation",
+        )
+        .await
+        .expect("mark row failed");
+        db.prepare_for_retry(Some("PrimarySync"))
+            .await
+            .expect("prepare row for retry");
+        db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.state_id())
+            .await
+            .expect("seed asset/master mapping");
+
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let plan = build_pending_retry_download_tasks(&passes, &config, CancellationToken::new())
+            .await
+            .expect("adopt metadata-rewritten retry");
+
+        assert!(plan.tasks.is_empty());
+        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"shorter");
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(recorded_path.as_path())
+        );
+        assert_eq!(
+            downloaded[0].local_checksum.as_deref(),
+            Some(local_checksum.as_str())
+        );
+        assert_eq!(
+            downloaded[0].download_checksum.as_deref(),
+            Some("download-checksum-before-metadata")
+        );
+    }
+
+    #[tokio::test]
     async fn truncated_reconcile_retry_uses_safe_recorded_directory_sibling() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
@@ -15243,6 +15415,95 @@ mod tests {
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_sync_skips_smaller_metadata_rewritten_file() {
+        let mut records = incremental_photo_records_with_url(
+            "INCREMENTAL_METADATA_REWRITTEN",
+            "incremental-rewritten.jpg",
+            "https://p01.icloud-content.com/incremental-rewritten.jpg",
+            8,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!("ck_incremental_metadata_rewritten");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.id())
+            .await
+            .expect("seed asset/master mapping");
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let target_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .expect("asset should derive a path")
+            .path;
+        tokio::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .await
+            .expect("create target parent");
+        tokio::fs::write(&target_path, b"shorter")
+            .await
+            .expect("seed metadata-rewritten file");
+        let local_checksum = file::compute_sha256(&target_path)
+            .await
+            .expect("hash metadata-rewritten file");
+        let state_id = asset.asset_record_name();
+        let state_record = TestAssetRecord::new(state_id)
+            .filename("incremental-rewritten.jpg")
+            .checksum("ck_incremental_metadata_rewritten")
+            .size(8)
+            .build();
+        db.upsert_seen(&state_record)
+            .await
+            .expect("seed downloaded row");
+        db.mark_downloaded(
+            "PrimarySync",
+            state_id,
+            VersionSizeKey::Original.as_str(),
+            &target_path,
+            &local_checksum,
+            Some("download-checksum-before-metadata"),
+        )
+        .await
+        .expect("seed metadata-rewritten state");
+
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album(
+                "Library",
+                MockPhotosFlow::new()
+                    .changes_zone_page(records, "zone-token-next", false)
+                    .build(),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let result = download_photos_incremental_collecting_inner(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("incremental sync should skip the verified local file");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert_eq!(tokio::fs::read(&target_path).await.unwrap(), b"shorter");
+        assert!(
+            !target_path
+                .with_file_name("incremental-rewritten-8.jpg")
+                .exists(),
+            "incremental sync must not create a size-suffixed duplicate"
+        );
     }
 
     #[tokio::test]
