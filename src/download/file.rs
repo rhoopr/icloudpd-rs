@@ -613,7 +613,7 @@ async fn replace_truncated_file(
     let replacement = fingerprint_regular_file(part_path)
         .await
         .with_context(|| format!("Could not verify replacement file {}", part_path.display()))?;
-    let displaced_path = exchange_repair_files(part_path, final_path).await?;
+    let displaced_path = exchange_repair_files(part_path, final_path, expected).await?;
     let displaced = match fingerprint_regular_file(&displaced_path).await {
         Ok(displaced) => displaced,
         Err(error) => {
@@ -810,7 +810,11 @@ fn renameat2_blocking(
 }
 
 #[cfg(target_os = "linux")]
-async fn exchange_repair_files(part_path: &Path, final_path: &Path) -> std::io::Result<PathBuf> {
+async fn exchange_repair_files(
+    part_path: &Path,
+    final_path: &Path,
+    _expected: ExistingFileFingerprint,
+) -> std::io::Result<PathBuf> {
     let part = part_path.to_path_buf();
     let final_path_buf = final_path.to_path_buf();
     tokio::task::spawn_blocking(move || renameat2_exchange_blocking(&part, &final_path_buf))
@@ -870,7 +874,11 @@ fn rename_exchange_blocking(part_path: &Path, final_path: &Path) -> std::io::Res
 }
 
 #[cfg(target_os = "macos")]
-async fn exchange_repair_files(part_path: &Path, final_path: &Path) -> std::io::Result<PathBuf> {
+async fn exchange_repair_files(
+    part_path: &Path,
+    final_path: &Path,
+    _expected: ExistingFileFingerprint,
+) -> std::io::Result<PathBuf> {
     let part = part_path.to_path_buf();
     let final_path_buf = final_path.to_path_buf();
     tokio::task::spawn_blocking(move || rename_exchange_blocking(&part, &final_path_buf))
@@ -893,7 +901,11 @@ async fn restore_exchanged_repair_files(
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-async fn exchange_repair_files(_part_path: &Path, _final_path: &Path) -> std::io::Result<PathBuf> {
+async fn exchange_repair_files(
+    _part_path: &Path,
+    _final_path: &Path,
+    _expected: ExistingFileFingerprint,
+) -> std::io::Result<PathBuf> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "atomic truncated-file replacement is unsupported on this platform",
@@ -1039,7 +1051,11 @@ fn repair_backup_path(part_path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-async fn exchange_repair_files(part_path: &Path, final_path: &Path) -> std::io::Result<PathBuf> {
+async fn exchange_repair_files(
+    part_path: &Path,
+    final_path: &Path,
+    expected: ExistingFileFingerprint,
+) -> anyhow::Result<PathBuf> {
     let backup_path = repair_backup_path(part_path);
     if fs::try_exists(&backup_path).await? {
         return Err(std::io::Error::new(
@@ -1050,12 +1066,71 @@ async fn exchange_repair_files(part_path: &Path, final_path: &Path) -> std::io::
     let part = part_path.to_path_buf();
     let final_path_buf = final_path.to_path_buf();
     let backup = backup_path.clone();
-    tokio::task::spawn_blocking(move || {
+    let replace_result = tokio::task::spawn_blocking(move || {
         replace_file_with_backup_blocking(&final_path_buf, &part, &backup)
     })
     .await
-    .map_err(std::io::Error::other)??;
-    Ok(backup_path)
+    .map_err(std::io::Error::other)?;
+    finish_windows_repair_exchange(final_path, &backup_path, expected, replace_result).await
+}
+
+#[cfg(windows)]
+async fn finish_windows_repair_exchange(
+    final_path: &Path,
+    backup_path: &Path,
+    expected: ExistingFileFingerprint,
+    result: std::io::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+
+    match result {
+        Ok(()) => Ok(backup_path.to_path_buf()),
+        Err(source)
+            if source
+                .raw_os_error()
+                .and_then(|code| u32::try_from(code).ok())
+                == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) =>
+        {
+            let source_message = source.to_string();
+            let displaced = fingerprint_regular_file(backup_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Could not verify the partially displaced repair target; it remains at {}",
+                        backup_path.display()
+                    )
+                })?;
+            anyhow::ensure!(
+                displaced == expected,
+                "Refusing to restore {} because the displaced bytes changed; they remain at {}",
+                final_path.display(),
+                backup_path.display()
+            );
+
+            let final_path_buf = final_path.to_path_buf();
+            let backup_path_buf = backup_path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                move_file_no_replace_blocking(&backup_path_buf, &final_path_buf)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+            .with_context(|| {
+                format!(
+                    "Could not restore {}; the original bytes remain at {}",
+                    final_path.display(),
+                    backup_path.display()
+                )
+            })?;
+            crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
+            Err(source).with_context(|| {
+                format!(
+                    "Windows file replacement partially failed after moving {}; the original target was restored: {source_message}",
+                    final_path.display()
+                )
+            })
+        }
+        Err(source) => Err(source.into()),
+    }
 }
 
 #[cfg(windows)]
@@ -4020,6 +4095,48 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&part).await.unwrap(),
             b"verified replacement"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_partial_replace_failure_restores_original_path() {
+        use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        let backup_path = repair_backup_path(&part);
+        tokio::fs::write(&final_path, b"bad").await.unwrap();
+        tokio::fs::write(&part, b"verified replacement")
+            .await
+            .unwrap();
+        let expected = fingerprint_file(&final_path).await.unwrap();
+
+        tokio::fs::rename(&final_path, &backup_path).await.unwrap();
+        let error_code = i32::try_from(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2).unwrap();
+        let error = finish_windows_repair_exchange(
+            &final_path,
+            &backup_path,
+            expected,
+            Err(std::io::Error::from_raw_os_error(error_code)),
+        )
+        .await
+        .unwrap_err();
+
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("original target was restored"),
+            "{error_chain}"
+        );
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"bad");
+        assert_eq!(
+            tokio::fs::read(&part).await.unwrap(),
+            b"verified replacement"
+        );
+        assert!(
+            !backup_path.exists(),
+            "restored backup path must be removed"
         );
     }
 
