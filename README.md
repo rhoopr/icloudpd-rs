@@ -155,6 +155,27 @@ sweep, cannot use album, smart-folder, media, or date/recent filters, and does
 not run under `kei service run`. It is a manual recovery step; the permanent
 automatic fix is tracked in [#687](https://github.com/rhoopr/kei/issues/687).
 
+### Replace a truncated local file
+
+First, mark missing and truncated files for retry:
+
+```sh
+kei reconcile
+```
+
+Use an explicit repair sync when a truncated file should keep its recorded
+path instead of producing a size-suffixed sibling:
+
+```sh
+kei sync --repair-truncated
+```
+
+This one-shot option applies only to a recorded path that `reconcile` marked
+truncated. Kei verifies the new download and confirms that the existing bytes
+did not change before it atomically replaces the file. Normal downloads and
+missing-file retries still use no-overwrite publication. This option does not
+run under `kei service run`.
+
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
 ## Docs

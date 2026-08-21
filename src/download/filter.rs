@@ -18,6 +18,7 @@ use crate::types::{
 };
 
 use super::DownloadConfig;
+use super::file::FinalPublication;
 use super::paths;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,6 +534,7 @@ pub(super) struct DownloadTask {
     // Heap types first
     pub(super) url: Box<str>,
     pub(super) download_path: PathBuf,
+    pub(super) publication: FinalPublication,
     pub(super) checksum: Box<str>,
     /// iCloud asset ID for state tracking. Shared with the producer's
     /// dedup set and any deferred state writes via refcount bump.
@@ -1754,6 +1756,7 @@ pub(super) fn filter_asset_to_tasks(
             tasks.push(DownloadTask {
                 url,
                 download_path: p,
+                publication: FinalPublication::NoReplace,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -1819,6 +1822,7 @@ pub(super) fn filter_asset_to_tasks(
             tasks.push(DownloadTask {
                 url,
                 download_path: p,
+                publication: FinalPublication::NoReplace,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -1876,6 +1880,7 @@ pub(super) fn filter_asset_to_tasks(
             tasks.push(DownloadTask {
                 url,
                 download_path: p,
+                publication: FinalPublication::NoReplace,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),

@@ -1104,6 +1104,7 @@ pub(crate) struct DownloadConfig {
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
     pub(crate) metadata: crate::config::MetadataConfig,
     pub(crate) refresh_metadata: bool,
+    pub(crate) repair_truncated: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
     pub(crate) recent_scope: crate::cli::RecentScope,
@@ -1254,6 +1255,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("skip_created_after", &self.skip_created_after);
         s.field("metadata", &self.metadata)
             .field("refresh_metadata", &self.refresh_metadata)
+            .field("repair_truncated", &self.repair_truncated)
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
             .field("recent_scope", &self.recent_scope)
@@ -1302,6 +1304,7 @@ impl DownloadConfig {
             skip_created_after: None,
             metadata: crate::config::MetadataConfig::default(),
             refresh_metadata: false,
+            repair_truncated: false,
             concurrent_downloads: 1,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -4947,7 +4950,17 @@ pub async fn download_photos_with_sync(
                 tracing::warn!(error = %e, "Failed to prune source-deleted retry assets");
             }
         }
-        match db.prepare_for_retry(Some(&config.library)).await {
+        let error_retention = if config.repair_truncated {
+            crate::state::RetryErrorRetention::Preserve(
+                crate::commands::reconcile::FILE_TRUNCATED_REASON,
+            )
+        } else {
+            crate::state::RetryErrorRetention::Clear
+        };
+        match db
+            .prepare_for_retry(Some(&config.library), error_retention)
+            .await
+        {
             Ok((failed, stale, total_pending)) => {
                 if failed > 0 {
                     tracing::debug!(count = failed, "Reset failed assets for retry");
@@ -8252,6 +8265,7 @@ mod tests {
         DownloadTask {
             url: format!("https://p01.icloud-content.com/{asset_id}").into(),
             download_path: Path::new("/tmp/codex/kei/retry-tests").join(path),
+            publication: file::FinalPublication::NoReplace,
             checksum: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             asset_id: Arc::from(asset_id),
             asset_record_name: Arc::from(asset_id),
@@ -12766,9 +12780,12 @@ mod tests {
         )
         .await
         .expect("mark retry pending");
-        db.prepare_for_retry(Some("PrimarySync"))
-            .await
-            .expect("prepare failed row for retry");
+        db.prepare_for_retry(
+            Some("PrimarySync"),
+            crate::state::RetryErrorRetention::Clear,
+        )
+        .await
+        .expect("prepare failed row for retry");
         db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.state_id())
             .await
             .expect("seed asset/master mapping");
@@ -12932,9 +12949,12 @@ mod tests {
         )
         .await
         .expect("mark row failed");
-        db.prepare_for_retry(Some("PrimarySync"))
-            .await
-            .expect("prepare row for retry");
+        db.prepare_for_retry(
+            Some("PrimarySync"),
+            crate::state::RetryErrorRetention::Clear,
+        )
+        .await
+        .expect("prepare row for retry");
         db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.state_id())
             .await
             .expect("seed asset/master mapping");
@@ -12973,7 +12993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncated_reconcile_retry_uses_safe_recorded_directory_sibling() {
+    async fn approved_truncated_reconcile_retry_replaces_the_recorded_path() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
         use wiremock::matchers::{method, path};
@@ -13067,6 +13087,7 @@ mod tests {
         let mut config = test_config();
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
+        config.repair_truncated = true;
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
         };
@@ -13083,16 +13104,159 @@ mod tests {
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.stats.downloaded, 1);
-        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"bad");
+        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), body);
         let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
         assert_eq!(downloaded.len(), 1);
         let repaired_path = downloaded[0]
             .local_path
             .as_ref()
             .expect("repair records its final path");
-        assert_ne!(repaired_path, &recorded_path);
-        assert_eq!(repaired_path.parent(), recorded_path.parent());
-        assert_eq!(tokio::fs::read(repaired_path).await.unwrap(), body);
+        assert_eq!(repaired_path, &recorded_path);
+        let mut directory = tokio::fs::read_dir(recorded_path.parent().unwrap())
+            .await
+            .expect("read repair directory");
+        let mut names = Vec::new();
+        while let Some(entry) = directory.next_entry().await.expect("read directory entry") {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, vec![recorded_path.file_name().unwrap()]);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn truncated_repair_provider_version_change_uses_sibling() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let current_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let current_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&current_body));
+        Mock::given(method("GET"))
+            .and(path("/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(current_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let recorded_path = dir.path().join("2019/11/2019-11-28/photo.jpg");
+        tokio::fs::create_dir_all(recorded_path.parent().expect("recorded parent"))
+            .await
+            .expect("create recorded directory");
+        let prior_body = &current_body[..current_body.len() - 1];
+        tokio::fs::write(&recorded_path, prior_body)
+            .await
+            .expect("seed prior provider version");
+        let prior_local_checksum = file::compute_sha256(&recorded_path)
+            .await
+            .expect("hash prior provider version");
+        let record = crate::test_helpers::TestAssetRecord::new("CHANGED_TRUNCATED_PATH")
+            .filename("photo.jpg")
+            .checksum("old-provider-checksum")
+            .size(prior_body.len() as u64)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            "CHANGED_TRUNCATED_PATH",
+            "original",
+            &recorded_path,
+            &prior_local_checksum,
+            Some(&prior_local_checksum),
+        )
+        .await
+        .expect("seed recorded local path");
+        tokio::fs::write(&recorded_path, b"bad")
+            .await
+            .expect("truncate recorded download");
+
+        let (counts, drift) = crate::commands::reconcile::scan_local_drift(
+            db.as_ref(),
+            |_: &crate::commands::reconcile::LocalDriftAsset| {},
+            |_: &str| {},
+        )
+        .await
+        .expect("scan truncated download");
+        assert_eq!(counts.damaged, 1);
+        assert_eq!(drift.len(), 1);
+        for update in &drift {
+            db.mark_failed(
+                &update.library,
+                &update.id,
+                update.version_size.as_str(),
+                update.kind.reason(),
+            )
+            .await
+            .expect("mark truncated download failed");
+        }
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-CHANGED_TRUNCATED_PATH",
+            "CHANGED_TRUNCATED_PATH",
+        )
+        .await
+        .expect("seed asset/master mapping");
+
+        let download_url = format!("{}/photo.jpg", server.uri());
+        let mut records = incremental_photo_records_with_url(
+            "CHANGED_TRUNCATED_PATH",
+            "photo.jpg",
+            &download_url,
+            current_body.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(current_checksum);
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session(
+                "PrimarySync",
+                "AlbumOne",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.repair_truncated = true;
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("retry changed provider version through production pipeline");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"bad");
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(downloaded.len(), 1);
+        let current_path = downloaded[0]
+            .local_path
+            .as_ref()
+            .expect("current provider version has a local path");
+        assert_ne!(current_path, &recorded_path);
+        assert_eq!(tokio::fs::read(current_path).await.unwrap(), current_body);
+        assert_eq!(current_path.parent(), recorded_path.parent());
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.pending, 0);

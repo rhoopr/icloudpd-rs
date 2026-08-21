@@ -430,6 +430,22 @@ fn refresh_metadata_forces_one_shot(
     Ok(true)
 }
 
+/// Keep explicit truncated-file replacement out of long-running service mode.
+/// The operator must authorize each repair run from a foreground command.
+fn repair_truncated_forces_one_shot(
+    repair_truncated: bool,
+    service_mode: bool,
+) -> anyhow::Result<bool> {
+    if !repair_truncated {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        !service_mode,
+        "--repair-truncated is a one-shot repair and is not supported under `kei service run`. Run `kei sync --repair-truncated` instead."
+    );
+    Ok(true)
+}
+
 fn merge_refresh_tail_outcome(
     cycle_result: &mut crate::sync_cycle::CycleResult,
     failed: usize,
@@ -537,6 +553,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         service_mode,
         config.filters.narrows_enumeration(),
     )? {
+        config.watch.interval = None;
+    }
+    if repair_truncated_forces_one_shot(config.runtime.repair_truncated, service_mode)? {
         config.watch.interval = None;
     }
 
@@ -935,6 +954,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             skip_created_after,
             metadata: config.metadata,
             refresh_metadata: config.runtime.refresh_metadata,
+            repair_truncated: config.runtime.repair_truncated,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
             recent_scope: config.filters.recent_scope,
@@ -4472,8 +4492,9 @@ mod tests {
         async fn prepare_for_retry(
             &self,
             library: Option<&str>,
+            error_retention: state::RetryErrorRetention,
         ) -> Result<(u64, u64, u64), state::error::StateError> {
-            self.inner.prepare_for_retry(library).await
+            self.inner.prepare_for_retry(library, error_retention).await
         }
 
         async fn promote_pending_to_failed(
@@ -8522,6 +8543,22 @@ mod tests {
     fn refresh_metadata_rejected_with_narrowing_filter() {
         let err = refresh_metadata_forces_one_shot(true, false, true).unwrap_err();
         assert!(err.to_string().contains("filters"), "{err}");
+    }
+
+    #[test]
+    fn repair_truncated_off_never_forces_one_shot() {
+        assert!(!repair_truncated_forces_one_shot(false, true).unwrap());
+    }
+
+    #[test]
+    fn repair_truncated_forces_one_shot_for_plain_sync() {
+        assert!(repair_truncated_forces_one_shot(true, false).unwrap());
+    }
+
+    #[test]
+    fn repair_truncated_rejected_under_service_run() {
+        let err = repair_truncated_forces_one_shot(true, true).unwrap_err();
+        assert!(err.to_string().contains("service run"), "{err}");
     }
 
     #[test]

@@ -135,6 +135,12 @@ impl AssetVerificationState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryErrorRetention {
+    Clear,
+    Preserve(&'static str),
+}
+
 /// State operations used by the download producer and finalizer.
 #[allow(
     dead_code,
@@ -177,8 +183,11 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<(), StateError>;
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
     async fn reset_failed(&self) -> Result<u64, StateError>;
-    async fn prepare_for_retry(&self, library: Option<&str>)
-    -> Result<(u64, u64, u64), StateError>;
+    async fn prepare_for_retry(
+        &self,
+        library: Option<&str>,
+        error_retention: RetryErrorRetention,
+    ) -> Result<(u64, u64, u64), StateError>;
     async fn prune_source_deleted_retries(
         &self,
         _library: Option<&str>,
@@ -1983,44 +1992,69 @@ impl SqliteStateDb {
     }
 
     pub(crate) async fn reset_failed(&self) -> Result<u64, StateError> {
-        let (failed, _, _) = self.prepare_for_retry(None).await?;
+        let (failed, _, _) = self
+            .prepare_for_retry(None, RetryErrorRetention::Clear)
+            .await?;
         Ok(failed)
     }
 
     pub(crate) async fn prepare_for_retry(
         &self,
         library: Option<&str>,
+        error_retention: RetryErrorRetention,
     ) -> Result<(u64, u64, u64), StateError> {
         let library = library.map(ToOwned::to_owned);
         self.with_conn("prepare_for_retry", move |conn| {
-            let failed = if let Some(library) = library.as_deref() {
-                conn.execute(
+            let failed = match (library.as_deref(), error_retention) {
+                (Some(library), RetryErrorRetention::Clear) => conn.execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
                      WHERE status = 'failed' AND is_deleted = 0 AND library = ?1",
                     rusqlite::params![library],
-                )
-            } else {
-                conn.execute(
+                ),
+                (None, RetryErrorRetention::Clear) => conn.execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
                      WHERE status = 'failed' AND is_deleted = 0",
                     [],
-                )
+                ),
+                (Some(library), RetryErrorRetention::Preserve(reason)) => conn.execute(
+                    "UPDATE assets SET status = 'pending', download_attempts = 0, \
+                     last_error = CASE WHEN last_error = ?2 THEN last_error ELSE NULL END \
+                     WHERE status = 'failed' AND is_deleted = 0 AND library = ?1",
+                    rusqlite::params![library, reason],
+                ),
+                (None, RetryErrorRetention::Preserve(reason)) => conn.execute(
+                    "UPDATE assets SET status = 'pending', download_attempts = 0, \
+                     last_error = CASE WHEN last_error = ?1 THEN last_error ELSE NULL END \
+                     WHERE status = 'failed' AND is_deleted = 0",
+                    rusqlite::params![reason],
+                ),
             }
             .map_err(|e| StateError::query("prepare_for_retry", e))?
                 as u64;
 
-            let pending = if let Some(library) = library.as_deref() {
-                conn.execute(
+            let pending = match (library.as_deref(), error_retention) {
+                (Some(library), RetryErrorRetention::Clear) => conn.execute(
                     "UPDATE assets SET download_attempts = 0, last_error = NULL \
                      WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0 AND library = ?1",
                     rusqlite::params![library],
-                )
-            } else {
-                conn.execute(
+                ),
+                (None, RetryErrorRetention::Clear) => conn.execute(
                     "UPDATE assets SET download_attempts = 0, last_error = NULL \
                      WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0",
                     [],
-                )
+                ),
+                (Some(library), RetryErrorRetention::Preserve(reason)) => conn.execute(
+                    "UPDATE assets SET download_attempts = 0, \
+                     last_error = CASE WHEN last_error = ?2 THEN last_error ELSE NULL END \
+                     WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0 AND library = ?1",
+                    rusqlite::params![library, reason],
+                ),
+                (None, RetryErrorRetention::Preserve(reason)) => conn.execute(
+                    "UPDATE assets SET download_attempts = 0, \
+                     last_error = CASE WHEN last_error = ?1 THEN last_error ELSE NULL END \
+                     WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0",
+                    rusqlite::params![reason],
+                ),
             }
             .map_err(|e| StateError::query("prepare_for_retry", e))?
                 as u64;
@@ -3904,8 +3938,9 @@ impl DownloadStateStore for SqliteStateDb {
     async fn prepare_for_retry(
         &self,
         library: Option<&str>,
+        error_retention: RetryErrorRetention,
     ) -> Result<(u64, u64, u64), StateError> {
-        SqliteStateDb::prepare_for_retry(self, library).await
+        SqliteStateDb::prepare_for_retry(self, library, error_retention).await
     }
 
     async fn prune_source_deleted_retries(&self, library: Option<&str>) -> Result<u64, StateError> {
@@ -7425,8 +7460,10 @@ mod tests {
         assert_eq!(before.pending, 2); // normal + stuck
         assert_eq!(before.failed, 2);
 
-        let (failed_reset, pending_reset, total_pending) =
-            db.prepare_for_retry(None).await.unwrap();
+        let (failed_reset, pending_reset, total_pending) = db
+            .prepare_for_retry(None, RetryErrorRetention::Clear)
+            .await
+            .unwrap();
 
         assert_eq!(failed_reset, 2);
         assert_eq!(pending_reset, 1); // only the stuck one
@@ -7440,6 +7477,50 @@ mod tests {
         // Verify attempt counts are all zero now
         let attempts = db.get_attempt_counts().await.unwrap();
         assert!(attempts.is_empty(), "all attempt counts should be zero");
+    }
+
+    #[tokio::test]
+    async fn prepare_for_retry_preserves_only_the_authorized_error() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (id, error) in [
+            (
+                "truncated",
+                crate::commands::reconcile::FILE_TRUNCATED_REASON,
+            ),
+            ("network", "HTTP 500"),
+        ] {
+            let record = TestAssetRecord::new(id)
+                .checksum(&format!("checksum-{id}"))
+                .filename(&format!("{id}.jpg"))
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed("PrimarySync", id, "original", error)
+                .await
+                .unwrap();
+        }
+
+        db.prepare_for_retry(
+            None,
+            RetryErrorRetention::Preserve(crate::commands::reconcile::FILE_TRUNCATED_REASON),
+        )
+        .await
+        .unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 2);
+        let truncated = pending
+            .iter()
+            .find(|row| row.id.as_ref() == "truncated")
+            .unwrap();
+        let network = pending
+            .iter()
+            .find(|row| row.id.as_ref() == "network")
+            .unwrap();
+        assert_eq!(
+            truncated.last_error.as_deref(),
+            Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+        );
+        assert!(network.last_error.is_none());
     }
 
     #[tokio::test]
@@ -7479,8 +7560,10 @@ mod tests {
                 .unwrap();
         }
 
-        let (failed_reset, pending_reset, total_pending) =
-            db.prepare_for_retry(Some("PrimarySync")).await.unwrap();
+        let (failed_reset, pending_reset, total_pending) = db
+            .prepare_for_retry(Some("PrimarySync"), RetryErrorRetention::Clear)
+            .await
+            .unwrap();
 
         assert_eq!(failed_reset, 1);
         assert_eq!(pending_reset, 1);
@@ -7489,8 +7572,10 @@ mod tests {
             "only PrimarySync pending rows should drive the retry fallback gate"
         );
 
-        let (shared_failed_reset, shared_pending_reset, shared_total_pending) =
-            db.prepare_for_retry(Some(shared)).await.unwrap();
+        let (shared_failed_reset, shared_pending_reset, shared_total_pending) = db
+            .prepare_for_retry(Some(shared), RetryErrorRetention::Clear)
+            .await
+            .unwrap();
         assert_eq!(shared_failed_reset, 1);
         assert_eq!(shared_pending_reset, 1);
         assert_eq!(

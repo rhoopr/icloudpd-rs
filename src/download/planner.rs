@@ -94,6 +94,27 @@ impl TaskPlanner {
         }
     }
 
+    pub(super) async fn claim_recorded_repair_path(
+        &mut self,
+        recorded_path: &Path,
+        planned_path: &Path,
+        expected_size: u64,
+    ) -> bool {
+        let planned = NormalizedPath::normalize(planned_path);
+        if self.claimed_paths.get(planned.as_ref()) == Some(&expected_size) {
+            self.claimed_paths.remove(planned.as_ref());
+        }
+
+        let recorded = NormalizedPath::normalize(recorded_path);
+        if self.claimed_paths.contains_key(recorded.as_ref()) {
+            return false;
+        }
+        self.prepare_path_parent(recorded_path).await;
+        self.claimed_paths
+            .insert(NormalizedPath::new(recorded_path), expected_size);
+        true
+    }
+
     pub(super) async fn resolve_recorded_retry_path(
         &mut self,
         recorded_path: &Path,

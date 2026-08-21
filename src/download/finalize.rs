@@ -111,8 +111,19 @@ pub(super) async fn finalize_failed<D>(
 where
     D: DownloadStateStore + ?Sized,
 {
-    db.mark_failed(library, &task.asset_id, task.version_size.as_str(), error)
-        .await
+    let durable_error = match task.publication {
+        super::file::FinalPublication::NoReplace => error,
+        super::file::FinalPublication::ReplaceTruncated(_) => {
+            crate::commands::reconcile::FILE_TRUNCATED_REASON
+        }
+    };
+    db.mark_failed(
+        library,
+        &task.asset_id,
+        task.version_size.as_str(),
+        durable_error,
+    )
+    .await
 }
 
 /// Record a metadata-rewrite marker when the EXIF/XMP writer failed.
@@ -329,6 +340,7 @@ mod tests {
         DownloadTask {
             url: "https://example.test/photo.jpg".into(),
             download_path: path,
+            publication: crate::download::file::FinalPublication::NoReplace,
             checksum: "remote_checksum".into(),
             asset_id: Arc::from(asset_id),
             asset_record_name: Arc::from(asset_id),
@@ -452,5 +464,29 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].id.as_ref(), "FINAL_FAILED");
         assert_eq!(failed[0].last_error.as_deref(), Some("cdn expired"));
+    }
+
+    #[tokio::test]
+    async fn failed_truncated_repair_preserves_durable_authorization() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_pending(&db, "FINAL_REPAIR", "repair.jpg").await;
+        let mut task = task("FINAL_REPAIR", PathBuf::from("repair.jpg"));
+        task.publication = crate::download::file::FinalPublication::ReplaceTruncated(
+            crate::download::file::ExistingFileFingerprint {
+                size: 3,
+                sha256: [7; 32],
+            },
+        );
+
+        finalize_failed(&db, &Arc::from(LIBRARY), &task, "network failed")
+            .await
+            .unwrap();
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+        );
     }
 }

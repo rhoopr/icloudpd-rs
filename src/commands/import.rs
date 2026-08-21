@@ -1589,6 +1589,7 @@ mod wiremock_tests {
             skip_created_after: None,
             metadata: crate::config::MetadataConfig::default(),
             refresh_metadata: false,
+            repair_truncated: false,
             concurrent_downloads: 1,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,

@@ -3249,6 +3249,7 @@ async fn download_single_task(
         super::file::DownloadOpts {
             skip_rename: needs_embed,
             expected_size: if task.size > 0 { Some(task.size) } else { None },
+            publication: task.publication,
         },
         super::file::DownloadLimits {
             rate_limit_counter: context.rate_limit_counter,
@@ -3315,7 +3316,7 @@ async fn download_single_task(
 
     // Atomic rename: .part → final (only when EXIF path was used)
     if let Some(part) = &part_path {
-        super::file::rename_part_to_final(part, &task.download_path).await?;
+        super::file::publish_part_to_final(part, &task.download_path, task.publication).await?;
     }
 
     let outcome =
@@ -4067,6 +4068,7 @@ mod tests {
                             DownloadTask {
                                 url: "https://p01.icloud-content.com/a".into(),
                                 download_path: dir.path().join("a.jpg"),
+                                publication: crate::download::file::FinalPublication::NoReplace,
                                 checksum: "aaa".into(),
                                 created_local: chrono::Local::now(),
                                 size: 1000,
@@ -4080,6 +4082,7 @@ mod tests {
                             DownloadTask {
                                 url: "https://p01.icloud-content.com/b".into(),
                                 download_path: dir.path().join("b.jpg"),
+                                publication: crate::download::file::FinalPublication::NoReplace,
                                 checksum: "bbb".into(),
                                 created_local: chrono::Local::now(),
                                 size: 2000,
@@ -4133,6 +4136,7 @@ mod tests {
                         let tasks = vec![DownloadTask {
                             url: "https://0.0.0.0:1/nonexistent".into(),
                             download_path: dir.path().join("c.jpg"),
+                            publication: crate::download::file::FinalPublication::NoReplace,
                             checksum: "ccc".into(),
                             created_local: chrono::Local::now(),
                             size: 500,
@@ -4464,6 +4468,7 @@ mod tests {
         async fn prepare_for_retry(
             &self,
             _library: Option<&str>,
+            _error_retention: crate::state::RetryErrorRetention,
         ) -> Result<(u64, u64, u64), StateError> {
             Ok((0, 0, 0))
         }
@@ -5028,6 +5033,7 @@ mod tests {
         let task = DownloadTask {
             url: format!("{}/photo.jpg", server.uri()).into(),
             download_path: download_path.clone(),
+            publication: crate::download::file::FinalPublication::NoReplace,
             checksum: checksum.into(),
             asset_id: "UNKNOWN_MEDIA".into(),
             asset_record_name: "UNKNOWN_MEDIA".into(),
@@ -5110,6 +5116,7 @@ mod tests {
             .map(|i| DownloadTask {
                 url: format!("{}/photo_{i}.jpg", server.uri()).into(),
                 download_path: dir.path().join(format!("photo_{i}.jpg")),
+                publication: crate::download::file::FinalPublication::NoReplace,
                 checksum: checksum.clone().into(),
                 asset_id: format!("CIRCUIT_{i}").into(),
                 asset_record_name: format!("CIRCUIT_{i}").into(),
@@ -5226,6 +5233,7 @@ mod tests {
             skip_created_after: None,
             metadata: crate::config::MetadataConfig::default(),
             refresh_metadata: false,
+            repair_truncated: false,
             concurrent_downloads: 10,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -5308,6 +5316,7 @@ mod tests {
             skip_created_after: None,
             metadata: crate::config::MetadataConfig::default(),
             refresh_metadata: false,
+            repair_truncated: false,
             concurrent_downloads: 1,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -5874,7 +5883,12 @@ mod tests {
         )
         .await
         .unwrap();
-        db.prepare_for_retry(Some("SharedSync-abc")).await.unwrap();
+        db.prepare_for_retry(
+            Some("SharedSync-abc"),
+            crate::state::RetryErrorRetention::Clear,
+        )
+        .await
+        .unwrap();
 
         let client = reqwest::Client::new();
         let sync_started_at = chrono::Utc::now().timestamp();
