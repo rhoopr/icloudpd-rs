@@ -1061,7 +1061,8 @@ async fn exchange_repair_files(
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("repair backup already exists at {}", backup_path.display()),
-        ));
+        )
+        .into());
     }
     let part = part_path.to_path_buf();
     let final_path_buf = final_path.to_path_buf();
