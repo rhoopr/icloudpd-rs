@@ -13127,6 +13127,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_repair_provider_version_change_uses_sibling() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let current_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let current_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&current_body));
+        Mock::given(method("GET"))
+            .and(path("/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(current_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let recorded_path = dir.path().join("2019/11/2019-11-28/photo.jpg");
+        tokio::fs::create_dir_all(recorded_path.parent().expect("recorded parent"))
+            .await
+            .expect("create recorded directory");
+        let prior_body = &current_body[..current_body.len() - 1];
+        tokio::fs::write(&recorded_path, prior_body)
+            .await
+            .expect("seed prior provider version");
+        let prior_local_checksum = file::compute_sha256(&recorded_path)
+            .await
+            .expect("hash prior provider version");
+        let record = crate::test_helpers::TestAssetRecord::new("CHANGED_TRUNCATED_PATH")
+            .filename("photo.jpg")
+            .checksum("old-provider-checksum")
+            .size(prior_body.len() as u64)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            "CHANGED_TRUNCATED_PATH",
+            "original",
+            &recorded_path,
+            &prior_local_checksum,
+            Some(&prior_local_checksum),
+        )
+        .await
+        .expect("seed recorded local path");
+        tokio::fs::write(&recorded_path, b"bad")
+            .await
+            .expect("truncate recorded download");
+
+        let (counts, drift) = crate::commands::reconcile::scan_local_drift(
+            db.as_ref(),
+            |_: &crate::commands::reconcile::LocalDriftAsset| {},
+            |_: &str| {},
+        )
+        .await
+        .expect("scan truncated download");
+        assert_eq!(counts.damaged, 1);
+        assert_eq!(drift.len(), 1);
+        for update in &drift {
+            db.mark_failed(
+                &update.library,
+                &update.id,
+                update.version_size.as_str(),
+                update.kind.reason(),
+            )
+            .await
+            .expect("mark truncated download failed");
+        }
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-CHANGED_TRUNCATED_PATH",
+            "CHANGED_TRUNCATED_PATH",
+        )
+        .await
+        .expect("seed asset/master mapping");
+
+        let download_url = format!("{}/photo.jpg", server.uri());
+        let mut records = incremental_photo_records_with_url(
+            "CHANGED_TRUNCATED_PATH",
+            "photo.jpg",
+            &download_url,
+            current_body.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(current_checksum);
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session(
+                "PrimarySync",
+                "AlbumOne",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.repair_truncated = true;
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("retry changed provider version through production pipeline");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"bad");
+        let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
+        assert_eq!(downloaded.len(), 1);
+        let current_path = downloaded[0]
+            .local_path
+            .as_ref()
+            .expect("current provider version has a local path");
+        assert_ne!(current_path, &recorded_path);
+        assert_eq!(tokio::fs::read(current_path).await.unwrap(), current_body);
+        assert_eq!(current_path.parent(), recorded_path.parent());
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
     async fn same_size_provider_change_retry_does_not_adopt_stale_recorded_path() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};

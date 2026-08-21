@@ -112,6 +112,10 @@ impl PendingRetryEvidence {
         Ok(Some(fingerprint))
     }
 
+    fn matches_provider_version(&self, task: &DownloadTask) -> bool {
+        self.checksum.as_ref() == task.checksum.as_ref() && self.size_bytes == task.size
+    }
+
     fn local_path_under<'a>(&'a self, directory: &Path) -> Option<&'a Path> {
         self.local_file
             .as_ref()
@@ -291,9 +295,10 @@ impl PendingRetryPlanning<'_> {
                 if let Some(evidence) = self.pending_evidence.get(&target)
                     && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
                 {
-                    if let Some(fingerprint) = evidence
-                        .truncated_repair_fingerprint(pass_config.repair_truncated)
-                        .await?
+                    if evidence.matches_provider_version(&task)
+                        && let Some(fingerprint) = evidence
+                            .truncated_repair_fingerprint(pass_config.repair_truncated)
+                            .await?
                     {
                         if !self
                             .task_planner
