@@ -129,7 +129,7 @@ run. Use it for:
 - hand-crafted inputs that exercise a code path the fuzzer keeps missing
 
 `fuzz/seeds/heif_rewrite/replacement-fits` and `replacement-grows` are
-generated through the production writer.  They guarantee that fuzzing starts
+generated through the production writer. They guarantee that fuzzing starts
 with both existing-XMP replacement branches reachable.
 
 `corpus/<target>/` and `artifacts/<target>/` stay gitignored because

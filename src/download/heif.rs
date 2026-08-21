@@ -2,8 +2,8 @@
 //! files.
 //!
 //! Adobe's XMP Toolkit has no HEIF handler, so kei reads HEIF item metadata
-//! directly via [`mp4_atom`].  The writer below edits only the XMP item map and
-//! raw box headers.  All other boxes and payloads are copied byte-for-byte.
+//! directly via [`mp4_atom`]. The writer below edits only the XMP item map and
+//! raw box headers. All other boxes and payloads are copied byte-for-byte.
 
 #![allow(
     clippy::map_err_ignore,
@@ -539,7 +539,7 @@ pub(crate) fn extract_xmp_strict(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifEr
 /// primary image.
 ///
 /// HEIF prefixes an Exif item with a four-byte big-endian offset from the end
-/// of that field to the TIFF header.  Only construction-method-0 items are
+/// of that field to the TIFF header. Only construction-method-0 items are
 /// supported because their extents address file bytes directly.
 pub(crate) fn extract_exif_tiff_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifError> {
     let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes)?;
@@ -950,7 +950,7 @@ fn parse_iloc(bytes: &[u8], iloc: RawBox) -> Result<IlocLayout, HeifError> {
         usize::try_from(count).map_err(|_| invalid_layout("iloc item count is too large"))?;
     // Every item occupies at least its id, the optional construction and
     // reserved fields, the data-reference index, its base offset, and the
-    // extent count.  Reject a count that cannot be backed by the remaining
+    // extent count. Reject a count that cannot be backed by the remaining
     // body so a crafted iloc cannot force a large speculative allocation.
     let item_id_size = if version == 2 { 4u8 } else { 2 };
     let min_item_bytes = usize::from(item_id_size)
@@ -988,7 +988,7 @@ fn parse_iloc(bytes: &[u8], iloc: RawBox) -> Result<IlocLayout, HeifError> {
         let extent_count = usize::try_from(extent_count)
             .map_err(|_| invalid_layout("iloc extent count is too large"))?;
         // Each extent occupies its optional index plus its offset and length
-        // fields (index_size is zero for version 0).  When all three widths are
+        // fields (index_size is zero for version 0). When all three widths are
         // zero the extents carry no bytes, so more than one is meaningless;
         // otherwise reject a count the remaining body cannot hold before
         // allocating for it.
@@ -1235,7 +1235,7 @@ fn opaque_meta_sub_boxes(bytes: &[u8]) -> Result<Vec<([u8; 4], usize, usize)>, H
 /// opaque `meta` sub-box byte-for-byte.
 ///
 /// The writer may update `iinf`, `iloc`, and `iref`, and may replace or append
-/// the XMP payload.  Any other difference is unsafe because it can redirect or
+/// the XMP payload. Any other difference is unsafe because it can redirect or
 /// damage image data while leaving the XMP item readable.
 pub(crate) fn validate_rewrite_preserves_non_xmp_items(
     input: &[u8],
@@ -1326,9 +1326,9 @@ fn ensure_insertion_layout(bytes: &[u8]) -> Result<(), HeifError> {
 }
 
 /// Refuse insertion when a construction-method-0 item's data overlaps the
-/// `meta` box.  Insertion grows `meta` and relocates everything after it, so an
+/// `meta` box. Insertion grows `meta` and relocates everything after it, so an
 /// item whose bytes fall inside the region being rewritten cannot be preserved
-/// or safely repointed.  Such a layout is malformed; fail closed and leave the
+/// or safely repointed. Such a layout is malformed; fail closed and leave the
 /// file untouched rather than emit a file whose item points at changed bytes.
 fn reject_meta_overlapping_items(layout: &IlocLayout, meta: RawBox) -> Result<(), HeifError> {
     let meta_start = meta.start as u64;
@@ -1625,10 +1625,10 @@ fn append_cdsc_reference(
 }
 
 /// Build a fresh `iref` box carrying a single `cdsc` reference from the new XMP
-/// item to the primary image.  Used when a file has no `iref` of its own so
+/// item to the primary image. Used when a file has no `iref` of its own so
 /// insertion can still associate the descriptive XMP with the image, the way
 /// Apple's own writer does, rather than refusing the file and leaving a retry
-/// marker that never resolves.  Version 0 encodes 16-bit ids; version 1 is used
+/// marker that never resolves. Version 0 encodes 16-bit ids; version 1 is used
 /// when either id exceeds 16 bits.
 fn synthesise_cdsc_iref(xmp_item_id: u32, primary_item_id: u32) -> Result<Vec<u8>, HeifError> {
     let mut cdsc_body = Vec::new();
@@ -1803,7 +1803,7 @@ fn make_new_iloc_entry(
     }
     write_uint_vec(&mut entry, 2, 0)?;
     // The item's file position must land in whichever field can hold it: the
-    // extent offset when present, otherwise the base offset.  Writing it to a
+    // extent offset when present, otherwise the base offset. Writing it to a
     // zero-width field would silently drop it and point the item at offset 0.
     let (base_value, offset_value) = if layout.offset_size != 0 {
         (0, data_offset)
@@ -1852,7 +1852,7 @@ fn write_uint_vec(bytes: &mut Vec<u8>, width: u8, value: u64) -> Result<(), Heif
 }
 
 /// Whether an extent's absolute start sits at or past the boundary where the
-/// appended metadata begins, so it must move with the shift.  An offset that
+/// appended metadata begins, so it must move with the shift. An offset that
 /// overflows `u64` is treated as past the boundary; the shift below uses
 /// `checked_add` and rejects an offset it cannot represent rather than writing
 /// a wrapped value.
@@ -1955,15 +1955,15 @@ fn append_iloc_entry(
 }
 
 /// Rewrite an XMP packet without decoding or re-encoding the surrounding
-/// HEIC item graph.  Existing packets are replaced in place when possible;
-/// otherwise only the XMP iloc entry is repointed to an appended mdat.  Files
+/// HEIC item graph. Existing packets are replaced in place when possible;
+/// otherwise only the XMP iloc entry is repointed to an appended mdat. Files
 /// without XMP receive one new item, one new location, and a `cdsc` reference
 /// to the primary image, synthesising an `iref` box when the file has none.
 /// Every unrelated box and payload is copied unchanged.
 ///
 /// Insertion is limited to files whose top-level boxes have no unhandled
-/// absolute offsets.  Existing-XMP updates do not grow `meta` and can append
-/// after otherwise unsupported top-level boxes.  The complete rewritten file
+/// absolute offsets. Existing-XMP updates do not grow `meta` and can append
+/// after otherwise unsupported top-level boxes. The complete rewritten file
 /// is materialised before it is written to `writer`.
 #[allow(
     clippy::indexing_slicing,
@@ -2347,7 +2347,7 @@ fn iinf_entry_count(body: &[u8], version: u8) -> Option<u32> {
 
 /// Fuzz-only driver that exercises [`rewrite_xmp`] with a fixed XMP marker and
 /// asserts the writer's safety contract, rather than merely that it does not
-/// crash.  A rejected rewrite must emit nothing.  An accepted rewrite must keep
+/// crash. A rejected rewrite must emit nothing. An accepted rewrite must keep
 /// the container HEIF, make the written packet readable again, preserve every
 /// non-XMP item payload, and preserve opaque `meta` sub-boxes byte-for-byte.
 /// Compiled only for the fuzz harness; absent from production builds.
@@ -2382,7 +2382,7 @@ pub(crate) fn fuzz_rewrite_xmp_preserves(input: &[u8]) {
 }
 
 /// Extract the XMP packet through the writer-side parser, for the fuzz safety
-/// check.  Independent of the mp4-atom read path so item ids above `u16` and
+/// check. Independent of the mp4-atom read path so item ids above `u16` and
 /// iloc version 2 are covered.
 #[cfg(feature = "__fuzz_internals")]
 fn fuzz_extract_xmp(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -2395,9 +2395,9 @@ fn fuzz_extract_xmp(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Legacy typed-atom XMP writer retained for parser fixture tests.
 ///
-/// The HEIC container is ISO-BMFF, a sequence of top-level atoms.  XMP lives
+/// The HEIC container is ISO-BMFF, a sequence of top-level atoms. XMP lives
 /// inside the `meta` atom as an item with `item_type = "mime"` and
-/// `content_type = "application/rdf+xml"`.  This helper appends the XMP bytes as a new
+/// `content_type = "application/rdf+xml"`. This helper appends the XMP bytes as a new
 /// trailing `mdat` (construction_method 0, file-absolute offsets), so the
 /// encoded image bytes in the original `mdat` stay byte-for-byte identical
 /// even after `meta` grows.
@@ -4065,7 +4065,7 @@ mod tests {
 
     const MATRIX_XMP: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>4</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
 
-    /// One HEIF item for [`build_heic`].  `data` is placed in the top-level
+    /// One HEIF item for [`build_heic`]. `data` is placed in the top-level
     /// `mdat` for construction method 0; construction methods 1 and 2 leave it
     /// empty and use `offset`/`length` verbatim.
     struct ItemSpec {
@@ -4254,7 +4254,7 @@ mod tests {
     }
 
     /// Resolve a construction-method-0 item's payload bytes through kei's raw
-    /// iloc parser.  Used to prove image bytes survive a rewrite and that
+    /// iloc parser. Used to prove image bytes survive a rewrite and that
     /// shifted offsets still point at the same data.
     fn resolve_item_data(bytes: &[u8], item_id: u32) -> Vec<u8> {
         let (_, _, iloc, _, _, _) = find_meta_layout(bytes).expect("meta layout");

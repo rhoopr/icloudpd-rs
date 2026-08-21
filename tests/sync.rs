@@ -1019,7 +1019,7 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
 }
 
 /// [metadata].embed_xmp on a HEIC file uses the byte-preserving embedded XMP
-/// writer.  Sync should still succeed and leave the downloaded HEIC usable.
+/// writer. Sync should still succeed and leave the downloaded HEIC usable.
 #[cfg(feature = "xmp")]
 #[test]
 #[ignore]

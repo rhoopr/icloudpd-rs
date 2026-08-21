@@ -216,8 +216,8 @@ fn ensure_initialized() {
     });
 }
 
-/// Snapshot of existing metadata fields that gate write decisions.  HEIF
-/// probes merge XMP with the standalone Exif item.  Other formats use XMP
+/// Snapshot of existing metadata fields that gate write decisions. HEIF
+/// probes merge XMP with the standalone Exif item. Other formats use XMP
 /// Toolkit in default builds or native EXIF without the `xmp` feature.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExifProbe {
@@ -273,10 +273,10 @@ fn parse_capture_timestamp(value: &str) -> Option<(NaiveDateTime, Option<FixedOf
 /// Read the existing XMP / EXIF state of a media file.
 ///
 /// Dispatch is content-based, mirroring [`apply_metadata`]: the first 12 bytes
-/// are inspected for an ISO-BMFF `ftyp` box with a HEIF-family brand.  HEIF
+/// are inspected for an ISO-BMFF `ftyp` box with a HEIF-family brand. HEIF
 /// inputs get parsed through their XMP and Exif items because XMP Toolkit
-/// ships no HEIF handler.  Non-HEIF inputs go through the XMP Toolkit smart
-/// handler so JPEG/PNG/TIFF/MP4/MOV reconciled EXIF/IPTC is visible.  An
+/// ships no HEIF handler. Non-HEIF inputs go through the XMP Toolkit smart
+/// handler so JPEG/PNG/TIFF/MP4/MOV reconciled EXIF/IPTC is visible. An
 /// unreadable HEIF Exif item is treated as existing metadata so a derived
 /// datetime or GPS value cannot compete with data kei could not inspect.
 pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
@@ -1051,7 +1051,7 @@ impl MetadataWrite {
 /// Write the requested metadata into the file, using XMP Toolkit in default
 /// builds and native EXIF for JPEG/TIFF in no-`xmp` builds.
 ///
-/// HEIF-family embedded writes use a byte-preserving XMP item update.  The
+/// HEIF-family embedded writes use a byte-preserving XMP item update. The
 /// writer rejects layouts it cannot update without re-encoding the item graph.
 ///
 /// Atomic: we copy the input to a sibling temp file named with `temp_suffix`,
@@ -3465,7 +3465,7 @@ mod tests {
         None
     }
 
-    // HEIF probes merge the standalone Exif item with embedded XMP.  Content
+    // HEIF probes merge the standalone Exif item with embedded XMP. Content
     // sniffing keeps the same behaviour on final paths and `.kei-tmp` files.
     #[test]
     fn probe_exif_heic_reports_seeded_datetime() {
@@ -3597,7 +3597,7 @@ mod tests {
     // ── Regression: HEIC writes must work on part-file paths (issue #552) ──
     //
     // The download pipeline writes embedded metadata onto the `<base32>.kei-tmp`
-    // part file before the atomic rename to the final `.HEIC` name.  Content
+    // part file before the atomic rename to the final `.HEIC` name. Content
     // sniffing must route that extension-shadowed part file to the HEIF writer.
 
     #[test]
@@ -3675,7 +3675,7 @@ mod tests {
         }
 
         // mp4-atom writes iloc offsets verbatim, so adding the uri entry grows
-        // meta and shifts the mdat without repointing the item offsets.  Repoint
+        // meta and shifts the mdat without repointing the item offsets. Repoint
         // every item at the re-encoded mdat so the fixture stays a valid HEIC
         // whose image data lives after meta, not inside it.
         let mdat_start = {
