@@ -117,6 +117,9 @@ fn sync_help_succeeds() {
         .success()
         .stdout(predicate::str::contains("--friendly"))
         .stdout(predicate::str::contains("--recent"))
+        .stdout(predicate::str::contains("capture-local calendar date"))
+        .stdout(predicate::str::contains("explicit datetimes"))
+        .stdout(predicate::str::contains("relative intervals"))
         .stdout(predicate::str::contains("--download-dir").not());
 }
 

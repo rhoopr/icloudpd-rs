@@ -62,7 +62,10 @@ ICLOUD_USERNAME=you@example.com kei import-existing --config ~/.config/kei/confi
 If most files show as unmatched, stop and fix the path options before running a
 real import. A mismatch doesn't error, and it doesn't rewrite your files. It
 just leaves those assets unknown to kei, which means a later sync may download
-another copy.
+another copy. The one cause no path option fixes is a
+[date folder](#date-folders) difference, where Python filed an asset under the
+timezone of the machine it ran on and kei expects the timezone the photo was
+taken in.
 
 The import is safe to repeat. Re-importing the same files updates the existing
 state rows.
@@ -120,6 +123,28 @@ folder_structure_albums = "{album}/%Y/%m/%d"
 ```
 
 On v0.20 and later, `{album}` is only accepted in `folder_structure_albums`.
+
+### Date folders
+
+Python renders date folders in the timezone of the machine running it. kei
+renders them in the timezone the photo was taken in, from the per-asset offset
+Apple stores alongside each asset. kei therefore places an asset in the same
+folder whatever host it runs on, while Python's layout depends on how the
+machine that built the tree was configured. The two agree only where that
+machine was set to the capture timezone, so a photo taken while travelling, or
+a tree Python built on a UTC server or container, can sort into a different
+date folder under kei. Assets for which Apple supplies no usable offset keep
+host-local rendering and land where Python put them.
+
+`import-existing` adopts a file only at the path kei derives, so an asset whose
+folders differ stays unadopted. kei does not move media that already sits in a
+Python-created folder. A full sync downloads an affected asset into its
+capture-local folder and leaves the earlier copy in place, so expect both
+copies until you remove the older one.
+
+Sidecar timestamps are the exception. Python's `--xmp-sidecar` builds its
+timestamps from the same per-asset offset, so both tools record the same
+capture time and offset even where the folder dates differ.
 
 ### Filename policy
 

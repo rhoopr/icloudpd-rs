@@ -62,19 +62,19 @@ domain = "com"
 # Option: download.folder_structure
 # Default value: %Y/%m/%d
 # Valid values: strftime template plus optional leading {library}; use "none" for no date folders
-# Description: Directory template for unfiled and library-wide files. {album} and {smart-folder} are not valid here.
+# Description: Directory template for unfiled and library-wide files. {album} and {smart-folder} are not valid here. Date tokens render the capture-local date when Apple supplies a usable timezone offset, otherwise the backup host's local date.
 folder_structure = "%Y/%m/%d"
 
 # Option: download.folder_structure_albums
 # Default value: {album}
 # Valid values: strftime template plus optional leading {library} and leading {album}
-# Description: Directory template for album passes. Put date folders after {album}, for example {album}/%Y/%m.
+# Description: Directory template for album passes. Put date folders after {album}, for example {album}/%Y/%m. Date tokens render the capture-local date when Apple supplies a usable timezone offset, otherwise the backup host's local date.
 folder_structure_albums = "{album}"
 
 # Option: download.folder_structure_smart_folders
 # Default value: {smart-folder}
 # Valid values: strftime template plus optional leading {library} and leading {smart-folder}
-# Description: Directory template for smart-folder passes. Put date folders after {smart-folder}.
+# Description: Directory template for smart-folder passes. Put date folders after {smart-folder}. Date tokens render the capture-local date when Apple supplies a usable timezone offset, otherwise the backup host's local date.
 folder_structure_smart_folders = "{smart-folder}"
 
 # Option: download.threads
@@ -160,13 +160,13 @@ filename_exclude = []
 # Option: filters.skip_created_before
 # Default value: unset
 # Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 30d
-# Description: Skips assets created before the resolved local timestamp.
+# Description: Skips assets created before this cutoff. Date-only values compare the capture-local calendar date; explicit datetimes and relative intervals compare the instant.
 # skip_created_before = "2024-01-01"
 
 # Option: filters.skip_created_after
 # Default value: unset
 # Valid values: YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, or day interval such as 7d
-# Description: Skips assets created after the resolved local timestamp.
+# Description: Skips assets created after this cutoff. Date-only values compare the capture-local calendar date; explicit datetimes and relative intervals compare the instant.
 # skip_created_after = "2024-12-31"
 
 [photos]

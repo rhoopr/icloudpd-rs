@@ -610,7 +610,7 @@ These fields are populated when a photo has been edited in the Photos app or ano
 |-------|------|-------------|
 | `orientation` | INT64 | Current EXIF orientation |
 | `duration` | DOUBLE | Duration in seconds (videos) |
-| `timeZoneOffset` | INT64 | Timezone offset from UTC |
+| `timeZoneOffset` | INT64 | Capture timezone offset from UTC, in seconds |
 | `assetSubtype` | INT64 | Asset subtype classification |
 | `assetSubtypeV2` | INT64 | Asset subtype v2 classification |
 | `assetHDRType` | INT64 | HDR type indicator |

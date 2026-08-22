@@ -997,13 +997,13 @@ fn date_prompt(label: &str) -> anyhow::Result<Option<String>> {
     })
 }
 
-/// Accept blank or anything `config::parse_date_or_interval` parses cleanly,
+/// Accept blank or anything `config::parse_created_date_filter` parses cleanly,
 /// so a typo here surfaces with the same error the runtime would print.
 fn validate_date_or_blank(s: &str) -> Result<(), String> {
     if s.trim().is_empty() {
         return Ok(());
     }
-    crate::config::parse_date_or_interval(s.trim())
+    crate::config::parse_created_date_filter(s.trim())
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

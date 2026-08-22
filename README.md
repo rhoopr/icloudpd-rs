@@ -155,6 +155,15 @@ sweep, cannot use album, smart-folder, media, or date/recent filters, and does
 not run under `kei service run`. It is a manual recovery step; the permanent
 automatic fix is tracked in [#687](https://github.com/rhoopr/kei/issues/687).
 
+Use this command after upgrading from a version that rendered capture times in
+the backup host's timezone. It rewrites XMP sidecars in full. For a timestamp
+already present in a file, it adds the capture offset only where the timestamp
+reads as capture-local, because an offset attached to a host-local timestamp
+would state a capture time the photo never had. When embedded datetime output
+is configured, a file with no capture timestamp receives one, with the offset
+when Apple supplied it. The command does not move existing media between date
+folders.
+
 ### Replace a truncated local file
 
 First, mark missing and truncated files for retry:

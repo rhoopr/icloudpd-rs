@@ -4070,7 +4070,7 @@ mod tests {
                                 download_path: dir.path().join("a.jpg"),
                                 publication: crate::download::file::FinalPublication::NoReplace,
                                 checksum: "aaa".into(),
-                                created_local: chrono::Local::now(),
+                                created_local: chrono::Local::now().fixed_offset(),
                                 size: 1000,
                                 asset_id: "ASSET_A".into(),
                                 asset_record_name: "ASSET_A".into(),
@@ -4084,7 +4084,7 @@ mod tests {
                                 download_path: dir.path().join("b.jpg"),
                                 publication: crate::download::file::FinalPublication::NoReplace,
                                 checksum: "bbb".into(),
-                                created_local: chrono::Local::now(),
+                                created_local: chrono::Local::now().fixed_offset(),
                                 size: 2000,
                                 asset_id: "ASSET_B".into(),
                                 asset_record_name: "ASSET_B".into(),
@@ -4138,7 +4138,7 @@ mod tests {
                             download_path: dir.path().join("c.jpg"),
                             publication: crate::download::file::FinalPublication::NoReplace,
                             checksum: "ccc".into(),
-                            created_local: chrono::Local::now(),
+                            created_local: chrono::Local::now().fixed_offset(),
                             size: 500,
                             asset_id: "ASSET_C".into(),
                             asset_record_name: "ASSET_C".into(),
@@ -5040,7 +5040,7 @@ mod tests {
             library: "PrimarySync".into(),
             metadata: Arc::new(MetadataPayload::default()),
             size: body.len() as u64,
-            created_local: chrono::Local::now(),
+            created_local: chrono::Local::now().fixed_offset(),
             version_size: VersionSizeKey::Original,
             media_type: crate::state::MediaType::Photo,
         };
@@ -5123,7 +5123,7 @@ mod tests {
                 library: "PrimarySync".into(),
                 metadata: Arc::new(MetadataPayload::default()),
                 size: jpeg_body.len() as u64,
-                created_local: chrono::Local::now(),
+                created_local: chrono::Local::now().fixed_offset(),
                 version_size: VersionSizeKey::Original,
                 media_type: crate::state::MediaType::Photo,
             })
@@ -7201,7 +7201,7 @@ mod tests {
         let target_path = crate::download::paths::local_download_path(
             &config.directory,
             &config.folder_structure,
-            &asset.created().with_timezone(&chrono::Local),
+            &asset.created_local(),
             "deleted.jpg",
             None,
         );
@@ -7290,7 +7290,7 @@ mod tests {
         let target_path = crate::download::paths::local_download_path(
             &config.directory,
             &config.folder_structure,
-            &existing_asset.created().with_timezone(&chrono::Local),
+            &existing_asset.created_local(),
             "IMG_4123.JPG",
             None,
         );
@@ -7412,7 +7412,7 @@ mod tests {
         crate::download::paths::local_download_path(
             &config.directory,
             &config.folder_structure,
-            &asset.created().with_timezone(&chrono::Local),
+            &asset.created_local(),
             filename,
             None,
         )
@@ -8022,6 +8022,88 @@ mod tests {
             "missing new target must be forwarded for re-download"
         );
         assert_eq!(&*failed[0].id, "OLD_DIR_SUFFIXED_B");
+    }
+
+    /// Capture-local derivation can move an asset into a different date
+    /// folder than a host-local rendering chose. The stored path is then not
+    /// a current derived path, so a full sweep forwards the asset for
+    /// download into its capture-local folder, and the earlier copy is left
+    /// untouched because kei never deletes local media.
+    #[tokio::test]
+    async fn capture_local_date_folder_forwards_and_keeps_host_local_copy() {
+        use crate::download::DownloadConfig;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        // 2026-01-31T22:31:59Z captured at +11:00 is 2026-02-01 locally.
+        let asset = TestPhotoAsset::new("CAPTURE_OFFSET_MOVE")
+            .filename("IMG_9001.JPG")
+            .orig_size(1234)
+            .orig_url("https://p01.icloud-content.com/IMG_9001.JPG")
+            .orig_checksum("ck_capture_offset_move")
+            .asset_date(1_769_898_719_000.0)
+            .timezone_offset(39_600)
+            .build();
+
+        let derived = crate::download::filter::expected_paths_for(&asset, config.as_ref())
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        assert!(derived.parent().is_some_and(|p| p.ends_with("2026/02/01")));
+
+        let host_local_path = dir.path().join("2026/01/31/IMG_9001.JPG");
+        fs::create_dir_all(host_local_path.parent().unwrap()).unwrap();
+        fs::write(&host_local_path, vec![7u8; 1234]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("CAPTURE_OFFSET_MOVE")
+            .checksum("ck_capture_offset_move")
+            .filename("IMG_9001.JPG")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "CAPTURE_OFFSET_MOVE",
+            "original",
+            &host_local_path,
+            "local_checksum_for_host_local_file",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.skip_summary.on_disk, 0,
+            "a host-local stored path must not satisfy the capture-local target"
+        );
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1, "missing capture-local target is forwarded");
+        assert_eq!(&*failed[0].id, "CAPTURE_OFFSET_MOVE");
+        assert!(
+            host_local_path.exists(),
+            "the earlier copy must survive; kei does not delete local media"
+        );
     }
 
     /// Data-sacred regression for state-backed on-disk skips.

@@ -308,6 +308,7 @@ pub struct TestPhotoAsset {
     orig_checksum: String,
     orig_file_type: String,
     asset_date: f64,
+    timezone_offset: Option<i32>,
     favorite: bool,
     live_photo: Option<LivePhotoFields>,
     adjusted_version: Option<AdjustedVersionFields>,
@@ -346,6 +347,7 @@ impl TestPhotoAsset {
             orig_checksum: "abc123".to_string(),
             orig_file_type: "public.jpeg".to_string(),
             asset_date: 1736899200000.0,
+            timezone_offset: None,
             favorite: false,
             live_photo: None,
             adjusted_version: None,
@@ -386,6 +388,11 @@ impl TestPhotoAsset {
 
     pub fn asset_date(mut self, d: f64) -> Self {
         self.asset_date = d;
+        self
+    }
+
+    pub fn timezone_offset(mut self, seconds: i32) -> Self {
+        self.timezone_offset = Some(seconds);
         self
     }
 
@@ -491,12 +498,15 @@ impl TestPhotoAsset {
             "recordName": self.record_name,
             "fields": fields,
         });
-        let asset = json!({
+        let mut asset = json!({
             "fields": {
                 "assetDate": {"value": self.asset_date},
                 "isFavorite": {"value": i64::from(self.favorite)},
             },
         });
+        if let Some(offset) = self.timezone_offset {
+            asset["fields"]["timeZoneOffset"] = json!({"value": offset});
+        }
         PhotoAsset::new(master, asset)
     }
 }

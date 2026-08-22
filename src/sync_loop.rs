@@ -900,14 +900,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Pre-compute config values used each cycle to build DownloadConfig.
     // DownloadConfig is rebuilt per-cycle so sync_mode can vary.
-    let skip_created_before = config
-        .filters
-        .skip_created_before
-        .map(|d| d.with_timezone(&chrono::Utc));
-    let skip_created_after = config
-        .filters
-        .skip_created_after
-        .map(|d| d.with_timezone(&chrono::Utc));
+    let skip_created_before = config.filters.skip_created_before;
+    let skip_created_after = config.filters.skip_created_after;
     let retry_config = api_retry_config;
     let live_resolution = config.photos.live_resolution.to_asset_version_size();
     // One shared limiter per sync run so the configured cap applies to
@@ -3515,13 +3509,11 @@ mod tests {
     /// The `assetDate`/`addedDate` embedded by [`full_album_page_with_download`].
     const RUN_CYCLE_ASSET_DATE_MS: i64 = 1_700_000_000_000;
 
-    /// The local-time `%Y/%m/%d` folder the pipeline derives for [`RUN_CYCLE_ASSET_DATE_MS`].
+    /// The host-local `%Y/%m/%d` folder for an asset without an offset.
     fn run_cycle_expected_date_dir() -> String {
-        use chrono::TimeZone;
-        chrono::Local
-            .timestamp_millis_opt(RUN_CYCLE_ASSET_DATE_MS)
-            .single()
+        chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS)
             .expect("valid asset timestamp")
+            .with_timezone(&chrono::Local)
             .format("%Y/%m/%d")
             .to_string()
     }
@@ -3731,6 +3723,8 @@ mod tests {
         media: config::MediaSelection,
         per_pass_paths: bool,
         recent: Option<u32>,
+        skip_created_before: Option<config::CreatedDateFilter>,
+        skip_created_after: Option<config::CreatedDateFilter>,
         file_match_policy: Option<crate::types::FileMatchPolicy>,
         #[cfg(feature = "xmp")]
         xmp_sidecar: bool,
@@ -3793,6 +3787,8 @@ mod tests {
                 config.metadata.xmp_sidecar = options.xmp_sidecar;
             }
             config.recent = options.recent;
+            config.skip_created_before = options.skip_created_before;
+            config.skip_created_after = options.skip_created_after;
             if let Some(concurrent_downloads) = options.concurrent_downloads {
                 config.concurrent_downloads = concurrent_downloads;
             }
@@ -3840,6 +3836,122 @@ mod tests {
             None,
         )
         .expect("test config")
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_cycle_capture_offset_drives_date_filter_path_and_sidecar() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use xmp_toolkit::{XmpMeta, xmp_ns};
+
+        let server = crate::start_wiremock_or_skip!();
+        let body = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        Mock::given(method("GET"))
+            .and(path("/capture-offset.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let capture_date = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let mut page = full_album_page_with_download(
+            "PrimarySync",
+            "capture-offset",
+            "zone-token",
+            &format!("{}/capture-offset.jpg", server.uri()),
+            body.len() as u64,
+            &checksum,
+        );
+        page["records"][1]["fields"]["assetDate"]["value"] =
+            serde_json::json!(1_769_898_719_000_i64);
+        page["records"][1]["fields"]["addedDate"]["value"] =
+            serde_json::json!(1_769_898_719_000_i64);
+        page["records"][1]["fields"]["timeZoneOffset"] =
+            serde_json::json!({"value": 39_600, "type": "INT64"});
+
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(page),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let boundary = config::CreatedDateFilter::CaptureDate(capture_date);
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                skip_created_before: Some(boundary),
+                skip_created_after: Some(boundary),
+                xmp_sidecar: true,
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let mut config = make_run_cycle_config();
+        config.filters.skip_created_before = Some(boundary);
+        config.filters.skip_created_after = Some(boundary);
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run capture-offset cycle");
+
+        assert_eq!(result.stats.downloaded, 1);
+        let downloaded = db.get_downloaded_page(0, 1).await.expect("downloaded row");
+        let media_path = downloaded[0].local_path.as_ref().expect("downloaded path");
+        assert!(
+            media_path
+                .parent()
+                .is_some_and(|parent| parent.ends_with("2026/02/01"))
+        );
+        assert_eq!(std::fs::read(media_path).expect("downloaded media"), body);
+
+        let sidecar = std::fs::read_to_string(media_path.with_file_name(format!(
+            "{}.xmp",
+            media_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("media filename")
+        )))
+        .expect("capture-offset sidecar");
+        let metadata = sidecar.parse::<XmpMeta>().expect("valid XMP sidecar");
+        assert_eq!(
+            metadata
+                .property(xmp_ns::EXIF, "DateTimeOriginal")
+                .expect("DateTimeOriginal")
+                .value,
+            "2026-02-01T09:31:59+11:00"
+        );
+        assert_eq!(
+            metadata
+                .property("http://cipa.jp/exif/1.0/", "OffsetTimeOriginal")
+                .expect("OffsetTimeOriginal")
+                .value,
+            "+11:00"
+        );
     }
 
     async fn run_full_cycle_with_album(
