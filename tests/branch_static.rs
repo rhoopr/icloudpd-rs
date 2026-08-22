@@ -855,7 +855,9 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile .github/scripts/*.py",
         "actionlint .github/workflows/*.yml",
         "lint-scripts:",
-        "bash -n \"${shell_files[@]}\"",
+        "python_files+=(scripts/check-contracts)",
+        "for shell_file in \"${shell_files[@]}\"; do",
+        "bash -n \"$shell_file\"",
         "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile \"${python_files[@]}\"",
         "shellcheck \"${shell_files[@]}\"",
         "shfmt -d \"${shell_files[@]}\"",
@@ -900,6 +902,16 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         ci.contains("PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile"),
         "CI script lint must route generated Python bytecode outside the repo tree"
     );
+    for expected in [
+        "python_files+=(scripts/check-contracts)",
+        "for shell_file in \"${shell_files[@]}\"; do",
+        "bash -n \"$shell_file\"",
+    ] {
+        assert!(
+            ci.contains(expected),
+            "CI script lint must check each script with the matching interpreter: {expected}"
+        );
+    }
     let aggregate = ci
         .split_once("  ci:\n")
         .map(|(_, tail)| tail)

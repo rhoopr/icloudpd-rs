@@ -53,9 +53,12 @@ lint-scripts:
     set -euo pipefail
     pycache_dir="${PYTHONPYCACHEPREFIX:-/tmp/codex/kei/pycache}"
     mkdir -p "$pycache_dir"
-    mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' -o -name 'check-contracts' \) -print | sort)
+    mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' \) -print | sort)
     mapfile -t python_files < <(find scripts .github/scripts -maxdepth 3 -type f -name '*.py' -print | sort)
-    bash -n "${shell_files[@]}"
+    python_files+=(scripts/check-contracts)
+    for shell_file in "${shell_files[@]}"; do
+        bash -n "$shell_file"
+    done
     PYTHONPYCACHEPREFIX="$pycache_dir" python3 -m py_compile "${python_files[@]}"
     if command -v shellcheck >/dev/null 2>&1; then
         shellcheck "${shell_files[@]}"
