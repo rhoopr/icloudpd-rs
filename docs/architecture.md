@@ -352,6 +352,8 @@ Stable IDs connect safety rules to production owners and focused tests.
 - Live iCloud tests are ignored by default and run single-threaded.
 - Shell suites cover crash, concurrency, state-machine, and container behavior.
 - Fuzz targets cover parser and metadata trust boundaries.
+- `justfile` owns local script and workflow lint commands. Protected CI runs
+  the same shellcheck, shfmt, ruff, and actionlint checks with pinned versions.
 
 See [the test guide](../tests/README.md) for the current suites and commands.
 

@@ -80,8 +80,9 @@ must cover interruption, retry, partial completion, and stale configuration.
    script lint, contract markers, typos, and the serializer round-trip
    detector. It stops on the first failure.
 
-   Without `just`, run the raw commands below. See `justfile` for optional
-   local linters and the current full list.
+   Without `just`, run the raw commands below. See `justfile` for the current
+   local commands and `.github/workflows/ci.yml` for the pinned CI tool
+   versions.
 
    ```sh
    cargo fmt --all --check
@@ -93,8 +94,15 @@ must cover interruption, retry, partial completion, and stale configuration.
    cargo fetch --locked
    cargo audit --deny warnings
    python3 .github/scripts/check_workflow_hardening.py
-   PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile .github/scripts/*.py scripts/full-test/*.py
-   bash -n scripts/check-contracts scripts/check-roundtrip-gate.sh scripts/full-test/*.sh scripts/just/*.sh scripts/notify-synology-photos.sh tests/shell/*.sh docker/entrypoint.sh
+   mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' \) -print | sort)
+   mapfile -t python_files < <(find scripts .github/scripts -maxdepth 3 -type f -name '*.py' -print | sort)
+   python_files+=(scripts/check-contracts)
+   for shell_file in "${shell_files[@]}"; do bash -n "$shell_file"; done
+   PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile "${python_files[@]}"
+   shellcheck -x -P tests/shell:scripts:scripts/full-test "${shell_files[@]}"
+   shfmt -d "${shell_files[@]}"
+   ruff check "${python_files[@]}"
+   actionlint .github/workflows/*.yml
    scripts/check-contracts
    typos
    bash scripts/check-roundtrip-gate.sh
