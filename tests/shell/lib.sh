@@ -38,7 +38,7 @@ kei_user_slug() {
 kei_cookie_dir() {
     if [ -n "${ICLOUD_TEST_COOKIE_DIR:-}" ]; then
         case "$ICLOUD_TEST_COOKIE_DIR" in
-            "~/"*) printf '%s/%s' "$HOME" "${ICLOUD_TEST_COOKIE_DIR#~/}" ;;
+            \~/*) printf '%s/%s' "$HOME" "${ICLOUD_TEST_COOKIE_DIR#\~/}" ;;
             *) printf '%s' "$ICLOUD_TEST_COOKIE_DIR" ;;
         esac
     else

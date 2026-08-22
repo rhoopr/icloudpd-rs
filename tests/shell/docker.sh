@@ -289,7 +289,7 @@ puid_run() {
 }
 PUID_OUT=$(puid_run sh -c 'id -u; id -g; stat -c %u /config; stat -c %u /photos' 2>&1)
 echo "  Output (uid, gid, /config uid, /photos uid):"
-echo "$PUID_OUT" | sed 's/^/    /'
+printf '    %s\n' "${PUID_OUT//$'\n'/$'\n    '}"
 EXPECTED=$(printf '%s\n%s\n%s\n%s' "$TEST_PUID" "$TEST_PGID" "$TEST_PUID" "$TEST_PUID")
 [ "$PUID_OUT" = "$EXPECTED" ]
 kei_check "process runs as PUID:PGID and volumes are chowned"

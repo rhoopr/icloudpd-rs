@@ -83,7 +83,7 @@ run_command() {
     local start_s
     start_s=$(date +%s)
     local frame_index=0
-    local frames=('-' '\' '|' '/')
+    local frames=('-' $'\\' '|' '/')
 
     while kill -0 "$pid" 2>/dev/null; do
         local now_s elapsed frame

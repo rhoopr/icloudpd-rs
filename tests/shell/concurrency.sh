@@ -21,7 +21,6 @@ kei_require_release_binary
 kei_install_scratch_cleanup
 
 COOKIES="$(kei_cookie_dir)"
-ALBUM="$(kei_album)"
 KEI="$(kei_release_bin)"
 kei_check_init
 

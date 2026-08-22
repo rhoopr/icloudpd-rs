@@ -23,7 +23,6 @@ kei_require_release_binary
 kei_install_scratch_cleanup
 
 COOKIES="$(kei_cookie_dir)"
-ALBUM="$(kei_album)"
 KEI="$(kei_release_bin)"
 kei_check_init
 
@@ -180,6 +179,8 @@ sync_and_count_downloads() {
     echo "$out" | grep -E "incremental|change|download|[Cc]ompleted"
     echo "$out" | grep -qE "No new photos|[Cc]ompleted"
     kei_check "$label completed without error"
+    # Parameter expansion uses glob patterns and cannot express ANSI SGR sequences.
+    # shellcheck disable=SC2001
     clean=$(echo "$out" | sed 's/\x1b\[[0-9;]*m//g')
     dl=$(echo "$clean" | grep -oE '[0-9]+ downloaded,' | head -1 | grep -oE '^[0-9]+')
     dl="${dl:-0}"
