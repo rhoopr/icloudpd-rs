@@ -3175,6 +3175,64 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// An iOS HDR capture carries an XMP packet per image. Writing the
+    /// photograph's metadata into an auxiliary image's packet would attach it
+    /// to a gain map, and no later read could tell.
+    #[test]
+    fn apply_metadata_heic_writes_past_auxiliary_image_xmp() {
+        const AUX_XMP: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description xmlns:HDRGainMap='http://ns.apple.com/HDRGainMap/1.0/' HDRGainMap:HDRGainMapHeadroom='2.67'/></rdf:RDF></x:xmpmeta>";
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let seed = build_xmp_packet(&MetadataWrite {
+            title: Some("First".into()),
+            ..MetadataWrite::default()
+        })
+        .expect("seed XMP packet");
+
+        for (name, primary) in [
+            ("aux_and_primary_xmp.heic", Some(seed.as_slice())),
+            ("aux_xmp_only.heic", None),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, heif::apple_multi_xmp_heic(primary, AUX_XMP)).unwrap();
+
+            apply_metadata_with_default_suffix(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+            )
+            .expect("HEIC metadata update");
+
+            let rewritten = fs::read(&path).unwrap();
+            let packets = xmp_packets_in_heic(&rewritten);
+            assert_eq!(packets.len(), 2, "{name} must keep both XMP items");
+            assert!(
+                packets.iter().any(|(_, packet)| packet == AUX_XMP),
+                "{name} must leave the auxiliary image's packet byte-for-byte"
+            );
+            let photo = packets
+                .iter()
+                .find(|(_, packet)| packet != AUX_XMP)
+                .map(|(_, packet)| packet.clone())
+                .expect("photograph's packet");
+            let meta: XmpMeta = std::str::from_utf8(&photo).unwrap().parse().unwrap();
+            assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 4);
+            if primary.is_some() {
+                assert_eq!(
+                    meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                        .unwrap()
+                        .0
+                        .value,
+                    "First",
+                    "{name} must merge into the photograph's own packet"
+                );
+            }
+            fs::remove_file(&path).ok();
+        }
+    }
+
     #[test]
     fn apply_metadata_heic_preserves_fixture_with_seeded_xmp_item() {
         let dir = test_tmp_dir("meta_heic_tests");
@@ -3394,38 +3452,53 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// Walk a HEIC file's top-level atoms and return the XMP packet bytes.
-    /// The write path puts XMP in a trailing `mdat`; the iloc entry is
-    /// construction_method=0 with a file-absolute offset, so we slice the
-    /// file bytes directly.
+    /// The first XMP packet in a HEIC file. Single-packet fixtures only; use
+    /// [`xmp_packets_in_heic`] where several images each carry one.
     fn extract_xmp_from_heic(bytes: &[u8]) -> Option<Vec<u8>> {
+        xmp_packets_in_heic(bytes)
+            .into_iter()
+            .next()
+            .map(|(_, packet)| packet)
+    }
+
+    /// Walk a HEIC file's top-level atoms and return every XMP packet with its
+    /// item ID. The write path puts XMP in a trailing `mdat`; the iloc entry is
+    /// construction_method=0 with a file-absolute offset, so we slice the
+    /// file bytes directly. Parsed independently of kei's own reader so a test
+    /// cannot confirm the reader against itself.
+    fn xmp_packets_in_heic(bytes: &[u8]) -> Vec<(u32, Vec<u8>)> {
         use mp4_atom::{Any, DecodeMaybe, FourCC, Iinf, Iloc};
         let mut cursor: &[u8] = bytes;
         while let Ok(Some(atom)) = Any::decode_maybe(&mut cursor) {
-            if let Any::Meta(meta) = atom {
-                let iinf = meta.get::<Iinf>()?;
-                let iloc = meta.get::<Iloc>()?;
-                let xmp_entry = iinf.item_infos.iter().find(|e| {
+            let Any::Meta(meta) = atom else {
+                continue;
+            };
+            let (Some(iinf), Some(iloc)) = (meta.get::<Iinf>(), meta.get::<Iloc>()) else {
+                return Vec::new();
+            };
+            return iinf
+                .item_infos
+                .iter()
+                .filter(|e| {
                     e.item_type == Some(FourCC::new(b"mime"))
                         && e.content_type.as_deref() == Some("application/rdf+xml")
-                })?;
-                let loc = iloc
-                    .item_locations
-                    .iter()
-                    .find(|l| l.item_id == xmp_entry.item_id)?;
-                if loc.construction_method != 0 {
-                    return None;
-                }
-                let extent = loc.extents.first()?;
-                let start = loc.base_offset.saturating_add(extent.offset) as usize;
-                let end = start + extent.length as usize;
-                if end > bytes.len() {
-                    return None;
-                }
-                return Some(bytes[start..end].to_vec());
-            }
+                })
+                .filter_map(|entry| {
+                    let loc = iloc
+                        .item_locations
+                        .iter()
+                        .find(|l| l.item_id == entry.item_id)?;
+                    if loc.construction_method != 0 {
+                        return None;
+                    }
+                    let extent = loc.extents.first()?;
+                    let start = loc.base_offset.saturating_add(extent.offset) as usize;
+                    let end = start + extent.length as usize;
+                    Some((entry.item_id, bytes.get(start..end)?.to_vec()))
+                })
+                .collect();
         }
-        None
+        Vec::new()
     }
 
     fn count_xmp_items_in_heic(bytes: &[u8]) -> usize {

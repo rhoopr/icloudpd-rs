@@ -269,11 +269,15 @@ Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
 HEIF-family embedded XMP updates use the byte-preserving item-map writer and
 reject layouts that cannot be changed without re-encoding unknown item-graph
-data. The HEIF probe reads both XMP and the standalone Exif item before
-planning datetime or GPS writes. New XMP items receive a `cdsc` reference to
-the primary image, and insertion rejects top-level boxes whose absolute offsets
-are not adjusted. Before publication, validation confirms that every
-construction-method-0 non-XMP item and every opaque `meta` sub-box remains
+data. A file may hold one XMP item per image, so probe and write both resolve
+the packet through its `cdsc` association with the primary image and refuse
+item maps where several are equally plausible. An unassociated packet answers
+for the primary only when it is the sole candidate. The HEIF probe reads both
+XMP and the standalone Exif item before planning datetime or GPS writes. New
+XMP items receive a `cdsc` reference to the primary image, and insertion
+rejects top-level boxes whose absolute offsets are not adjusted. Before
+publication, validation confirms that every construction-method-0 item other
+than the resolved XMP packet, and every opaque `meta` sub-box, remains
 byte-identical.
 
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the

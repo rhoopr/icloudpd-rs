@@ -489,10 +489,12 @@ fn read_file_exact<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
-/// Locate the XMP packet bytes embedded in a HEIC file, if any. Returns the
-/// raw RDF/XML payload referenced by the first `mime`-type item with
-/// content_type `"application/rdf+xml"`. Used by the write path to preserve
-/// existing XMP on rewrite (symmetric with xmp_toolkit's `file.xmp()`).
+/// Locate the primary image's embedded XMP packet, if any. Returns the raw
+/// RDF/XML payload of the `mime` item with content_type
+/// `"application/rdf+xml"` that [`select_xmp_item_id`] resolves to the primary
+/// image. Used by the write path to preserve existing XMP on rewrite
+/// (symmetric with xmp_toolkit's `file.xmp()`), so both ends of a
+/// read-merge-write agree on which packet they own.
 ///
 /// Walks top-level boxes by header only and descends into `meta` directly,
 /// rather than using `Any::decode_maybe` which dispatches into mp4-atom's
@@ -508,11 +510,13 @@ pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     extract_xmp_strict(bytes).unwrap_or_default()
 }
 
-/// Strict variant of [`extract_xmp_bytes`] that distinguishes "no XMP item
-/// present" (`Ok(None)`) from "the file's iinf/iloc structure failed to
-/// decode" (`Err(MetaSubBoxDecode)`). Used by the metadata write path so a
-/// malformed item map fails loudly instead of silently stripping pre-existing
-/// XMP.
+/// Strict variant of [`extract_xmp_bytes`] that distinguishes "the primary
+/// image has no XMP item" (`Ok(None)`) from a file that cannot be resolved:
+/// `Err(MetaSubBoxDecode)` when the iinf/iloc structure fails to decode, and
+/// `Err(InvalidLayout)` when several packets are equally plausible candidates
+/// for the primary image. Used by the metadata write path so a malformed or
+/// undecidable item map fails loudly instead of silently stripping
+/// pre-existing XMP.
 pub(crate) fn extract_xmp_strict(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifError> {
     let mut cursor: &[u8] = bytes;
     while cursor.has_remaining() {
@@ -645,7 +649,7 @@ struct IinfLayout {
     count_pos: usize,
     count_size: usize,
     max_item_id: u32,
-    xmp_item_id: Option<u32>,
+    xmp_item_ids: Vec<u32>,
     exif_item_ids: Vec<u32>,
     item_ids: Vec<u32>,
 }
@@ -800,7 +804,7 @@ fn parse_iinf(bytes: &[u8], iinf: RawBox) -> Result<IinfLayout, HeifError> {
         ));
     }
     let mut max_item_id = 0u32;
-    let mut xmp_item_id = None;
+    let mut xmp_item_ids = Vec::new();
     let mut exif_item_ids = Vec::new();
     let mut item_ids = HashSet::with_capacity(entries.len());
     for entry in entries {
@@ -813,11 +817,8 @@ fn parse_iinf(bytes: &[u8], iinf: RawBox) -> Result<IinfLayout, HeifError> {
             return Err(invalid_layout("iinf contains duplicate item IDs"));
         }
         max_item_id = max_item_id.max(item_id);
-        if item_type == Some(*b"mime")
-            && content_type.as_deref() == Some("application/rdf+xml")
-            && xmp_item_id.replace(item_id).is_some()
-        {
-            return Err(invalid_layout("HEIC contains multiple XMP items"));
+        if item_type == Some(*b"mime") && content_type.as_deref() == Some("application/rdf+xml") {
+            xmp_item_ids.push(item_id);
         }
         if item_type == Some(*b"Exif") {
             exif_item_ids.push(item_id);
@@ -828,7 +829,7 @@ fn parse_iinf(bytes: &[u8], iinf: RawBox) -> Result<IinfLayout, HeifError> {
         count_pos,
         count_size,
         max_item_id,
-        xmp_item_id,
+        xmp_item_ids,
         exif_item_ids,
         item_ids: item_ids.into_iter().collect(),
     })
@@ -1231,36 +1232,47 @@ fn opaque_meta_sub_boxes(bytes: &[u8]) -> Result<Vec<([u8; 4], usize, usize)>, H
         .collect())
 }
 
-/// Verify that a rewritten HEIF preserves every non-XMP item payload and every
-/// opaque `meta` sub-box byte-for-byte.
+/// Verify that a rewritten HEIF preserves every item payload except the
+/// primary image's XMP packet, and every opaque `meta` sub-box, byte-for-byte.
 ///
 /// The writer may update `iinf`, `iloc`, and `iref`, and may replace or append
-/// the XMP payload. Any other difference is unsafe because it can redirect or
-/// damage image data while leaving the XMP item readable.
+/// the packet it owns. Any other difference is unsafe because it can redirect
+/// or damage image data while leaving the XMP item readable. An auxiliary
+/// image's XMP is that image's metadata, so it is preserved like any other
+/// payload.
 pub(crate) fn validate_rewrite_preserves_non_xmp_items(
     input: &[u8],
     rewritten: &[u8],
 ) -> Result<(), HeifError> {
-    let (_, input_iinf, input_iloc, _, _, _) = find_meta_layout(input)?;
+    let (_, input_iinf, input_iloc, input_iref, input_primary, _) = find_meta_layout(input)?;
     let input_iinf_layout = parse_iinf(input, input_iinf)?;
     let input_iloc_layout = parse_iloc(input, input_iloc)?;
-    let (_, rewritten_iinf, rewritten_iloc, _, _, _) = find_meta_layout(rewritten)?;
+    let input_xmp_item_id = select_xmp_item_id(
+        input,
+        input_iref,
+        input_primary,
+        &input_iinf_layout.xmp_item_ids,
+    )?;
+    let (_, rewritten_iinf, rewritten_iloc, rewritten_iref, rewritten_primary, _) =
+        find_meta_layout(rewritten)?;
     let rewritten_iinf_layout = parse_iinf(rewritten, rewritten_iinf)?;
     let rewritten_iloc_layout = parse_iloc(rewritten, rewritten_iloc)?;
+    let rewritten_xmp_item_id = select_xmp_item_id(
+        rewritten,
+        rewritten_iref,
+        rewritten_primary,
+        &rewritten_iinf_layout.xmp_item_ids,
+    )?;
 
     let input_items = input_iloc_layout
         .items
         .iter()
-        .filter(|item| {
-            item.construction_method == 0 && Some(item.item_id) != input_iinf_layout.xmp_item_id
-        })
+        .filter(|item| item.construction_method == 0 && Some(item.item_id) != input_xmp_item_id)
         .collect::<Vec<_>>();
     let rewritten_items = rewritten_iloc_layout
         .items
         .iter()
-        .filter(|item| {
-            item.construction_method == 0 && Some(item.item_id) != rewritten_iinf_layout.xmp_item_id
-        })
+        .filter(|item| item.construction_method == 0 && Some(item.item_id) != rewritten_xmp_item_id)
         .collect::<Vec<_>>();
     if input_items.len() != rewritten_items.len() {
         return Err(invalid_layout(
@@ -1403,18 +1415,14 @@ fn append_iinf_entry(
     clippy::indexing_slicing,
     reason = "The raw-box parser and version-specific size checks prove every iref child field before direct access."
 )]
-fn cdsc_sources_for_target(
-    bytes: &[u8],
-    iref: RawBox,
-    target_item_id: u32,
-) -> Result<Vec<u32>, HeifError> {
+fn cdsc_pairs(bytes: &[u8], iref: RawBox) -> Result<Vec<(u32, Vec<u32>)>, HeifError> {
     let body = &bytes[iref.body_start()..iref.end()];
     if body.len() < 4 {
         return Err(invalid_layout("iref box is truncated"));
     }
     let version = body[0];
     let children = scan_raw_boxes(body, 4, body.len())?;
-    let mut sources = Vec::new();
+    let mut pairs = Vec::new();
     for child in children {
         if child.kind != *b"cdsc" {
             continue;
@@ -1459,6 +1467,7 @@ fn cdsc_sources_for_target(
         if child_body.len() != expected_len {
             return Err(invalid_layout("iref reference list is inconsistent"));
         }
+        let mut targets = Vec::with_capacity(count);
         for index in 0..count {
             let start = count_pos + 2 + index * id_width;
             let to_item_id = if id_width == 2 {
@@ -1473,13 +1482,82 @@ fn cdsc_sources_for_target(
                         .map_err(|_| invalid_layout("invalid iref target item ID"))?,
                 )
             };
-            if to_item_id == target_item_id {
-                sources.push(from_item_id);
-                break;
-            }
+            targets.push(to_item_id);
         }
+        pairs.push((from_item_id, targets));
     }
-    Ok(sources)
+    Ok(pairs)
+}
+
+/// Item IDs that describe some other item through a `cdsc` reference.
+fn cdsc_sources_for_target(
+    bytes: &[u8],
+    iref: RawBox,
+    target_item_id: u32,
+) -> Result<Vec<u32>, HeifError> {
+    Ok(cdsc_pairs(bytes, iref)?
+        .into_iter()
+        .filter(|(_, targets)| targets.contains(&target_item_id))
+        .map(|(from_item_id, _)| from_item_id)
+        .collect())
+}
+
+/// Resolve which XMP item holds the primary image's metadata.
+///
+/// A `cdsc` reference binds a descriptive item to the image it describes, so
+/// an XMP item that names an auxiliary image (a depth map, a portrait matte, a
+/// gain map) is that image's metadata and not the photograph's. Absence of a
+/// reference is evidence too: when every packet names an auxiliary image the
+/// primary has no XMP of its own, which is the same conclusion as a file with
+/// no XMP at all, and `Ok(None)` lets the caller insert one.
+///
+/// Items with no `cdsc` reference are unattributed. A single unattributed
+/// packet is the ordinary single-XMP HEIC and resolves to itself; several are
+/// undecidable and fail closed rather than risk overwriting the wrong one.
+fn select_xmp_item_id(
+    bytes: &[u8],
+    iref: Option<RawBox>,
+    primary_item_id: u32,
+    xmp_item_ids: &[u32],
+) -> Result<Option<u32>, HeifError> {
+    let Some((first, rest)) = xmp_item_ids.split_first() else {
+        return Ok(None);
+    };
+    let Some(iref) = iref else {
+        return if rest.is_empty() {
+            Ok(Some(*first))
+        } else {
+            Err(invalid_layout(
+                "multiple XMP items have no primary-image association",
+            ))
+        };
+    };
+    let pairs = cdsc_pairs(bytes, iref)?;
+    let mut primary = xmp_item_ids.iter().copied().filter(|item_id| {
+        pairs
+            .iter()
+            .any(|(from, targets)| from == item_id && targets.contains(&primary_item_id))
+    });
+    if let Some(item_id) = primary.next() {
+        return if primary.next().is_some() {
+            Err(invalid_layout(
+                "multiple XMP items describe the primary image",
+            ))
+        } else {
+            Ok(Some(item_id))
+        };
+    }
+    let mut unattributed = xmp_item_ids
+        .iter()
+        .copied()
+        .filter(|item_id| !pairs.iter().any(|(from, _)| from == item_id));
+    match (unattributed.next(), unattributed.next()) {
+        (None, _) => Ok(None),
+        (Some(item_id), None) => Ok(Some(item_id)),
+        (Some(_), Some(_)) => Err(invalid_layout(
+            "multiple XMP items have no primary-image association",
+        )),
+    }
 }
 
 fn select_exif_item_id(
@@ -1656,6 +1734,8 @@ fn locate_xmp(
     bytes: &[u8],
     iinf: RawBox,
     iloc: RawBox,
+    iref: Option<RawBox>,
+    primary_item_id: u32,
 ) -> Result<
     (
         Option<XmpLocation>,
@@ -1677,7 +1757,8 @@ fn locate_xmp(
         }
         max_item_id = max_item_id.max(item.item_id);
     }
-    let xmp = iinf_layout.xmp_item_id.and_then(|item_id| {
+    let xmp_item_id = select_xmp_item_id(bytes, iref, primary_item_id, &iinf_layout.xmp_item_ids)?;
+    let xmp = xmp_item_id.and_then(|item_id| {
         iloc_layout
             .items
             .iter()
@@ -1701,7 +1782,7 @@ fn locate_xmp(
     });
     Ok((
         xmp,
-        iinf_layout.xmp_item_id,
+        xmp_item_id,
         max_item_id,
         iinf_layout.version,
         iinf_layout.count_pos,
@@ -1987,7 +2068,7 @@ pub(crate) fn rewrite_xmp<W: Write>(
         iinf_count_pos,
         iinf_count_size,
         iinf_item_ids,
-    ) = locate_xmp(input, iinf, iloc)?;
+    ) = locate_xmp(input, iinf, iloc, iref, primary_item_id)?;
 
     reject_meta_overlapping_items(&iloc_layout, meta)?;
     for item in &iloc_layout.items {
@@ -2237,16 +2318,36 @@ fn extract_xmp_from_meta(
     let (Some(iinf), Some(iloc)) = (iinf, iloc) else {
         return Ok(None);
     };
-    let Some(xmp_entry) = iinf.item_infos.iter().find(|e| {
-        e.item_type == Some(FourCC::new(b"mime"))
-            && e.content_type.as_deref() == Some("application/rdf+xml")
-    }) else {
+    let xmp_item_ids: Vec<u32> = iinf
+        .item_infos
+        .iter()
+        .filter(|e| {
+            e.item_type == Some(FourCC::new(b"mime"))
+                && e.content_type.as_deref() == Some("application/rdf+xml")
+        })
+        .map(|e| e.item_id)
+        .collect();
+    if xmp_item_ids.is_empty() {
         return Ok(None);
+    }
+    let xmp_item_id = match find_meta_layout(file_bytes) {
+        Ok((_, _, _, iref, primary_item_id, _)) => {
+            match select_xmp_item_id(file_bytes, iref, primary_item_id, &xmp_item_ids)? {
+                Some(item_id) => item_id,
+                None => return Ok(None),
+            }
+        }
+        // Without a resolvable item graph there is no association to read, so a
+        // lone packet still answers for the primary image.
+        Err(err) => match xmp_item_ids.as_slice() {
+            [item_id] => *item_id,
+            _ => return Err(err),
+        },
     };
     let Some(loc) = iloc
         .item_locations
         .iter()
-        .find(|l| l.item_id == xmp_entry.item_id)
+        .find(|l| l.item_id == xmp_item_id)
     else {
         return Ok(None);
     };
@@ -2349,7 +2450,8 @@ fn iinf_entry_count(body: &[u8], version: u8) -> Option<u32> {
 /// asserts the writer's safety contract, rather than merely that it does not
 /// crash. A rejected rewrite must emit nothing. An accepted rewrite must keep
 /// the container HEIF, make the written packet readable again, preserve every
-/// non-XMP item payload, and preserve opaque `meta` sub-boxes byte-for-byte.
+/// item payload it does not own, and preserve opaque `meta` sub-boxes
+/// byte-for-byte.
 /// Compiled only for the fuzz harness; absent from production builds.
 #[cfg(feature = "__fuzz_internals")]
 pub(crate) fn fuzz_rewrite_xmp_preserves(input: &[u8]) {
@@ -2386,8 +2488,8 @@ pub(crate) fn fuzz_rewrite_xmp_preserves(input: &[u8]) {
 /// iloc version 2 are covered.
 #[cfg(feature = "__fuzz_internals")]
 fn fuzz_extract_xmp(bytes: &[u8]) -> Option<Vec<u8>> {
-    let (_, iinf, iloc, _, _, _) = find_meta_layout(bytes).ok()?;
-    let (location, _, _, _, _, _, _) = locate_xmp(bytes, iinf, iloc).ok()?;
+    let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes).ok()?;
+    let (location, _, _, _, _, _, _) = locate_xmp(bytes, iinf, iloc, iref, primary_item_id).ok()?;
     let location = location?;
     let end = location.extent_start.checked_add(location.extent_length)?;
     bytes.get(location.extent_start..end).map(<[u8]>::to_vec)
@@ -2785,6 +2887,9 @@ fn push_iloc_entry(meta: &mut Meta, loc: ItemLocation) {
         }),
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::apple_multi_xmp_heic;
 
 #[cfg(test)]
 mod tests {
@@ -3558,14 +3663,26 @@ mod tests {
             replaced_by_append.len() > grows.len(),
             "growing seed must repoint XMP to an appended mdat"
         );
+
+        // The fuzzer will not synthesise a valid multi-image item map on its
+        // own, so selection stays unreachable without a seed carrying one.
+        let multi = include_bytes!("../../fuzz/seeds/heif_rewrite/multi-xmp");
+        assert_eq!(
+            extract_xmp_raw(multi).as_deref(),
+            Some(PRIMARY_XMP),
+            "multi-image seed must resolve to the primary image's packet"
+        );
+        #[cfg(feature = "__fuzz_internals")]
+        fuzz_rewrite_xmp_preserves(multi);
     }
 
     #[test]
     fn rewrite_xmp_appends_when_existing_extent_includes_mdat_header() {
         const MARKER: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>3</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
         let mut input = include_bytes!("../../fuzz/seeds/heif_rewrite/replacement-fits").to_vec();
-        let (_, iinf, iloc, _, _, _) = find_meta_layout(&input).unwrap();
-        let (location, xmp_item_id, _, _, _, _, _) = locate_xmp(&input, iinf, iloc).unwrap();
+        let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(&input).unwrap();
+        let (location, xmp_item_id, _, _, _, _, _) =
+            locate_xmp(&input, iinf, iloc, iref, primary_item_id).unwrap();
         let location = location.expect("seed XMP location");
         let layout = parse_iloc(&input, iloc).unwrap();
         let item = layout
@@ -3763,9 +3880,14 @@ mod tests {
     }
 
     fn xmp_and_primary_item_ids(bytes: &[u8]) -> (u32, u32) {
-        let (_, iinf, _, _, primary_item_id, _) = find_meta_layout(bytes).unwrap();
+        let (_, iinf, _, iref, primary_item_id, _) = find_meta_layout(bytes).unwrap();
         let iinf_layout = parse_iinf(bytes, iinf).unwrap();
-        (iinf_layout.xmp_item_id.unwrap(), primary_item_id)
+        (
+            select_xmp_item_id(bytes, iref, primary_item_id, &iinf_layout.xmp_item_ids)
+                .unwrap()
+                .unwrap(),
+            primary_item_id,
+        )
     }
 
     fn cdsc_references(bytes: &[u8]) -> Vec<(u32, u32)> {
@@ -4162,6 +4284,10 @@ mod tests {
                     entry.extend_from_slice(&0u16.to_be_bytes());
                     entry.extend_from_slice(&item.item_type);
                     entry.push(0);
+                    if item.item_type == *b"mime" {
+                        entry.extend_from_slice(b"application/rdf+xml\0");
+                        entry.push(0);
+                    }
                     body.extend_from_slice(&sbox(b"infe", &entry));
                 }
                 sbox(b"iinf", &body)
@@ -4281,8 +4407,9 @@ mod tests {
     /// the mp4-atom read path, so item ids above `u16` and iloc version 2 are
     /// covered too.
     fn extract_xmp_raw(bytes: &[u8]) -> Option<Vec<u8>> {
-        let (_, iinf, iloc, _, _, _) = find_meta_layout(bytes).ok()?;
-        let (location, _, _, _, _, _, _) = locate_xmp(bytes, iinf, iloc).ok()?;
+        let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes).ok()?;
+        let (location, _, _, _, _, _, _) =
+            locate_xmp(bytes, iinf, iloc, iref, primary_item_id).ok()?;
         let location = location?;
         Some(bytes[location.extent_start..location.extent_start + location.extent_length].to_vec())
     }
@@ -4399,6 +4526,214 @@ mod tests {
             again, output,
             "repeated grid rewrite must be byte-idempotent"
         );
+    }
+
+    const AUX_XMP: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description xmlns:HDRGainMap='http://ns.apple.com/HDRGainMap/1.0/' HDRGainMap:HDRGainMapHeadroom='2.67'/></rdf:RDF></x:xmpmeta>";
+    const PRIMARY_XMP: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description xmlns:xmp='http://ns.adobe.com/xap/1.0/' xmp:Rating='1'/></rdf:RDF></x:xmpmeta>";
+
+    /// The shape iOS writes for an HDR or portrait capture: a `grid` primary
+    /// over `hvc1` tiles, an auxiliary image, and one XMP item per image. Only
+    /// the packet whose `cdsc` names the primary is the photograph's.
+    fn apple_multi_xmp_spec(xmp_items: Vec<ItemSpec>, cdsc: Vec<Vec<u8>>) -> HeicSpec {
+        let grid_header = vec![0u8, 0, 1, 1, 0, 0x40, 0, 0x40];
+        let mut items = vec![
+            ItemSpec {
+                item_id: 1,
+                item_type: *b"grid",
+                infe_version: 2,
+                construction_method: 1,
+                data: Vec::new(),
+                offset: 0,
+                length: grid_header.len() as u64,
+            },
+            ItemSpec {
+                item_id: 2,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (0u8..40).collect(),
+                offset: 0,
+                length: 0,
+            },
+            ItemSpec {
+                item_id: 3,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (40u8..96).collect(),
+                offset: 0,
+                length: 0,
+            },
+            ItemSpec {
+                item_id: 4,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (96u8..128).collect(),
+                offset: 0,
+                length: 0,
+            },
+        ];
+        items.extend(xmp_items);
+        let mut iref_children = vec![ref_box(b"dimg", 1, &[2, 3])];
+        iref_children.extend(cdsc);
+        HeicSpec {
+            iloc_version: 1,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items,
+            idat: Some(grid_header),
+            iref_children,
+        }
+    }
+
+    fn xmp_item(item_id: u32, packet: &[u8]) -> ItemSpec {
+        ItemSpec {
+            item_id,
+            item_type: *b"mime",
+            infe_version: 2,
+            construction_method: 0,
+            data: packet.to_vec(),
+            offset: 0,
+            length: 0,
+        }
+    }
+
+    /// A HEIF file shaped like an iOS HDR capture, for tests outside this
+    /// module: a `grid` primary over `hvc1` tiles, an auxiliary image carrying
+    /// its own XMP packet, and optionally the photograph's packet bound to the
+    /// primary by `cdsc`.
+    pub(crate) fn apple_multi_xmp_heic(primary_xmp: Option<&[u8]>, aux_xmp: &[u8]) -> Vec<u8> {
+        let mut xmp_items = vec![xmp_item(5, aux_xmp)];
+        let mut cdsc = vec![ref_box(b"cdsc", 5, &[4])];
+        if let Some(packet) = primary_xmp {
+            xmp_items.push(xmp_item(6, packet));
+            cdsc.push(ref_box(b"cdsc", 6, &[1, 3]));
+        }
+        build_heic(&apple_multi_xmp_spec(xmp_items, cdsc))
+    }
+
+    #[test]
+    fn rewrite_xmp_targets_the_xmp_item_describing_the_primary_image() {
+        let spec = apple_multi_xmp_spec(
+            vec![xmp_item(5, AUX_XMP), xmp_item(6, PRIMARY_XMP)],
+            vec![ref_box(b"cdsc", 5, &[4]), ref_box(b"cdsc", 6, &[1, 3])],
+        );
+        let input = build_heic(&spec);
+
+        assert_eq!(
+            extract_xmp_raw(&input).as_deref(),
+            Some(PRIMARY_XMP),
+            "the writer must resolve the packet the cdsc binds to the primary"
+        );
+        assert_eq!(
+            extract_xmp_strict(&input).unwrap().as_deref(),
+            Some(PRIMARY_XMP),
+            "the reader must resolve the same packet as the writer, or a merge \
+             would move auxiliary metadata onto the photograph"
+        );
+
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("multi-XMP rewrite");
+
+        assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
+        assert_eq!(
+            resolve_item_data(&output, 5),
+            AUX_XMP,
+            "the auxiliary image's packet must survive byte-for-byte"
+        );
+        for tile in [2, 3, 4] {
+            assert_eq!(
+                resolve_item_data(&input, tile),
+                resolve_item_data(&output, tile),
+                "item {tile} payload must be untouched"
+            );
+        }
+        validate_rewrite_preserves_non_xmp_items(&input, &output)
+            .expect("every item but the selected XMP packet must be preserved");
+
+        let mut again = Vec::new();
+        rewrite_xmp(&output, MATRIX_XMP, &mut again).expect("multi-XMP idempotent");
+        assert_eq!(again, output, "repeated rewrite must be byte-idempotent");
+    }
+
+    #[test]
+    fn rewrite_xmp_inserts_when_every_packet_describes_an_auxiliary_image() {
+        // Twelve of sixty-one files in a real library carry one auxiliary
+        // packet, and eight carry several. In both the photograph has no XMP,
+        // so selecting one would overwrite a gain map's metadata with the
+        // photograph's.
+        for (xmp_items, cdsc) in [
+            (vec![xmp_item(5, AUX_XMP)], vec![ref_box(b"cdsc", 5, &[4])]),
+            (
+                vec![xmp_item(5, AUX_XMP), xmp_item(6, AUX_XMP)],
+                vec![ref_box(b"cdsc", 5, &[4]), ref_box(b"cdsc", 6, &[3])],
+            ),
+        ] {
+            let ids: Vec<u32> = xmp_items.iter().map(|item| item.item_id).collect();
+            let spec = apple_multi_xmp_spec(xmp_items, cdsc);
+            let input = build_heic(&spec);
+
+            assert!(
+                extract_xmp_strict(&input).unwrap().is_none(),
+                "an auxiliary packet must not answer for the primary image"
+            );
+
+            let mut output = Vec::new();
+            rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("insertion beside auxiliary XMP");
+
+            assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
+            for id in &ids {
+                assert_eq!(
+                    resolve_item_data(&output, *id),
+                    AUX_XMP,
+                    "auxiliary packet {id} must survive byte-for-byte"
+                );
+            }
+            let (xmp_id, _) = xmp_and_primary_item_ids(&output);
+            assert!(
+                cdsc_references(&output).contains(&(xmp_id, 1)),
+                "the inserted item must be bound to the primary image"
+            );
+            validate_rewrite_preserves_non_xmp_items(&input, &output)
+                .expect("insertion must preserve every existing item");
+
+            let mut again = Vec::new();
+            rewrite_xmp(&output, MATRIX_XMP, &mut again).expect("insertion idempotent");
+            assert_eq!(again, output, "repeated rewrite must be byte-idempotent");
+        }
+    }
+
+    #[test]
+    fn rewrite_xmp_refuses_undecidable_xmp_item_maps() {
+        // Two packets naming the primary, and two naming nothing at all. Both
+        // shapes leave no evidence for choosing, so neither may be overwritten.
+        let ambiguous = [
+            (
+                vec![xmp_item(5, AUX_XMP), xmp_item(6, PRIMARY_XMP)],
+                vec![ref_box(b"cdsc", 5, &[1]), ref_box(b"cdsc", 6, &[1])],
+            ),
+            (vec![xmp_item(5, AUX_XMP), xmp_item(6, PRIMARY_XMP)], vec![]),
+        ];
+        for (xmp_items, cdsc) in ambiguous {
+            let spec = apple_multi_xmp_spec(xmp_items, cdsc);
+            let input = build_heic(&spec);
+
+            let mut output = Vec::new();
+            let result = rewrite_xmp(&input, MATRIX_XMP, &mut output);
+            assert!(
+                result.is_err(),
+                "an undecidable item map must not be written"
+            );
+            assert!(output.is_empty(), "a refused rewrite must emit nothing");
+            assert!(
+                extract_xmp_strict(&input).is_err(),
+                "the reader must refuse whatever the writer refuses"
+            );
+        }
     }
 
     #[test]
@@ -4556,13 +4891,15 @@ mod tests {
             &mut input,
         )
         .expect("seed existing XMP");
-        let (meta, iinf, iloc, _, _, prefix_size) = find_meta_layout(&input).unwrap();
+        let (meta, iinf, iloc, iref, primary_item_id, prefix_size) =
+            find_meta_layout(&input).unwrap();
         let children = scan_raw_boxes(&input, meta.body_start() + prefix_size, meta.end()).unwrap();
         let iprp = children
             .iter()
             .find(|child| child.kind == *b"iprp")
             .expect("sample HEIC iprp");
-        let (_, xmp_item_id, _, _, _, _, _) = locate_xmp(&input, iinf, iloc).unwrap();
+        let (_, xmp_item_id, _, _, _, _, _) =
+            locate_xmp(&input, iinf, iloc, iref, primary_item_id).unwrap();
         let layout = parse_iloc(&input, iloc).unwrap();
         let xmp_item = layout
             .items
