@@ -59,6 +59,7 @@ pub(crate) async fn run_reset_sync_token(
     yes: bool,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     let db_path = super::super::get_db_path(globals, toml)?;
 
@@ -68,9 +69,8 @@ pub(crate) async fn run_reset_sync_token(
     }
 
     if !yes {
-        use std::io::IsTerminal;
         use std::io::Write;
-        if !std::io::stdin().is_terminal() {
+        if !input_mode.can_prompt() {
             anyhow::bail!(
                 "`kei reset sync-token` needs `--yes` when stdin is not a terminal. The next sync will re-enumerate every asset, which can take a long time on a large library."
             );

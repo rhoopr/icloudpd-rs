@@ -352,6 +352,20 @@ fn submit_code_help_succeeds() {
 }
 
 #[test]
+fn password_set_help_documents_headless_sources() {
+    common::cmd()
+        .args(["password", "set", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "kei password --password-file <PATH> set",
+        ))
+        .stdout(predicate::str::contains(
+            "kei password --password-command <COMMAND> set",
+        ));
+}
+
+#[test]
 fn legacy_retry_failed_help_fails() {
     common::cmd()
         .args(["retry-failed", "--help"])

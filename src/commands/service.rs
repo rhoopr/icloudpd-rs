@@ -160,6 +160,7 @@ pub(crate) async fn attempt_reauth(
     username: &str,
     domain: &str,
     password_provider: &crate::password::PasswordProvider,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     let mut session = shared_session.write().await;
 
@@ -180,7 +181,7 @@ pub(crate) async fn attempt_reauth(
     session.release_lock()?;
     drop(session);
 
-    let new_auth = auth::authenticate(
+    let new_auth = auth::authenticate_in_input_mode(
         cookie_directory,
         username,
         password_provider,
@@ -188,6 +189,7 @@ pub(crate) async fn attempt_reauth(
         None,
         None,
         None, // no code — interactive prompt or TwoFactorRequired
+        input_mode,
     )
     .await?;
 

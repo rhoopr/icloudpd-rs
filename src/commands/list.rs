@@ -18,6 +18,7 @@ pub(crate) async fn run_list(
     cli_libraries: Vec<String>,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
@@ -27,11 +28,17 @@ pub(crate) async fn run_list(
         );
     }
 
-    let password_provider =
-        super::super::make_provider_from_auth(pw, password, &username, &cookie_directory, toml);
+    let password_provider = super::super::make_provider_from_auth(
+        pw,
+        password,
+        &username,
+        &cookie_directory,
+        toml,
+        input_mode,
+    );
 
     let auth_result = retry_on_lock_contention(|| {
-        auth::authenticate(
+        auth::authenticate_in_input_mode(
             &cookie_directory,
             &username,
             &password_provider,
@@ -39,6 +46,7 @@ pub(crate) async fn run_list(
             None,
             None,
             None,
+            input_mode,
         )
     })
     .await?;

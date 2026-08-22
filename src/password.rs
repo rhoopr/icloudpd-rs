@@ -8,7 +8,6 @@
 //! command, credential store, interactive prompt) and evaluates lazily — the
 //! password is only fetched at auth time and released immediately after.
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 // Permissive-mode warnings are unix-only (Windows has no POSIX mode bits).
@@ -115,14 +114,26 @@ impl PasswordSource {
     /// For [`Command`](Self::Command) and [`File`](Self::File) sources, this
     /// re-executes the command or re-reads the file each time, supporting
     /// password rotation and external secret managers.
+    #[allow(
+        dead_code,
+        reason = "kept as the default-input wrapper; CLI providers use the startup input snapshot"
+    )]
     pub fn resolve(&self) -> anyhow::Result<Option<SecretString>> {
+        self.resolve_in_mode(crate::InputMode::detect())
+    }
+
+    /// Evaluate the source using the input mode captured at process startup.
+    pub(crate) fn resolve_in_mode(
+        &self,
+        input_mode: crate::InputMode,
+    ) -> anyhow::Result<Option<SecretString>> {
         match self {
             Self::Direct(s) => Ok(Some(SecretString::from(s.expose_secret().to_owned()))),
             Self::Command(cmd) => run_password_command(cmd).map(Some),
             Self::File(path) => read_password_file(path).map(Some),
             Self::Store(store) => store.retrieve(),
             Self::Interactive => {
-                if !std::io::stdin().is_terminal() {
+                if !input_mode.can_prompt() {
                     anyhow::bail!(
                         "No iCloud password is configured, and kei cannot prompt because stdin is not a terminal. \
                          Set a password with one of:\n  \
@@ -628,6 +639,15 @@ mod tests {
             }
             other => panic!("expected SkipWithWarning, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn interactive_source_rejects_no_input_mode_before_prompting() {
+        let error = PasswordSource::Interactive
+            .resolve_in_mode(crate::InputMode::NoInput)
+            .expect_err("headless password lookup must not prompt");
+
+        assert!(error.to_string().contains("stdin is not a terminal"));
     }
 
     // ── check_password_file_mode (unix-only) ────────────────────────

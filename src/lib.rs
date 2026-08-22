@@ -62,6 +62,35 @@ use std::sync::Arc;
 
 use password::{ExposeSecret, SecretString};
 
+/// Whether this process can ask the operator for input.
+///
+/// Detect this once before the async runtime starts, then pass the result to
+/// command owners. This prevents prompt and wait policy from drifting when a
+/// command runs under cron, CI, Docker, or a service manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputMode {
+    Interactive,
+    NoInput,
+}
+
+impl InputMode {
+    #[must_use]
+    fn detect() -> Self {
+        use std::io::IsTerminal;
+
+        if std::io::stdin().is_terminal() {
+            Self::Interactive
+        } else {
+            Self::NoInput
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn can_prompt(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+}
+
 /// A writer wrapper that redacts a password string from log output.
 ///
 /// Wraps any `io::Write` implementor and replaces occurrences of the
@@ -294,14 +323,9 @@ const EXIT_TERMINAL_AUTH: u8 = 4;
 #[error("{0} sync failures")]
 struct PartialSyncError(usize);
 
-/// Maps a fatal `Err` from `run` to an exit code and decides whether to
-/// log it. `TwoFactorRequired` is the non-obvious case: exit 0, no log.
+/// Maps a fatal `Err` from `run` to an exit code and decides whether to log it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitClassification {
-    /// Exit 0 with no error log: kei already told the user how to
-    /// proceed, and `restart: on-failure` would loop Apple's auth
-    /// endpoint if 2FA were treated as a failure.
-    TwoFactorRequired,
     Partial,
     Auth,
     TerminalAuth,
@@ -311,7 +335,6 @@ enum ExitClassification {
 impl ExitClassification {
     const fn exit_code(self) -> u8 {
         match self {
-            Self::TwoFactorRequired => 0,
             Self::Partial => EXIT_PARTIAL,
             Self::Auth => EXIT_AUTH,
             Self::TerminalAuth => EXIT_TERMINAL_AUTH,
@@ -320,7 +343,7 @@ impl ExitClassification {
     }
 
     const fn should_log(self) -> bool {
-        !matches!(self, Self::TwoFactorRequired)
+        true
     }
 
     const fn should_suggest_diagnostics(self) -> bool {
@@ -332,7 +355,7 @@ fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
     if e.downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_two_factor_required)
     {
-        ExitClassification::TwoFactorRequired
+        ExitClassification::Auth
     } else if e
         .downcast_ref::<auth::error::AuthError>()
         .is_some_and(auth::error::AuthError::is_terminal_apple_auth)
@@ -479,8 +502,11 @@ pub(crate) fn check_min_disk_space(available_bytes: u64, directory: &Path) -> an
 /// path can dispatch invocations through `spawn_blocking` (see
 /// [`password::invoke_password_provider`]) instead of calling the
 /// blocking `resolve()` directly on a tokio worker.
-fn make_password_provider(source: password::PasswordSource) -> password::PasswordProvider {
-    std::sync::Arc::new(move || match source.resolve() {
+fn make_password_provider(
+    source: password::PasswordSource,
+    input_mode: InputMode,
+) -> password::PasswordProvider {
+    std::sync::Arc::new(move || match source.resolve_in_mode(input_mode) {
         Ok(pw) => pw,
         Err(e) => {
             tracing::error!(error = %e, "Password source resolution failed");
@@ -498,6 +524,7 @@ fn make_provider_from_auth(
     username: &str,
     cookie_directory: &Path,
     toml: Option<&config::TomlConfig>,
+    input_mode: InputMode,
 ) -> password::PasswordProvider {
     let toml_auth = toml.and_then(|t| t.auth.as_ref());
     let password_command = config::resolve_password_command(pw, toml_auth);
@@ -508,7 +535,7 @@ fn make_provider_from_auth(
         password_file.as_deref(),
         credential::CredentialStore::new(username, cookie_directory),
     );
-    make_password_provider(source)
+    make_password_provider(source, input_mode)
 }
 
 use commands::{
@@ -614,6 +641,8 @@ impl Drop for PidFileGuard {
 /// of the lib so it's reachable from integration tests, fuzz harnesses,
 /// and any future companion binaries.
 pub fn main_inner() -> ExitCode {
+    let input_mode = InputMode::detect();
+
     // Snapshot and scrub the password env var while truly single-threaded,
     // before the tokio runtime creates worker threads.
     let env_password = std::env::var("ICLOUD_PASSWORD")
@@ -631,7 +660,7 @@ pub fn main_inner() -> ExitCode {
         .build()
         .expect("Failed to create tokio runtime");
 
-    match rt.block_on(run(env_password)) {
+    match rt.block_on(run(env_password, input_mode)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if let Some(parse_exit) = classify_cli_parse_exit(&e) {
@@ -670,7 +699,7 @@ pub fn main_inner() -> ExitCode {
     }
 }
 
-async fn run(env_password: Option<String>) -> anyhow::Result<()> {
+async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Result<()> {
     let cli = cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
 
     // Load TOML config early so it can influence log level.
@@ -844,7 +873,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 return run_reset_state(yes, &globals, toml_config.as_ref()).await;
             }
             cli::ResetCommand::SyncToken { yes } => {
-                return run_reset_sync_token(yes, &globals, toml_config.as_ref()).await;
+                return run_reset_sync_token(yes, &globals, toml_config.as_ref(), input_mode).await;
             }
         },
         Command::Verify(args) => {
@@ -854,23 +883,44 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             return run_reconcile(args, &globals, toml_config.as_ref()).await;
         }
         Command::ImportExisting(args) => {
-            return run_import_existing(args, &globals, toml_config.as_ref()).await;
+            return run_import_existing(args, &globals, toml_config.as_ref(), input_mode).await;
         }
         Command::Login {
             password,
             subcommand,
         } => {
-            return run_login(subcommand, &password, &globals, toml_config.as_ref()).await;
+            return run_login(
+                subcommand,
+                &password,
+                &globals,
+                toml_config.as_ref(),
+                input_mode,
+            )
+            .await;
         }
         Command::Password { password, action } => {
-            return run_password(action, &globals, &password, toml_config.as_ref());
+            return run_password(
+                action,
+                &globals,
+                &password,
+                toml_config.as_ref(),
+                input_mode,
+            );
         }
         Command::List {
             password,
             libraries,
             what,
         } => {
-            return run_list(what, &password, libraries, &globals, toml_config.as_ref()).await;
+            return run_list(
+                what,
+                &password,
+                libraries,
+                &globals,
+                toml_config.as_ref(),
+                input_mode,
+            )
+            .await;
         }
         Command::Config { action } => match action {
             cli::ConfigAction::Show => {
@@ -878,7 +928,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             }
             cli::ConfigAction::Setup { output } => {
                 let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
-                match setup::run_setup(&path)? {
+                match setup::run_setup(&path, input_mode)? {
                     setup::SetupResult::SyncNow {
                         config_path: cfg_path,
                         one_shot_password,
@@ -921,6 +971,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         // already Off here, but pass through for symmetry.
                         personality_mode,
                         friendly_request,
+                        input_mode,
                     },
                 ))
                 .await;
@@ -941,6 +992,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             redact_password: Arc::clone(&redact_password),
             personality_mode,
             friendly_request,
+            input_mode,
         },
     ))
     .await
@@ -950,6 +1002,12 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn input_mode_only_allows_interactive_prompts() {
+        assert!(InputMode::Interactive.can_prompt());
+        assert!(!InputMode::NoInput.can_prompt());
+    }
 
     #[test]
     fn pid_file_guard_creates_and_removes() {
@@ -1338,7 +1396,7 @@ mod tests {
     #[test]
     fn make_password_provider_with_direct_source() {
         let source = password::PasswordSource::Direct(Arc::new(SecretString::from("mypass")));
-        let provider = make_password_provider(source);
+        let provider = make_password_provider(source, InputMode::Interactive);
         let result = provider().unwrap();
         assert_eq!(result.expose_secret(), "mypass");
         // Can be called multiple times
@@ -1353,7 +1411,7 @@ mod tests {
     #[test]
     fn make_password_provider_with_command_source() {
         let source = password::PasswordSource::Command("echo cmd_test".to_string());
-        let provider = make_password_provider(source);
+        let provider = make_password_provider(source, InputMode::Interactive);
         let result = provider().unwrap();
         assert_eq!(result.expose_secret(), "cmd_test");
     }
@@ -1490,15 +1548,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_exit_error_two_factor_required_is_suppressed_success() {
+    fn classify_exit_error_two_factor_required_uses_auth_failure() {
         let e: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
         let c = classify_exit_error(&e);
-        assert_eq!(c, ExitClassification::TwoFactorRequired);
-        assert_eq!(c.exit_code(), 0);
-        assert!(
-            !c.should_log(),
-            "2FA-required must not emit a final error log; that path is the success branch"
-        );
+        assert_eq!(c, ExitClassification::Auth);
+        assert_eq!(c.exit_code(), EXIT_AUTH);
+        assert!(c.should_log());
     }
 
     #[test]
@@ -1584,9 +1639,8 @@ mod tests {
             .context("during startup");
         assert_eq!(
             classify_exit_error(&e),
-            ExitClassification::TwoFactorRequired,
-            "AuthError wrapped in .context() must still classify as 2FA-required; \
-             otherwise context-wrapping at any call site silently flips exit 0 -> exit 1"
+            ExitClassification::Auth,
+            "context-wrapped 2FA-required must keep the documented auth exit code"
         );
 
         let e: anyhow::Error =
@@ -1605,7 +1659,6 @@ mod tests {
     #[test]
     fn classify_exit_error_codes_are_distinct() {
         let codes = [
-            ExitClassification::TwoFactorRequired.exit_code(),
             ExitClassification::Partial.exit_code(),
             ExitClassification::Auth.exit_code(),
             ExitClassification::TerminalAuth.exit_code(),

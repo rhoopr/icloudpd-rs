@@ -60,6 +60,14 @@ The CLI requires a subcommand. `kei sync` enters the sync path. Commands such
 as `status`, `doctor`, and `manifest` read local state without entering the
 normal iCloud sync loop.
 
+`main_inner` records whether stdin is interactive before it starts the async
+runtime. Command owners use that single input mode for password and 2FA
+prompts. A foreground command returns `TwoFactorRequired` to the exit
+classifier, which reports auth exit code 3 and the `login get-code` and
+`login submit-code` recovery flow. Only the sync owner may convert that error
+into a durable wait, and only when the resolved configuration is in watch or
+service mode.
+
 ### Sync and provider checkpoints
 
 ```text
@@ -284,6 +292,10 @@ uses a redacting writer as a backstop, but code must not send Apple IDs,
 passwords, session cookies, bearer tokens, or unredacted provider identifiers
 to logs or machine output. Preserve process hardening that limits credential
 exposure through core dumps.
+
+`password set` prompts only in interactive input mode. Headless callers must
+use a password file or password command. The command resolves the secret and
+passes it directly to the credential store without printing it.
 
 ## Safety contract catalog
 

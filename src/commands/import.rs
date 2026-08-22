@@ -841,6 +841,7 @@ pub(crate) async fn run_import_existing(
     args: cli::ImportArgs,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     let shutdown_token = crate::shutdown::install_signal_handler(
         SystemdNotifier::new(false),
@@ -885,9 +886,10 @@ pub(crate) async fn run_import_existing(
         &username,
         &cookie_directory,
         toml,
+        input_mode,
     );
 
-    let auth_result = auth::authenticate(
+    let auth_result = auth::authenticate_in_input_mode(
         &cookie_directory,
         &username,
         &password_provider,
@@ -895,6 +897,7 @@ pub(crate) async fn run_import_existing(
         None,
         None,
         None,
+        input_mode,
     )
     .await?;
 

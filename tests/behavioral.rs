@@ -42,6 +42,7 @@ fn clean_cmd() -> assert_cmd::Command {
         .env_remove("KEI_DOWNLOAD_DIR")
         .env_remove("KEI_LOG_LEVEL")
         .env_remove("KEI_NO_AUTO_CONFIG")
+        .env_remove("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS")
         .env("KEI_DATA_DIR", default_data_dir)
         .timeout(TIMEOUT);
     cmd
@@ -705,6 +706,134 @@ fn password_set_requires_username() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Set your iCloud username"));
+}
+
+#[test]
+fn password_set_headless_accepts_password_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let password_file = dir.path().join("icloud-password");
+    let data_dir = dir.path().join("data");
+    let secret = "file-source-secret";
+    std::fs::write(&password_file, format!("{secret}\n")).unwrap();
+
+    clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", &data_dir)
+        .args([
+            "password",
+            "--password-file",
+            password_file.to_str().unwrap(),
+            "set",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Password stored in"))
+        .stdout(predicate::str::contains(secret).not())
+        .stderr(predicate::str::contains(secret).not());
+}
+
+#[test]
+fn password_set_headless_without_source_fails_before_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+
+    clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["password", "set"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stdin is not a terminal"))
+        .stderr(predicate::str::contains(
+            "kei password --password-file <PATH> set",
+        ))
+        .stderr(predicate::str::contains(
+            "kei password --password-command <COMMAND> set",
+        ));
+}
+
+fn write_fake_two_factor_config(dir: &std::path::Path, username: &str) -> std::path::PathBuf {
+    let download_dir = dir.join("photos");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    let config_path = dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[auth]\nusername = {}\n\n[download]\ndirectory = {}\n",
+            common::toml_string(username),
+            common::toml_string(&download_dir.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+fn assert_foreground_two_factor_failure(command: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = write_fake_two_factor_config(dir.path(), "test@example.com");
+
+    clean_cmd()
+        .env("KEI_DATA_DIR", dir.path().join("data"))
+        .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+        .args([command, "--config", config_path.to_str().unwrap()])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("kei login get-code"))
+        .stderr(predicate::str::contains("kei login submit-code <CODE>"));
+}
+
+#[test]
+fn login_two_factor_required_exits_with_auth_code() {
+    assert_foreground_two_factor_failure("login");
+}
+
+#[test]
+fn one_shot_sync_two_factor_required_exits_with_auth_code() {
+    assert_foreground_two_factor_failure("sync");
+}
+
+#[test]
+fn service_two_factor_required_keeps_waiting_for_submitted_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let config_path = write_fake_two_factor_config(dir.path(), username);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(
+        data_dir.join(format!("{}.session", sanitize_username(username))),
+        "{}\n",
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kei"))
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .env_remove("KEI_CONFIG")
+        .env("KEI_DATA_DIR", &data_dir)
+        .env("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS", "1")
+        .args(["service", "run", "--config", config_path.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(Duration::from_secs(1));
+    if let Some(status) = child.try_wait().unwrap() {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "service exited instead of waiting for 2FA: {status}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Waiting for 2FA code submission"),
+        "service did not enter durable 2FA wait:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 #[test]
 fn password_clear_requires_username() {
