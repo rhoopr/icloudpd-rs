@@ -29,7 +29,6 @@ case "$status" in
         ;;
 esac
 
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 mkdir -p "$runs_dir"
 current="$runs_dir/.current.jsonl"

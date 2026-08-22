@@ -15,7 +15,6 @@
 
 set -euo pipefail
 
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 baseline_n="${KEI_FULLTEST_BASELINE_N:-5}"
 

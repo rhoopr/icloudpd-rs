@@ -7,7 +7,6 @@
 
 set -euo pipefail
 
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 current="$runs_dir/.current.jsonl"
 start_file="$runs_dir/.run-started-at"
