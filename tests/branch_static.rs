@@ -948,6 +948,8 @@ fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
     for expected in [
         "  push:\n    branches: [main]",
         "if [[ \"$EVENT_NAME\" != \"pull_request\" ]]; then",
+        "git diff --name-only \"${BASE_SHA}\"...HEAD > \"$files_path\"",
+        "mapfile -t files < \"$files_path\"",
         "github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'",
     ] {
         assert!(
