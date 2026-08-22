@@ -453,7 +453,10 @@ pub enum ListCommand {
 /// Password management actions.
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordAction {
-    /// Store a password in the credential store (prompts interactively)
+    /// Store a password from a prompt, password file, or password command
+    #[command(
+        after_help = "Headless examples:\n  kei password --password-file <PATH> set\n  kei password --password-command <COMMAND> set"
+    )]
     Set,
     /// Remove a stored password
     Clear,

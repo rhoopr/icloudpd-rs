@@ -15,6 +15,7 @@ pub(crate) async fn run_login(
     pw: &cli::PasswordArgs,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
@@ -24,8 +25,14 @@ pub(crate) async fn run_login(
         );
     }
 
-    let password_provider =
-        super::super::make_provider_from_auth(pw, password, &username, &cookie_directory, toml);
+    let password_provider = super::super::make_provider_from_auth(
+        pw,
+        password,
+        &username,
+        &cookie_directory,
+        toml,
+        input_mode,
+    );
 
     match subcommand {
         Some(cli::LoginCommand::GetCode) => {
@@ -43,7 +50,7 @@ pub(crate) async fn run_login(
         }
         Some(cli::LoginCommand::SubmitCode { code }) => {
             let result = retry_on_lock_contention(|| {
-                auth::authenticate(
+                auth::authenticate_in_input_mode(
                     &cookie_directory,
                     &username,
                     &password_provider,
@@ -51,6 +58,7 @@ pub(crate) async fn run_login(
                     None,
                     None,
                     Some(&code),
+                    input_mode,
                 )
             })
             .await?;
@@ -63,7 +71,7 @@ pub(crate) async fn run_login(
         None => {
             // Bare "kei login" = auth-only
             retry_on_lock_contention(|| {
-                auth::authenticate(
+                auth::authenticate_in_input_mode(
                     &cookie_directory,
                     &username,
                     &password_provider,
@@ -71,6 +79,7 @@ pub(crate) async fn run_login(
                     None,
                     None,
                     None,
+                    input_mode,
                 )
             })
             .await?;

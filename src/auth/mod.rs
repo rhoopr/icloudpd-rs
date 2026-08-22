@@ -21,7 +21,6 @@ pub(crate) const AUTH_RETRY_CONFIG: RetryConfig = RetryConfig {
     max_delay_secs: 30,
 };
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -107,9 +106,12 @@ fn classify_auth_flow_error(err: &anyhow::Error) -> AuthFlowErrorClass {
 ///    otherwise prompts the user interactively.
 /// 5. Returns the authenticated session and account data.
 ///
-/// When `code` is `None` and 2FA is required but stdin is not a TTY,
-/// returns `AuthError::TwoFactorRequired` so the caller can handle it
-/// (e.g., fire a notification script and wait).
+/// When `code` is `None` and the captured input mode disallows prompts,
+/// returns `AuthError::TwoFactorRequired` so the caller can handle it.
+#[allow(
+    dead_code,
+    reason = "kept as the default-input wrapper for internal auth integrations; CLI owners use the startup snapshot"
+)]
 pub async fn authenticate(
     cookie_dir: &Path,
     apple_id: &str,
@@ -119,7 +121,7 @@ pub async fn authenticate(
     timeout_secs: Option<u64>,
     code: Option<&str>,
 ) -> Result<AuthResult> {
-    authenticate_with_mode(
+    authenticate_with_modes(
         cookie_dir,
         apple_id,
         password_provider,
@@ -128,6 +130,32 @@ pub async fn authenticate(
         timeout_secs,
         code,
         crate::personality::Mode::Off,
+        crate::InputMode::detect(),
+    )
+    .await
+}
+
+/// Authenticate using the process input mode captured at startup.
+pub(crate) async fn authenticate_in_input_mode(
+    cookie_dir: &Path,
+    apple_id: &str,
+    password_provider: &crate::password::PasswordProvider,
+    domain: &str,
+    client_id: Option<String>,
+    timeout_secs: Option<u64>,
+    code: Option<&str>,
+    input_mode: crate::InputMode,
+) -> Result<AuthResult> {
+    authenticate_with_modes(
+        cookie_dir,
+        apple_id,
+        password_provider,
+        domain,
+        client_id,
+        timeout_secs,
+        code,
+        crate::personality::Mode::Off,
+        input_mode,
     )
     .await
 }
@@ -139,6 +167,10 @@ pub async fn authenticate(
     clippy::too_many_arguments,
     reason = "mode is a UX gate that doesn't fit any existing struct param without muddying its semantics"
 )]
+#[allow(
+    dead_code,
+    reason = "kept as the output-mode wrapper for internal auth integrations; CLI owners also pass the startup input snapshot"
+)]
 pub async fn authenticate_with_mode(
     cookie_dir: &Path,
     apple_id: &str,
@@ -149,6 +181,42 @@ pub async fn authenticate_with_mode(
     code: Option<&str>,
     mode: crate::personality::Mode,
 ) -> Result<AuthResult> {
+    authenticate_with_modes(
+        cookie_dir,
+        apple_id,
+        password_provider,
+        domain,
+        client_id,
+        timeout_secs,
+        code,
+        mode,
+        crate::InputMode::detect(),
+    )
+    .await
+}
+
+/// Authenticate with caller-resolved output and input modes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "input and personality modes are independent startup policies"
+)]
+pub(crate) async fn authenticate_with_modes(
+    cookie_dir: &Path,
+    apple_id: &str,
+    password_provider: &crate::password::PasswordProvider,
+    domain: &str,
+    client_id: Option<String>,
+    timeout_secs: Option<u64>,
+    code: Option<&str>,
+    mode: crate::personality::Mode,
+    input_mode: crate::InputMode,
+) -> Result<AuthResult> {
+    #[cfg(debug_assertions)]
+    if std::env::var("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS").as_deref() == Ok("1") {
+        tracing::warn!("Offline 2FA-required test seam enabled; skipping Apple authentication");
+        return Err(AuthError::TwoFactorRequired.into());
+    }
+
     let endpoints = Endpoints::for_domain(domain)?;
     let session = Session::new(cookie_dir, apple_id, endpoints.home, timeout_secs).await?;
     authenticate_inner(
@@ -160,6 +228,7 @@ pub async fn authenticate_with_mode(
         client_id,
         code,
         mode,
+        input_mode,
     )
     .await
 }
@@ -177,6 +246,7 @@ async fn authenticate_inner(
     client_id: Option<String>,
     code: Option<&str>,
     mode: crate::personality::Mode,
+    input_mode: crate::InputMode,
 ) -> Result<AuthResult> {
     // Prefer persisted client_id to maintain session continuity across runs
     let client_id = session
@@ -354,7 +424,7 @@ async fn authenticate_inner(
 
         // Headless with no code: bail without any Apple API calls.
         // The user triggers the push manually via `get-code`.
-        if code.is_none() && !std::io::stdin().is_terminal() {
+        if code.is_none() && !input_mode.can_prompt() {
             return Err(AuthError::TwoFactorRequired.into());
         }
 
@@ -1031,6 +1101,7 @@ mod tests {
             None,
             None,
             crate::personality::Mode::Off,
+            crate::InputMode::Interactive,
         )
         .await
         .expect("live validate success should authenticate the persisted session");

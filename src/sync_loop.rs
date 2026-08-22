@@ -82,6 +82,12 @@ fn classify_sync_auth_error(err: &anyhow::Error) -> SyncAuthErrorClass {
     }
 }
 
+fn two_factor_recovery_message(username: &str) -> String {
+    format!(
+        "2FA required for {username}. Run `kei login get-code`, then `kei login submit-code <CODE>`."
+    )
+}
+
 impl WatchPrecheck {
     fn proceed_all() -> Self {
         Self::Proceed {
@@ -497,6 +503,8 @@ pub(crate) struct SyncArgs {
     /// resolved Config exposes the same intent the gate saw, useful for
     /// downstream code that wants to know whether the user opted in.
     pub friendly_request: Option<bool>,
+    /// Whether startup detected a terminal on stdin.
+    pub input_mode: crate::InputMode,
 }
 
 /// Run the sync command: authenticate, enumerate photos, download, and
@@ -513,6 +521,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         redact_password,
         personality_mode,
         friendly_request,
+        input_mode,
     } = args;
 
     let is_retry_failed = sync.retry_failed;
@@ -569,6 +578,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             "service mode: applied default watch interval"
         );
     }
+    let is_watch_mode = config.watch.interval.is_some();
 
     // Install password redaction now that we know the password
     if let Some(pw) = &config.auth.password
@@ -664,9 +674,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .auth
         .save_password
         .then(|| password::decide_save_password_action(&source));
-    let password_provider = make_password_provider(source);
+    let password_provider = make_password_provider(source, input_mode);
 
-    let auth_result = match auth::authenticate_with_mode(
+    let auth_result = match auth::authenticate_with_modes(
         &config.auth.cookie_directory,
         &config.auth.username,
         &password_provider,
@@ -675,15 +685,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         None,
         None,
         config.ui.personality_mode,
+        input_mode,
     )
     .await
     {
         Ok(result) => result,
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
-            let msg = format!(
-                "2FA required for {u}. Run: kei login get-code",
-                u = config.auth.username
-            );
+            if !should_wait_for_2fa(is_watch_mode, &e) {
+                return Err(e);
+            }
+            let msg = two_factor_recovery_message(&config.auth.username);
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(
                 notifications::Event::TwoFaRequired,
@@ -694,7 +705,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             );
 
             wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
-                auth::authenticate_with_mode(
+                auth::authenticate_with_modes(
                     &config.auth.cookie_directory,
                     &config.auth.username,
                     &password_provider,
@@ -703,6 +714,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     None,
                     None,
                     config.ui.personality_mode,
+                    input_mode,
                 )
             })
             .await?
@@ -770,8 +782,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 );
                 retried_after_session_error = true;
                 pending_auth = Some(
-                    reauth_after_session_error(&config, &password_provider, &notifier, None)
-                        .await?,
+                    reauth_after_session_error(
+                        &config,
+                        &password_provider,
+                        &notifier,
+                        None,
+                        is_watch_mode,
+                        input_mode,
+                    )
+                    .await?,
                 );
                 continue;
             }
@@ -791,6 +810,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         &password_provider,
                         &notifier,
                         Some((ss, ps)),
+                        is_watch_mode,
+                        input_mode,
                     )
                     .await?,
                 );
@@ -1004,7 +1025,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         None
     };
 
-    let is_watch_mode = config.watch.interval.is_some();
     let mut reauth_attempts = 0u32;
     // Sum of per-cycle failed_counts across the lifetime of this process.
     // Surfaced at exit so watch-mode daemons don't mask earlier-cycle
@@ -1320,6 +1340,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     &config.auth.username,
                     config.auth.domain.as_str(),
                     &password_provider,
+                    input_mode,
                 )
                 .await
                 {
@@ -1336,10 +1357,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         // can't exhaust the limit.
                         reauth_attempts -= 1;
 
-                        let msg = format!(
-                            "2FA required for {u}. Run: kei login get-code",
-                            u = config.auth.username
-                        );
+                        let msg = two_factor_recovery_message(&config.auth.username);
                         tracing::warn!(message = %msg, "2FA required");
                         notifier.notify(
                             notifications::Event::TwoFaRequired,
@@ -1362,6 +1380,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                                     &config.auth.username,
                                     config.auth.domain.as_str(),
                                     &password_provider,
+                                    input_mode,
                                 )
                             },
                         )
@@ -1434,7 +1453,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
 
             // Validate session before next cycle; re-authenticate if expired.
-            reacquire_session(&shared_session, &config, &password_provider).await?;
+            reacquire_session(&shared_session, &config, &password_provider, input_mode).await?;
 
             // Mark album/pass plans stale after an idle sleep, but defer the
             // CloudKit refresh until `changes/database` says a selected
@@ -1556,6 +1575,8 @@ async fn reauth_after_session_error(
     password_provider: &crate::password::PasswordProvider,
     notifier: &Notifier,
     live: Option<(auth::SharedSession, crate::icloud::photos::PhotosService)>,
+    is_watch_mode: bool,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
     if let Some((ss, ps)) = live {
         ss.read().await.release_lock()?;
@@ -1564,15 +1585,19 @@ async fn reauth_after_session_error(
     }
 
     clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
-    match authenticate_sync_session(config, password_provider).await {
+    match authenticate_sync_session(config, password_provider, input_mode).await {
         Ok(result) => return Ok(result),
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
             if let Some(result) =
-                retry_persisted_session_after_two_factor(config, password_provider).await
+                retry_persisted_session_after_two_factor(config, password_provider, input_mode)
+                    .await
             {
                 return Ok(result);
             }
-            return notify_and_wait_for_2fa(config, password_provider, notifier).await;
+            if !should_wait_for_2fa(is_watch_mode, &e) {
+                return Err(e);
+            }
+            return notify_and_wait_for_2fa(config, password_provider, notifier, input_mode).await;
         }
         Err(e) => {
             tracing::warn!(
@@ -1586,15 +1611,19 @@ async fn reauth_after_session_error(
         auth::session_file_path(&config.auth.cookie_directory, &config.auth.username);
     auth::strip_session_routing_state(&session_file).await;
 
-    match authenticate_sync_session(config, password_provider).await {
+    match authenticate_sync_session(config, password_provider, input_mode).await {
         Ok(result) => Ok(result),
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
             if let Some(result) =
-                retry_persisted_session_after_two_factor(config, password_provider).await
+                retry_persisted_session_after_two_factor(config, password_provider, input_mode)
+                    .await
             {
                 return Ok(result);
             }
-            notify_and_wait_for_2fa(config, password_provider, notifier).await
+            if !should_wait_for_2fa(is_watch_mode, &e) {
+                return Err(e);
+            }
+            notify_and_wait_for_2fa(config, password_provider, notifier, input_mode).await
         }
         Err(e) => Err(e),
     }
@@ -1618,8 +1647,9 @@ async fn clear_validation_cache_for_reauth(cookie_dir: &std::path::Path, usernam
 async fn authenticate_sync_session(
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
-    auth::authenticate_with_mode(
+    auth::authenticate_with_modes(
         &config.auth.cookie_directory,
         &config.auth.username,
         password_provider,
@@ -1628,6 +1658,7 @@ async fn authenticate_sync_session(
         None,
         None,
         config.ui.personality_mode,
+        input_mode,
     )
     .await
 }
@@ -1635,12 +1666,13 @@ async fn authenticate_sync_session(
 async fn retry_persisted_session_after_two_factor(
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
+    input_mode: crate::InputMode,
 ) -> Option<auth::AuthResult> {
     tracing::debug!(
         "2FA-required auth wrote session state; retrying persisted-session auth once before waiting"
     );
     clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
-    match authenticate_sync_session(config, password_provider).await {
+    match authenticate_sync_session(config, password_provider, input_mode).await {
         Ok(result) => Some(result),
         Err(e) => {
             tracing::debug!(
@@ -1656,11 +1688,9 @@ async fn notify_and_wait_for_2fa(
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
     notifier: &Notifier,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
-    let msg = format!(
-        "2FA required for {u}. Run: kei login get-code",
-        u = config.auth.username
-    );
+    let msg = two_factor_recovery_message(&config.auth.username);
     tracing::warn!(message = %msg, "2FA required");
     notifier.notify(
         notifications::Event::TwoFaRequired,
@@ -1670,7 +1700,7 @@ async fn notify_and_wait_for_2fa(
         None,
     );
     wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
-        authenticate_sync_session(config, password_provider)
+        authenticate_sync_session(config, password_provider, input_mode)
     })
     .await
 }
@@ -1938,12 +1968,9 @@ pub(crate) fn should_reconcile_this_cycle(cycle_index: u64, every_n: Option<u64>
 /// a cron, the systemd unit's first start) needs the error so it can exit
 /// non-zero and the operator can run `kei login get-code`.
 ///
-/// Note that the **entry-point** auth path (`run_sync`'s initial
-/// `auth::authenticate` call) intentionally does NOT use this predicate --
-/// it always parks on `wait_and_retry_2fa` because the user is presumed
-/// present at a terminal during the initial command. This helper exists
-/// because the *reauth* branch fires mid-cycle, by which point a one-shot
-/// caller has long since detached and there is no operator to type a code.
+/// The initial-auth, provider-session recovery, and mid-cycle reauth paths all
+/// use this predicate. Keeping the wait decision in the sync owner prevents a
+/// foreground error from being reclassified globally as service success.
 pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> bool {
     is_watch_mode && classify_sync_auth_error(err) == SyncAuthErrorClass::TwoFactorRequired
 }
@@ -2282,6 +2309,7 @@ async fn reacquire_session(
     shared_session: &auth::SharedSession,
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     reacquire_session_lock_after_idle(shared_session).await?;
 
@@ -2291,6 +2319,7 @@ async fn reacquire_session(
         &config.auth.username,
         config.auth.domain.as_str(),
         password_provider,
+        input_mode,
     )
     .await
     {
@@ -4342,7 +4371,7 @@ mod tests {
             .find("clear_validation_cache_for_reauth")
             .expect("session-error reauth must clear cache before retrying auth");
         let lenient_auth = body
-            .find("authenticate_sync_session(config, password_provider)")
+            .find("authenticate_sync_session(config, password_provider, input_mode)")
             .expect("session-error reauth must try persisted-session auth");
         let strip = body
             .find("auth::strip_session_routing_state")

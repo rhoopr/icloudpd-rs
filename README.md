@@ -74,6 +74,27 @@ kei sync --recent 30d
 kei list albums
 ```
 
+### Headless authentication
+
+Use a password file or password command when stdin is not a terminal. To copy
+a password from a file into kei's credential store, run:
+
+```sh
+kei password --password-file /run/secrets/icloud_password set
+```
+
+If a foreground `login` or one-shot `sync` needs 2FA, kei exits with auth code
+`3` and prints the recovery commands. Complete the login, then retry the
+foreground command:
+
+```sh
+kei login get-code
+kei login submit-code 123456
+```
+
+Watch and service processes stay running while they wait for the submitted
+code. They resume from the saved authentication state.
+
 ## What kei gives you
 
 - Fast, parallel downloads for large cloud photo libraries.

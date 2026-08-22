@@ -4,7 +4,6 @@
 )]
 
 use std::fmt::Write as FmtWrite;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -232,8 +231,11 @@ fn print_toml_preview(toml_content: &str) {
     println!();
 }
 
-pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
-    if !std::io::stdin().is_terminal() {
+pub(crate) fn run_setup(
+    config_path: &Path,
+    input_mode: crate::InputMode,
+) -> anyhow::Result<SetupResult> {
+    if !input_mode.can_prompt() {
         bail!("The setup wizard needs an interactive terminal.");
     }
 
