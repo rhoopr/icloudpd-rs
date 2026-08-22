@@ -4,10 +4,9 @@
 //! (monitoring tools, Home Assistant, webhooks). In watch mode the file is
 //! overwritten every cycle — it's the current cycle's state, not a history log.
 //!
-//! # Schema v2
+//! # Schema v3
 //!
-//! v2 renames run-option fields to match the v0.20 public CLI and removes
-//! old incremental controls.
+//! v3 adds metadata-capture revision and repair progress to `stats`.
 
 use std::path::{Path, PathBuf};
 
@@ -182,7 +181,7 @@ mod tests {
     #[test]
     fn report_serialization_roundtrip() {
         let report = SyncReport {
-            version: "2",
+            version: "3",
             kei_version: "0.7.12",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
@@ -226,6 +225,10 @@ mod tests {
                 },
                 bytes_downloaded: 1_200_000_000,
                 disk_bytes_written: 1_300_000_000,
+                metadata_capture_revision: Some(1),
+                metadata_capture_refreshed: 25,
+                metadata_capture_failures: 2,
+                metadata_capture_remaining: 75,
                 inventory_drop_warnings: 1,
                 inventory_drop_assets: 5,
                 inventory_drop_percent: Some(1.2),
@@ -242,10 +245,14 @@ mod tests {
         let json = serde_json::to_string_pretty(&report).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
 
-        assert_eq!(parsed["version"], "2");
+        assert_eq!(parsed["version"], "3");
         assert_eq!(parsed["status"], "success");
         assert_eq!(parsed["stats"]["downloaded"], 50);
         assert_eq!(parsed["stats"]["api_total_at_start"], 405);
+        assert_eq!(parsed["stats"]["metadata_capture_revision"], 1);
+        assert_eq!(parsed["stats"]["metadata_capture_refreshed"], 25);
+        assert_eq!(parsed["stats"]["metadata_capture_failures"], 2);
+        assert_eq!(parsed["stats"]["metadata_capture_remaining"], 75);
         assert_eq!(parsed["stats"]["inventory_drop_warnings"], 1);
         assert_eq!(parsed["stats"]["inventory_drop_previous_total"], 410);
         assert_eq!(parsed["stats"]["inventory_drop_current_total"], 405);
@@ -295,11 +302,11 @@ mod tests {
         assert_eq!(json["threads"], 6);
         assert!(
             json.get("directory").is_none(),
-            "schema v2 must not emit the legacy options.directory key"
+            "schema v3 must not emit the legacy options.directory key"
         );
         assert!(
             json.get("threads_num").is_none(),
-            "schema v2 must not emit the legacy options.threads_num key"
+            "schema v3 must not emit the legacy options.threads_num key"
         );
     }
 
@@ -351,7 +358,7 @@ mod tests {
         // and is_zero_usize on failed_assets_truncated must keep clean-run
         // reports free of both fields.
         let report = SyncReport {
-            version: "2",
+            version: "3",
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
@@ -404,7 +411,7 @@ mod tests {
             error_message: Some("HTTP 429".to_string()),
         };
         let report = SyncReport {
-            version: "2",
+            version: "3",
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
@@ -452,7 +459,7 @@ mod tests {
     #[test]
     fn failed_assets_truncated_emitted_when_nonzero() {
         let report = SyncReport {
-            version: "2",
+            version: "3",
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
@@ -501,7 +508,7 @@ mod tests {
         let path = dir.path().join("report.json");
 
         let report = SyncReport {
-            version: "2",
+            version: "3",
             kei_version: "0.7.12",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
@@ -540,7 +547,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
-        assert_eq!(parsed["version"], "2");
+        assert_eq!(parsed["version"], "3");
         assert_eq!(parsed["options"]["username"], "test@example.com");
     }
 }

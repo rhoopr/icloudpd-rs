@@ -22,4 +22,7 @@ pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,
     SqliteStateDb, SyncTokenStore,
 };
+#[cfg(test)]
+pub(crate) use types::MetadataCaptureStatus;
 pub use types::{AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, VersionSizeKey};
+pub(crate) use types::{METADATA_CAPTURE_REVISION, MetadataCaptureCandidate};

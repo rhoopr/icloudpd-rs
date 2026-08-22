@@ -282,7 +282,7 @@ where
         };
         let (failed_assets, failed_assets_truncated) = self.failed_asset_sample().await;
         let report = report::SyncReport {
-            version: "2",
+            version: "3",
             kei_version: env!("CARGO_PKG_VERSION"),
             timestamp: chrono::Utc::now().to_rfc3339(),
             status: input.status.as_report_str().to_string(),

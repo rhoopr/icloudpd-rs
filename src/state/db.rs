@@ -11,7 +11,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use super::error::StateError;
 use super::schema;
 use super::types::{
-    AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
+    AssetMetadata, AssetRecord, AssetStatus, METADATA_CAPTURE_REVISION, MediaType,
+    MetadataCaptureCandidate, MetadataCaptureStatus, MetadataCaptureVersionEvidence, SyncRunStats,
+    SyncSummary, VersionSizeKey,
 };
 
 /// Fallback source identifier when `AssetMetadata::source` is unset.
@@ -630,6 +632,7 @@ pub trait MetadataRewriteStore: Send + Sync {
         asset_id: &str,
         metadata: &AssetMetadata,
         mark_for_rewrite: bool,
+        capture_revision: i64,
     ) -> Result<usize, StateError>;
     async fn get_downloaded_metadata_hashes(
         &self,
@@ -660,6 +663,58 @@ pub trait MetadataRewriteStore: Send + Sync {
         pre_rewrite_checksum: Option<&str>,
     ) -> Result<(), StateError>;
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
+    async fn begin_metadata_capture_revision(
+        &self,
+        _library: &str,
+        _target_revision: i64,
+    ) -> Result<MetadataCaptureStatus, StateError> {
+        Err(StateError::Invariant {
+            operation: "begin_metadata_capture_revision",
+            detail: "metadata-capture revision state is not implemented by this store".into(),
+        })
+    }
+    async fn get_metadata_capture_candidates(
+        &self,
+        _library: &str,
+        _target_revision: i64,
+        _limit: usize,
+    ) -> Result<Vec<MetadataCaptureCandidate>, StateError> {
+        Err(StateError::Invariant {
+            operation: "get_metadata_capture_candidates",
+            detail: "metadata-capture candidate reads are not implemented by this store".into(),
+        })
+    }
+    async fn record_metadata_capture_failure(
+        &self,
+        _library: &str,
+        _target_revision: i64,
+        _error: &str,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "record_metadata_capture_failure",
+            detail: "metadata-capture failure state is not implemented by this store".into(),
+        })
+    }
+    async fn complete_metadata_capture_revision(
+        &self,
+        _library: &str,
+        _target_revision: i64,
+    ) -> Result<MetadataCaptureStatus, StateError> {
+        Err(StateError::Invariant {
+            operation: "complete_metadata_capture_revision",
+            detail: "metadata-capture completion is not implemented by this store".into(),
+        })
+    }
+    async fn has_metadata_capture_work(
+        &self,
+        _libraries: &[&str],
+        _target_revision: i64,
+    ) -> Result<bool, StateError> {
+        Err(StateError::Invariant {
+            operation: "has_metadata_capture_work",
+            detail: "metadata-capture work checks are not implemented by this store".into(),
+        })
+    }
 }
 
 pub struct SqliteStateDb {
@@ -1008,6 +1063,36 @@ fn upsert_asset_row(
     Ok(())
 }
 
+fn record_metadata_capture_revision(
+    conn: &Connection,
+    library: &str,
+    asset_id: &str,
+    revision: i64,
+    updated_at: i64,
+) -> Result<(), StateError> {
+    let changed = conn
+        .execute(
+            "INSERT INTO asset_metadata_capture_revisions \
+                (library, asset_id, revision, updated_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(library, asset_id) DO UPDATE SET \
+                revision = excluded.revision, updated_at = excluded.updated_at \
+             WHERE asset_metadata_capture_revisions.revision < excluded.revision",
+            rusqlite::params![library, asset_id, revision, updated_at],
+        )
+        .map_err(|e| StateError::query("record_metadata_capture_revision", e))?;
+    if changed > 0 {
+        conn.execute(
+            "UPDATE metadata_capture_state SET \
+                processed_assets = processed_assets + 1, updated_at = ?1 \
+             WHERE library = ?2 AND pending_revision = ?3",
+            rusqlite::params![updated_at, library, revision],
+        )
+        .map_err(|e| StateError::query("record_metadata_capture_revision::progress", e))?;
+    }
+    Ok(())
+}
+
 /// Execute the `mark_downloaded` UPDATE on `conn`. Returns rows affected;
 /// callers decide what zero rows means in their context.
 fn update_status_to_downloaded(
@@ -1219,6 +1304,14 @@ impl SqliteStateDb {
                 });
             }
 
+            record_metadata_capture_revision(
+                conn,
+                &library,
+                &id,
+                METADATA_CAPTURE_REVISION,
+                downloaded_at,
+            )?;
+
             Ok(())
         })
         .await
@@ -1257,6 +1350,13 @@ impl SqliteStateDb {
                 rows, 1,
                 "import_adopt UPDATE missed the row inserted by UPSERT in the same tx — SQL bug"
             );
+            record_metadata_capture_revision(
+                &tx,
+                &record.library,
+                &record.id,
+                METADATA_CAPTURE_REVISION,
+                now,
+            )?;
 
             // Snapshot on-disk size + mtime so the next import-existing run
             // can short-circuit the SHA-256 re-read when the file is
@@ -1724,6 +1824,30 @@ impl SqliteStateDb {
                 }
             }
 
+            let mut capture_stmt = conn
+                .prepare(
+                    "SELECT library FROM metadata_capture_state \
+                     UNION SELECT DISTINCT library FROM assets \
+                     ORDER BY library",
+                )
+                .map_err(|e| StateError::query("get_summary::metadata_capture", e))?;
+            let capture_libraries = capture_stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| StateError::query("get_summary::metadata_capture", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_summary::metadata_capture", e))?;
+            let mut metadata_capture = Vec::with_capacity(capture_libraries.len());
+            for library in capture_libraries {
+                let remaining =
+                    metadata_capture_remaining(conn, &library, METADATA_CAPTURE_REVISION)?;
+                metadata_capture.push(metadata_capture_status(
+                    conn,
+                    &library,
+                    METADATA_CAPTURE_REVISION,
+                    remaining,
+                )?);
+            }
+
             Ok(SyncSummary {
                 total_assets,
                 downloaded,
@@ -1751,6 +1875,7 @@ impl SqliteStateDb {
                 last_inventory_drop_previous_total,
                 last_inventory_drop_current_total,
                 last_inventory_drop_library,
+                metadata_capture,
             })
         })
         .await
@@ -3634,6 +3759,7 @@ impl SqliteStateDb {
         asset_id: &str,
         metadata: &AssetMetadata,
         mark_for_rewrite: bool,
+        capture_revision: i64,
     ) -> Result<usize, StateError> {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
@@ -3706,24 +3832,35 @@ impl SqliteStateDb {
                     ],
                 )
                 .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
-            if updated > 0 {
-                return Ok(updated);
+            let durable = if updated > 0 {
+                updated
+            } else {
+                // A row can leave `downloaded` mid-cycle when the provider
+                // publishes new media for the same asset, which stores the
+                // incoming metadata as it resets the row for re-download. The
+                // metadata is durable, so report the match rather than a lost
+                // write. A missing or still-stale row stays a failure.
+                let durable: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM assets \
+                         WHERE library = ?1 AND id = ?2 AND is_deleted = 0 \
+                           AND metadata_hash IS NOT NULL AND metadata_hash = ?3",
+                        rusqlite::params![library, asset_id, metadata.metadata_hash.as_deref()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
+                usize::try_from(durable).unwrap_or(0)
+            };
+            if durable > 0 {
+                record_metadata_capture_revision(
+                    conn,
+                    &library,
+                    &asset_id,
+                    capture_revision,
+                    rewrite_at,
+                )?;
             }
-            // A row can leave `downloaded` mid-cycle when the provider
-            // publishes new media for the same asset, which stores the
-            // incoming metadata as it resets the row for re-download. The
-            // metadata is durable, so report the match rather than a lost
-            // write. A missing or still-stale row stays a failure.
-            let durable: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM assets \
-                     WHERE library = ?1 AND id = ?2 AND is_deleted = 0 \
-                       AND metadata_hash IS NOT NULL AND metadata_hash = ?3",
-                    rusqlite::params![library, asset_id, metadata.metadata_hash.as_deref()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
-            Ok(usize::try_from(durable).unwrap_or(0))
+            Ok(durable)
         })
         .await
     }
@@ -3949,6 +4086,319 @@ impl SqliteStateDb {
         })
         .await
     }
+
+    pub(crate) async fn begin_metadata_capture_revision(
+        &self,
+        library: &str,
+        target_revision: i64,
+    ) -> Result<MetadataCaptureStatus, StateError> {
+        let library = library.to_owned();
+        self.with_conn_mut("begin_metadata_capture_revision", move |conn| {
+            let tx = conn.transaction().map_err(|e| {
+                StateError::query("begin_metadata_capture_revision::transaction", e)
+            })?;
+            let remaining = metadata_capture_remaining(&tx, &library, target_revision)?;
+            let existing = tx
+                .query_row(
+                    "SELECT active_revision, pending_revision, processed_assets, \
+                            failed_assets, last_error \
+                     FROM metadata_capture_state WHERE library = ?1",
+                    [&library],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| StateError::query("begin_metadata_capture_revision::read", e))?;
+            let (mut active, previous_pending, mut processed, mut failed, mut last_error) =
+                existing.unwrap_or((0, None, 0, 0, None));
+            let pending = if remaining == 0 {
+                active = active.max(target_revision);
+                None
+            } else {
+                if previous_pending != Some(target_revision) {
+                    processed = 0;
+                    failed = 0;
+                    last_error = None;
+                }
+                Some(target_revision)
+            };
+            let now = Utc::now().timestamp();
+            tx.execute(
+                "INSERT INTO metadata_capture_state \
+                    (library, active_revision, pending_revision, processed_assets, \
+                     failed_assets, last_error, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(library) DO UPDATE SET \
+                    active_revision = excluded.active_revision, \
+                    pending_revision = excluded.pending_revision, \
+                    processed_assets = excluded.processed_assets, \
+                    failed_assets = excluded.failed_assets, \
+                    last_error = excluded.last_error, updated_at = excluded.updated_at",
+                rusqlite::params![library, active, pending, processed, failed, last_error, now],
+            )
+            .map_err(|e| StateError::query("begin_metadata_capture_revision::write", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("begin_metadata_capture_revision::commit", e))?;
+            Ok(MetadataCaptureStatus {
+                library,
+                active_revision: active,
+                pending_revision: pending,
+                processed_assets: u64::try_from(processed).unwrap_or(0),
+                failed_assets: u64::try_from(failed).unwrap_or(0),
+                remaining_assets: remaining,
+                last_error,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn get_metadata_capture_candidates(
+        &self,
+        library: &str,
+        target_revision: i64,
+        limit: usize,
+    ) -> Result<Vec<MetadataCaptureCandidate>, StateError> {
+        let library = library.to_owned();
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn("get_metadata_capture_candidates", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    r"
+                    WITH stale_assets AS (
+                        SELECT assets.library, assets.id
+                        FROM assets
+                        LEFT JOIN asset_metadata_capture_revisions AS revisions
+                          ON revisions.library = assets.library
+                         AND revisions.asset_id = assets.id
+                        WHERE assets.library = ?1
+                          AND assets.status = 'downloaded'
+                          AND assets.is_deleted = 0
+                          AND (revisions.revision IS NULL OR revisions.revision < ?2)
+                        GROUP BY assets.library, assets.id
+                        ORDER BY assets.id
+                        LIMIT ?3
+                    )
+                    SELECT stale_assets.library, stale_assets.id,
+                           COALESCE(mapping.master_record_name,
+                                    owner.master_record_name,
+                                    stale_assets.id),
+                           COALESCE(mapping.asset_record_name,
+                                    owner.asset_record_name),
+                           assets.version_size, assets.checksum, assets.size_bytes
+                    FROM stale_assets
+                    JOIN assets
+                      ON assets.library = stale_assets.library
+                     AND assets.id = stale_assets.id
+                     AND assets.status = 'downloaded'
+                     AND assets.is_deleted = 0
+                    LEFT JOIN asset_master_mappings AS mapping
+                      ON mapping.library = stale_assets.library
+                     AND mapping.asset_record_name = stale_assets.id
+                    LEFT JOIN legacy_master_state_owners AS owner
+                      ON owner.library = stale_assets.library
+                     AND owner.master_record_name = stale_assets.id
+                    ORDER BY stale_assets.id, assets.version_size
+                    ",
+                )
+                .map_err(|e| StateError::query("get_metadata_capture_candidates::prepare", e))?;
+            let rows = stmt
+                .query_map(rusqlite::params![library, target_revision, limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(|e| StateError::query("get_metadata_capture_candidates::query", e))?;
+            let mut candidates = Vec::<MetadataCaptureCandidate>::new();
+            for row in rows {
+                let (library, asset_id, master, asset, version, checksum, size) =
+                    row.map_err(|e| StateError::query("get_metadata_capture_candidates::row", e))?;
+                let version_size =
+                    VersionSizeKey::from_str(&version).ok_or_else(|| StateError::Invariant {
+                        operation: "get_metadata_capture_candidates",
+                        detail: format!("unknown durable version_size {version:?}"),
+                    })?;
+                let evidence = MetadataCaptureVersionEvidence {
+                    version_size,
+                    checksum,
+                    size_bytes: u64::try_from(size).unwrap_or(0),
+                };
+                if let Some(candidate) = candidates.last_mut()
+                    && candidate.asset_id == asset_id
+                {
+                    candidate.versions.push(evidence);
+                } else {
+                    candidates.push(MetadataCaptureCandidate {
+                        library,
+                        asset_id,
+                        master_record_name: master,
+                        asset_record_name: asset,
+                        versions: vec![evidence],
+                    });
+                }
+            }
+            Ok(candidates)
+        })
+        .await
+    }
+
+    pub(crate) async fn record_metadata_capture_failure(
+        &self,
+        library: &str,
+        target_revision: i64,
+        error: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let error = error.to_owned();
+        self.with_conn("record_metadata_capture_failure", move |conn| {
+            conn.execute(
+                "UPDATE metadata_capture_state SET failed_assets = failed_assets + 1, \
+                    last_error = ?1, updated_at = ?2 \
+                 WHERE library = ?3 AND pending_revision = ?4",
+                rusqlite::params![error, Utc::now().timestamp(), library, target_revision],
+            )
+            .map_err(|e| StateError::query("record_metadata_capture_failure", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn complete_metadata_capture_revision(
+        &self,
+        library: &str,
+        target_revision: i64,
+    ) -> Result<MetadataCaptureStatus, StateError> {
+        let library = library.to_owned();
+        self.with_conn_mut("complete_metadata_capture_revision", move |conn| {
+            let tx = conn.transaction().map_err(|e| {
+                StateError::query("complete_metadata_capture_revision::transaction", e)
+            })?;
+            let remaining = metadata_capture_remaining(&tx, &library, target_revision)?;
+            if remaining == 0 {
+                tx.execute(
+                    "UPDATE metadata_capture_state SET active_revision = MAX(active_revision, ?1), \
+                        pending_revision = NULL, failed_assets = 0, last_error = NULL, \
+                        updated_at = ?2 \
+                     WHERE library = ?3",
+                    rusqlite::params![target_revision, Utc::now().timestamp(), library],
+                )
+                .map_err(|e| StateError::query("complete_metadata_capture_revision::write", e))?;
+            }
+            let status = metadata_capture_status(&tx, &library, target_revision, remaining)?;
+            tx.commit()
+                .map_err(|e| StateError::query("complete_metadata_capture_revision::commit", e))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    pub(crate) async fn has_metadata_capture_work(
+        &self,
+        libraries: &[&str],
+        target_revision: i64,
+    ) -> Result<bool, StateError> {
+        if libraries.is_empty() {
+            return Ok(false);
+        }
+        let libraries = unique_sorted_strings(libraries);
+        self.with_conn("has_metadata_capture_work", move |conn| {
+            for library in libraries {
+                if metadata_capture_remaining(conn, &library, target_revision)? > 0 {
+                    return Ok(true);
+                }
+                let pending: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM metadata_capture_state \
+                         WHERE library = ?1 AND pending_revision = ?2)",
+                        rusqlite::params![library, target_revision],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|value| value != 0)
+                    .map_err(|e| StateError::query("has_metadata_capture_work", e))?;
+                if pending {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+    }
+}
+
+fn metadata_capture_remaining(
+    conn: &Connection,
+    library: &str,
+    target_revision: i64,
+) -> Result<u64, StateError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM ( \
+             SELECT assets.id FROM assets \
+             LEFT JOIN asset_metadata_capture_revisions AS revisions \
+               ON revisions.library = assets.library AND revisions.asset_id = assets.id \
+             WHERE assets.library = ?1 AND assets.status = 'downloaded' \
+               AND assets.is_deleted = 0 \
+               AND (revisions.revision IS NULL OR revisions.revision < ?2) \
+             GROUP BY assets.id \
+         )",
+        rusqlite::params![library, target_revision],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| u64::try_from(count).unwrap_or(0))
+    .map_err(|e| StateError::query("metadata_capture_remaining", e))
+}
+
+fn metadata_capture_status(
+    conn: &Connection,
+    library: &str,
+    target_revision: i64,
+    remaining_assets: u64,
+) -> Result<MetadataCaptureStatus, StateError> {
+    let row = conn
+        .query_row(
+            "SELECT active_revision, pending_revision, processed_assets, \
+                    failed_assets, last_error \
+             FROM metadata_capture_state WHERE library = ?1",
+            [library],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| StateError::query("metadata_capture_status", e))?;
+    let (active_revision, pending_revision, processed, failed, last_error) = row.unwrap_or({
+        if remaining_assets > 0 {
+            (0, Some(target_revision), 0, 0, None)
+        } else {
+            (target_revision, None, 0, 0, None)
+        }
+    });
+    Ok(MetadataCaptureStatus {
+        library: library.to_owned(),
+        active_revision,
+        pending_revision,
+        processed_assets: u64::try_from(processed).unwrap_or(0),
+        failed_assets: u64::try_from(failed).unwrap_or(0),
+        remaining_assets,
+        last_error,
+    })
 }
 
 #[async_trait]
@@ -4574,6 +5024,7 @@ impl MetadataRewriteStore for SqliteStateDb {
         asset_id: &str,
         metadata: &AssetMetadata,
         mark_for_rewrite: bool,
+        capture_revision: i64,
     ) -> Result<usize, StateError> {
         SqliteStateDb::refresh_downloaded_asset_metadata(
             self,
@@ -4581,6 +5032,7 @@ impl MetadataRewriteStore for SqliteStateDb {
             asset_id,
             metadata,
             mark_for_rewrite,
+            capture_revision,
         )
         .await
     }
@@ -4636,6 +5088,48 @@ impl MetadataRewriteStore for SqliteStateDb {
 
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
         SqliteStateDb::has_downloaded_without_metadata_hash(self).await
+    }
+
+    async fn begin_metadata_capture_revision(
+        &self,
+        library: &str,
+        target_revision: i64,
+    ) -> Result<MetadataCaptureStatus, StateError> {
+        SqliteStateDb::begin_metadata_capture_revision(self, library, target_revision).await
+    }
+
+    async fn get_metadata_capture_candidates(
+        &self,
+        library: &str,
+        target_revision: i64,
+        limit: usize,
+    ) -> Result<Vec<MetadataCaptureCandidate>, StateError> {
+        SqliteStateDb::get_metadata_capture_candidates(self, library, target_revision, limit).await
+    }
+
+    async fn record_metadata_capture_failure(
+        &self,
+        library: &str,
+        target_revision: i64,
+        error: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::record_metadata_capture_failure(self, library, target_revision, error).await
+    }
+
+    async fn complete_metadata_capture_revision(
+        &self,
+        library: &str,
+        target_revision: i64,
+    ) -> Result<MetadataCaptureStatus, StateError> {
+        SqliteStateDb::complete_metadata_capture_revision(self, library, target_revision).await
+    }
+
+    async fn has_metadata_capture_work(
+        &self,
+        libraries: &[&str],
+        target_revision: i64,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::has_metadata_capture_work(self, libraries, target_revision).await
     }
 }
 
@@ -4726,6 +5220,24 @@ impl SqliteStateDb {
             "UPDATE assets SET metadata_hash = NULL \
              WHERE library = ?1 AND id = ?2 AND version_size = ?3",
             rusqlite::params![library, asset_id, version_size],
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn set_metadata_capture_revision_for_test(
+        &self,
+        library: &str,
+        asset_id: &str,
+        revision: i64,
+    ) {
+        let conn = self
+            .acquire_lock("test_set_metadata_capture_revision")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO asset_metadata_capture_revisions \
+                (library, asset_id, revision, updated_at) VALUES (?1, ?2, ?3, 0) \
+             ON CONFLICT(library, asset_id) DO UPDATE SET revision = excluded.revision",
+            rusqlite::params![library, asset_id, revision],
         )
         .unwrap();
     }
@@ -9462,7 +9974,13 @@ mod tests {
         db.upsert_seen(&republished).await.unwrap();
 
         let matched = db
-            .refresh_downloaded_asset_metadata("PrimarySync", "MOVED_ON", &edited, true)
+            .refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "MOVED_ON",
+                &edited,
+                true,
+                METADATA_CAPTURE_REVISION,
+            )
             .await
             .unwrap();
         assert!(
@@ -9471,7 +9989,13 @@ mod tests {
         );
 
         let stale = db
-            .refresh_downloaded_asset_metadata("PrimarySync", "ABSENT", &edited, true)
+            .refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "ABSENT",
+                &edited,
+                true,
+                METADATA_CAPTURE_REVISION,
+            )
             .await
             .unwrap();
         assert_eq!(stale, 0, "a missing row is still a lost write");
@@ -9628,7 +10152,13 @@ mod tests {
         };
         let expected_hash = metadata.compute_hash();
         let updated = db
-            .refresh_downloaded_asset_metadata("PrimarySync", "PHOTO", &metadata, true)
+            .refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "PHOTO",
+                &metadata,
+                true,
+                METADATA_CAPTURE_REVISION,
+            )
             .await
             .unwrap();
         assert_eq!(updated, 2);
@@ -9660,6 +10190,167 @@ mod tests {
             assert_eq!(record.checksum.as_ref(), "checksum123");
             assert_eq!(record.metadata.rating, Some(4));
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_capture_revision_repair_is_resumable_and_preserves_file_state() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("ASSET_CHILD")
+            .checksum("provider-checksum")
+            .filename("photo.jpg")
+            .size(2048)
+            .metadata(AssetMetadata {
+                metadata_hash: Some("revision-zero".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ASSET_CHILD",
+            "original",
+            Path::new("/photos/photo.jpg"),
+            "local-checksum",
+            Some("provider-checksum"),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "ASSET_CHILD", "MASTER")
+            .await
+            .unwrap();
+        {
+            let conn = db.acquire_lock("test_metadata_capture_revision").unwrap();
+            conn.execute(
+                "UPDATE asset_metadata_capture_revisions SET revision = 0 \
+                 WHERE library = 'PrimarySync' AND asset_id = 'ASSET_CHILD'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let started = db
+            .begin_metadata_capture_revision("PrimarySync", METADATA_CAPTURE_REVISION)
+            .await
+            .unwrap();
+        assert_eq!(started.active_revision, 0);
+        assert_eq!(started.pending_revision, Some(METADATA_CAPTURE_REVISION));
+        assert_eq!(started.remaining_assets, 1);
+
+        let candidates = db
+            .get_metadata_capture_candidates("PrimarySync", METADATA_CAPTURE_REVISION, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].asset_id, "ASSET_CHILD");
+        assert_eq!(candidates[0].master_record_name, "MASTER");
+        assert_eq!(
+            candidates[0].asset_record_name.as_deref(),
+            Some("ASSET_CHILD")
+        );
+        assert_eq!(candidates[0].versions.len(), 1);
+        assert_eq!(candidates[0].versions[0].size_bytes, 2048);
+
+        db.record_metadata_capture_failure(
+            "PrimarySync",
+            METADATA_CAPTURE_REVISION,
+            "temporary provider failure",
+        )
+        .await
+        .unwrap();
+        let still_pending = db
+            .complete_metadata_capture_revision("PrimarySync", METADATA_CAPTURE_REVISION)
+            .await
+            .unwrap();
+        assert_eq!(still_pending.remaining_assets, 1);
+        assert_eq!(still_pending.failed_assets, 1);
+
+        let metadata = AssetMetadata {
+            rating: Some(5),
+            ..AssetMetadata::default()
+        };
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "ASSET_CHILD",
+            &metadata,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let completed = db
+            .complete_metadata_capture_revision("PrimarySync", METADATA_CAPTURE_REVISION)
+            .await
+            .unwrap();
+        assert_eq!(completed.active_revision, METADATA_CAPTURE_REVISION);
+        assert_eq!(completed.pending_revision, None);
+        assert_eq!(completed.remaining_assets, 0);
+        assert_eq!(completed.processed_assets, 1);
+        assert_eq!(completed.failed_assets, 0);
+
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(Path::new("/photos/photo.jpg"))
+        );
+        assert_eq!(
+            downloaded[0].local_checksum.as_deref(),
+            Some("local-checksum")
+        );
+        assert_eq!(
+            downloaded[0].download_checksum.as_deref(),
+            Some("provider-checksum")
+        );
+        assert_eq!(downloaded[0].metadata.rating, Some(5));
+        assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_capture_candidates_are_bounded_and_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (library, id) in [
+            ("PrimarySync", "A"),
+            ("PrimarySync", "B"),
+            ("PrimarySync", "C"),
+            ("SharedSync-AAAA", "D"),
+        ] {
+            let mut record = TestAssetRecord::new(id).build();
+            record.library = Arc::from(library);
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                library,
+                id,
+                "original",
+                Path::new("/photos/photo.jpg"),
+                "local-checksum",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let conn = db.acquire_lock("test_metadata_capture_scope").unwrap();
+            conn.execute("DELETE FROM asset_metadata_capture_revisions", [])
+                .unwrap();
+        }
+
+        assert!(
+            db.has_metadata_capture_work(&["PrimarySync"], METADATA_CAPTURE_REVISION)
+                .await
+                .unwrap()
+        );
+        let primary = db
+            .get_metadata_capture_candidates("PrimarySync", METADATA_CAPTURE_REVISION, 2)
+            .await
+            .unwrap();
+        assert_eq!(primary.len(), 2);
+        assert!(primary.iter().all(|row| row.library == "PrimarySync"));
+        let shared = db
+            .get_metadata_capture_candidates("SharedSync-AAAA", METADATA_CAPTURE_REVISION, 2)
+            .await
+            .unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].asset_id, "D");
     }
 
     #[test]

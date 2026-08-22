@@ -126,6 +126,28 @@ impl WatchPrecheck {
             } => true,
         }
     }
+
+    fn include_local_work_zones(&mut self, zones: rustc_hash::FxHashSet<String>) {
+        if zones.is_empty() {
+            return;
+        }
+        match self {
+            Self::SkipAll => {
+                *self = Self::Proceed {
+                    changed_zones: Some(zones),
+                    db_sync_token_after_success: None,
+                };
+            }
+            Self::Proceed {
+                changed_zones: Some(changed_zones),
+                ..
+            } => changed_zones.extend(zones),
+            Self::Proceed {
+                changed_zones: None,
+                ..
+            } => {}
+        }
+    }
 }
 
 /// State-DB metadata key for the first-sync shared-library notice. Bumping
@@ -1193,6 +1215,47 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     "Local drift probe found missing or damaged files; forcing this cycle to retry them"
                 );
                 watch_precheck = WatchPrecheck::proceed_all();
+            }
+        }
+
+        if is_watch_mode
+            && !config.runtime.dry_run
+            && !config.runtime.only_print_filenames
+            && let Some(db) = state_db.as_deref()
+        {
+            let mut local_work_zones = rustc_hash::FxHashSet::default();
+            for library in &library_states {
+                let zone = library.zone_name.as_str();
+                let capture_pending = match db
+                    .has_metadata_capture_work(&[zone], state::METADATA_CAPTURE_REVISION)
+                    .await
+                {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Could not inspect metadata-capture work before watch pre-check");
+                        true
+                    }
+                };
+                let rewrite_pending = match db
+                    .get_pending_metadata_rewrites_page(Some(&[zone]), 0, 1)
+                    .await
+                {
+                    Ok(rows) => !rows.is_empty(),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Could not inspect metadata-rewrite work before watch pre-check");
+                        true
+                    }
+                };
+                if capture_pending || rewrite_pending {
+                    local_work_zones.insert(library.zone_name.clone());
+                }
+            }
+            if !local_work_zones.is_empty() {
+                tracing::debug!(
+                    libraries = local_work_zones.len(),
+                    "Pending metadata work bypassed the watch no-change shortcut"
+                );
+                watch_precheck.include_local_work_zones(local_work_zones);
             }
         }
 
@@ -2431,6 +2494,40 @@ mod tests {
         );
         assert!(precheck.should_sync_zone("PrimarySync"));
         assert!(!precheck.should_sync_zone("SharedSync-123"));
+    }
+
+    #[test]
+    fn pending_metadata_work_bypasses_skip_for_only_affected_zone() {
+        let mut precheck = WatchPrecheck::SkipAll;
+        let mut local_zones = rustc_hash::FxHashSet::default();
+        local_zones.insert("SharedSync-123".to_string());
+
+        precheck.include_local_work_zones(local_zones);
+
+        assert!(!precheck.should_sync_zone("PrimarySync"));
+        assert!(precheck.should_sync_zone("SharedSync-123"));
+        assert!(precheck.db_sync_token_after_success().is_none());
+    }
+
+    #[test]
+    fn pending_metadata_work_joins_provider_changed_zones_without_losing_db_token() {
+        let mut changed_zones = rustc_hash::FxHashSet::default();
+        changed_zones.insert("PrimarySync".to_string());
+        let mut precheck = WatchPrecheck::Proceed {
+            changed_zones: Some(changed_zones),
+            db_sync_token_after_success: Some("db-token-after-cycle".to_string()),
+        };
+        let mut local_zones = rustc_hash::FxHashSet::default();
+        local_zones.insert("SharedSync-123".to_string());
+
+        precheck.include_local_work_zones(local_zones);
+
+        assert!(precheck.should_sync_zone("PrimarySync"));
+        assert!(precheck.should_sync_zone("SharedSync-123"));
+        assert_eq!(
+            precheck.db_sync_token_after_success(),
+            Some("db-token-after-cycle")
+        );
     }
 
     #[tokio::test]
@@ -4593,7 +4690,13 @@ mod tests {
             }
             if let Some(newer) = &self.refresh_on_mark_downloaded {
                 self.inner
-                    .refresh_downloaded_asset_metadata(library, id, newer, true)
+                    .refresh_downloaded_asset_metadata(
+                        library,
+                        id,
+                        newer,
+                        true,
+                        state::METADATA_CAPTURE_REVISION,
+                    )
                     .await?;
             }
             self.inner
@@ -5158,6 +5261,7 @@ mod tests {
             asset_id: &str,
             metadata: &state::AssetMetadata,
             mark_for_rewrite: bool,
+            capture_revision: i64,
         ) -> Result<usize, state::error::StateError> {
             if self.fail_refresh_downloaded_metadata {
                 return Err(state::error::StateError::LockPoisoned(
@@ -5165,7 +5269,13 @@ mod tests {
                 ));
             }
             self.inner
-                .refresh_downloaded_asset_metadata(library, asset_id, metadata, mark_for_rewrite)
+                .refresh_downloaded_asset_metadata(
+                    library,
+                    asset_id,
+                    metadata,
+                    mark_for_rewrite,
+                    capture_revision,
+                )
                 .await
         }
 
@@ -5237,6 +5347,58 @@ mod tests {
             &self,
         ) -> Result<bool, state::error::StateError> {
             self.inner.has_downloaded_without_metadata_hash().await
+        }
+
+        async fn begin_metadata_capture_revision(
+            &self,
+            library: &str,
+            target_revision: i64,
+        ) -> Result<state::MetadataCaptureStatus, state::error::StateError> {
+            self.inner
+                .begin_metadata_capture_revision(library, target_revision)
+                .await
+        }
+
+        async fn get_metadata_capture_candidates(
+            &self,
+            library: &str,
+            target_revision: i64,
+            limit: usize,
+        ) -> Result<Vec<state::MetadataCaptureCandidate>, state::error::StateError> {
+            self.inner
+                .get_metadata_capture_candidates(library, target_revision, limit)
+                .await
+        }
+
+        async fn record_metadata_capture_failure(
+            &self,
+            library: &str,
+            target_revision: i64,
+            error: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .record_metadata_capture_failure(library, target_revision, error)
+                .await
+        }
+
+        async fn complete_metadata_capture_revision(
+            &self,
+            library: &str,
+            target_revision: i64,
+        ) -> Result<state::MetadataCaptureStatus, state::error::StateError> {
+            self.inner
+                .complete_metadata_capture_revision(library, target_revision)
+                .await
+        }
+
+        async fn has_metadata_capture_work(
+            &self,
+            libraries: &[&str],
+            target_revision: i64,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .has_metadata_capture_work(libraries, target_revision)
+                .await
         }
     }
 
@@ -6556,6 +6718,132 @@ mod tests {
                 .as_deref(),
             Some("zone-tok-new"),
             "durable provider state must allow the zone checkpoint to advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_capture_revision_repair_advances_checkpoint_after_durable_metadata() {
+        #[derive(Clone, Debug)]
+        struct CaptureRevisionSession {
+            records: Arc<Vec<serde_json::Value>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for CaptureRevisionSession {
+            async fn post(
+                &self,
+                url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                if url.contains("/records/lookup?") {
+                    return Ok(serde_json::json!({"records": self.records.as_ref()}));
+                }
+                if url.contains("/changes/zone?") {
+                    return Ok(serde_json::json!({
+                        "zones": [{
+                            "zoneID": {
+                                "zoneName": "PrimarySync",
+                                "ownerRecordName": "_defaultOwner"
+                            },
+                            "syncToken": "zone-tok-new",
+                            "moreComing": false,
+                            "records": []
+                        }]
+                    }));
+                }
+                Ok(serde_json::json!({"records": []}))
+            }
+
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        let config = make_run_cycle_config();
+        let inner = Arc::new(state::SqliteStateDb::open_in_memory().expect("state db"));
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        seed_run_cycle_metadata_drift_asset(&db, download_dir.path()).await;
+        inner
+            .upsert_asset_master_mapping(
+                "PrimarySync",
+                "asset-master-PrimarySync",
+                "master-PrimarySync",
+            )
+            .await
+            .expect("seed durable provider identity");
+        assert!(
+            inner
+                .claim_legacy_master_state_owner(
+                    "PrimarySync",
+                    "master-PrimarySync",
+                    "asset-master-PrimarySync",
+                )
+                .await
+                .expect("seed legacy state owner")
+        );
+        inner.set_metadata_capture_revision_for_test("PrimarySync", "master-PrimarySync", 0);
+
+        let page = run_cycle_favourited_asset_page();
+        let records = page["records"]
+            .as_array()
+            .expect("provider page records")
+            .clone();
+        let album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(CaptureRevisionSession {
+                records: Arc::new(records),
+            }),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.stats.metadata_capture_refreshed, 1);
+        assert_eq!(result.stats.metadata_capture_remaining, 0);
+        assert!(
+            inner.get_downloaded_page(0, 1).await.unwrap()[0]
+                .metadata
+                .is_favorite,
+            "automatic repair must durably store the provider metadata"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-new"),
+            "durable capture repair must allow the zone checkpoint to advance"
         );
     }
 
