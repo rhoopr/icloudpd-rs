@@ -3822,8 +3822,10 @@ mod tests {
             .output()
             .is_ok_and(|out| out.status.success());
         if !available {
+            let required = std::env::var("KEI_REQUIRE_HEIF_ORACLE")
+                .is_ok_and(|value| !value.trim().is_empty());
             assert!(
-                std::env::var_os("KEI_REQUIRE_HEIF_ORACLE").is_none(),
+                !required,
                 "KEI_REQUIRE_HEIF_ORACLE is set but exiftool is not installed"
             );
             eprintln!("exiftool unavailable; skipping independent HEIF reader check");
