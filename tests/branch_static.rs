@@ -974,6 +974,7 @@ fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
     let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
 
     for expected in [
+        "sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt",
         r#"curl -fsSL "$BASE/SHA256SUMS.txt" -o /tmp/SHA256SUMS.txt"#,
         r#"curl -fsSL "$BASE/$file" -o "/tmp/$file""#,
         r#"expected_sha=$(awk -v file="$file" '$2 == file { print $1 }' /tmp/SHA256SUMS.txt)"#,
