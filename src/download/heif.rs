@@ -3806,76 +3806,81 @@ mod tests {
         );
     }
 
+    /// Independent-reader oracle. kei's reader and writer share a code base, so
+    /// a packet that round-trips through both proves only self-consistency. This
+    /// drives ExifTool, which parses the HEIF item map itself and applies the
+    /// same primary-image rule, over the rewritten bytes.
+    ///
+    /// ExifTool is optional for a local run. `KEI_REQUIRE_HEIF_ORACLE` makes it
+    /// mandatory, so CI cannot lose this coverage by failing to install it.
     #[test]
-    fn rewrite_xmp_is_readable_by_independent_heif_tools_when_available() {
+    fn rewrite_xmp_is_readable_by_an_independent_heif_reader() {
         use std::process::Command;
 
-        let ffprobe = Command::new("ffprobe").arg("-version").output();
-        if ffprobe.is_err() {
-            eprintln!("ffprobe unavailable; skipping independent HEIF reader check");
-            return;
-        }
-        let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>5</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
-        let dir = tempfile::tempdir().expect("reader fixture directory");
-        let source_path = dir.path().join("source.heic");
-        std::fs::write(&source_path, include_bytes!("../../tests/data/sample.heic"))
-            .expect("write source reader fixture");
-        let source_probe = Command::new("ffprobe")
-            .args(["-v", "error"])
-            .arg(&source_path)
+        let available = Command::new("exiftool")
+            .arg("-ver")
             .output()
-            .expect("run ffprobe on source");
-        if !source_probe.status.success() {
-            eprintln!(
-                "ffprobe cannot read the repository HEIC fixture; skipping independent reader check"
+            .is_ok_and(|out| out.status.success());
+        if !available {
+            assert!(
+                std::env::var_os("KEI_REQUIRE_HEIF_ORACLE").is_none(),
+                "KEI_REQUIRE_HEIF_ORACLE is set but exiftool is not installed"
             );
+            eprintln!("exiftool unavailable; skipping independent HEIF reader check");
             return;
         }
 
-        let mut output = Vec::new();
-        rewrite_xmp(
-            include_bytes!("../../tests/data/sample.heic"),
-            xmp,
-            &mut output,
-        )
-        .expect("real HEIC rewrite");
-        let path = dir.path().join("rewritten.heic");
-        std::fs::write(&path, &output).expect("write reader fixture");
+        let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description><xmp:Rating xmlns:xmp='http://ns.adobe.com/xap/1.0/'>5</xmp:Rating></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let dir = tempfile::tempdir().expect("reader fixture directory");
 
-        let probe = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "format=format_name",
-                "-of",
-                "default=nw=1:nk=1",
-            ])
-            .arg(&path)
-            .output()
-            .expect("run ffprobe");
-        assert!(
-            probe.status.success(),
-            "ffprobe must accept rewritten HEIC: {}",
-            String::from_utf8_lossy(&probe.stderr)
-        );
-        assert!(
-            !probe.stdout.is_empty(),
-            "ffprobe must identify the rewritten HEIF container"
-        );
-
-        if Command::new("exiftool").arg("-ver").output().is_ok() {
-            let rating = Command::new("exiftool")
-                .args(["-s3", "-XMP:Rating"])
-                .arg(&path)
+        let read_tag = |path: &std::path::Path, tag: &str| -> String {
+            let out = Command::new("exiftool")
+                .args(["-s3", tag])
+                .arg(path)
                 .output()
                 .expect("run exiftool");
             assert!(
-                rating.status.success(),
-                "exiftool must accept rewritten HEIC: {}",
-                String::from_utf8_lossy(&rating.stderr)
+                out.status.success(),
+                "exiftool must accept {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr)
             );
-            assert_eq!(String::from_utf8_lossy(&rating.stdout).trim(), "5");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        for (name, source) in [
+            (
+                "sample.heic",
+                include_bytes!("../../tests/data/sample.heic").as_slice(),
+            ),
+            (
+                "apple-hdr-gainmap.heic",
+                include_bytes!("../../tests/data/apple-hdr-gainmap.heic").as_slice(),
+            ),
+        ] {
+            let mut output = Vec::new();
+            rewrite_xmp(source, xmp, &mut output).expect("rewrite for reader check");
+            let path = dir.path().join(name);
+            std::fs::write(&path, &output).expect("write reader fixture");
+
+            assert_eq!(
+                read_tag(&path, "-Validate"),
+                "OK",
+                "{name} must still validate after a rewrite"
+            );
+            assert_eq!(
+                read_tag(&path, "-XMP:Rating"),
+                "5",
+                "an independent reader must resolve the packet kei wrote into {name}"
+            );
+
+            let source_path = dir.path().join(format!("source-{name}"));
+            std::fs::write(&source_path, source).expect("write source fixture");
+            assert_eq!(
+                read_tag(&path, "-HDRGainMapVersion"),
+                read_tag(&source_path, "-HDRGainMapVersion"),
+                "{name} must keep whatever gain map it arrived with"
+            );
         }
     }
 
@@ -4657,6 +4662,60 @@ mod tests {
 
         let mut again = Vec::new();
         rewrite_xmp(&output, MATRIX_XMP, &mut again).expect("multi-XMP idempotent");
+        assert_eq!(again, output, "repeated rewrite must be byte-idempotent");
+    }
+
+    /// The synthetic multi-XMP tests above control the item map precisely, but
+    /// they are still kei's own idea of an Apple file. This drives the same
+    /// selection rule through a genuine iOS 17.6.1 HDR capture: a `grid`
+    /// primary over six tiles, a gain map, and two XMP packets, one describing
+    /// the photograph and one describing the gain map. Choosing the wrong one
+    /// moves the user's rating onto the gain map.
+    #[test]
+    fn rewrite_xmp_targets_the_primary_packet_in_a_real_apple_hdr_capture() {
+        const PRIMARY_XMP_ITEM: u32 = 9;
+        const GAIN_MAP_XMP_ITEM: u32 = 11;
+        let input = include_bytes!("../../tests/data/apple-hdr-gainmap.heic");
+
+        let gain_map_packet = resolve_item_data(input, GAIN_MAP_XMP_ITEM);
+        let selected = extract_xmp_raw(input).expect("the capture carries XMP");
+        assert_eq!(
+            selected,
+            resolve_item_data(input, PRIMARY_XMP_ITEM),
+            "the writer must resolve the packet bound to the primary image"
+        );
+        assert_ne!(
+            selected, gain_map_packet,
+            "the gain map's packet must never answer for the photograph"
+        );
+        assert_eq!(
+            extract_xmp_strict(input).unwrap().as_deref(),
+            Some(selected.as_slice()),
+            "the reader must resolve the same packet as the writer"
+        );
+
+        let mut output = Vec::new();
+        rewrite_xmp(input, MATRIX_XMP, &mut output).expect("real Apple HDR rewrite");
+
+        // The capture's packet is far larger than the replacement, so this is
+        // the in-place branch: the extent is reused and the tail padded.
+        let written = extract_xmp_raw(&output).expect("rewritten capture carries XMP");
+        assert_eq!(written.trim_ascii_end(), MATRIX_XMP);
+        assert_eq!(
+            written.len(),
+            selected.len(),
+            "a shrinking packet must reuse the existing extent"
+        );
+        assert_eq!(
+            resolve_item_data(&output, GAIN_MAP_XMP_ITEM),
+            gain_map_packet,
+            "the gain map's packet must survive byte-for-byte"
+        );
+        validate_rewrite_preserves_non_xmp_items(input, &output)
+            .expect("every tile, the gain map, and Exif must be preserved");
+
+        let mut again = Vec::new();
+        rewrite_xmp(&output, MATRIX_XMP, &mut again).expect("real Apple HDR idempotent");
         assert_eq!(again, output, "repeated rewrite must be byte-idempotent");
     }
 

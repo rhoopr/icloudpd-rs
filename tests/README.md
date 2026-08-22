@@ -10,7 +10,7 @@ explains what runs where.
 ```
 tests/
   common/mod.rs       shared Rust helpers (require_preauth, walkdir, auth-retry)
-  data/               fixtures (sample.heic, etc.)
+  data/               media fixtures (see "Media fixtures" below)
   cli.rs                       argument parsing and help output
   behavioral.rs                offline end-to-end behavior (pre-seeded DB, real binary)
   sync.rs                      live sync flow against iCloud (#[ignore] live tests)
@@ -95,6 +95,25 @@ cargo test --bin kei --test cli --test behavioral
 cargo test --all-features --test sync --test state_auth -- --ignored --test-threads=1
 ./tests/shell/concurrency.sh
 ```
+
+## Media fixtures
+
+`tests/data/` holds real camera files, not synthesised containers, so the
+metadata writers are exercised against layouts Apple actually produces.
+
+| Fixture | Origin | Licence | Covers |
+|---------|--------|---------|--------|
+| `sample.heic` | iPhone capture | repository fixture | single `hvc1` primary, Exif item, thumbnail, no XMP |
+| `apple-hdr-gainmap.heic` | [`johncf/apple-hdr-heic`](https://github.com/johncf/apple-hdr-heic/blob/master/tests/data/hdr-sample.heic), iOS 17.6.1 | MIT, reproduced in `tests/data/LICENSE-apple-hdr-gainmap` | `grid` primary over six tiles, HDR gain map, `idat`, and two XMP items |
+
+`apple-hdr-gainmap.heic` is the multi-image case. Item 9 is the XMP describing
+the primary image and item 11 describes the gain map, so a writer that picks
+the wrong packet moves the photograph's rating and keywords onto the gain map.
+Its primary is a derived `grid`, which also keeps the tiled layout covered.
+
+Hand-built containers still appear in unit tests for layouts no real file
+provides, such as construction method 2, item IDs above `u16`, and deliberately
+malformed boxes.
 
 ## Fuzzing
 
