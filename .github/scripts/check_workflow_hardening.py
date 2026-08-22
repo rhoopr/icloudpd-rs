@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Guard security-sensitive GitHub Actions invariants."""
 
 from __future__ import annotations
