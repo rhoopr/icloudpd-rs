@@ -61,7 +61,7 @@ lint-scripts:
     done
     PYTHONPYCACHEPREFIX="$pycache_dir" python3 -m py_compile "${python_files[@]}"
     if command -v shellcheck >/dev/null 2>&1; then
-        shellcheck "${shell_files[@]}"
+        shellcheck -x -P tests/shell:scripts:scripts/full-test "${shell_files[@]}"
     else
         echo "lint-scripts: shellcheck not installed; skipping optional shell lint" >&2
     fi

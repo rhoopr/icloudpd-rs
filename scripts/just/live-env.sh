@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared live-test environment setup for just recipes.
 #
 # Source this file from bash recipes that need live iCloud credentials. It

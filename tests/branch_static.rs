@@ -859,7 +859,7 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         "for shell_file in \"${shell_files[@]}\"; do",
         "bash -n \"$shell_file\"",
         "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile \"${python_files[@]}\"",
-        "shellcheck \"${shell_files[@]}\"",
+        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
         "shfmt -d \"${shell_files[@]}\"",
         "ruff check \"${python_files[@]}\"",
     ] {

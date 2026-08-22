@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers for kei's shell-native test scripts.
 #
 # Source this file after setting PROJECT_DIR (usually
