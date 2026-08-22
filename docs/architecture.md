@@ -278,7 +278,9 @@ XMP items receive a `cdsc` reference to the primary image, and insertion
 rejects top-level boxes whose absolute offsets are not adjusted. Before
 publication, validation confirms that every construction-method-0 item other
 than the resolved XMP packet, and every opaque `meta` sub-box, remains
-byte-identical.
+byte-identical, and that re-reading the rewritten file resolves the packet just
+written, allowing for the space padding an in-place replacement leaves in the
+reused extent.
 
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active

@@ -1150,6 +1150,22 @@ fn apply_metadata_heif_with_installer(
         .with_context(|| format!("Rewritten HEIC XMP is not UTF-8: {}", tmp_path.display()))?
         .parse::<XmpMeta>()
         .with_context(|| format!("Rewritten HEIC XMP is invalid: {}", tmp_path.display()))?;
+    // A multi-image HEIC holds one XMP packet per image, so reader and writer
+    // must resolve the same item or a merge moves an auxiliary image's metadata
+    // onto the photograph. Replacing in place leaves the extent length alone and
+    // pads the tail with spaces, so the written packet is a prefix rather than
+    // the whole extent.
+    let resolves_to_written_packet = rewritten_xmp
+        .split_at_checked(xmp.len())
+        .is_some_and(|(written, padding)| written == xmp && padding.iter().all(|b| *b == b' '));
+    if !resolves_to_written_packet {
+        anyhow::bail!(
+            "HEIC XMP rewrite resolved a different item than it wrote in {}: wrote {} bytes, read back {} bytes. Refusing to replace the user's file.",
+            tmp_path.display(),
+            xmp.len(),
+            rewritten_xmp.len()
+        );
+    }
     drop(file);
     install(&tmp_path, path).with_context(|| {
         format!(
@@ -3407,8 +3423,12 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// Each write merges into the packet the reader resolved, so unrelated
+    /// fields must survive. A shrinking packet also reuses the existing extent
+    /// and pads the tail, which is the layout the post-write identity check has
+    /// to tolerate.
     #[test]
-    fn apply_metadata_heic_changes_rating_without_rewriting_other_xmp() {
+    fn apply_metadata_heic_changes_one_field_without_rewriting_other_xmp() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = write_seeded_heic(
             &dir,
@@ -3416,6 +3436,12 @@ mod tests {
             &MetadataWrite {
                 rating: Some(5),
                 title: Some("Keep this".into()),
+                keywords: vec![
+                    "alpha".into(),
+                    "beta".into(),
+                    "gamma".into(),
+                    "delta".into(),
+                ],
                 ..MetadataWrite::default()
             },
         );
@@ -3448,6 +3474,41 @@ mod tests {
         assert_eq!(
             cleared.property_i32(xmp_ns::XMP, "Rating").unwrap().value,
             0
+        );
+
+        let before = extract_xmp_from_heic(&fs::read(&path).unwrap()).expect("packet before");
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                keywords: vec!["alpha".into()],
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC keyword removal");
+        let after = extract_xmp_from_heic(&fs::read(&path).unwrap()).expect("packet after");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a shrinking packet must reuse the existing extent"
+        );
+        assert!(
+            after.ends_with(b" "),
+            "the reused extent must be padded to its original length"
+        );
+        let shrunk = read_heic_meta(&fs::read(&path).unwrap());
+        assert_eq!(
+            shrunk
+                .localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "Keep this",
+            "removing a keyword must not disturb the rest of the packet"
+        );
+        assert_eq!(
+            shrunk.property_array(xmp_ns::DC, "subject").count(),
+            1,
+            "stale keywords must not accumulate"
         );
         fs::remove_file(&path).ok();
     }
