@@ -464,6 +464,152 @@ pub(super) struct PendingRetryPlan {
     pub(super) requested: usize,
 }
 
+struct ProviderLookupPlan {
+    requests: Vec<RecordLookupRequest>,
+    master_by_state_id: FxHashMap<String, String>,
+}
+
+async fn build_provider_lookup_plan(
+    db: &dyn DownloadStore,
+    library: &str,
+    state_ids: &[&str],
+) -> Result<ProviderLookupPlan> {
+    let mut requests = Vec::new();
+    let mut seen_requests = FxHashSet::default();
+    let mut master_by_state_id = FxHashMap::default();
+    for &state_id in state_ids {
+        let mapped_master = db
+            .get_master_record_name_for_asset(library, state_id)
+            .await?;
+        let master = mapped_master.as_deref().unwrap_or(state_id).to_string();
+        let asset_record_names = if mapped_master.is_some() {
+            vec![state_id.to_string()]
+        } else {
+            db.get_asset_record_names_for_master(library, &master)
+                .await?
+        };
+        master_by_state_id.insert(state_id.to_string(), master.clone());
+        if asset_record_names.is_empty() {
+            let request_key = (state_id.to_string(), master.clone(), None);
+            if seen_requests.insert(request_key.clone()) {
+                requests.push(RecordLookupRequest::master_only(
+                    ProviderRecordId::new(request_key.0),
+                    ProviderRecordId::new(request_key.1),
+                ));
+            }
+            continue;
+        }
+        for asset_record_name in asset_record_names {
+            let request_key = (
+                state_id.to_string(),
+                master.clone(),
+                Some(asset_record_name.clone()),
+            );
+            if seen_requests.insert(request_key.clone()) {
+                requests.push(RecordLookupRequest::paired(
+                    ProviderRecordId::new(request_key.0),
+                    ProviderRecordId::new(request_key.1),
+                    ProviderRecordId::new(asset_record_name),
+                ));
+            }
+        }
+    }
+
+    Ok(ProviderLookupPlan {
+        requests,
+        master_by_state_id,
+    })
+}
+
+async fn apply_policy_excluded_resolutions(
+    db: &dyn DownloadStore,
+    library: &str,
+    master_by_state_id: &FxHashMap<String, String>,
+    resolutions: Vec<(ProviderRecordId, RecordResolution)>,
+    shutdown_token: &CancellationToken,
+) -> Result<usize> {
+    let mut source_deleted = 0usize;
+    for (state_id, resolution) in resolutions {
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        // CONTRACT: POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION
+        if let RecordResolution::Deleted {
+            deleted_at,
+            master_family,
+        } = resolution
+        {
+            let state_id = state_id.as_str();
+            let resolved = if master_family {
+                let master = master_by_state_id
+                    .get(state_id)
+                    .map(String::as_str)
+                    .unwrap_or(state_id);
+                db.resolve_master_family_source_deleted_affected(library, master, deleted_at)
+                    .await?
+            } else {
+                db.resolve_source_deleted_affected(library, state_id, deleted_at)
+                    .await?
+            };
+            source_deleted = source_deleted.saturating_add(resolved);
+        }
+    }
+    Ok(source_deleted)
+}
+
+async fn revalidate_policy_excluded_assets(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    shutdown_token: &CancellationToken,
+) -> Result<()> {
+    let Some(db) = &config.state_db else {
+        return Ok(());
+    };
+    let state_ids = db
+        .get_policy_excluded_ids_for_revalidation(&config.library)
+        .await?;
+    if state_ids.is_empty() || shutdown_token.is_cancelled() {
+        return Ok(());
+    }
+    let Some(pass) = passes.first() else {
+        return Ok(());
+    };
+    let state_id_refs: Vec<&str> = state_ids.iter().map(String::as_str).collect();
+    let ProviderLookupPlan {
+        requests,
+        master_by_state_id,
+    } = build_provider_lookup_plan(db.as_ref(), &config.library, &state_id_refs).await?;
+
+    let requested = state_ids.len();
+    let batch = pass.album.resolve_records(&requests).await;
+    let complete = batch.complete;
+    let source_deleted = apply_policy_excluded_resolutions(
+        db.as_ref(),
+        &config.library,
+        &master_by_state_id,
+        batch.results,
+        shutdown_token,
+    )
+    .await?;
+    if source_deleted > 0 {
+        tracing::info!(
+            library = %config.library,
+            requested,
+            source_deleted,
+            complete,
+            "Provider deletion superseded policy exclusion"
+        );
+    } else {
+        tracing::debug!(
+            library = %config.library,
+            requested,
+            complete,
+            "Policy-excluded provider revalidation retained current state"
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn build_pending_retry_download_tasks(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
@@ -472,6 +618,8 @@ pub(super) async fn build_pending_retry_download_tasks(
     let Some(db) = &config.state_db else {
         return Ok(PendingRetryPlan::default());
     };
+
+    revalidate_policy_excluded_assets(passes, config, &shutdown_token).await?;
 
     let pending = db.get_pending().await?;
     let mut pending_targets: FxHashSet<PendingRetryTarget> = pending
@@ -516,52 +664,15 @@ pub(super) async fn build_pending_retry_download_tasks(
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
     let mut task_planner = planner::TaskPlanner::new();
-    let mut lookup_requests = Vec::new();
-    let mut seen_requests = FxHashSet::default();
-    let mut master_by_state_id: FxHashMap<String, String> = FxHashMap::default();
-    for record in pending
+    let pending_state_ids: Vec<&str> = pending
         .iter()
         .filter(|record| record.library.as_ref() == config.library.as_ref())
-    {
-        let mapped_master = db
-            .get_master_record_name_for_asset(&config.library, &record.id)
-            .await?;
-        let master = mapped_master
-            .as_deref()
-            .unwrap_or(record.id.as_ref())
-            .to_string();
-        let asset_record_names = if mapped_master.is_some() {
-            vec![record.id.to_string()]
-        } else {
-            db.get_asset_record_names_for_master(&config.library, &master)
-                .await?
-        };
-        master_by_state_id.insert(record.id.to_string(), master.clone());
-        if asset_record_names.is_empty() {
-            let request_key = (record.id.to_string(), master.clone(), None);
-            if seen_requests.insert(request_key.clone()) {
-                lookup_requests.push(RecordLookupRequest::master_only(
-                    ProviderRecordId::new(request_key.0),
-                    ProviderRecordId::new(request_key.1),
-                ));
-            }
-            continue;
-        }
-        for asset_record_name in asset_record_names {
-            let request_key = (
-                record.id.to_string(),
-                master.clone(),
-                Some(asset_record_name.clone()),
-            );
-            if seen_requests.insert(request_key.clone()) {
-                lookup_requests.push(RecordLookupRequest::paired(
-                    ProviderRecordId::new(request_key.0),
-                    ProviderRecordId::new(request_key.1),
-                    ProviderRecordId::new(asset_record_name),
-                ));
-            }
-        }
-    }
+        .map(|record| record.id.as_ref())
+        .collect();
+    let ProviderLookupPlan {
+        requests: lookup_requests,
+        master_by_state_id,
+    } = build_provider_lookup_plan(db.as_ref(), &config.library, &pending_state_ids).await?;
 
     let requested_state_ids: FxHashSet<&str> = lookup_requests
         .iter()
@@ -910,6 +1021,70 @@ mod tests {
                 },
             }),
         )
+    }
+
+    #[tokio::test]
+    async fn contract_policy_excluded_requires_explicit_source_deletion() {
+        let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
+        for id in ["PRESENT", "OMITTED", "MALFORMED", "TRANSIENT", "DELETED"] {
+            let record = TestAssetRecord::new(id).build();
+            db.upsert_seen(&record).await.unwrap();
+            assert!(
+                db.mark_policy_excluded("PrimarySync", id, "original")
+                    .await
+                    .unwrap()
+            );
+        }
+        let resolutions = vec![
+            (
+                ProviderRecordId::new("PRESENT"),
+                RecordResolution::Present(candidate(
+                    "PRESENT",
+                    "asset-PRESENT",
+                    "present-checksum",
+                    100,
+                )),
+            ),
+            (ProviderRecordId::new("OMITTED"), RecordResolution::Unknown),
+            (
+                ProviderRecordId::new("MALFORMED"),
+                RecordResolution::TransientFailure(
+                    crate::icloud::photos::ProviderLookupError::Malformed(
+                        "missing records array".to_string(),
+                    ),
+                ),
+            ),
+            (
+                ProviderRecordId::new("TRANSIENT"),
+                RecordResolution::TransientFailure(
+                    crate::icloud::photos::ProviderLookupError::Request(
+                        "temporary lookup failure".to_string(),
+                    ),
+                ),
+            ),
+            (
+                ProviderRecordId::new("DELETED"),
+                RecordResolution::Deleted {
+                    deleted_at: None,
+                    master_family: false,
+                },
+            ),
+        ];
+
+        let source_deleted = apply_policy_excluded_resolutions(
+            &db,
+            "PrimarySync",
+            &FxHashMap::default(),
+            resolutions,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(source_deleted, 1);
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.policy_excluded, 4);
+        assert_eq!(summary.source_deleted, 1);
     }
 
     #[test]

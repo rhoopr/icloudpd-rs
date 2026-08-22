@@ -4729,6 +4729,15 @@ mod tests {
             self.inner.get_pending().await
         }
 
+        async fn get_policy_excluded_ids_for_revalidation(
+            &self,
+            library: &str,
+        ) -> Result<Vec<String>, state::error::StateError> {
+            self.inner
+                .get_policy_excluded_ids_for_revalidation(library)
+                .await
+        }
+
         async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
             self.inner.reset_failed().await
         }

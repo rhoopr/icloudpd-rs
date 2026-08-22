@@ -191,6 +191,14 @@ pub trait DownloadStateStore: Send + Sync {
         error: &str,
     ) -> Result<(), StateError>;
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
+    /// Return live policy-excluded identities for targeted deletion revalidation.
+    ///
+    /// These identities are not actionable retry work. Callers must not plan
+    /// downloads from this projection.
+    async fn get_policy_excluded_ids_for_revalidation(
+        &self,
+        library: &str,
+    ) -> Result<Vec<String>, StateError>;
     async fn reset_failed(&self) -> Result<u64, StateError>;
     async fn prepare_for_retry(
         &self,
@@ -1546,6 +1554,31 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("get_pending", e))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| StateError::query("get_pending", e))?;
+
+            Ok(records)
+        })
+        .await
+    }
+
+    pub(crate) async fn get_policy_excluded_ids_for_revalidation(
+        &self,
+        library: &str,
+    ) -> Result<Vec<String>, StateError> {
+        let library = library.to_owned();
+        self.with_conn("get_policy_excluded_ids_for_revalidation", move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT id FROM assets \
+                     WHERE status = 'policy_excluded' AND is_deleted = 0 AND library = ?1 \
+                     ORDER BY id",
+                )
+                .map_err(|e| StateError::query("get_policy_excluded_ids_for_revalidation", e))?;
+
+            let records = stmt
+                .query_map(rusqlite::params![library], |row| row.get(0))
+                .map_err(|e| StateError::query("get_policy_excluded_ids_for_revalidation", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_policy_excluded_ids_for_revalidation", e))?;
 
             Ok(records)
         })
@@ -4454,6 +4487,13 @@ impl DownloadStateStore for SqliteStateDb {
         <SqliteStateDb as ReportStateStore>::get_pending_page(self, 0, u32::MAX).await
     }
 
+    async fn get_policy_excluded_ids_for_revalidation(
+        &self,
+        library: &str,
+    ) -> Result<Vec<String>, StateError> {
+        SqliteStateDb::get_policy_excluded_ids_for_revalidation(self, library).await
+    }
+
     async fn reset_failed(&self) -> Result<u64, StateError> {
         SqliteStateDb::reset_failed(self).await
     }
@@ -6262,6 +6302,34 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.policy_excluded, 0);
+    }
+
+    #[tokio::test]
+    async fn policy_excluded_revalidation_reader_is_live_and_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (id, library) in [
+            ("LIVE_PRIMARY", "PrimarySync"),
+            ("DELETED_PRIMARY", "PrimarySync"),
+            ("LIVE_SHARED", "SharedSync"),
+        ] {
+            let record = TestAssetRecord::new(id).library(library).build();
+            db.upsert_seen(&record).await.unwrap();
+            assert!(
+                db.mark_policy_excluded(library, id, "original")
+                    .await
+                    .unwrap()
+            );
+        }
+        db.resolve_source_deleted("PrimarySync", "DELETED_PRIMARY", None)
+            .await
+            .unwrap();
+
+        let ids = db
+            .get_policy_excluded_ids_for_revalidation("PrimarySync")
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec!["LIVE_PRIMARY"]);
     }
 
     #[tokio::test]
