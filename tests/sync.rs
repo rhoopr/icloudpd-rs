@@ -1018,12 +1018,18 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
     });
 }
 
-/// [metadata].embed_xmp on a HEIC file uses the byte-preserving embedded XMP
-/// writer. Sync should still succeed and leave the downloaded HEIC usable.
+/// [metadata].embed_xmp on a HEIC file drives the byte-preserving embedded XMP
+/// writer. A rejected item map fails the metadata write and the whole sync, so
+/// a successful run is evidence the writer accepted the album's HEIC, and the
+/// file must still be on disk with content afterwards.
+///
+/// The packet is not read back here. xmp_toolkit has no HEIF handler, which is
+/// why kei resolves HEIC XMP itself; the resolved packet is covered by the unit
+/// tests over `src/download/heif.rs`.
 #[cfg(feature = "xmp")]
 #[test]
 #[ignore]
-fn sync_embed_xmp_on_heic_writes_embedded_xmp() {
+fn sync_embed_xmp_on_heic_succeeds_and_keeps_the_file() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -1043,31 +1049,11 @@ fn sync_embed_xmp_on_heic_writes_embedded_xmp() {
         .assert()
         .success();
 
-        let files = common::walkdir(download_dir.path());
-        let heics: Vec<_> = files
-            .iter()
-            .filter(|p| {
-                let ext = p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                ext == "heic" || ext == "heif"
-            })
-            .collect();
-
-        if heics.is_empty() {
-            eprintln!(
-                "test album `{}` has no HEIC file; skipping HEIC-specific assertion",
-                album()
-            );
-            return;
-        }
-
+        let heic = first_heic(&download_dir.path());
         assert!(
-            std::fs::metadata(heics[0]).expect("stat HEIC").len() > 0,
+            std::fs::metadata(&heic).expect("stat HEIC").len() > 0,
             "HEIC `{}` should still be downloaded when embed_xmp is enabled",
-            heics[0].display()
+            heic.display()
         );
     });
 }
@@ -1088,6 +1074,31 @@ fn first_jpeg(dir: &&std::path::Path) -> std::path::PathBuf {
             ext == "jpg" || ext == "jpeg"
         })
         .unwrap_or_else(|| panic!("no JPEG in {}", dir.display()))
+}
+
+/// Find the first downloaded HEIC in `dir`. Panics with a clear message if none
+/// is present. The test album must contain a Live Photo, so a missing HEIC
+/// means the fixture is wrong rather than that the case does not apply.
+#[cfg(feature = "xmp")]
+fn first_heic(dir: &&std::path::Path) -> std::path::PathBuf {
+    let files = common::walkdir(dir);
+    files
+        .into_iter()
+        .find(|p| {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            ext == "heic" || ext == "heif"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no HEIC in {}; test album `{}` must contain a Live Photo",
+                dir.display(),
+                album()
+            )
+        })
 }
 
 // ── RAW alignment ───────────────────────────────────────────────────────
