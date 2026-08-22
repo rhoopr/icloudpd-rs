@@ -146,6 +146,7 @@ def audit_warnings() -> int | None:
     try:
         proc = subprocess.run(
             ["cargo", "audit"],
+            check=False,
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
             text=True,
