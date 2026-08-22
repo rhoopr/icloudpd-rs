@@ -38,7 +38,7 @@ kei_cookie_dir() {
     if [ -n "${ICLOUD_TEST_COOKIE_DIR:-}" ]; then
         case "$ICLOUD_TEST_COOKIE_DIR" in
             "~/"*) printf '%s/%s' "$HOME" "${ICLOUD_TEST_COOKIE_DIR#~/}" ;;
-            *)     printf '%s' "$ICLOUD_TEST_COOKIE_DIR" ;;
+            *) printf '%s' "$ICLOUD_TEST_COOKIE_DIR" ;;
         esac
     else
         printf '%s/.test-cookies' "$PROJECT_DIR"
@@ -102,7 +102,7 @@ kei_write_sync_config() {
             echo "[photos]"
             kei_append_toml_fragment "$photos_extra"
         fi
-    } > "$config"
+    } >"$config"
     printf '%s' "$config"
 }
 
@@ -151,7 +151,7 @@ kei_require_release_binary() {
     fi
     if [ "$needs_build" -eq 1 ]; then
         echo "Building release binary (required by shell suites)..."
-        ( cd "$PROJECT_DIR" && cargo build --release ) || {
+        (cd "$PROJECT_DIR" && cargo build --release) || {
             echo "ABORT: cargo build --release failed"
             exit 1
         }

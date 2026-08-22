@@ -82,8 +82,8 @@ curl "$@" "$SYNOLOGY_URL/webapi/entry.cgi" \
     --data-urlencode "method=send" \
     --data-urlencode "subject=kei sync" \
     --data-urlencode "message=$MSG" \
-    --data-urlencode "_sid=$SID" >/dev/null || \
-        echo "kei-notify-synology: notification send failed (continuing)" >&2
+    --data-urlencode "_sid=$SID" >/dev/null ||
+    echo "kei-notify-synology: notification send failed (continuing)" >&2
 
 # 3. Optional: explicit reindex via the documented `synoindex` CLI on
 # the host. Requires SSH key-based access from the kei container to the

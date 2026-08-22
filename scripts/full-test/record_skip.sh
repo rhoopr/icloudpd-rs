@@ -12,8 +12,8 @@
 set -u
 
 if [[ $# -lt 3 ]]; then
-  echo "usage: $0 <phase-name> <status> <reason...>" >&2
-  exit 64
+    echo "usage: $0 <phase-name> <status> <reason...>" >&2
+    exit 64
 fi
 
 phase="$1"
@@ -22,8 +22,11 @@ shift 2
 reason="$*"
 
 case "$status" in
-  skipped|rate_limited) ;;
-  *) echo "record_skip: status must be skipped or rate_limited (got: $status)" >&2; exit 64 ;;
+    skipped | rate_limited) ;;
+    *)
+        echo "record_skip: status must be skipped or rate_limited (got: $status)" >&2
+        exit 64
+        ;;
 esac
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -32,7 +35,8 @@ mkdir -p "$runs_dir"
 current="$runs_dir/.current.jsonl"
 lockfile="$runs_dir/.lock"
 
-rec_json=$(python3 - "$phase" "$status" "$reason" <<'PY'
+rec_json=$(
+    python3 - "$phase" "$status" "$reason" <<'PY'
 import json, sys
 phase, status, reason = sys.argv[1:4]
 print(json.dumps({
@@ -46,8 +50,8 @@ PY
 )
 
 (
-  flock 9
-  echo "$rec_json" >> "$current"
+    flock 9
+    echo "$rec_json" >>"$current"
 ) 9>"$lockfile"
 
 printf '[%s] %s recorded (%s)\n' "$status" "$phase" "$reason" >&2

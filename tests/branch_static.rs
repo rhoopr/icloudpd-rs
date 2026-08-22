@@ -124,7 +124,11 @@ fn docker_packaging_defaults_to_service_run() {
     let entrypoint = repo_file("docker/entrypoint.sh");
     let whitelist = entrypoint
         .lines()
-        .find(|line| line.contains("sync|login|list|password"))
+        .find(|line| {
+            ["sync", "login", "list", "password"]
+                .iter()
+                .all(|subcommand| line.contains(subcommand))
+        })
         .expect("entrypoint must keep an explicit kei subcommand whitelist");
     for subcommand in [
         "sync",
@@ -151,15 +155,14 @@ fn docker_packaging_defaults_to_service_run() {
             "entrypoint whitelist must include the kei `{subcommand}` subcommand"
         );
     }
-    let service_index = entrypoint
-        .find("|service)")
-        .or_else(|| entrypoint.find("|service|"))
-        .expect("entrypoint whitelist must include the kei service subcommand");
+    let whitelist_index = entrypoint
+        .find(whitelist)
+        .expect("entrypoint must contain its parsed subcommand whitelist");
     let command_lookup = entrypoint
         .find("command -v")
         .expect("entrypoint should still fall back to command lookup");
     assert!(
-        service_index < command_lookup,
+        whitelist_index < command_lookup,
         "`service` must be recognized as a kei subcommand before shell command lookup"
     );
 }
@@ -373,7 +376,7 @@ fn full_test_run_start_metadata_is_stable_until_finalize() {
         "flock 9",
         "if [[ $marker_age -lt 3600 ]]; then",
         "staging: $current (no records yet)",
-        "date +%Y-%m-%dT%H:%M:%S > \"$start_file\"",
+        "date +%Y-%m-%dT%H:%M:%S >\"$start_file\"",
     ] {
         assert!(
             begin.contains(expected),
@@ -1314,7 +1317,7 @@ fn live_import_rehearsal_seeds_album_with_per_filter_recent_scope() {
         "live import rehearsal must seed from the selected album's recent window, not the global library frontier"
     );
     assert!(
-        rehearsal.contains("set +e\n  \"$@\" >\"$out\" 2>\"$err\"\n  local rc=$?\n  set -e"),
+        rehearsal.contains("set +e\n    \"$@\" >\"$out\" 2>\"$err\"\n    local rc=$?\n    set -e"),
         "live import rehearsal must print command tails before propagating a failed command"
     );
     assert!(

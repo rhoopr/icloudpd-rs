@@ -14,8 +14,8 @@ start_file="$runs_dir/.run-started-at"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 if [[ ! -s "$current" ]]; then
-  echo "no phases recorded in $current" >&2
-  exit 1
+    echo "no phases recorded in $current" >&2
+    exit 1
 fi
 
 ts=$(date +%Y%m%dT%H%M%S)
@@ -25,9 +25,9 @@ branch=$(git branch --show-current 2>/dev/null || echo "(detached)")
 head=$(git rev-parse --short HEAD 2>/dev/null || echo "(no rev)")
 rustc=$(rustc -V 2>/dev/null || echo "(no rustc)")
 if [[ -s "$start_file" ]]; then
-  started_at=$(head -n 1 "$start_file")
+    started_at=$(head -n 1 "$start_file")
 else
-  started_at=$(date +%Y-%m-%dT%H:%M:%S)
+    started_at=$(date +%Y-%m-%dT%H:%M:%S)
 fi
 
 # Run-level metrics. Failures here don't fail the finalize step -- prefer

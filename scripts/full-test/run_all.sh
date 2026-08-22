@@ -32,8 +32,8 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
-  echo "run_all: not in a git repo" >&2
-  exit 1
+    echo "run_all: not in a git repo" >&2
+    exit 1
 }
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 cd "$repo_root"
@@ -43,15 +43,15 @@ current_phase="setup"
 summary_path="$runs_dir/.current.jsonl"
 
 cleanup_failed_run() {
-  rc=$?
-  if [[ $rc -ne 0 && $run_started -eq 1 ]]; then
-    "$script_dir/render_summary.py" "$summary_path" \
-      --result fail \
-      --fallback-failure "$current_phase" "run stopped before this phase completed" \
-      || true
-    rm -f "$runs_dir/.run-marker"
-  fi
-  exit "$rc"
+    rc=$?
+    if [[ $rc -ne 0 && $run_started -eq 1 ]]; then
+        "$script_dir/render_summary.py" "$summary_path" \
+            --result fail \
+            --fallback-failure "$current_phase" "run stopped before this phase completed" ||
+            true
+        rm -f "$runs_dir/.run-marker"
+    fi
+    exit "$rc"
 }
 trap cleanup_failed_run EXIT
 
@@ -65,10 +65,10 @@ echo "begin: run_id=$run_id (repo: $repo_root)" >&2
 
 # --- Source .env so live phases see ICLOUD_USERNAME etc. ------------------
 if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
 fi
 
 current_phase="prereqs"
@@ -91,12 +91,12 @@ mkdir -p "$KEI_TEST_SCRATCH_DIR"
 
 tp() { "$script_dir/time_phase.sh" "$@"; }
 run_phase() {
-  current_phase="$1"
-  tp "$@"
+    current_phase="$1"
+    tp "$@"
 }
 run_live_phase() {
-  current_phase="$1"
-  tp --live "$@"
+    current_phase="$1"
+    tp --live "$@"
 }
 
 # --- Static + offline behavior -------------------------------------------
@@ -119,18 +119,18 @@ current_phase="live_binary"
 "$script_dir/run_live_smokes.sh"
 run_live_phase live_import_rehearsal -- "$script_dir/run_live_import_rehearsal.sh"
 if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then
-  run_live_phase live_cross_zone_album -- "$script_dir/run_cross_zone_album_hydration.sh"
+    run_live_phase live_cross_zone_album -- "$script_dir/run_cross_zone_album_hydration.sh"
 fi
 
 # --- Service smoke ---------------------------------------------------------
 if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then
-  "$script_dir/record_skip.sh" service skipped "not Linux or macOS"
+    "$script_dir/record_skip.sh" service skipped "not Linux or macOS"
 else
-  run_phase service -- just test service
+    run_phase service -- just test service
 fi
 
 if [[ "${KEI_FULL_TEST_REAL_SERVICE:-0}" == "1" ]]; then
-  run_live_phase host_service -- just test host-service
+    run_live_phase host_service -- just test host-service
 fi
 
 # --- Cleanup --------------------------------------------------------------

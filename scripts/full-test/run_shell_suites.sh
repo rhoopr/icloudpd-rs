@@ -18,8 +18,8 @@ time_phase="$script_dir/time_phase.sh"
 shell_dir="$repo_root/tests/shell"
 
 if [[ ! -d "$shell_dir" ]]; then
-  echo "run_shell_suites: $shell_dir missing" >&2
-  exit 1
+    echo "run_shell_suites: $shell_dir missing" >&2
+    exit 1
 fi
 
 album="${KEI_TEST_ALBUM:-kei-test}"
@@ -28,14 +28,14 @@ shell_scratch="${KEI_TEST_SCRATCH_DIR:-/tmp/codex/kei/full-test/shell}"
 mkdir -p "$shell_scratch"
 
 for sh in "$shell_dir"/*.sh; do
-  [[ -f "$sh" ]] || continue
-  base=$(basename "$sh" .sh)
-  [[ "$base" == "lib" ]] && continue
-  phase="test_shell_${base//-/_}"
-  "$time_phase" --live "$phase" -- \
-    env \
-      KEI_TEST_ALBUM="$album" \
-      KEI_DOCKER_IMAGE="$image" \
-      KEI_TEST_SCRATCH_DIR="$shell_scratch" \
-      "$sh"
+    [[ -f "$sh" ]] || continue
+    base=$(basename "$sh" .sh)
+    [[ "$base" == "lib" ]] && continue
+    phase="test_shell_${base//-/_}"
+    "$time_phase" --live "$phase" -- \
+        env \
+        KEI_TEST_ALBUM="$album" \
+        KEI_DOCKER_IMAGE="$image" \
+        KEI_TEST_SCRATCH_DIR="$shell_scratch" \
+        "$sh"
 done

@@ -29,51 +29,51 @@ flag="$runs_dir/.live-skipped"
 reasons=()
 
 report_tool() {
-  local cmd="$1"
-  local label="${2:-$1}"
-  local optional="${3:-0}"
-  if command -v "$cmd" >/dev/null 2>&1; then
-    echo "$label: pass"
-  elif [[ "$optional" == "1" ]]; then
-    echo "$label: optional-missing $cmd not found"
-  else
-    local reason="$cmd not found"
-    echo "$label: skip $reason"
-    reasons+=("$label: $reason")
-  fi
+    local cmd="$1"
+    local label="${2:-$1}"
+    local optional="${3:-0}"
+    if command -v "$cmd" >/dev/null 2>&1; then
+        echo "$label: pass"
+    elif [[ "$optional" == "1" ]]; then
+        echo "$label: optional-missing $cmd not found"
+    else
+        local reason="$cmd not found"
+        echo "$label: skip $reason"
+        reasons+=("$label: $reason")
+    fi
 }
 
 # --- .env present ---------------------------------------------------------
 env_path="$repo_root/.env"
 if [[ -f "$env_path" ]]; then
-  echo "env: pass"
+    echo "env: pass"
 else
-  reason=".env missing at $env_path"
-  echo "env: skip $reason"
-  reasons+=("env: $reason")
+    reason=".env missing at $env_path"
+    echo "env: skip $reason"
+    reasons+=("env: $reason")
 fi
 
 # --- cookies owned by current user ---------------------------------------
 cookies_dir="$repo_root/.test-cookies"
 me=$(id -un)
 if [[ ! -d "$cookies_dir" ]]; then
-  reason="$cookies_dir does not exist (run live tests once to create it)"
-  echo "cookies: skip $reason"
-  reasons+=("cookies: $reason")
-else
-  bad=$(find "$cookies_dir" -mindepth 1 -maxdepth 1 -exec stat -c '%U %n' {} \; 2>/dev/null \
-        | awk -v me="$me" '$1 != me { print $0 }')
-  if [[ -z "$bad" ]]; then
-    echo "cookies: pass"
-  else
-    reason="non-$me-owned files in $cookies_dir (Docker chown? run 'chown -R $me $cookies_dir' as root to fix)"
+    reason="$cookies_dir does not exist (run live tests once to create it)"
     echo "cookies: skip $reason"
-    {
-      echo "  offending entries:"
-      printf '%s\n' "$bad" | sed 's/^/    /'
-    } >&2
     reasons+=("cookies: $reason")
-  fi
+else
+    bad=$(find "$cookies_dir" -mindepth 1 -maxdepth 1 -exec stat -c '%U %n' {} \; 2>/dev/null |
+        awk -v me="$me" '$1 != me { print $0 }')
+    if [[ -z "$bad" ]]; then
+        echo "cookies: pass"
+    else
+        reason="non-$me-owned files in $cookies_dir (Docker chown? run 'chown -R $me $cookies_dir' as root to fix)"
+        echo "cookies: skip $reason"
+        {
+            echo "  offending entries:"
+            printf '%s\n' "$bad" | sed 's/^/    /'
+        } >&2
+        reasons+=("cookies: $reason")
+    fi
 fi
 
 # --- local tooling visibility --------------------------------------------
@@ -85,9 +85,9 @@ report_tool cargo-bloat cargo-bloat 1
 
 # --- summary + flag -------------------------------------------------------
 if [[ ${#reasons[@]} -gt 0 ]]; then
-  printf '%s\n' "${reasons[@]}" > "$flag"
-  echo
-  echo "live-phases: SKIP (${#reasons[@]} prereq failure(s)); flag=$flag" >&2
+    printf '%s\n' "${reasons[@]}" >"$flag"
+    echo
+    echo "live-phases: SKIP (${#reasons[@]} prereq failure(s)); flag=$flag" >&2
 else
-  rm -f "$flag"
+    rm -f "$flag"
 fi

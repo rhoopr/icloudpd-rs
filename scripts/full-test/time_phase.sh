@@ -38,13 +38,13 @@ set -u
 
 is_live=0
 if [[ "${1:-}" == "--live" ]]; then
-  is_live=1
-  shift
+    is_live=1
+    shift
 fi
 
 if [[ $# -lt 3 || "$2" != "--" ]]; then
-  echo "usage: $0 [--live] <phase-name> -- <command...>" >&2
-  exit 64
+    echo "usage: $0 [--live] <phase-name> -- <command...>" >&2
+    exit 64
 fi
 
 phase="$1"
@@ -63,64 +63,65 @@ mkdir -p "$log_dir"
 phase_log="$log_dir/full-test-$phase.log"
 
 run_command() {
-  if [[ "${KEI_FULLTEST_VERBOSE:-0}" == "1" ]]; then
-    "$@" 2>&1 | tee "$phase_log"
-    return "${PIPESTATUS[0]}"
-  fi
-
-  local progress_to_tty=0
-  if [[ -e /dev/tty ]] && { true > /dev/tty; } 2>/dev/null; then
-    progress_to_tty=1
-  fi
-
-  : > "$phase_log"
-  if [[ "$progress_to_tty" -eq 1 ]]; then
-    printf '[run] %s (log: %s)\n' "$phase" "$phase_log" > /dev/tty
-  else
-    printf '[run] %s (log: %s)\n' "$phase" "$phase_log" >&2
-  fi
-  "$@" > "$phase_log" 2>&1 &
-  local pid=$!
-  local start_s
-  start_s=$(date +%s)
-  local frame_index=0
-  local frames=('-' '\' '|' '/')
-
-  while kill -0 "$pid" 2>/dev/null; do
-    local now_s elapsed frame
-    now_s=$(date +%s)
-    elapsed=$(( now_s - start_s ))
-    frame="${frames[$(( frame_index % ${#frames[@]} ))]}"
-    if [[ "$progress_to_tty" -eq 1 ]]; then
-      printf '\r[%s] %s running %ss' "$frame" "$phase" "$elapsed" > /dev/tty
+    if [[ "${KEI_FULLTEST_VERBOSE:-0}" == "1" ]]; then
+        "$@" 2>&1 | tee "$phase_log"
+        return "${PIPESTATUS[0]}"
     fi
-    frame_index=$(( frame_index + 1 ))
-    sleep 0.2
-  done
 
-  wait "$pid"
-  local rc=$?
-  if [[ "$progress_to_tty" -eq 1 ]]; then
-    printf '\r%*s\r' 80 '' > /dev/tty
-  fi
-  return "$rc"
+    local progress_to_tty=0
+    if [[ -e /dev/tty ]] && { true >/dev/tty; } 2>/dev/null; then
+        progress_to_tty=1
+    fi
+
+    : >"$phase_log"
+    if [[ "$progress_to_tty" -eq 1 ]]; then
+        printf '[run] %s (log: %s)\n' "$phase" "$phase_log" >/dev/tty
+    else
+        printf '[run] %s (log: %s)\n' "$phase" "$phase_log" >&2
+    fi
+    "$@" >"$phase_log" 2>&1 &
+    local pid=$!
+    local start_s
+    start_s=$(date +%s)
+    local frame_index=0
+    local frames=('-' '\' '|' '/')
+
+    while kill -0 "$pid" 2>/dev/null; do
+        local now_s elapsed frame
+        now_s=$(date +%s)
+        elapsed=$((now_s - start_s))
+        frame="${frames[$((frame_index % ${#frames[@]}))]}"
+        if [[ "$progress_to_tty" -eq 1 ]]; then
+            printf '\r[%s] %s running %ss' "$frame" "$phase" "$elapsed" >/dev/tty
+        fi
+        frame_index=$((frame_index + 1))
+        sleep 0.2
+    done
+
+    wait "$pid"
+    local rc=$?
+    if [[ "$progress_to_tty" -eq 1 ]]; then
+        printf '\r%*s\r' 80 '' >/dev/tty
+    fi
+    return "$rc"
 }
 
 # --- Auto-skip path: live phase + a flag is set ---------------------------
 if [[ $is_live -eq 1 ]]; then
-  skip_status=""
-  skip_reason=""
-  if [[ -f "$skip_flag" ]]; then
-    skip_status="skipped"
-    skip_reason=$(tr '\n' ';' < "$skip_flag" | sed 's/;$//')
-  elif [[ -f "$rate_flag" ]]; then
-    skip_status="rate_limited"
-    if ! skip_reason=$(<"$rate_flag"); then
-      skip_reason="503 detected earlier this run"
+    skip_status=""
+    skip_reason=""
+    if [[ -f "$skip_flag" ]]; then
+        skip_status="skipped"
+        skip_reason=$(tr '\n' ';' <"$skip_flag" | sed 's/;$//')
+    elif [[ -f "$rate_flag" ]]; then
+        skip_status="rate_limited"
+        if ! skip_reason=$(<"$rate_flag"); then
+            skip_reason="503 detected earlier this run"
+        fi
     fi
-  fi
-  if [[ -n "$skip_status" ]]; then
-    skip_json=$(python3 - "$phase" "$skip_status" "$skip_reason" <<'PY'
+    if [[ -n "$skip_status" ]]; then
+        skip_json=$(
+            python3 - "$phase" "$skip_status" "$skip_reason" <<'PY'
 import json, sys
 phase, status, reason = sys.argv[1:4]
 print(json.dumps({
@@ -131,14 +132,14 @@ print(json.dumps({
     "reason": reason,
 }))
 PY
-)
-    (
-      flock 9
-      echo "$skip_json" >> "$current"
-    ) 9>"$lockfile"
-    printf '[%s] %s skipped (%s)\n' "$skip_status" "$phase" "$skip_reason" >&2
-    exit 0
-  fi
+        )
+        (
+            flock 9
+            echo "$skip_json" >>"$current"
+        ) 9>"$lockfile"
+        printf '[%s] %s skipped (%s)\n' "$skip_status" "$phase" "$skip_reason" >&2
+        exit 0
+    fi
 fi
 
 t0=$(date +%s.%N)
@@ -148,12 +149,12 @@ t1=$(date +%s.%N)
 
 # --- 503 detection: live phase only, after the run ------------------------
 if [[ $is_live -eq 1 && -f "$phase_log" ]]; then
-  if grep -Eq '503 Service (Temporarily )?Unavailable' "$phase_log"; then
-    if [[ ! -f "$rate_flag" ]]; then
-      echo "Apple 503 detected in phase $phase (log: $phase_log)" > "$rate_flag"
-      echo "*** Apple 503 detected in $phase -- downstream live phases will auto-skip ***" >&2
+    if grep -Eq '503 Service (Temporarily )?Unavailable' "$phase_log"; then
+        if [[ ! -f "$rate_flag" ]]; then
+            echo "Apple 503 detected in phase $phase (log: $phase_log)" >"$rate_flag"
+            echo "*** Apple 503 detected in $phase -- downstream live phases will auto-skip ***" >&2
+        fi
     fi
-  fi
 fi
 
 wall=$(python3 -c "print(round($t1 - $t0, 2))" 2>/dev/null || echo "0")
@@ -161,18 +162,19 @@ status="pass"
 [[ $rc -ne 0 ]] && status="fail"
 
 if [[ "$status" == "fail" ]]; then
-  fail_tail_lines="${KEI_FULLTEST_FAIL_TAIL_LINES:-80}"
-  {
-    echo
-    echo "[fail] $phase output tail (last $fail_tail_lines lines from $phase_log):"
-    tail -n "$fail_tail_lines" "$phase_log" 2>/dev/null || true
-    echo
-  } >&2
+    fail_tail_lines="${KEI_FULLTEST_FAIL_TAIL_LINES:-80}"
+    {
+        echo
+        echo "[fail] $phase output tail (last $fail_tail_lines lines from $phase_log):"
+        tail -n "$fail_tail_lines" "$phase_log" 2>/dev/null || true
+        echo
+    } >&2
 fi
 
 # Single python pass: extract every metric we care about, emit a JSON
 # fragment that the bash side merges into the final record.
-metrics_json=$(python3 - "$phase_log" <<'PY'
+metrics_json=$(
+    python3 - "$phase_log" <<'PY'
 import json, re, sys
 
 tests = 0
@@ -231,7 +233,8 @@ PY
 
 # Final record. Always include log_path so diff_runs.sh can surface it on
 # failure. Test count + parsed metrics are merged from the python output.
-final_json=$(python3 - "$phase" "$wall" "$rc" "$status" "$phase_log" "$metrics_json" <<'PY'
+final_json=$(
+    python3 - "$phase" "$wall" "$rc" "$status" "$phase_log" "$metrics_json" <<'PY'
 import json, sys
 phase, wall, rc, status, log_path, metrics_json = sys.argv[1:7]
 rec = {
@@ -249,16 +252,16 @@ PY
 # flock'd append: parallel phases (e.g. cargo build --release in
 # parallel with `just docker build`) both call time_phase.sh.
 (
-  flock 9
-  echo "$final_json" >> "$current"
+    flock 9
+    echo "$final_json" >>"$current"
 ) 9>"$lockfile"
 
 # Live status line on stderr.
 tests_count=$(printf '%s' "$metrics_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('tests',''))")
 if [[ -n "$tests_count" ]]; then
-  printf '[%s] %s in %ss (rc=%d, %s tests)\n' "$status" "$phase" "$wall" "$rc" "$tests_count" >&2
+    printf '[%s] %s in %ss (rc=%d, %s tests)\n' "$status" "$phase" "$wall" "$rc" "$tests_count" >&2
 else
-  printf '[%s] %s in %ss (rc=%d)\n' "$status" "$phase" "$wall" "$rc" >&2
+    printf '[%s] %s in %ss (rc=%d)\n' "$status" "$phase" "$wall" "$rc" >&2
 fi
 
 exit "$rc"

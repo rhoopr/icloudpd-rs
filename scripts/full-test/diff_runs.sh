@@ -22,8 +22,8 @@ baseline_n="${KEI_FULLTEST_BASELINE_N:-5}"
 mapfile -t recs < <(find "$runs_dir" -maxdepth 1 -name '*.json' -type f -printf '%f\n' | sort)
 
 if [[ ${#recs[@]} -eq 0 ]]; then
-  echo "(no run records found)" >&2
-  exit 1
+    echo "(no run records found)" >&2
+    exit 1
 fi
 
 current="$runs_dir/${recs[-1]}"
@@ -32,9 +32,9 @@ current="$runs_dir/${recs[-1]}"
 # last $baseline_n in Python.
 priors=()
 if [[ ${#recs[@]} -ge 2 ]]; then
-  for f in "${recs[@]:0:${#recs[@]}-1}"; do
-    priors+=("$runs_dir/$f")
-  done
+    for f in "${recs[@]:0:${#recs[@]}-1}"; do
+        priors+=("$runs_dir/$f")
+    done
 fi
 
 python3 - "$current" "$baseline_n" "${priors[@]}" <<'PY'
