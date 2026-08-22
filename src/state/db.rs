@@ -98,6 +98,13 @@ pub struct AlbumMembershipRecord {
     pub source: String,
 }
 
+/// Album and people rows for a bounded set of asset IDs in one library.
+#[derive(Debug, Default)]
+pub(crate) struct AssetGroupingRows {
+    pub(crate) albums: Vec<(String, String)>,
+    pub(crate) people: Vec<(String, String)>,
+}
+
 /// Scoped database-level `/changes/database` pre-check token.
 ///
 /// This is not a per-zone coverage token. The canonical JSON fields are
@@ -483,6 +490,17 @@ pub trait MembershipStore: Send + Sync {
         &self,
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError>;
+
+    async fn get_asset_groupings(
+        &self,
+        _library: &str,
+        _asset_ids: &[&str],
+    ) -> Result<AssetGroupingRows, StateError> {
+        Err(StateError::Invariant {
+            operation: "get_asset_groupings",
+            detail: "bounded asset grouping reads are not implemented by this state store".into(),
+        })
+    }
 
     async fn upsert_album_container(
         &self,
@@ -2657,6 +2675,61 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_asset_groupings(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<AssetGroupingRows, StateError> {
+        let library = library.to_owned();
+        let asset_ids = unique_sorted_strings(asset_ids);
+        if asset_ids.is_empty() {
+            return Ok(AssetGroupingRows::default());
+        }
+        self.with_conn("get_asset_groupings", move |conn| {
+            let placeholders = sqlite_placeholders(asset_ids.len());
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(asset_ids.len() + 1);
+            params.push(&library);
+            for asset_id in &asset_ids {
+                params.push(asset_id);
+            }
+
+            let album_sql = format!(
+                "SELECT asset_id, album_name FROM asset_albums \
+                 WHERE library = ? AND asset_id IN ({placeholders}) \
+                 ORDER BY asset_id, album_name"
+            );
+            let mut album_stmt = conn
+                .prepare(&album_sql)
+                .map_err(|e| StateError::query("get_asset_groupings", e))?;
+            let albums = album_stmt
+                .query_map(rusqlite::params_from_iter(params.iter().copied()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_asset_groupings", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_asset_groupings", e))?;
+
+            let people_sql = format!(
+                "SELECT asset_id, person_name FROM asset_people \
+                 WHERE library = ? AND asset_id IN ({placeholders}) \
+                 ORDER BY asset_id, person_name"
+            );
+            let mut people_stmt = conn
+                .prepare(&people_sql)
+                .map_err(|e| StateError::query("get_asset_groupings", e))?;
+            let people = people_stmt
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StateError::query("get_asset_groupings", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_asset_groupings", e))?;
+
+            Ok(AssetGroupingRows { albums, people })
+        })
+        .await
+    }
+
     pub(crate) async fn upsert_album_container(
         &self,
         library: &str,
@@ -4343,6 +4416,14 @@ impl MembershipStore for SqliteStateDb {
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
         SqliteStateDb::get_all_asset_people(self, library).await
+    }
+
+    async fn get_asset_groupings(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<AssetGroupingRows, StateError> {
+        SqliteStateDb::get_asset_groupings(self, library, asset_ids).await
     }
 
     async fn upsert_album_container(
@@ -8690,6 +8771,42 @@ mod tests {
         let shared = db.get_all_asset_albums("SharedSync-AB").await.unwrap();
         assert_eq!(primary, vec![("ID".into(), "Vacation".into())]);
         assert_eq!(shared, vec![("ID".into(), "Family".into())]);
+    }
+
+    #[tokio::test]
+    async fn get_asset_groupings_is_bounded_and_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (library, asset_id, album) in [
+            ("PrimarySync", "TARGET", "Vacation"),
+            ("PrimarySync", "OTHER", "Work"),
+            ("SharedSync-AB", "TARGET", "Family"),
+        ] {
+            db.add_asset_album(library, asset_id, album, "icloud")
+                .await
+                .unwrap();
+        }
+        {
+            let conn = db.acquire_lock("seed people").unwrap();
+            for (library, asset_id, person) in [
+                ("PrimarySync", "TARGET", "Alice"),
+                ("PrimarySync", "OTHER", "Bob"),
+                ("SharedSync-AB", "TARGET", "Casey"),
+            ] {
+                conn.execute(
+                    "INSERT INTO asset_people (library, asset_id, person_name) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![library, asset_id, person],
+                )
+                .unwrap();
+            }
+        }
+
+        let rows = db
+            .get_asset_groupings("PrimarySync", &["TARGET"])
+            .await
+            .unwrap();
+        assert_eq!(rows.albums, vec![("TARGET".into(), "Vacation".into())]);
+        assert_eq!(rows.people, vec![("TARGET".into(), "Alice".into())]);
     }
 
     #[tokio::test]

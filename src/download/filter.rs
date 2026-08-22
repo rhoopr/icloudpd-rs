@@ -506,23 +506,27 @@ pub(crate) struct AssetGroupings {
     pub(crate) people: FxHashMap<String, Vec<String>>,
 }
 
+impl AssetGroupings {
+    pub(super) fn metadata_payload(
+        &self,
+        asset_id: &str,
+        metadata: &crate::state::AssetMetadata,
+    ) -> MetadataPayload {
+        let albums = self.albums.get(asset_id).map(Vec::as_slice).unwrap_or(&[]);
+        let people = self.people.get(asset_id).map(Vec::as_slice).unwrap_or(&[]);
+        MetadataPayload::from_metadata(metadata).with_asset_groupings(albums, people)
+    }
+}
+
 fn build_payload(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> Arc<MetadataPayload> {
-    let albums = config
-        .asset_groupings
-        .albums
-        .get(asset.state_id())
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let people = config
-        .asset_groupings
-        .people
-        .get(asset.state_id())
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    Arc::new(MetadataPayload::from_metadata(asset.metadata()).with_asset_groupings(albums, people))
+    Arc::new(
+        config
+            .asset_groupings
+            .metadata_payload(asset.state_id(), asset.metadata()),
+    )
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.

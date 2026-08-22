@@ -246,8 +246,10 @@ deciding whether unchanged media needs downloading. A failed commit preserves
 the provider checkpoint. Queued rewrites drain once per cycle, after every
 producer has finished, so a single writer owns each file. Read-only runs never
 drain. Only that drain retires a marker on success, because it writes the file
-from the same row it then clears. A completed download writes the snapshot it
-was planned from, so it records a marker on failure but never retires one.
+from the same row it then clears. Each bounded rewrite batch loads current album
+and people rows for its library-scoped asset IDs. A grouping-read failure leaves
+the affected markers pending. A completed download writes the snapshot it was
+planned from, so it records a marker on failure but never retires one.
 
 XMP sidecars record the exact properties that kei writes in the kei namespace.
 A later rewrite deletes a cleared property only when that marker proves kei

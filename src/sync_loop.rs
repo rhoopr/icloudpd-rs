@@ -4971,6 +4971,14 @@ mod tests {
             self.inner.get_all_asset_people(library).await
         }
 
+        async fn get_asset_groupings(
+            &self,
+            library: &str,
+            asset_ids: &[&str],
+        ) -> Result<state::db::AssetGroupingRows, state::error::StateError> {
+            self.inner.get_asset_groupings(library, asset_ids).await
+        }
+
         async fn upsert_album_container(
             &self,
             library: &str,
