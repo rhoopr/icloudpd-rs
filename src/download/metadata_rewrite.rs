@@ -5,6 +5,7 @@
 //! that transfer: embed writes before publish, sidecar writes after publish,
 //! metadata-only retry marker tagging, and pending retry marker draining.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,9 +14,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::download::filter::MetadataPayload;
 use crate::icloud::photos::PhotoAsset;
-use crate::state::{MetadataRewriteStore, VersionSizeKey};
+use crate::state::{MembershipStore, MetadataRewriteStore, VersionSizeKey};
 
-use super::{DownloadConfig, DownloadContext};
+use super::{AssetGroupings, DownloadConfig, DownloadContext};
 
 bitflags::bitflags! {
     /// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
@@ -51,6 +52,10 @@ impl MetadataFlags {
 
     pub(super) fn has_any_write(self) -> bool {
         !self.is_empty()
+    }
+
+    fn uses_xmp_groupings(self) -> bool {
+        self.intersects(Self::EMBED_XMP | Self::XMP_SIDECAR)
     }
 }
 
@@ -383,9 +388,51 @@ pub(super) async fn run_pending<D>(
     shutdown_token: &CancellationToken,
 ) -> RewritePass
 where
-    D: MetadataRewriteStore + ?Sized,
+    D: MembershipStore + MetadataRewriteStore + ?Sized,
 {
     run_pending_page(db, metadata_flags, temp_suffix, shutdown_token, None, 0).await
+}
+
+async fn load_pending_groupings<D>(
+    db: &D,
+    pending: &[crate::state::types::AssetRecord],
+) -> (HashMap<String, AssetGroupings>, HashSet<String>)
+where
+    D: MembershipStore + ?Sized,
+{
+    let mut ids_by_library: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for record in pending {
+        ids_by_library
+            .entry(record.library.as_ref())
+            .or_default()
+            .push(record.id.as_ref());
+    }
+
+    let mut groupings_by_library = HashMap::with_capacity(ids_by_library.len());
+    let mut failed_libraries = HashSet::new();
+    for (library, asset_ids) in ids_by_library {
+        match db.get_asset_groupings(library, &asset_ids).await {
+            Ok(rows) => {
+                let mut groupings = AssetGroupings::default();
+                for (asset_id, album) in rows.albums {
+                    groupings.albums.entry(asset_id).or_default().push(album);
+                }
+                for (asset_id, person) in rows.people {
+                    groupings.people.entry(asset_id).or_default().push(person);
+                }
+                groupings_by_library.insert(library.to_owned(), groupings);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    library,
+                    "Failed to load asset groupings for metadata rewrites; leaving markers for retry"
+                );
+                failed_libraries.insert(library.to_owned());
+            }
+        }
+    }
+    (groupings_by_library, failed_libraries)
 }
 
 /// Drops a recorded hash that a rewrite may already have invalidated. Keeping a
@@ -423,7 +470,7 @@ pub(super) async fn run_pending_page<D>(
     offset: usize,
 ) -> RewritePass
 where
-    D: MetadataRewriteStore + ?Sized,
+    D: MembershipStore + MetadataRewriteStore + ?Sized,
 {
     let pending = match db
         .get_pending_metadata_rewrites_page(library_scope, offset, METADATA_REWRITE_BATCH)
@@ -441,6 +488,11 @@ where
     if pending.is_empty() {
         return RewritePass::default();
     }
+    let (groupings_by_library, grouping_read_failures) = if metadata_flags.uses_xmp_groupings() {
+        load_pending_groupings(db, &pending).await
+    } else {
+        (HashMap::new(), HashSet::new())
+    };
     let pending_count = pending.len();
     tracing::info!(
         count = pending_count,
@@ -456,6 +508,10 @@ where
             deferred += pending_count - idx;
             tracing::info!("Shutdown requested, deferring remaining metadata rewrites");
             break;
+        }
+        if grouping_read_failures.contains(record.library.as_ref()) {
+            errored += 1;
+            continue;
         }
         let Some(local_path) = record.local_path.as_deref() else {
             continue;
@@ -482,7 +538,14 @@ where
             }
         }
 
-        let payload = Arc::new(MetadataPayload::from_metadata(&record.metadata));
+        let payload = Arc::new(
+            groupings_by_library
+                .get(record.library.as_ref())
+                .map_or_else(
+                    || MetadataPayload::from_metadata(&record.metadata),
+                    |groupings| groupings.metadata_payload(&record.id, &record.metadata),
+                ),
+        );
         let created_local = record.metadata.capture_local(record.created_at);
         let version_size = record.version_size;
 
@@ -1127,6 +1190,211 @@ mod tests {
         // the downloaded state; AssetStatus is referenced here for
         // documentation and as an import check.
         let _ = AssetStatus::Downloaded;
+    }
+
+    #[cfg(feature = "xmp")]
+    fn grouped_xmp(meta: &xmp_toolkit::XmpMeta) -> (Vec<String>, Vec<String>) {
+        let keywords: Vec<String> = meta
+            .property_array(xmp_toolkit::xmp_ns::DC, "subject")
+            .map(|value| value.value)
+            .collect();
+        let people: Vec<String> = meta
+            .property_array(xmp_toolkit::xmp_ns::IPTC_EXT, "PersonInImage")
+            .map(|value| value.value)
+            .collect();
+        (keywords, people)
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_pending_matches_normal_grouped_xmp_payload() {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+        use xmp_toolkit::{OpenFileOptions, XmpFile};
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("grouped.jpg");
+        std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
+        let checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+        let metadata = AssetMetadata {
+            keywords: Some(r#"["beach"]"#.into()),
+            metadata_hash: Some("grouped-hash".into()),
+            ..AssetMetadata::default()
+        };
+        let record = crate::test_helpers::TestAssetRecord::new("GROUPED")
+            .filename("grouped.jpg")
+            .metadata(metadata)
+            .build();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "GROUPED",
+            "original",
+            &photo_path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "GROUPED", "original")
+            .await
+            .unwrap();
+        db.add_asset_album("PrimarySync", "GROUPED", "Vacation", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("PrimarySync", "GROUPED", "beach", "icloud")
+            .await
+            .unwrap();
+        {
+            let conn = db.acquire_lock("seed person").unwrap();
+            conn.execute(
+                "INSERT INTO asset_people (library, asset_id, person_name) \
+                 VALUES ('PrimarySync', 'GROUPED', 'Alice')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let grouping_rows = db
+            .get_asset_groupings("PrimarySync", &["GROUPED"])
+            .await
+            .unwrap();
+        let mut normal_groupings = AssetGroupings::default();
+        for (asset_id, album) in grouping_rows.albums {
+            normal_groupings
+                .albums
+                .entry(asset_id)
+                .or_default()
+                .push(album);
+        }
+        for (asset_id, person) in grouping_rows.people {
+            normal_groupings
+                .people
+                .entry(asset_id)
+                .or_default()
+                .push(person);
+        }
+        let normal_payload = normal_groupings.metadata_payload("GROUPED", &record.metadata);
+        assert_eq!(normal_payload.keywords, vec!["beach", "Vacation"]);
+        assert_eq!(normal_payload.people, vec!["Alice"]);
+
+        let normal_path = dir.path().join("normal.jpg");
+        std::fs::write(&normal_path, minimal_jpeg_bytes()).unwrap();
+        let normal_outcome = write_download_metadata(MetadataWriteRequest {
+            final_path: &normal_path,
+            embed_path: Some(&normal_path),
+            sidecar_path: Some(&normal_path),
+            payload: Arc::new(normal_payload),
+            created_local: record.metadata.capture_local(record.created_at),
+            flags: MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+            temp_suffix: ".meta-tmp",
+        })
+        .await;
+        assert!(!normal_outcome.any_failed());
+
+        let mut normal_file = XmpFile::new().unwrap();
+        normal_file
+            .open_file(&normal_path, OpenFileOptions::default().for_read())
+            .unwrap();
+        let normal_embedded = normal_file.xmp().expect("normal embedded XMP");
+        let normal_sidecar = std::fs::read_to_string(dir.path().join("normal.jpg.xmp"))
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let pass = run_pending(
+            &db,
+            MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(pass.applied, 1);
+
+        let mut embedded_file = XmpFile::new().unwrap();
+        embedded_file
+            .open_file(&photo_path, OpenFileOptions::default().for_read())
+            .unwrap();
+        assert_eq!(
+            grouped_xmp(&embedded_file.xmp().expect("rewritten embedded XMP")),
+            grouped_xmp(&normal_embedded)
+        );
+
+        let sidecar = std::fs::read_to_string(dir.path().join("grouped.jpg.xmp"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(grouped_xmp(&sidecar), grouped_xmp(&normal_sidecar));
+        assert_eq!(
+            grouped_xmp(&sidecar),
+            (
+                vec!["beach".into(), "Vacation".into()],
+                vec!["Alice".into()]
+            )
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn grouping_read_failure_keeps_marker_without_writing() {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("grouping_read_failure.jpg");
+        let before = minimal_jpeg_bytes();
+        std::fs::write(&photo_path, &before).unwrap();
+        let checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("GROUPING_READ_FAILURE")
+            .filename("grouping_read_failure.jpg")
+            .metadata(AssetMetadata {
+                keywords: Some(r#"["beach"]"#.into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "GROUPING_READ_FAILURE",
+            "original",
+            &photo_path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "GROUPING_READ_FAILURE", "original")
+            .await
+            .unwrap();
+        db.acquire_lock("break grouping read")
+            .unwrap()
+            .execute("DROP TABLE asset_people", [])
+            .unwrap();
+
+        let pass = run_pending(
+            &db,
+            MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(pass.failed, 1);
+        assert_eq!(std::fs::read(&photo_path).unwrap(), before);
+        assert!(!dir.path().join("grouping_read_failure.jpg.xmp").exists());
+        assert_eq!(db.get_pending_metadata_rewrites(1).await.unwrap().len(), 1);
     }
 
     /// If the on-disk file has vanished between tagging and the rewrite
