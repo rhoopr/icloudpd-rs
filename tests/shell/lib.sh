@@ -134,7 +134,7 @@ kei_scratch_dir() {
 }
 
 kei_release_bin() {
-    printf '%s/target/release/kei' "$PROJECT_DIR"
+    printf '%s/release/kei' "$("$PROJECT_DIR/scripts/full-test/cargo_target_dir.sh")"
 }
 
 # Build if missing or older than Cargo.toml/Cargo.lock. The stat short-

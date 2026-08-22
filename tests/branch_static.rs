@@ -309,6 +309,59 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_release_artifacts_follow_cargo_target_dir() {
+    let repo = repo_path("");
+    let helper = repo_path("scripts/full-test/cargo_target_dir.sh");
+
+    let default = Command::new(&helper)
+        .current_dir("/")
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("run cargo target directory helper without override");
+    assert!(default.status.success());
+    assert_eq!(
+        command_text(&default).trim(),
+        repo.join("target").display().to_string()
+    );
+
+    let relative = Command::new(&helper)
+        .current_dir("/")
+        .env("CARGO_TARGET_DIR", "target/full-test")
+        .output()
+        .expect("run cargo target directory helper with relative override");
+    assert!(relative.status.success());
+    assert_eq!(
+        command_text(&relative).trim(),
+        repo.join("target/full-test").display().to_string()
+    );
+
+    let absolute_dir = repo.join("target/full-test-absolute");
+    let absolute = Command::new(&helper)
+        .current_dir("/")
+        .env("CARGO_TARGET_DIR", &absolute_dir)
+        .output()
+        .expect("run cargo target directory helper with absolute override");
+    assert!(absolute.status.success());
+    assert_eq!(
+        command_text(&absolute).trim(),
+        absolute_dir.display().to_string()
+    );
+
+    for consumer in [
+        "scripts/full-test/run_release_archive_smoke.sh",
+        "scripts/full-test/run_live_smokes.sh",
+        "tests/shell/lib.sh",
+        "justfile",
+    ] {
+        assert!(
+            repo_file(consumer).contains("cargo_target_dir.sh"),
+            "{consumer} must resolve release artifacts through cargo_target_dir.sh"
+        );
+    }
+}
+
 #[test]
 fn full_test_run_start_metadata_is_stable_until_finalize() {
     let begin = repo_file("scripts/full-test/begin_run.sh");

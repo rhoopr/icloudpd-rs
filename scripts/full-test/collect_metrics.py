@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Collect repo-level metrics for /full-test runs.
 
-Run from the kei repo root after the build + docker phases have
-completed (so target/release/kei and the kei:dev image both exist). Emits a
-JSON object on stdout that finalize_run.sh embeds in the run record.
+Run from the kei repo root after the build + docker phases have completed.
+The release binary under Cargo's target directory and the kei:dev image must
+both exist. Emits a JSON object on stdout that finalize_run.sh embeds in the
+run record.
 
 Metrics:
 - binary_mb           Release binary size, MB (1dp). Bloat detector.
@@ -40,6 +41,11 @@ def file_size_mb(path: Path) -> float | None:
     if not path.exists():
         return None
     return round(path.stat().st_size / 1048576, 1)
+
+
+def cargo_target_dir(repo: Path) -> Path:
+    target = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
+    return target if target.is_absolute() else repo / target
 
 
 def docker_image_size_mb(tag: str) -> float | None:
@@ -159,7 +165,7 @@ def main() -> int:
     repo = repo_root()
     os.chdir(repo)
     metrics = {
-        "binary_mb": file_size_mb(repo / "target" / "release" / "kei"),
+        "binary_mb": file_size_mb(cargo_target_dir(repo) / "release" / "kei"),
         "docker_image_mb": docker_image_size_mb("kei:dev"),
         "src_unwrap_expect": src_unwrap_expect(repo),
         "src_allow_attrs": src_allow_attrs(repo),

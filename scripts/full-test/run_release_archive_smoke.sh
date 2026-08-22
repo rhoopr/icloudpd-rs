@@ -18,7 +18,8 @@ cd "$repo_root"
 
 target=$(rustc -vV | awk '/^host:/ { print $2 }')
 version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
-binary="$repo_root/target/release/kei"
+target_dir=$(scripts/full-test/cargo_target_dir.sh)
+binary="$target_dir/release/kei"
 
 if [[ ! -x "$binary" ]]; then
   echo "run_release_archive_smoke: missing release binary at $binary" >&2
@@ -36,7 +37,7 @@ rm -rf "$work"
 mkdir -p "$work/extract" "$work/data"
 
 archive="$work/kei-$target.tar.gz"
-tar -C "$repo_root/target/release" -czf "$archive" kei
+tar -C "$target_dir/release" -czf "$archive" kei
 sha256sum "$archive" > "$work/SHA256SUMS.txt"
 
 tar -C "$work/extract" -xzf "$archive"
