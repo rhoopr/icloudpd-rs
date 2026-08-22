@@ -246,6 +246,24 @@ recovery work needed after that checkpoint is durable.
 
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
+`METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
+current binary. Schema v18 stores per-asset revisions and per-library active
+and pending repair state. A normal sync hydrates stale downloaded rows in
+bounded provider-lookup batches, independent of album, media, and date filters.
+Only an identity that cannot be resolved from durable asset/master evidence
+uses the bounded legacy hydration path. Unselected libraries keep separate
+pending state and do not force work in selected libraries.
+
+The watch pre-check includes only libraries with pending capture or rewrite
+work, even when iCloud reports no provider changes. A capture refresh preserves
+download status, paths, checksums, and media bytes. It stores corrected
+catalogue metadata, the current revision, and any configured rewrite marker
+before the library revision can become active. Lookup or state failures leave
+the row stale, report the remaining work, and preserve the affected provider
+checkpoint. A library promotes its active revision only when every live
+downloaded row is current. Persisted rewrite markers may drain later because
+they are durable recovery evidence.
+
 Metadata failure markers must survive so a later run can retry metadata
 without downloading the media again. Full enumeration, single-pass incremental,
 and collecting incremental sync all commit changed catalogue metadata and its
@@ -309,6 +327,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
+| `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
 ## Change-impact checklist
 

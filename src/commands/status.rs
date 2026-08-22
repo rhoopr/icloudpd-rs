@@ -61,6 +61,30 @@ pub(crate) async fn run_status(
     {
         println!("Last recovery action: {action}");
     }
+    if !summary.metadata_capture.is_empty() {
+        println!("Metadata capture:");
+        for capture in &summary.metadata_capture {
+            if let Some(pending) = capture.pending_revision {
+                println!(
+                    "  {}: revision {} -> {}; {} processed, {} failed, {} remaining",
+                    capture.library,
+                    capture.active_revision,
+                    pending,
+                    capture.processed_assets,
+                    capture.failed_assets,
+                    capture.remaining_assets
+                );
+                if let Some(error) = &capture.last_error {
+                    println!("    Last error: {error}");
+                }
+            } else {
+                println!(
+                    "  {}: revision {} current",
+                    capture.library, capture.active_revision
+                );
+            }
+        }
+    }
     println!("{}", backup_status_line(&summary));
     println!();
 
@@ -196,6 +220,34 @@ fn backup_status_line(summary: &state::types::SyncSummary) -> String {
         reasons.push(format!(
             "{} awaiting provider verification",
             count_phrase(summary.awaiting_provider_verification, "asset")
+        ));
+    }
+    let metadata_capture_remaining: u64 = summary
+        .metadata_capture
+        .iter()
+        .map(|capture| capture.remaining_assets)
+        .sum();
+    if metadata_capture_remaining > 0 {
+        reasons.push(format!(
+            "{} metadata capture {}",
+            count_phrase(metadata_capture_remaining, "asset"),
+            remain_verb(metadata_capture_remaining)
+        ));
+    }
+    let metadata_capture_failures: u64 = summary
+        .metadata_capture
+        .iter()
+        .map(|capture| capture.failed_assets)
+        .sum();
+    if metadata_capture_failures > 0 {
+        reasons.push(format!(
+            "{} metadata capture failure{} recorded",
+            metadata_capture_failures,
+            if metadata_capture_failures == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
     if summary.last_inventory_drop_detected {

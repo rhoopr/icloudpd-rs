@@ -7,6 +7,11 @@ use chrono::{DateTime, FixedOffset, Local, Utc};
 
 use crate::types::AssetVersionSize;
 
+/// Revision of the catalogue metadata semantics produced by the current
+/// binary. Bump this when decoder or capture behavior changes in a way that
+/// requires existing catalogue rows to be hydrated again.
+pub(crate) const METADATA_CAPTURE_REVISION: i64 = 1;
+
 /// Version size key for state tracking.
 ///
 /// This is a 1-byte enum representing the version size, saving ~23 bytes
@@ -502,6 +507,39 @@ pub struct SyncRunStats {
     pub inventory_drop_library: Option<String>,
 }
 
+/// One provider version used to identify the correct child of a legacy
+/// master-keyed catalogue row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataCaptureVersionEvidence {
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) checksum: String,
+    pub(crate) size_bytes: u64,
+}
+
+/// One stale catalogue identity selected for bounded provider hydration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataCaptureCandidate {
+    pub(crate) library: String,
+    pub(crate) asset_id: String,
+    pub(crate) master_record_name: String,
+    pub(crate) asset_record_name: Option<String>,
+    pub(crate) versions: Vec<MetadataCaptureVersionEvidence>,
+}
+
+/// Durable metadata-capture state for one provider library.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MetadataCaptureStatus {
+    pub library: String,
+    pub active_revision: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_revision: Option<i64>,
+    pub processed_assets: u64,
+    pub failed_assets: u64,
+    pub remaining_assets: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 /// Summary of the current state database.
 #[derive(Debug, Clone)]
 pub struct SyncSummary {
@@ -559,6 +597,8 @@ pub struct SyncSummary {
     pub last_inventory_drop_current_total: Option<u64>,
     /// Library where the latest inventory warning was observed.
     pub last_inventory_drop_library: Option<String>,
+    /// Per-library metadata-capture revision and repair progress.
+    pub metadata_capture: Vec<MetadataCaptureStatus>,
 }
 
 #[cfg(test)]

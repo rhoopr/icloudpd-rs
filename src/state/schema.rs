@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 17;
+pub(crate) const SCHEMA_VERSION: i32 = 18;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -479,6 +479,34 @@ CREATE TABLE IF NOT EXISTS legacy_master_state_owners (
 );
 ";
 
+/// V18 metadata-capture revisions and per-library repair state.
+///
+/// Existing assets intentionally receive no row in
+/// `asset_metadata_capture_revisions`; absence is durable evidence that the
+/// catalogue metadata predates the current capture semantics.
+const SCHEMA_V18: &str = r"
+CREATE TABLE IF NOT EXISTS asset_metadata_capture_revisions (
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (library, asset_id)
+);
+
+CREATE TABLE IF NOT EXISTS metadata_capture_state (
+    library TEXT PRIMARY KEY NOT NULL,
+    active_revision INTEGER NOT NULL DEFAULT 0,
+    pending_revision INTEGER,
+    processed_assets INTEGER NOT NULL DEFAULT 0,
+    failed_assets INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_metadata_capture_revision
+    ON asset_metadata_capture_revisions (library, revision);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -633,6 +661,7 @@ fn migrate_to_version(
         15 => conn.execute_batch(SCHEMA_V15)?,
         16 => conn.execute_batch(SCHEMA_V16)?,
         17 => conn.execute_batch(SCHEMA_V17)?,
+        18 => conn.execute_batch(SCHEMA_V18)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1901,6 +1930,47 @@ mod tests {
             assert!(column_exists(&conn, "legacy_master_state_owners", column).unwrap());
         }
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v18_creates_metadata_capture_revision_state_without_backfill() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=17 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, \
+                created_at, size_bytes, media_type, status, last_seen_at) \
+             VALUES ('PrimarySync', 'legacy', 'original', 'checksum', 'legacy.jpg', \
+                1, 10, 'photo', 'downloaded', 1)",
+            [],
+        )
+        .unwrap();
+        set_schema_version(&conn, 17).unwrap();
+
+        migrate(&conn).unwrap();
+
+        for table in ["asset_metadata_capture_revisions", "metadata_capture_state"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing {table}");
+        }
+        let revisions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_metadata_capture_revisions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            revisions, 0,
+            "pre-v18 catalogue rows must remain visibly stale"
+        );
     }
 
     #[test]

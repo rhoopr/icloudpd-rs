@@ -1322,6 +1322,7 @@ mod tests {
             last_inventory_drop_previous_total: None,
             last_inventory_drop_current_total: None,
             last_inventory_drop_library: None,
+            metadata_capture: Vec::new(),
         }
     }
 

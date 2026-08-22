@@ -82,7 +82,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 17;
+const HELPER_SCHEMA_VERSION: i32 = 18;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -265,6 +265,27 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             PRIMARY KEY (library, master_record_name)
         );
 
+        CREATE TABLE IF NOT EXISTS asset_metadata_capture_revisions (
+            library TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (library, asset_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS metadata_capture_state (
+            library TEXT PRIMARY KEY NOT NULL,
+            active_revision INTEGER NOT NULL DEFAULT 0,
+            pending_revision INTEGER,
+            processed_assets INTEGER NOT NULL DEFAULT 0,
+            failed_assets INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_asset_metadata_capture_revision
+            ON asset_metadata_capture_revisions (library, revision);
+
         CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
             provider TEXT NOT NULL,
             account TEXT NOT NULL,
@@ -310,7 +331,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 17). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 18). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -328,7 +349,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 17;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 18;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -398,7 +419,7 @@ friendly = false
 
     let body = std::fs::read_to_string(&report_path).expect("sync_report.json");
     let json: serde_json::Value = serde_json::from_str(&body).expect("valid report JSON");
-    assert_eq!(json["version"], "2", "schema version");
+    assert_eq!(json["version"], "3", "schema version");
     assert!(json["kei_version"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(
         json["timestamp"]
@@ -1661,6 +1682,13 @@ fn status_shows_safe_backup_summary_after_clean_sync() {
         None,
         None,
     );
+    conn.execute(
+        "INSERT INTO asset_metadata_capture_revisions \
+            (library, asset_id, revision, updated_at) \
+         VALUES ('PrimarySync', 'a1', 1, ?1)",
+        [1_700_000_000_i64],
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO sync_runs (
             started_at, completed_at, status, assets_seen, assets_downloaded,
@@ -3771,6 +3799,18 @@ fn behavioral_helper_carries_every_migrated_column() {
         has_legacy_master_state_owners,
         "v17 table legacy_master_state_owners must exist in the behavioral helper's DDL"
     );
+
+    for table in ["asset_metadata_capture_revisions", "metadata_capture_state"] {
+        let exists: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?1")
+            .unwrap()
+            .exists([table])
+            .unwrap();
+        assert!(
+            exists,
+            "v18 table {table} must exist in the behavioral helper's DDL"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
