@@ -651,6 +651,7 @@ struct IinfLayout {
     max_item_id: u32,
     xmp_item_ids: Vec<u32>,
     exif_item_ids: Vec<u32>,
+    tone_map_item_ids: Vec<u32>,
     item_ids: Vec<u32>,
 }
 
@@ -806,6 +807,7 @@ fn parse_iinf(bytes: &[u8], iinf: RawBox) -> Result<IinfLayout, HeifError> {
     let mut max_item_id = 0u32;
     let mut xmp_item_ids = Vec::new();
     let mut exif_item_ids = Vec::new();
+    let mut tone_map_item_ids = Vec::new();
     let mut item_ids = HashSet::with_capacity(entries.len());
     for entry in entries {
         if entry.kind != *b"infe" {
@@ -823,6 +825,9 @@ fn parse_iinf(bytes: &[u8], iinf: RawBox) -> Result<IinfLayout, HeifError> {
         if item_type == Some(*b"Exif") {
             exif_item_ids.push(item_id);
         }
+        if item_type == Some(*b"tmap") {
+            tone_map_item_ids.push(item_id);
+        }
     }
     Ok(IinfLayout {
         version,
@@ -831,6 +836,7 @@ fn parse_iinf(bytes: &[u8], iinf: RawBox) -> Result<IinfLayout, HeifError> {
         max_item_id,
         xmp_item_ids,
         exif_item_ids,
+        tone_map_item_ids,
         item_ids: item_ids.into_iter().collect(),
     })
 }
@@ -1595,6 +1601,42 @@ fn select_exif_item_id(
     }
 }
 
+/// Encode one `cdsc` reference from a descriptive item to the images it
+/// describes. `version` is the enclosing `iref` version, which fixes the
+/// item-id width at 16 or 32 bits.
+fn cdsc_body(version: u8, from_item_id: u32, to_item_ids: &[u32]) -> Result<Vec<u8>, HeifError> {
+    let count = u16::try_from(to_item_ids.len())
+        .map_err(|_| invalid_layout("cdsc names too many images"))?;
+    if count == 0 {
+        return Err(invalid_layout("cdsc names no image"));
+    }
+    let mut body = Vec::new();
+    match version {
+        0 => {
+            let from = u16::try_from(from_item_id).map_err(|_| HeifError::ValueOverflow {
+                field: "16-bit cdsc source item id",
+            })?;
+            body.extend_from_slice(&from.to_be_bytes());
+            body.extend_from_slice(&count.to_be_bytes());
+            for to_item_id in to_item_ids {
+                let to = u16::try_from(*to_item_id).map_err(|_| HeifError::ValueOverflow {
+                    field: "16-bit cdsc target item id",
+                })?;
+                body.extend_from_slice(&to.to_be_bytes());
+            }
+        }
+        1 => {
+            body.extend_from_slice(&from_item_id.to_be_bytes());
+            body.extend_from_slice(&count.to_be_bytes());
+            for to_item_id in to_item_ids {
+                body.extend_from_slice(&to_item_id.to_be_bytes());
+            }
+        }
+        _ => return Err(invalid_layout("unsupported iref version")),
+    }
+    Ok(body)
+}
+
 #[allow(
     clippy::indexing_slicing,
     reason = "The raw-box parser and version-specific size checks prove every iref child field before direct access."
@@ -1603,7 +1645,7 @@ fn append_cdsc_reference(
     bytes: &[u8],
     iref: RawBox,
     xmp_item_id: u32,
-    primary_item_id: u32,
+    described_item_ids: &[u32],
     known_item_ids: &[u32],
 ) -> Result<Vec<u8>, HeifError> {
     let body = &bytes[iref.body_start()..iref.end()];
@@ -1677,56 +1719,37 @@ fn append_cdsc_reference(
         }
     }
     let mut new_body = body.to_vec();
-    let mut cdsc_body = Vec::new();
-    match version {
-        0 => {
-            let xmp_item_id = u16::try_from(xmp_item_id).map_err(|_| HeifError::ValueOverflow {
-                field: "16-bit cdsc source item id",
-            })?;
-            let primary_item_id =
-                u16::try_from(primary_item_id).map_err(|_| HeifError::ValueOverflow {
-                    field: "16-bit cdsc target item id",
-                })?;
-            cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
-            cdsc_body.extend_from_slice(&1u16.to_be_bytes());
-            cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
-        }
-        1 => {
-            cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
-            cdsc_body.extend_from_slice(&1u16.to_be_bytes());
-            cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
-        }
-        _ => return Err(invalid_layout("unsupported iref version")),
-    }
-    new_body.extend_from_slice(&box_with_body(*b"cdsc", &cdsc_body)?);
+    new_body.extend_from_slice(&box_with_body(
+        *b"cdsc",
+        &cdsc_body(version, xmp_item_id, described_item_ids)?,
+    )?);
     box_with_body(iref.kind, &new_body)
 }
 
 /// Build a fresh `iref` box carrying a single `cdsc` reference from the new XMP
-/// item to the primary image. Used when a file has no `iref` of its own so
+/// item to the images it describes. Used when a file has no `iref` of its own so
 /// insertion can still associate the descriptive XMP with the image, the way
 /// Apple's own writer does, rather than refusing the file and leaving a retry
 /// marker that never resolves. Version 0 encodes 16-bit ids; version 1 is used
-/// when either id exceeds 16 bits.
-fn synthesise_cdsc_iref(xmp_item_id: u32, primary_item_id: u32) -> Result<Vec<u8>, HeifError> {
-    let mut cdsc_body = Vec::new();
-    let version = if xmp_item_id <= u32::from(u16::MAX) && primary_item_id <= u32::from(u16::MAX) {
-        let xmp_item_id = u16::try_from(xmp_item_id)
-            .map_err(|_| invalid_layout("XMP item ID does not fit iref version 0"))?;
-        let primary_item_id = u16::try_from(primary_item_id)
-            .map_err(|_| invalid_layout("primary item ID does not fit iref version 0"))?;
-        cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
-        cdsc_body.extend_from_slice(&1u16.to_be_bytes());
-        cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
+/// when any id exceeds 16 bits.
+fn synthesise_cdsc_iref(
+    xmp_item_id: u32,
+    described_item_ids: &[u32],
+) -> Result<Vec<u8>, HeifError> {
+    let version = if xmp_item_id <= u32::from(u16::MAX)
+        && described_item_ids
+            .iter()
+            .all(|item_id| *item_id <= u32::from(u16::MAX))
+    {
         0u8
     } else {
-        cdsc_body.extend_from_slice(&xmp_item_id.to_be_bytes());
-        cdsc_body.extend_from_slice(&1u16.to_be_bytes());
-        cdsc_body.extend_from_slice(&primary_item_id.to_be_bytes());
         1u8
     };
     let mut body = vec![version, 0, 0, 0];
-    body.extend_from_slice(&box_with_body(*b"cdsc", &cdsc_body)?);
+    body.extend_from_slice(&box_with_body(
+        *b"cdsc",
+        &cdsc_body(version, xmp_item_id, described_item_ids)?,
+    )?);
     box_with_body(*b"iref", &body)
 }
 
@@ -2137,6 +2160,13 @@ pub(crate) fn rewrite_xmp<W: Write>(
         ));
     }
     ensure_insertion_layout(input)?;
+    // An HDR capture from iPhone 15 onward carries a `tmap` tone-mapped image
+    // alongside the primary, and Apple names both from every descriptive
+    // reference it writes. A description bound to the primary alone stops Apple
+    // Preview showing the gain map, which is the defect ExifTool 13.09 fixed.
+    let described_item_ids: Vec<u32> = std::iter::once(primary_item_id)
+        .chain(parse_iinf(input, iinf)?.tone_map_item_ids)
+        .collect();
     let new_item_id = max_item_id
         .checked_add(1)
         .ok_or_else(|| invalid_layout("no free HEIC item id remains"))?;
@@ -2148,10 +2178,16 @@ pub(crate) fn rewrite_xmp<W: Write>(
     let new_iinf = append_iinf_entry(input, iinf, iinf_count_pos, iinf_count_size, new_item_id)?;
     let (new_iref, old_iref_size) = match iref {
         Some(iref) => (
-            append_cdsc_reference(input, iref, new_item_id, primary_item_id, &iinf_item_ids)?,
+            append_cdsc_reference(
+                input,
+                iref,
+                new_item_id,
+                &described_item_ids,
+                &iinf_item_ids,
+            )?,
             iref.size,
         ),
-        None => (synthesise_cdsc_iref(new_item_id, primary_item_id)?, 0),
+        None => (synthesise_cdsc_iref(new_item_id, &described_item_ids)?, 0),
     };
     let old_meta_len = meta.size;
     let xmp_length =
@@ -3897,6 +3933,8 @@ mod tests {
         )
     }
 
+    /// Every `cdsc` edge as a `(descriptive item, described image)` pair. A
+    /// reference may name several images, and each one becomes its own pair.
     fn cdsc_references(bytes: &[u8]) -> Vec<(u32, u32)> {
         let (_, _, _, Some(iref), _, _) = find_meta_layout(bytes).unwrap() else {
             return Vec::new();
@@ -3907,20 +3945,29 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter(|child| child.kind == *b"cdsc")
-            .filter_map(|child| {
+            .flat_map(|child| {
                 let child_body = &body[child.body_start()..child.end()];
-                if version == 0 && child_body.len() >= 6 {
-                    Some((
-                        u32::from(u16::from_be_bytes([child_body[0], child_body[1]])),
-                        u32::from(u16::from_be_bytes([child_body[4], child_body[5]])),
-                    ))
-                } else if version == 1 && child_body.len() >= 10 {
-                    let from = u32::from_be_bytes(child_body[0..4].try_into().ok()?);
-                    let to = u32::from_be_bytes(child_body[6..10].try_into().ok()?);
-                    Some((from, to))
+                let width = if version == 0 { 2 } else { 4 };
+                let from = if version == 0 {
+                    u32::from(u16::from_be_bytes([child_body[0], child_body[1]]))
                 } else {
-                    None
-                }
+                    u32::from_be_bytes(child_body[0..4].try_into().unwrap())
+                };
+                let count = u16::from_be_bytes([child_body[width], child_body[width + 1]]) as usize;
+                (0..count)
+                    .map(|index| {
+                        let start = width + 2 + index * width;
+                        let to = if version == 0 {
+                            u32::from(u16::from_be_bytes([
+                                child_body[start],
+                                child_body[start + 1],
+                            ]))
+                        } else {
+                            u32::from_be_bytes(child_body[start..start + 4].try_into().unwrap())
+                        };
+                        (from, to)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -4768,6 +4815,81 @@ mod tests {
         }
     }
 
+    /// An HDR capture from iPhone 15 onward carries a `tmap` tone-mapped image,
+    /// and Apple names both it and the primary from every descriptive reference
+    /// it writes. ExifTool 13.09 fixed the same defect: a description bound to
+    /// the primary alone stopped Apple Preview showing the gain map.
+    #[test]
+    fn rewrite_xmp_describes_the_tone_map_beside_the_primary() {
+        let tone_map = || ItemSpec {
+            item_id: 7,
+            item_type: *b"tmap",
+            infe_version: 2,
+            construction_method: 0,
+            data: (0u8..24).collect(),
+            offset: 0,
+            length: 0,
+        };
+
+        let mut insertion = apple_multi_xmp_spec(Vec::new(), Vec::new());
+        insertion.items.push(tone_map());
+        let input = build_heic(&insertion);
+        assert!(
+            extract_xmp_strict(&input).unwrap().is_none(),
+            "the fixture must carry no XMP so the writer takes the insertion path"
+        );
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("insert beside a tone-mapped image");
+        let xmp_id = xmp_and_primary_item_ids(&output).0;
+        let references = cdsc_references(&output);
+        assert!(
+            references.contains(&(xmp_id, 1)),
+            "the inserted packet must describe the primary image"
+        );
+        assert!(
+            references.contains(&(xmp_id, 7)),
+            "the inserted packet must also describe the tone-mapped image, or Apple stops \
+             rendering the gain map"
+        );
+        assert_eq!(
+            extract_xmp_raw(&output)
+                .as_deref()
+                .map(<[u8]>::trim_ascii_end),
+            Some(MATRIX_XMP)
+        );
+        assert_eq!(
+            resolve_item_data(&output, 7),
+            (0u8..24).collect::<Vec<u8>>(),
+            "the tone-mapped image must survive byte-for-byte"
+        );
+
+        let mut replacement = apple_multi_xmp_spec(
+            vec![xmp_item(6, PRIMARY_XMP)],
+            vec![ref_box(b"cdsc", 6, &[1])],
+        );
+        replacement.items.push(tone_map());
+        let input = build_heic(&replacement);
+        let mut output = Vec::new();
+        rewrite_xmp(&input, MATRIX_XMP, &mut output)
+            .expect("replacing an existing packet must still be allowed");
+        assert_eq!(
+            extract_xmp_raw(&output)
+                .as_deref()
+                .map(<[u8]>::trim_ascii_end),
+            Some(MATRIX_XMP)
+        );
+        assert_eq!(
+            cdsc_references(&output),
+            cdsc_references(&input),
+            "replacing a packet must leave every existing reference alone"
+        );
+        assert_eq!(
+            resolve_item_data(&output, 7),
+            (0u8..24).collect::<Vec<u8>>(),
+            "the tone-mapped image must survive byte-for-byte"
+        );
+    }
+
     #[test]
     fn rewrite_xmp_refuses_undecidable_xmp_item_maps() {
         // Two packets naming the primary, and two naming nothing at all. Both
@@ -4867,15 +4989,26 @@ mod tests {
             base_offset_size: 4,
             index_size: 0,
             primary_id: 1,
-            items: vec![ItemSpec {
-                item_id: 1,
-                item_type: *b"hvc1",
-                infe_version: 2,
-                construction_method: 0,
-                data: (0u8..32).collect(),
-                offset: 0,
-                length: 0,
-            }],
+            items: vec![
+                ItemSpec {
+                    item_id: 1,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: (0u8..32).collect(),
+                    offset: 0,
+                    length: 0,
+                },
+                ItemSpec {
+                    item_id: 2,
+                    item_type: *b"tmap",
+                    infe_version: 2,
+                    construction_method: 0,
+                    data: (0u8..16).collect(),
+                    offset: 0,
+                    length: 0,
+                },
+            ],
             idat: None,
             iref_children: Vec::new(),
         };
@@ -4896,9 +5029,14 @@ mod tests {
         );
         let (xmp_id, primary) = xmp_and_primary_item_ids(&output);
         assert_eq!(primary, 1);
+        let references = cdsc_references(&output);
         assert!(
-            cdsc_references(&output).contains(&(xmp_id, 1)),
+            references.contains(&(xmp_id, 1)),
             "synthesised iref must carry a cdsc from the XMP item to the primary"
+        );
+        assert!(
+            references.contains(&(xmp_id, 2)),
+            "a synthesised cdsc must name the tone-mapped image too"
         );
 
         let mut again = Vec::new();
