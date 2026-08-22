@@ -903,9 +903,18 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         "CI script lint must route generated Python bytecode outside the repo tree"
     );
     for expected in [
+        "jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db",
+        "actionlint = \"1.7.12\"",
+        "ruff = \"0.16.3\"",
+        "shellcheck = \"0.11.0\"",
+        "shfmt = \"3.13.1\"",
         "python_files+=(scripts/check-contracts)",
         "for shell_file in \"${shell_files[@]}\"; do",
         "bash -n \"$shell_file\"",
+        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
+        "shfmt -d \"${shell_files[@]}\"",
+        "ruff check \"${python_files[@]}\"",
+        "actionlint .github/workflows/*.yml",
     ] {
         assert!(
             ci.contains(expected),
