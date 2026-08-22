@@ -20,7 +20,7 @@ repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 PROJECT_DIR="$repo_root"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 time_phase="$script_dir/time_phase.sh"
-binary="$repo_root/target/release/kei"
+binary="$("$script_dir/cargo_target_dir.sh")/release/kei"
 # shellcheck disable=SC1091
 source "$repo_root/tests/shell/lib.sh"
 

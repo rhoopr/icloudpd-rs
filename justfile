@@ -605,7 +605,7 @@ service-smoke:
     #!/usr/bin/env bash
     set -euxo pipefail
     cargo build --release
-    KEI="$PWD/target/release/kei"
+    KEI="$(scripts/full-test/cargo_target_dir.sh)/release/kei"
     # `kei status` derives its state-DB path from the username; pin a
     # placeholder so the smoke does not depend on the operator's .env
     # or saved config.
