@@ -18,6 +18,8 @@ pub(crate) use album::MAX_EMPTY_PAGE_PROBES;
 pub use album::PhotoAlbum;
 #[cfg(test)]
 pub use album::PhotoAlbumConfig;
+#[cfg(test)]
+pub(crate) use album::ProviderLookupError;
 pub(crate) use album::{ProviderRecordId, RecordLookupRequest, RecordResolution};
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;

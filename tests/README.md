@@ -60,7 +60,7 @@ full set with `just test scenarios`.
 | `fulltest-harness` | Full-test phase reachability and rejection of stale or empty scenario filters | `just` dispatch, full-test orchestration, or scenario-runner helpers |
 | `identity-deltas` | Incremental identity mapping, hard and soft deletion, selected relations, and master-family transitions | CloudKit change parsing, identity mapping, membership, or tombstone policy |
 | `path-family` | Collision suffixes and primary, Live Photo, import, and pending-file family matching | Path rendering, collision handling, import matching, or on-disk adoption |
-| `pending-recovery` | Durable pending hydration, deletion proof, ambiguous identity retention, and sibling recovery | Retry resolution, pending state, provider identity, or targeted hydration |
+| `pending-recovery` | Durable pending hydration, policy-excluded deletion proof, ambiguous identity retention, and sibling recovery | Retry resolution, pending or policy-excluded state, provider identity, or targeted hydration |
 | `service-health` | Health and metrics facts exposed by unattended operation | Health checks, metrics, cycle reporting, or service monitoring |
 | `url-refresh` | Refresh of expired or aged download URLs without replaying stale deltas | Incremental downloads, URL freshness, album hydration, or retry downloads |
 
