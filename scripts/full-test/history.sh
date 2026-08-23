@@ -9,14 +9,13 @@
 
 set -euo pipefail
 
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 n="${1:-10}"
 
 mapfile -t recs < <(find "$runs_dir" -maxdepth 1 -name '*.json' -type f -printf '%f\n' | sort -r | head -n "$n")
 if [[ ${#recs[@]} -eq 0 ]]; then
-  echo "(no run records found)" >&2
-  exit 1
+    echo "(no run records found)" >&2
+    exit 1
 fi
 
 python3 - "$runs_dir" "${recs[@]}" <<'PY'

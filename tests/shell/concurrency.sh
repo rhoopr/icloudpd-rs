@@ -21,7 +21,6 @@ kei_require_release_binary
 kei_install_scratch_cleanup
 
 COOKIES="$(kei_cookie_dir)"
-ALBUM="$(kei_album)"
 KEI="$(kei_release_bin)"
 kei_check_init
 
@@ -71,10 +70,14 @@ EMPTY=$(find "$DIR1" -type f -empty | wc -l | tr -d ' ')
 DB_COUNT=$(kei_db_query "SELECT COUNT(DISTINCT id) FROM assets WHERE status='downloaded'")
 DUPES=$(kei_db_query "SELECT COUNT(*) FROM (SELECT id, version_size, COUNT(*) c FROM assets GROUP BY id, version_size HAVING c > 1)")
 echo "  Files=$FC Empty=$EMPTY DB_assets=$DB_COUNT Dupes=$DUPES"
-[ "$FC" -ge 1 ];       kei_check "files downloaded"
-[ "$EMPTY" -eq 0 ];    kei_check "no empty files"
-[ "$DB_COUNT" -ge 1 ]; kei_check "DB tracks all files"
-[ "$DUPES" -eq 0 ];    kei_check "no duplicate DB entries"
+[ "$FC" -ge 1 ]
+kei_check "files downloaded"
+[ "$EMPTY" -eq 0 ]
+kei_check "no empty files"
+[ "$DB_COUNT" -ge 1 ]
+kei_check "DB tracks all files"
+[ "$DUPES" -eq 0 ]
+kei_check "no duplicate DB entries"
 
 # Every file on disk must have a matching DB entry.
 ORPHANS=0
@@ -87,7 +90,8 @@ while read -r f; do
         ORPHANS=$((ORPHANS + 1))
     fi
 done < <(find "$DIR1" -type f)
-[ "$ORPHANS" -eq 0 ]; kei_check "no orphan files (all tracked in DB)"
+[ "$ORPHANS" -eq 0 ]
+kei_check "no orphan files (all tracked in DB)"
 rm -rf "$DIR1"
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -118,8 +122,10 @@ echo "$OUT" | grep -E "downloaded|failed|completed|Skipping"
 FINAL_FILES=$(find "$DIR2" -type f ! -name "*.kei-tmp" | wc -l | tr -d ' ')
 FINAL_PARTS=$(find "$DIR2" -name "*.kei-tmp" | wc -l | tr -d ' ')
 echo "  After resume: $FINAL_FILES complete, $FINAL_PARTS .kei-tmp files"
-[ "$FINAL_FILES" -ge 1 ]; kei_check "all files complete after resume"
-[ "$FINAL_PARTS" -eq 0 ]; kei_check "no .kei-tmp files remain"
+[ "$FINAL_FILES" -ge 1 ]
+kei_check "all files complete after resume"
+[ "$FINAL_PARTS" -eq 0 ]
+kei_check "no .kei-tmp files remain"
 rm -rf "$DIR2"
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -148,7 +154,8 @@ DB_FAILED=$(kei_db_query "SELECT COUNT(*) FROM assets WHERE status='failed'")
 echo "  Files downloaded: $DOWNLOADED, DB failed: $DB_FAILED"
 
 chmod -R 755 "$DIR3" 2>/dev/null
-[ "$EC" -eq 2 ]; kei_check "exit code 2 (partial failure)"
+[ "$EC" -eq 2 ]
+kei_check "exit code 2 (partial failure)"
 rm -rf "$DIR3"
 
 kei_check_summary "CONCURRENCY RESULTS"

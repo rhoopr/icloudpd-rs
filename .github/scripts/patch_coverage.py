@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Compute patch coverage and per-file file-level deltas.
 
 Outputs JSON to stdout:

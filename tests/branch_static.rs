@@ -124,7 +124,11 @@ fn docker_packaging_defaults_to_service_run() {
     let entrypoint = repo_file("docker/entrypoint.sh");
     let whitelist = entrypoint
         .lines()
-        .find(|line| line.contains("sync|login|list|password"))
+        .find(|line| {
+            ["sync", "login", "list", "password"]
+                .iter()
+                .all(|subcommand| line.contains(subcommand))
+        })
         .expect("entrypoint must keep an explicit kei subcommand whitelist");
     for subcommand in [
         "sync",
@@ -151,15 +155,14 @@ fn docker_packaging_defaults_to_service_run() {
             "entrypoint whitelist must include the kei `{subcommand}` subcommand"
         );
     }
-    let service_index = entrypoint
-        .find("|service)")
-        .or_else(|| entrypoint.find("|service|"))
-        .expect("entrypoint whitelist must include the kei service subcommand");
+    let whitelist_index = entrypoint
+        .find(whitelist)
+        .expect("entrypoint must contain its parsed subcommand whitelist");
     let command_lookup = entrypoint
         .find("command -v")
         .expect("entrypoint should still fall back to command lookup");
     assert!(
-        service_index < command_lookup,
+        whitelist_index < command_lookup,
         "`service` must be recognized as a kei subcommand before shell command lookup"
     );
 }
@@ -373,7 +376,7 @@ fn full_test_run_start_metadata_is_stable_until_finalize() {
         "flock 9",
         "if [[ $marker_age -lt 3600 ]]; then",
         "staging: $current (no records yet)",
-        "date +%Y-%m-%dT%H:%M:%S > \"$start_file\"",
+        "date +%Y-%m-%dT%H:%M:%S >\"$start_file\"",
     ] {
         assert!(
             begin.contains(expected),
@@ -852,9 +855,11 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile .github/scripts/*.py",
         "actionlint .github/workflows/*.yml",
         "lint-scripts:",
-        "bash -n \"${shell_files[@]}\"",
+        "python_files+=(scripts/check-contracts)",
+        "for shell_file in \"${shell_files[@]}\"; do",
+        "bash -n \"$shell_file\"",
         "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile \"${python_files[@]}\"",
-        "shellcheck \"${shell_files[@]}\"",
+        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
         "shfmt -d \"${shell_files[@]}\"",
         "ruff check \"${python_files[@]}\"",
     ] {
@@ -897,6 +902,25 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
         ci.contains("PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile"),
         "CI script lint must route generated Python bytecode outside the repo tree"
     );
+    for expected in [
+        "jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db",
+        "actionlint = \"1.7.12\"",
+        "ruff = \"0.16.3\"",
+        "shellcheck = \"0.11.0\"",
+        "shfmt = \"3.13.1\"",
+        "python_files+=(scripts/check-contracts)",
+        "for shell_file in \"${shell_files[@]}\"; do",
+        "bash -n \"$shell_file\"",
+        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
+        "shfmt -d \"${shell_files[@]}\"",
+        "ruff check \"${python_files[@]}\"",
+        "actionlint .github/workflows/*.yml",
+    ] {
+        assert!(
+            ci.contains(expected),
+            "CI script lint must check each script with the matching interpreter: {expected}"
+        );
+    }
     let aggregate = ci
         .split_once("  ci:\n")
         .map(|(_, tail)| tail)
@@ -933,6 +957,8 @@ fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
     for expected in [
         "  push:\n    branches: [main]",
         "if [[ \"$EVENT_NAME\" != \"pull_request\" ]]; then",
+        "git diff --name-only \"${BASE_SHA}\"...HEAD > \"$files_path\"",
+        "mapfile -t files < \"$files_path\"",
         "github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'",
     ] {
         assert!(
@@ -959,6 +985,7 @@ fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
     let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
 
     for expected in [
+        "sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt",
         r#"curl -fsSL "$BASE/SHA256SUMS.txt" -o /tmp/SHA256SUMS.txt"#,
         r#"curl -fsSL "$BASE/$file" -o "/tmp/$file""#,
         r#"expected_sha=$(awk -v file="$file" '$2 == file { print $1 }' /tmp/SHA256SUMS.txt)"#,
@@ -1024,8 +1051,13 @@ fn contributor_docs_match_current_gate() {
         "RUSTDOCFLAGS=\"-Dwarnings\" cargo doc --no-deps --all-features",
         "cargo audit --deny warnings",
         "python3 .github/scripts/check_workflow_hardening.py",
+        "python_files+=(scripts/check-contracts)",
+        "for shell_file in \"${shell_files[@]}\"; do bash -n \"$shell_file\"; done",
         "PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile",
-        "bash -n scripts/check-contracts scripts/check-roundtrip-gate.sh",
+        "shellcheck -x -P tests/shell:scripts:scripts/full-test \"${shell_files[@]}\"",
+        "shfmt -d \"${shell_files[@]}\"",
+        "ruff check \"${python_files[@]}\"",
+        "actionlint .github/workflows/*.yml",
         "scripts/check-contracts",
         "bash scripts/check-roundtrip-gate.sh",
     ] {
@@ -1314,7 +1346,7 @@ fn live_import_rehearsal_seeds_album_with_per_filter_recent_scope() {
         "live import rehearsal must seed from the selected album's recent window, not the global library frontier"
     );
     assert!(
-        rehearsal.contains("set +e\n  \"$@\" >\"$out\" 2>\"$err\"\n  local rc=$?\n  set -e"),
+        rehearsal.contains("set +e\n    \"$@\" >\"$out\" 2>\"$err\"\n    local rc=$?\n    set -e"),
         "live import rehearsal must print command tails before propagating a failed command"
     );
     assert!(

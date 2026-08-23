@@ -58,7 +58,7 @@ cp "$sync_config" "$DOCKER_CONFIG/config.toml"
     echo ""
     echo "[watch]"
     echo "interval = 60"
-} > "$DOCKER_CONFIG/watch-config.toml"
+} >"$DOCKER_CONFIG/watch-config.toml"
 
 echo "--- 1. Docker sync ($ALBUM album) ---"
 docker run --rm \
@@ -67,11 +67,11 @@ docker run --rm \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --config /config/config.toml \
-        --password "$ICLOUD_PASSWORD" \
-        --no-progress-bar \
-        \
-    2>&1
+    --config /config/config.toml \
+    --password "$ICLOUD_PASSWORD" \
+    --no-progress-bar \
+    2>& \
+    1
 kei_check "sync exits successfully"
 
 echo ""
@@ -82,7 +82,8 @@ find "$DOCKER_PHOTOS" -type f 2>/dev/null | sort | while read -r f; do
     size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)
     echo "    $f ($size bytes)"
 done
-[ "$FILE_COUNT" -ge 1 ]; kei_check "at least 1 file downloaded"
+[ "$FILE_COUNT" -ge 1 ]
+kei_check "at least 1 file downloaded"
 
 echo ""
 echo "--- 3. All files non-empty ---"
@@ -91,7 +92,8 @@ while IFS= read -r -d '' f; do
     size=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)
     [ "$size" -eq 0 ] && EMPTY=$((EMPTY + 1))
 done < <(find "$DOCKER_PHOTOS" -type f -print0 2>/dev/null)
-[ "$EMPTY" -eq 0 ]; kei_check "no empty files (found $EMPTY empty)"
+[ "$EMPTY" -eq 0 ]
+kei_check "no empty files (found $EMPTY empty)"
 
 echo ""
 echo "--- 4. health.json ---"
@@ -99,7 +101,8 @@ if [ -f "$DOCKER_CONFIG/health.json" ]; then
     cat "$DOCKER_CONFIG/health.json"
     echo ""
     CF=$(python3 -c "import json; d=json.load(open('$DOCKER_CONFIG/health.json')); print(d.get('consecutive_failures', -1))" 2>/dev/null)
-    [ "$CF" = "0" ]; kei_check "health.json consecutive_failures == 0"
+    [ "$CF" = "0" ]
+    kei_check "health.json consecutive_failures == 0"
 else
     kei_check "health.json exists" 1
 fi
@@ -109,7 +112,8 @@ echo "--- 5. State database ---"
 if [ -f "$DOCKER_CONFIG/${USER_SLUG}.db" ]; then
     ASSET_COUNT=$(sqlite3 "$DOCKER_CONFIG/${USER_SLUG}.db" "SELECT COUNT(*) FROM assets WHERE status='downloaded'" 2>/dev/null)
     echo "  Downloaded assets in DB: $ASSET_COUNT"
-    [ "$ASSET_COUNT" -ge 1 ]; kei_check "state DB has downloaded assets"
+    [ "$ASSET_COUNT" -ge 1 ]
+    kei_check "state DB has downloaded assets"
 else
     kei_check "state database exists" 1
 fi
@@ -122,15 +126,15 @@ RESYNC_OUT=$(docker run --rm \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --config /config/config.toml \
-        --password "$ICLOUD_PASSWORD" \
-        --no-progress-bar \
-        --log-level info \
+    --config /config/config.toml \
+    --password "$ICLOUD_PASSWORD" \
+    --no-progress-bar \
+    --log-level info \
     2>&1)
 RESYNC_EC=$?
 echo "$RESYNC_OUT"
 [ "$RESYNC_EC" -eq 0 ] && case "$RESYNC_OUT" in
-    *downloaded=0*|*"No new photos"*) true ;;
+    *downloaded=0* | *"No new photos"*) true ;;
     *) false ;;
 esac
 kei_check "re-sync downloads 0 files"
@@ -144,13 +148,14 @@ docker run --rm \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DRY_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --config /config/config.toml \
-        --password "$ICLOUD_PASSWORD" \
-        --no-progress-bar \
-        --dry-run \
+    --config /config/config.toml \
+    --password "$ICLOUD_PASSWORD" \
+    --no-progress-bar \
+    --dry-run \
     2>&1
 DRY_COUNT=$(find "$DRY_PHOTOS" -type f 2>/dev/null | wc -l | tr -d ' ')
-[ "$DRY_COUNT" -eq 0 ]; kei_check "dry run writes 0 files (got $DRY_COUNT)"
+[ "$DRY_COUNT" -eq 0 ]
+kei_check "dry run writes 0 files (got $DRY_COUNT)"
 rm -rf "$DRY_PHOTOS"
 
 echo ""
@@ -161,7 +166,8 @@ BACKEND=$(docker run --rm \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" password backend 2>&1)
 echo "  Backend: $BACKEND"
-[ -n "$BACKEND" ]; kei_check "credential backend reports a value"
+[ -n "$BACKEND" ]
+kei_check "credential backend reports a value"
 
 echo ""
 echo "--- 9. List albums in container ---"
@@ -183,10 +189,10 @@ docker run -d --name "$WATCH_NAME" \
     -v "$DOCKER_CONFIG:/config" \
     -v "$WATCH_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --config /config/watch-config.toml \
-        --password "$ICLOUD_PASSWORD" \
-        --no-progress-bar \
-        --log-level info >/dev/null
+    --config /config/watch-config.toml \
+    --password "$ICLOUD_PASSWORD" \
+    --no-progress-bar \
+    --log-level info >/dev/null
 
 sleep 130
 docker stop --time 30 "$WATCH_NAME" >/dev/null 2>&1
@@ -197,9 +203,10 @@ docker rm "$WATCH_NAME" >/dev/null 2>&1
 CYCLES=$(echo "$LOGS" | grep -c "Waiting before next cycle")
 echo "  Watch cycles observed: $CYCLES"
 echo "  Container exit code:   $EXIT_CODE"
-[ "$CYCLES" -ge 2 ]; kei_check "watch drove >= 2 cycles (got $CYCLES)"
+[ "$CYCLES" -ge 2 ]
+kei_check "watch drove >= 2 cycles (got $CYCLES)"
 # 0 = normal, 130 = SIGINT, 143 = SIGTERM after handler.
-case "$EXIT_CODE" in 0|130|143) true;; *) false;; esac
+case "$EXIT_CODE" in 0 | 130 | 143) true ;; *) false ;; esac
 kei_check "container exited cleanly on SIGTERM (exit $EXIT_CODE)"
 docker run --rm -v "$WATCH_PHOTOS:/p" "$IMAGE" \
     chown -R "$(id -u):$(id -g)" /p >/dev/null 2>&1 || true
@@ -230,7 +237,7 @@ kei_check "healthcheck probe reports HEALTHY"
 echo ""
 echo "--- 12. Password-file (Docker secrets style) ---"
 SECRETS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-secrets-XXXXX")
-printf '%s' "$ICLOUD_PASSWORD" > "$SECRETS_DIR/icloud_password"
+printf '%s' "$ICLOUD_PASSWORD" >"$SECRETS_DIR/icloud_password"
 chmod 400 "$SECRETS_DIR/icloud_password"
 PWFILE_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-pwfile-XXXXX")
 PWFILE_OUT=$(docker run --rm \
@@ -240,10 +247,10 @@ PWFILE_OUT=$(docker run --rm \
     -v "$PWFILE_PHOTOS:/photos" \
     -v "$SECRETS_DIR:/run/secrets:ro" \
     "$IMAGE" sync \
-        --config /config/config.toml \
-        --password-file /run/secrets/icloud_password \
-        --no-progress-bar \
-        --dry-run \
+    --config /config/config.toml \
+    --password-file /run/secrets/icloud_password \
+    --no-progress-bar \
+    --dry-run \
     2>&1)
 echo "$PWFILE_OUT" | tail -10
 echo "$PWFILE_OUT" | grep -qE "Would download|files would be downloaded"
@@ -257,7 +264,7 @@ STATUS_OUT=$(docker run --rm \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
-        --downloaded \
+    --downloaded \
     2>&1)
 echo "$STATUS_OUT" | tail -5
 echo "$STATUS_OUT" | grep -q "Downloaded assets:"
@@ -282,7 +289,7 @@ puid_run() {
 }
 PUID_OUT=$(puid_run sh -c 'id -u; id -g; stat -c %u /config; stat -c %u /photos' 2>&1)
 echo "  Output (uid, gid, /config uid, /photos uid):"
-echo "$PUID_OUT" | sed 's/^/    /'
+printf '    %s\n' "${PUID_OUT//$'\n'/$'\n    '}"
 EXPECTED=$(printf '%s\n%s\n%s\n%s' "$TEST_PUID" "$TEST_PGID" "$TEST_PUID" "$TEST_PUID")
 [ "$PUID_OUT" = "$EXPECTED" ]
 kei_check "process runs as PUID:PGID and volumes are chowned"
@@ -343,7 +350,7 @@ SUB_OUT=$(docker run --rm \
     -v "$SUB_CONFIG:/config" \
     -v "$SUB_PHOTOS:/photos" \
     "$IMAGE" status \
-        --downloaded \
+    --downloaded \
     2>&1)
 SUB_EC=$?
 echo "$SUB_OUT" | tail -5
@@ -366,7 +373,7 @@ COMBINED_OUT=$(docker run --rm \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
-        --pending --failed --downloaded \
+    --pending --failed --downloaded \
     2>&1)
 COMBINED_EC=$?
 echo "$COMBINED_OUT" | grep -q "Downloaded assets:"

@@ -8,19 +8,19 @@
 set -euo pipefail
 
 if [[ "${KEI_FULL_TEST_REAL_SERVICE:-0}" != "1" ]]; then
-  echo "run_real_service_lifecycle: set KEI_FULL_TEST_REAL_SERVICE=1 to run" >&2
-  exit 64
+    echo "run_real_service_lifecycle: set KEI_FULL_TEST_REAL_SERVICE=1 to run" >&2
+    exit 64
 fi
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
-  echo "run_real_service_lifecycle: not in a git repo" >&2
-  exit 1
+    echo "run_real_service_lifecycle: not in a git repo" >&2
+    exit 1
 }
 cd "$repo_root"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "run_real_service_lifecycle: Linux systemd user service smoke only" >&2
-  exit 64
+    echo "run_real_service_lifecycle: Linux systemd user service smoke only" >&2
+    exit 64
 fi
 
 PROJECT_DIR="$repo_root"
@@ -38,13 +38,13 @@ service_uninstalled=0
 pre_linger=$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null || true)
 
 cleanup() {
-  if [[ "$service_uninstalled" -eq 0 ]]; then
-    "$binary" uninstall >/dev/null 2>&1 || true
-  fi
-  if [[ "$pre_linger" == "Linger=no" ]]; then
-    loginctl disable-linger "$(id -un)" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$work" 2>/dev/null || true
+    if [[ "$service_uninstalled" -eq 0 ]]; then
+        "$binary" uninstall >/dev/null 2>&1 || true
+    fi
+    if [[ "$pre_linger" == "Linger=no" ]]; then
+        loginctl disable-linger "$(id -un)" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -54,8 +54,8 @@ echo "pre_enabled=$pre_enabled"
 echo "pre_active=$pre_active"
 
 if [[ "$pre_enabled" != "not-found" || "$pre_active" != "inactive" ]]; then
-  echo "run_real_service_lifecycle: kei.service already exists or is active; refusing to mutate it" >&2
-  exit 1
+    echo "run_real_service_lifecycle: kei.service already exists or is active; refusing to mutate it" >&2
+    exit 1
 fi
 
 data="$work/data"
@@ -66,28 +66,28 @@ cp "$cookies/".* "$data/" 2>/dev/null || true
 rm -f "$data/"*.lock "$data/.lock" "$data/"*.db "$data/health.json" 2>/dev/null || true
 
 password_file="$work/icloud_password"
-printf '%s' "$ICLOUD_PASSWORD" > "$password_file"
+printf '%s' "$ICLOUD_PASSWORD" >"$password_file"
 chmod 600 "$password_file"
 
 config="$work/config.toml"
 {
-  printf 'data_dir = %s\n' "$(kei_toml_string "$data")"
-  echo
-  echo "[auth]"
-  printf 'username = %s\n' "$(kei_toml_string "$ICLOUD_USERNAME")"
-  printf 'password_file = %s\n' "$(kei_toml_string "$password_file")"
-  echo
-  echo "[download]"
-  printf 'directory = %s\n' "$(kei_toml_string "$photos")"
-  echo
-  echo "[filters]"
-  printf 'albums = [%s]\n' "$(kei_toml_string "$album")"
-  echo "unfiled = false"
-  echo 'libraries = ["primary"]'
-  echo
-  echo "[watch]"
-  echo "interval = 86400"
-} > "$config"
+    printf 'data_dir = %s\n' "$(kei_toml_string "$data")"
+    echo
+    echo "[auth]"
+    printf 'username = %s\n' "$(kei_toml_string "$ICLOUD_USERNAME")"
+    printf 'password_file = %s\n' "$(kei_toml_string "$password_file")"
+    echo
+    echo "[download]"
+    printf 'directory = %s\n' "$(kei_toml_string "$photos")"
+    echo
+    echo "[filters]"
+    printf 'albums = [%s]\n' "$(kei_toml_string "$album")"
+    echo "unfiled = false"
+    echo 'libraries = ["primary"]'
+    echo
+    echo "[watch]"
+    echo "interval = 86400"
+} >"$config"
 
 "$binary" install --user --config "$config"
 sleep 5
@@ -98,8 +98,8 @@ echo "post_install_enabled=$post_enabled"
 echo "post_install_active=$post_active"
 
 if [[ "$post_enabled" != "enabled" || "$post_active" != "active" ]]; then
-  systemctl --user --no-pager status kei.service || true
-  exit 1
+    systemctl --user --no-pager status kei.service || true
+    exit 1
 fi
 
 "$binary" service status | tee "$work/service-status.out"
@@ -116,8 +116,8 @@ echo "post_uninstall_enabled=$final_enabled"
 echo "post_uninstall_active=$final_active"
 
 if [[ "$final_enabled" != "not-found" || "$final_active" != "inactive" ]]; then
-  echo "run_real_service_lifecycle: service was not removed cleanly" >&2
-  exit 1
+    echo "run_real_service_lifecycle: service was not removed cleanly" >&2
+    exit 1
 fi
 
 echo "real service lifecycle passed"

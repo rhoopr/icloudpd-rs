@@ -153,7 +153,7 @@ jobs:
         run: |
           cd artifacts
           find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
-          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
           cd -
 
@@ -170,12 +170,14 @@ jobs:
             echo "::error::CHANGELOG.md section for $VERSION is empty"
             exit 1
           else
-            echo "notes<<EOF" >> $GITHUB_OUTPUT
-            echo "$NOTES" >> $GITHUB_OUTPUT
-            echo "" >> $GITHUB_OUTPUT
-            echo "---" >> $GITHUB_OUTPUT
-            echo "**Full changelog:** [CHANGELOG.md](https://github.com/rhoopr/kei/blob/${{ github.ref_name }}/CHANGELOG.md)" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
+            {
+              echo "notes<<EOF"
+              echo "$NOTES"
+              echo ""
+              echo "---"
+              echo "**Full changelog:** [CHANGELOG.md](https://github.com/rhoopr/kei/blob/${{ github.ref_name }}/CHANGELOG.md)"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload release assets

@@ -16,7 +16,7 @@ elif [ "${1#-}" != "$1" ]; then
     set -- kei "$@"
 else
     case "$1" in
-        sync|login|list|password|reset|config|status|doctor|manifest|verify|reconcile|import-existing|install|uninstall|service|help)
+        sync | login | list | password | reset | config | status | doctor | manifest | verify | reconcile | import-existing | install | uninstall | service | help)
             set -- kei "$@"
             ;;
         *)
@@ -52,8 +52,7 @@ collect_removed_sync_env_names() {
         KEI_RECONCILE_EVERY_N_CYCLES \
         KEI_NOTIFICATION_SCRIPT \
         KEI_REPORT_JSON \
-        KEI_METRICS_PORT
-    do
+        KEI_METRICS_PORT; do
         if env | grep -q "^${name}="; then
             if [ -n "$found" ]; then
                 found="$found, $name"
@@ -68,7 +67,7 @@ collect_removed_sync_env_names() {
 has_help_or_version_flag() {
     for arg in "$@"; do
         case "$arg" in
-            -h|--help|-V|--version)
+            -h | --help | -V | --version)
                 return 0
                 ;;
         esac
@@ -90,7 +89,7 @@ is_sync_like_command() {
     fi
 
     case "${1:-}" in
-        sync|import-existing)
+        sync | import-existing)
             return 0
             ;;
         service)
@@ -166,9 +165,9 @@ esac
 # warning but don't fail; the user may have mounted them deliberately.
 for d in /config /photos; do
     [ -d "$d" ] || continue
-    find "$d" \! -uid "$PUID" -print0 2>/dev/null \
-        | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null \
-        || echo "kei: warning: chown $d failed (read-only mount?)" >&2
+    find "$d" \! -uid "$PUID" -print0 2>/dev/null |
+        xargs -0 -r chown "$PUID:$PGID" 2>/dev/null ||
+        echo "kei: warning: chown $d failed (read-only mount?)" >&2
 done
 
 # gosu accepts numeric uid:gid and runs without an /etc/passwd entry.
