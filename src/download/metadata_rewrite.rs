@@ -81,6 +81,11 @@ impl From<&crate::config::MetadataConfig> for MetadataFlags {
     }
 }
 
+#[must_use]
+pub(crate) fn writers_enabled(metadata: &crate::config::MetadataConfig) -> bool {
+    MetadataFlags::from(metadata).has_any_write()
+}
+
 /// Result of metadata writes attempted for one downloaded file.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataWriteOutcome {

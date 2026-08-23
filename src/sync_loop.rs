@@ -150,6 +150,53 @@ impl WatchPrecheck {
     }
 }
 
+async fn include_pending_metadata_work(
+    watch_precheck: &mut WatchPrecheck,
+    db: &dyn download::DownloadStore,
+    metadata: &config::MetadataConfig,
+    library_states: &[LibraryState],
+) {
+    let rewrite_writers_enabled = download::metadata_rewrite::writers_enabled(metadata);
+    let mut local_work_zones = rustc_hash::FxHashSet::default();
+    for library in library_states {
+        let zone = library.zone_name.as_str();
+        let capture_pending = match db
+            .has_metadata_capture_work(&[zone], state::METADATA_CAPTURE_REVISION)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(error = %error, "Could not inspect metadata-capture work before watch pre-check");
+                true
+            }
+        };
+        let rewrite_pending = if rewrite_writers_enabled {
+            match db
+                .get_pending_metadata_rewrites_page(Some(&[zone]), 0, 1)
+                .await
+            {
+                Ok(rows) => !rows.is_empty(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Could not inspect metadata-rewrite work before watch pre-check");
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        if capture_pending || rewrite_pending {
+            local_work_zones.insert(library.zone_name.clone());
+        }
+    }
+    if !local_work_zones.is_empty() {
+        tracing::debug!(
+            libraries = local_work_zones.len(),
+            "Pending metadata work bypassed the watch no-change shortcut"
+        );
+        watch_precheck.include_local_work_zones(local_work_zones);
+    }
+}
+
 /// State-DB metadata key for the first-sync shared-library notice. Bumping
 /// the version suffix (e.g. `_v2`) re-fires the notice for every existing
 /// data dir the next time it's used.
@@ -1223,40 +1270,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             && !config.runtime.only_print_filenames
             && let Some(db) = state_db.as_deref()
         {
-            let mut local_work_zones = rustc_hash::FxHashSet::default();
-            for library in &library_states {
-                let zone = library.zone_name.as_str();
-                let capture_pending = match db
-                    .has_metadata_capture_work(&[zone], state::METADATA_CAPTURE_REVISION)
-                    .await
-                {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "Could not inspect metadata-capture work before watch pre-check");
-                        true
-                    }
-                };
-                let rewrite_pending = match db
-                    .get_pending_metadata_rewrites_page(Some(&[zone]), 0, 1)
-                    .await
-                {
-                    Ok(rows) => !rows.is_empty(),
-                    Err(error) => {
-                        tracing::warn!(error = %error, "Could not inspect metadata-rewrite work before watch pre-check");
-                        true
-                    }
-                };
-                if capture_pending || rewrite_pending {
-                    local_work_zones.insert(library.zone_name.clone());
-                }
-            }
-            if !local_work_zones.is_empty() {
-                tracing::debug!(
-                    libraries = local_work_zones.len(),
-                    "Pending metadata work bypassed the watch no-change shortcut"
-                );
-                watch_precheck.include_local_work_zones(local_work_zones);
-            }
+            include_pending_metadata_work(
+                &mut watch_precheck,
+                db,
+                &config.metadata,
+                &library_states,
+            )
+            .await;
         }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
@@ -2528,6 +2548,115 @@ mod tests {
             precheck.db_sync_token_after_success(),
             Some("db-token-after-cycle")
         );
+    }
+
+    async fn seed_watch_metadata_work(
+        db: &state::SqliteStateDb,
+        library: &str,
+        asset_id: &str,
+        capture_revision: i64,
+    ) {
+        let record = crate::test_helpers::TestAssetRecord::new(asset_id)
+            .library(library)
+            .filename(&format!("{asset_id}.jpg"))
+            .build();
+        db.upsert_seen(&record).await.expect("seed asset");
+        db.mark_downloaded(
+            library,
+            asset_id,
+            "original",
+            std::path::Path::new("unused-watch-precheck-photo.jpg"),
+            "local-checksum",
+            None,
+        )
+        .await
+        .expect("mark asset downloaded");
+        db.set_metadata_capture_revision_for_test(library, asset_id, capture_revision);
+    }
+
+    #[tokio::test]
+    async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
+        let db = state::SqliteStateDb::open_in_memory().expect("state db");
+        seed_watch_metadata_work(
+            &db,
+            "PrimarySync",
+            "REWRITE_DISABLED",
+            state::METADATA_CAPTURE_REVISION,
+        )
+        .await;
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_DISABLED", "original")
+            .await
+            .expect("seed rewrite marker");
+        let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
+        let mut precheck = WatchPrecheck::SkipAll;
+
+        include_pending_metadata_work(
+            &mut precheck,
+            &db,
+            &config::MetadataConfig::default(),
+            &[library],
+        )
+        .await;
+
+        assert!(!precheck.should_sync_zone("PrimarySync"));
+        assert_eq!(
+            db.get_pending_metadata_rewrites_page(None, 0, 10)
+                .await
+                .expect("read rewrite markers")
+                .len(),
+            1,
+            "disabling writers must retain durable retry evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_metadata_writer_forces_only_selected_rewrite_zone() {
+        let db = state::SqliteStateDb::open_in_memory().expect("state db");
+        for (library, asset_id) in [
+            ("PrimarySync", "REWRITE_SELECTED"),
+            ("SharedSync-OTHER", "REWRITE_UNSELECTED"),
+        ] {
+            seed_watch_metadata_work(&db, library, asset_id, state::METADATA_CAPTURE_REVISION)
+                .await;
+            db.record_metadata_write_failure(library, asset_id, "original")
+                .await
+                .expect("seed rewrite marker");
+        }
+        let selected = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
+        let metadata = config::MetadataConfig {
+            set_exif_rating: true,
+            ..config::MetadataConfig::default()
+        };
+        let mut precheck = WatchPrecheck::SkipAll;
+
+        include_pending_metadata_work(&mut precheck, &db, &metadata, &[selected]).await;
+
+        assert!(precheck.should_sync_zone("PrimarySync"));
+        assert!(!precheck.should_sync_zone("SharedSync-OTHER"));
+    }
+
+    #[tokio::test]
+    async fn capture_revision_forces_watch_work_with_metadata_writers_disabled() {
+        let db = state::SqliteStateDb::open_in_memory().expect("state db");
+        seed_watch_metadata_work(
+            &db,
+            "PrimarySync",
+            "CAPTURE_PENDING",
+            state::METADATA_CAPTURE_REVISION - 1,
+        )
+        .await;
+        let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
+        let mut precheck = WatchPrecheck::SkipAll;
+
+        include_pending_metadata_work(
+            &mut precheck,
+            &db,
+            &config::MetadataConfig::default(),
+            &[library],
+        )
+        .await;
+
+        assert!(precheck.should_sync_zone("PrimarySync"));
     }
 
     #[tokio::test]
