@@ -259,12 +259,13 @@ Only an identity that cannot be resolved from durable asset/master evidence
 uses the bounded legacy hydration path. Unselected libraries keep separate
 pending state and do not force work in selected libraries.
 
-The watch pre-check includes only libraries with pending capture or rewrite
-work, even when iCloud reports no provider changes. A capture refresh preserves
-download status, paths, checksums, and media bytes. It stores corrected
-catalogue metadata, the current revision, and any configured rewrite marker
-before the library revision can become active. Lookup or state failures leave
-the row stale, report the remaining work, and preserve the affected provider
+The watch pre-check includes only libraries with pending capture work or
+serviceable rewrite work, even when iCloud reports no provider changes. A
+rewrite marker is serviceable only when a metadata writer is enabled. A capture
+refresh preserves download status, paths, checksums, and media bytes. It stores
+corrected catalogue metadata, the current revision, and any configured rewrite
+marker before the library revision can become active. Lookup or state failures
+leave the row stale, report the remaining work, and preserve the affected provider
 checkpoint. A library promotes its active revision only when every live
 downloaded row is current. Persisted rewrite markers may drain later because
 they are durable recovery evidence.
