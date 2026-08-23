@@ -186,6 +186,11 @@ inventory. The retry owner:
 
 Unknown identity is not permission to delete or forget work.
 
+Policy-excluded rows stay outside the actionable pending reader. After a
+successful source pass, targeted revalidation checks their durable provider
+identities only for explicit deletion. Present, omitted, malformed, and
+transient responses retain the policy-excluded rows.
+
 A provider checksum change makes the previous local path historical. Retry
 adoption requires durable proof that the path holds the current provider
 version and that its filename matches the recorded task filename.
@@ -326,6 +331,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
+| `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 

@@ -4462,6 +4462,13 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn get_policy_excluded_ids_for_revalidation(
+            &self,
+            _: &str,
+        ) -> Result<Vec<String>, StateError> {
+            Ok(Vec::new())
+        }
+
         async fn reset_failed(&self) -> Result<u64, StateError> {
             unimplemented!()
         }

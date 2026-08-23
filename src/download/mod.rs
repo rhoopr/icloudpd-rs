@@ -5045,7 +5045,7 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     })
 }
 
-async fn run_pending_retry_pass(
+async fn run_targeted_recovery_pass(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
@@ -5274,24 +5274,22 @@ fn pending_retry_no_download_result(
     }
 }
 
-async fn append_pending_retry_to_sync_result(
+async fn append_targeted_recovery_to_sync_result(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     shutdown_token: CancellationToken,
-    pending_at_start: u64,
     sync_result: SyncResult,
 ) -> Result<SyncResult> {
-    if pending_at_start == 0
-        || !matches!(sync_result.outcome, DownloadOutcome::Success)
+    if !matches!(sync_result.outcome, DownloadOutcome::Success)
         || sync_result.stats.interrupted
         || shutdown_token.is_cancelled()
     {
         return Ok(sync_result);
     }
 
-    let retry_result = match run_pending_retry_pass(
+    let retry_result = match run_targeted_recovery_pass(
         download_client,
         passes,
         config,
@@ -5310,7 +5308,7 @@ async fn append_pending_retry_to_sync_result(
             tracing::warn!(
                 error = %e,
                 diagnostic = PENDING_RETRY_UNMATCHED_REASON,
-                "Targeted pending retry failed before downloads; retaining durable work for a later cycle"
+                "Targeted recovery failed before downloads; retaining durable state for a later cycle"
             );
             SyncResult {
                 outcome: DownloadOutcome::PartialFailure { failed_count: 1 },
@@ -5367,7 +5365,7 @@ pub async fn download_photos_with_sync(
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
     // pending assets cleared so the per-sync cap starts from zero.
-    let (_retry_failed_count, total_pending) = if let Some(db) = &config.state_db {
+    if let Some(db) = &config.state_db {
         match db.prune_source_deleted_retries(Some(&config.library)).await {
             Ok(0) => {}
             Ok(count) => {
@@ -5391,7 +5389,7 @@ pub async fn download_photos_with_sync(
             .prepare_for_retry(Some(&config.library), error_retention)
             .await
         {
-            Ok((failed, stale, total_pending)) => {
+            Ok((failed, stale, _)) => {
                 if failed > 0 {
                     tracing::debug!(count = failed, "Reset failed assets for retry");
                 }
@@ -5401,16 +5399,12 @@ pub async fn download_photos_with_sync(
                         "Cleared stale attempt counts on pending assets"
                     );
                 }
-                (failed, total_pending)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to reset assets for retry");
-                (0, 0)
             }
         }
-    } else {
-        (0, 0)
-    };
+    }
 
     let result = match &config.sync_mode {
         SyncMode::Full => {
@@ -5532,13 +5526,12 @@ pub async fn download_photos_with_sync(
         }
     }?;
 
-    let mut result = append_pending_retry_to_sync_result(
+    let mut result = append_targeted_recovery_to_sync_result(
         download_client,
         passes,
         &config,
         controls,
         shutdown_token.clone(),
-        total_pending,
         result,
     )
     .await?;
@@ -9857,6 +9850,42 @@ mod tests {
                 return Ok(json!({"records": self.records.as_ref().clone()}));
             }
             Ok(json!({"records": [], "syncToken": "ignored-query-token"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct BoundedPolicyLookupSession {
+        records: Arc<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for BoundedPolicyLookupSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                return Ok(json!({"records": self.records.as_ref().clone()}));
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(json!({
+                    "zones": [{
+                        "zoneID": {
+                            "zoneName": "PrimarySync",
+                            "ownerRecordName": "_defaultOwner"
+                        },
+                        "moreComing": false,
+                        "records": []
+                    }]
+                }));
+            }
+            Ok(json!({"records": []}))
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -14663,7 +14692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_full_sync_excludes_filtered_live_pending_without_failure() {
+    async fn bounded_full_sync_revalidates_policy_excluded_asset_after_later_deletion() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = TestAssetRecord::new("LEGACY_FILTERED_MISSING")
             .filename("legacy-filtered-missing.jpg")
@@ -14676,13 +14705,13 @@ mod tests {
             Utc::now().timestamp().saturating_sub(86_400),
         );
 
-        let records = mock_photo_records_with_filename(
+        let live_records = mock_photo_records_with_filename(
             "LEGACY_FILTERED_MISSING",
             "legacy-filtered-missing.jpg",
         );
         let session = LegacyPendingHydrationSession {
-            lookup_records: Arc::new(vec![records[0].clone()]),
-            hydration_records: Arc::new(records),
+            lookup_records: Arc::new(vec![live_records[0].clone()]),
+            hydration_records: Arc::new(live_records.clone()),
             hydration_error: None,
         };
         let passes = vec![AlbumPass {
@@ -14704,7 +14733,7 @@ mod tests {
         let result = download_photos_with_sync(
             &Client::new(),
             &passes,
-            Arc::new(config),
+            Arc::new(config.clone()),
             DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
@@ -14724,6 +14753,65 @@ mod tests {
                 .as_deref(),
             Some("LEGACY_FILTERED_MISSING")
         );
+
+        let present_passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(BoundedPolicyLookupSession {
+                    records: Arc::new(live_records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let present_result = download_photos_with_sync(
+            &Client::new(),
+            &present_passes,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("present filtered asset should remain policy-excluded");
+        assert!(matches!(present_result.outcome, DownloadOutcome::Success));
+        assert_eq!(present_result.sync_token, None);
+        let summary = db.get_summary().await.expect("present summary");
+        assert_eq!(summary.policy_excluded, 1);
+        assert_eq!(summary.source_deleted, 0);
+
+        let deleted_passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(BoundedPolicyLookupSession {
+                    records: Arc::new(vec![json!({
+                        "recordName": "LEGACY_FILTERED_MISSING",
+                        "serverErrorCode": "UNKNOWN_ITEM",
+                        "reason": "record not found"
+                    })]),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let deleted_result = download_photos_with_sync(
+            &Client::new(),
+            &deleted_passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("explicit provider deletion should supersede policy exclusion");
+
+        assert!(matches!(deleted_result.outcome, DownloadOutcome::Success));
+        assert_eq!(deleted_result.sync_token, None);
+        let summary = db.get_summary().await.expect("deleted summary");
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.policy_excluded, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.source_deleted, 1);
     }
 
     #[tokio::test]
