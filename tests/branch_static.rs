@@ -46,6 +46,22 @@ fn command_text(output: &Output) -> String {
 }
 
 #[cfg(target_os = "linux")]
+fn run_git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|e| panic!("run git {}: {e}", args.join(" ")));
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    command_text(&output).trim().to_owned()
+}
+
+#[cfg(target_os = "linux")]
 fn assert_text_order(output: &str, names: &[&str]) {
     let mut previous = None;
     for name in names {
@@ -372,11 +388,15 @@ fn full_test_run_start_metadata_is_stable_until_finalize() {
 
     for expected in [
         "start_file=\"$runs_dir/.run-started-at\"",
+        "start_head_file=\"$runs_dir/.run-start-head\"",
+        "start_worktree_file=\"$runs_dir/.run-start-worktree-clean\"",
         "lockfile=\"$runs_dir/.lock\"",
         "flock 9",
         "if [[ $marker_age -lt 3600 ]]; then",
         "staging: $current (no records yet)",
         "date +%Y-%m-%dT%H:%M:%S >\"$start_file\"",
+        "git rev-parse HEAD >\"$start_head_file\"",
+        "git status --porcelain=v1 --untracked-files=all",
     ] {
         assert!(
             begin.contains(expected),
@@ -386,9 +406,18 @@ fn full_test_run_start_metadata_is_stable_until_finalize() {
 
     for expected in [
         "start_file=\"$runs_dir/.run-started-at\"",
+        "start_head_file=\"$runs_dir/.run-start-head\"",
+        "start_worktree_file=\"$runs_dir/.run-start-worktree-clean\"",
         "if [[ -s \"$start_file\" ]]; then",
         "started_at=$(head -n 1 \"$start_file\")",
-        "rm -f \"$current\" \"$runs_dir/.run-marker\" \"$start_file\"",
+        "head=$(head -n 1 \"$start_head_file\")",
+        "end_head=$(git rev-parse HEAD",
+        "start_worktree_clean=$(head -n 1 \"$start_worktree_file\")",
+        "end_worktree_clean=true",
+        "\"end_head\": end_head",
+        "\"start_worktree_clean\": start_clean == \"true\"",
+        "\"end_worktree_clean\": end_clean == \"true\"",
+        "rm -f \"$current\" \"$runs_dir/.run-marker\" \"$start_file\" \"$start_head_file\" \"$start_worktree_file\"",
     ] {
         assert!(
             finalize.contains(expected),
@@ -617,10 +646,21 @@ fn full_test_reporting_executes_grouped_and_legacy_fixtures() {
 #[test]
 fn full_test_finalize_emits_metrics_and_cleans_staging() {
     let temp = tempfile::tempdir().expect("finalize fixture tempdir");
+    let repo = temp.path().join("repo");
     let runs = temp.path().join("runs");
     let bin = temp.path().join("bin");
+    std::fs::create_dir(&repo).expect("create fixture repo");
     std::fs::create_dir(&runs).expect("create finalize runs dir");
     std::fs::create_dir(&bin).expect("create stub bin dir");
+
+    run_git(&repo, &["init", "-b", "fixture"]);
+    run_git(&repo, &["config", "user.name", "Kei Test"]);
+    run_git(&repo, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(repo.join("tracked.txt"), "fixture\n").expect("write fixture file");
+    std::fs::write(repo.join("Cargo.lock"), "name = \"fixture\"\n")
+        .expect("write fixture lockfile");
+    run_git(&repo, &["add", "tracked.txt", "Cargo.lock"]);
+    run_git(&repo, &["commit", "-m", "fixture"]);
 
     std::fs::write(
         runs.join(".current.jsonl"),
@@ -629,6 +669,11 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     .expect("write phase fixture");
     std::fs::write(runs.join(".run-started-at"), "2026-07-17T12:34:56\n")
         .expect("write start fixture");
+    let head = run_git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(runs.join(".run-start-head"), format!("{head}\n"))
+        .expect("write start head fixture");
+    std::fs::write(runs.join(".run-start-worktree-clean"), "true\n")
+        .expect("write start worktree fixture");
     std::fs::write(runs.join(".run-marker"), "fixture\n").expect("write marker fixture");
 
     write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
@@ -641,6 +686,7 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
 
     let output = Command::new("bash")
         .arg(repo_path("scripts/full-test/finalize_run.sh"))
+        .current_dir(&repo)
         .env("KEI_FULL_TEST_RUNS_DIR", &runs)
         .env("PATH", path)
         .output()
@@ -658,16 +704,196 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     )
     .expect("parse finalized record");
     assert_eq!(record["started_at"], "2026-07-17T12:34:56");
+    assert_eq!(record["head"], head);
+    assert_eq!(record["end_head"], head);
+    assert_eq!(record["start_worktree_clean"], true);
+    assert_eq!(record["end_worktree_clean"], true);
     assert_eq!(record["phases"]["static_checks"]["status"], "pass");
     assert_eq!(record["phases"]["static_checks"]["tests"], 3);
     assert!(record["metrics"].is_object());
     assert!(record["metrics"]["deps_count"].is_number());
-    for staging in [".current.jsonl", ".run-started-at", ".run-marker"] {
+    for staging in [
+        ".current.jsonl",
+        ".run-started-at",
+        ".run-start-head",
+        ".run-start-worktree-clean",
+        ".run-marker",
+    ] {
         assert!(
             !runs.join(staging).exists(),
             "finalize must remove {staging}"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_head_change_is_not_current_validation() {
+    let temp = tempfile::tempdir().expect("head change fixture tempdir");
+    let repo = temp.path().join("repo");
+    let runs = temp.path().join("runs");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&repo).expect("create fixture repo");
+    std::fs::create_dir_all(&runs).expect("create fixture runs directory");
+    std::fs::create_dir_all(&bin).expect("create stub bin directory");
+
+    run_git(&repo, &["init", "-b", "feature"]);
+    run_git(&repo, &["config", "user.name", "Kei Test"]);
+    run_git(&repo, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(repo.join("tracked.txt"), "start\n").expect("write starting file");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "start"]);
+    let start_head = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    let begin = Command::new(repo_path("scripts/full-test/begin_run.sh"))
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .output()
+        .expect("begin full-test fixture run");
+    assert!(
+        begin.status.success(),
+        "begin fixture failed: {}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+    std::fs::write(
+        runs.join(".current.jsonl"),
+        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.0}\n",
+    )
+    .expect("write phase fixture");
+
+    std::fs::write(repo.join("tracked.txt"), "end\n").expect("write ending file");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "end"]);
+    let end_head = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(&bin.join("docker"), "#!/usr/bin/env bash\nexit 1\n");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
+    let finalize = Command::new(repo_path("scripts/full-test/finalize_run.sh"))
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .env("PATH", path)
+        .output()
+        .expect("finalize full-test fixture run");
+    assert!(
+        finalize.status.success(),
+        "finalize fixture failed: {}",
+        String::from_utf8_lossy(&finalize.stderr)
+    );
+
+    let record_path = PathBuf::from(command_text(&finalize).trim());
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&record_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", record_path.display())),
+    )
+    .expect("parse head change record");
+    assert_eq!(record["head"], start_head);
+    assert_eq!(record["end_head"], end_head);
+    assert_eq!(record["start_worktree_clean"], true);
+    assert_eq!(record["end_worktree_clean"], true);
+
+    let scope = Command::new(repo_path("scripts/just/review-scope.sh"))
+        .arg("--validation-only")
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .output()
+        .expect("check changed-head validation provenance");
+    assert!(scope.status.success());
+    let scope = command_text(&scope);
+    assert!(scope.contains(&format!("validation_head: {start_head}")));
+    assert!(scope.contains(&format!("validation_end_head: {end_head}")));
+    assert!(
+        scope.contains("validation_status: STALE"),
+        "a run that changed heads must not be current:\n{scope}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_dirty_start_is_not_current_validation() {
+    let temp = tempfile::tempdir().expect("dirty start fixture tempdir");
+    let repo = temp.path().join("repo");
+    let runs = temp.path().join("runs");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&repo).expect("create fixture repo");
+    std::fs::create_dir_all(&runs).expect("create fixture runs directory");
+    std::fs::create_dir_all(&bin).expect("create stub bin directory");
+
+    run_git(&repo, &["init", "-b", "feature"]);
+    run_git(&repo, &["config", "user.name", "Kei Test"]);
+    run_git(&repo, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(repo.join("tracked.txt"), "committed\n").expect("write committed file");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+    let head = run_git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("tracked.txt"), "validated dirty bytes\n")
+        .expect("write dirty fixture");
+
+    let begin = Command::new(repo_path("scripts/full-test/begin_run.sh"))
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .output()
+        .expect("begin dirty fixture run");
+    assert!(
+        begin.status.success(),
+        "begin fixture failed: {}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+    std::fs::write(
+        runs.join(".current.jsonl"),
+        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.0}\n",
+    )
+    .expect("write phase fixture");
+    std::fs::write(repo.join("tracked.txt"), "committed\n").expect("restore committed file");
+
+    write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(&bin.join("docker"), "#!/usr/bin/env bash\nexit 1\n");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
+    let finalize = Command::new(repo_path("scripts/full-test/finalize_run.sh"))
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .env("PATH", path)
+        .output()
+        .expect("finalize dirty fixture run");
+    assert!(
+        finalize.status.success(),
+        "finalize fixture failed: {}",
+        String::from_utf8_lossy(&finalize.stderr)
+    );
+
+    let record_path = PathBuf::from(command_text(&finalize).trim());
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&record_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", record_path.display())),
+    )
+    .expect("parse dirty-start record");
+    assert_eq!(record["head"], head);
+    assert_eq!(record["end_head"], head);
+    assert_eq!(record["start_worktree_clean"], false);
+    assert_eq!(record["end_worktree_clean"], true);
+
+    let scope = Command::new(repo_path("scripts/just/review-scope.sh"))
+        .arg("--validation-only")
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .output()
+        .expect("check dirty-start validation provenance");
+    assert!(scope.status.success());
+    let scope = command_text(&scope);
+    assert!(scope.contains("validation_start_worktree_clean: false"));
+    assert!(scope.contains("validation_end_worktree_clean: true"));
+    assert!(
+        scope.contains("validation_status: STALE"),
+        "a run that started dirty must not be current:\n{scope}"
+    );
 }
 
 #[test]
@@ -1100,6 +1326,11 @@ fn repo_pr_ready_skill_uses_current_validation_workflow() {
         "name: kei-pr-ready",
         "without publishing or changing it",
         "just agent-status",
+        "just review-scope BASE=<resolved-base>",
+        "coverage ledger",
+        "validation provenance",
+        "STALE",
+        "OTHER BRANCH",
         "docs/architecture.md",
         "tests/README.md",
         "just test scenario NAME",
@@ -1116,6 +1347,122 @@ fn repo_pr_ready_skill_uses_current_validation_workflow() {
     assert!(
         metadata.contains("Use $kei-pr-ready"),
         "skill metadata must keep its default invocation aligned with SKILL.md"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn review_scope_reports_exact_diff_workspace_and_validation_provenance() {
+    let temp = tempfile::tempdir().expect("review scope tempdir");
+    let repo = temp.path().join("repo");
+    let runs = temp.path().join("runs");
+    std::fs::create_dir_all(&repo).expect("create fixture repo");
+    std::fs::create_dir_all(&runs).expect("create fixture runs directory");
+
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "Kei Test"]);
+    run_git(&repo, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(repo.join("tracked.txt"), "base\n").expect("write base file");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+    let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    run_git(&repo, &["checkout", "-b", "feature"]);
+    std::fs::write(repo.join("tracked.txt"), "feature\n").expect("write feature file");
+    std::fs::write(repo.join("added.txt"), "added\n").expect("write added file");
+    run_git(&repo, &["add", "tracked.txt", "added.txt"]);
+    run_git(&repo, &["commit", "-m", "feature"]);
+    let head = run_git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("tracked.txt"), "workspace\n").expect("write workspace file");
+    std::fs::write(repo.join("untracked.txt"), "untracked\n").expect("write untracked file");
+
+    let record = runs.join("latest.json");
+    let abbreviated_head = head
+        .get(..7)
+        .expect("git SHA has at least seven ASCII bytes");
+    write_json(
+        &record,
+        &serde_json::json!({
+            "branch": "feature",
+            "head": abbreviated_head,
+            "end_head": head,
+            "start_worktree_clean": true,
+            "end_worktree_clean": true
+        }),
+    );
+    let run_scope = || {
+        Command::new(repo_path("scripts/just/review-scope.sh"))
+            .arg("BASE=main")
+            .current_dir(&repo)
+            .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+            .output()
+            .expect("run review scope helper")
+    };
+
+    let current = run_scope();
+    assert!(
+        current.status.success(),
+        "review scope failed: {}",
+        String::from_utf8_lossy(&current.stderr)
+    );
+    let current = command_text(&current);
+    for expected in [
+        "base_ref: main",
+        &format!("base: {base}"),
+        &format!("merge_base: {base}"),
+        &format!("head: {head}"),
+        "commits: 1",
+        "A\tadded.txt",
+        "M\ttracked.txt",
+        " M tracked.txt",
+        "?? untracked.txt",
+        "validation_start_worktree_clean: true",
+        "validation_end_worktree_clean: true",
+        "validation_status: CURRENT",
+    ] {
+        assert!(
+            current.contains(expected),
+            "review scope output missing {expected}:\n{current}"
+        );
+    }
+
+    write_json(
+        &record,
+        &serde_json::json!({"branch": "feature", "head": head, "end_head": head}),
+    );
+    assert!(
+        command_text(&run_scope()).contains("validation_status: STALE"),
+        "legacy records without worktree evidence must not be current"
+    );
+
+    write_json(
+        &record,
+        &serde_json::json!({
+            "branch": "feature",
+            "head": base,
+            "end_head": base,
+            "start_worktree_clean": true,
+            "end_worktree_clean": true
+        }),
+    );
+    assert!(
+        command_text(&run_scope()).contains("validation_status: STALE"),
+        "same-branch result at another head must be stale"
+    );
+
+    write_json(
+        &record,
+        &serde_json::json!({
+            "branch": "other",
+            "head": base,
+            "end_head": base,
+            "start_worktree_clean": true,
+            "end_worktree_clean": true
+        }),
+    );
+    assert!(
+        command_text(&run_scope()).contains("validation_status: OTHER BRANCH"),
+        "result from another branch must not prove the current head"
     );
 }
 
