@@ -3948,82 +3948,9 @@ struct OwnedTempCleanup {
     retire: Vec<PathBuf>,
 }
 
-enum OwnedTempInspection {
-    Regular(std::fs::Metadata),
-    Retire,
-    Keep,
-    OutsideRoot,
-}
-
-/// Inspect one recorded path without following a symlink in the configured
-/// root, any descendant directory, or the temporary file itself.
-fn inspect_owned_temp_path(root: &Path, path: &Path) -> OwnedTempInspection {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return OwnedTempInspection::OutsideRoot;
-    };
-    let Some(file_name) = relative.file_name() else {
-        return OwnedTempInspection::Retire;
-    };
-
-    match std::fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => return OwnedTempInspection::Retire,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return OwnedTempInspection::Retire;
-        }
-        Err(error) => {
-            tracing::warn!(
-                path = %root.display(),
-                error = %error,
-                "Could not inspect download root during owned temporary-file cleanup"
-            );
-            return OwnedTempInspection::Keep;
-        }
-    }
-
-    let mut current = root.to_path_buf();
-    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    for component in parent.components() {
-        if !matches!(component, std::path::Component::Normal(_)) {
-            return OwnedTempInspection::Retire;
-        }
-        current.push(component.as_os_str());
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return OwnedTempInspection::Retire,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return OwnedTempInspection::Retire;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    path = %current.display(),
-                    error = %error,
-                    "Could not inspect directory during owned temporary-file cleanup"
-                );
-                return OwnedTempInspection::Keep;
-            }
-        }
-    }
-
-    current.push(file_name);
-    match std::fs::symlink_metadata(&current) {
-        Ok(metadata) if metadata.file_type().is_file() => OwnedTempInspection::Regular(metadata),
-        Ok(_) => OwnedTempInspection::Retire,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OwnedTempInspection::Retire,
-        Err(error) => {
-            tracing::warn!(
-                path = %current.display(),
-                error = %error,
-                "Could not inspect owned temporary file during cleanup"
-            );
-            OwnedTempInspection::Keep
-        }
-    }
-}
-
 /// Remove only stale exact paths from kei's durable temporary-file ownership
-/// ledger. No suffix match can authorize deletion, and inspection rejects
-/// every directory symlink before reaching the file.
+/// ledger. No suffix match can authorize deletion, and the removal stays
+/// relative to a verified directory or file handle.
 fn remove_owned_orphan_parts(
     root: &Path,
     owned: &[crate::state::OwnedTempFile],
@@ -4031,22 +3958,50 @@ fn remove_owned_orphan_parts(
     now_secs: i64,
     recent_grace_secs: i64,
 ) -> OwnedTempCleanup {
+    remove_owned_orphan_parts_with(
+        root,
+        owned,
+        cutoff_secs,
+        now_secs,
+        recent_grace_secs,
+        |_| {},
+    )
+}
+
+fn remove_owned_orphan_parts_with<F>(
+    root: &Path,
+    owned: &[crate::state::OwnedTempFile],
+    cutoff_secs: i64,
+    now_secs: i64,
+    recent_grace_secs: i64,
+    mut before_remove: F,
+) -> OwnedTempCleanup
+where
+    F: FnMut(&Path),
+{
+    use crate::fs_util::ConfinedFileOpen;
+
     let mut cleanup = OwnedTempCleanup::default();
     for record in owned {
         debug_assert!(record.claimed_at < cutoff_secs);
-        match inspect_owned_temp_path(root, &record.path) {
-            OwnedTempInspection::OutsideRoot | OwnedTempInspection::Keep => continue,
-            OwnedTempInspection::Retire => {
+        let candidate = match crate::fs_util::open_confined_regular_file(root, &record.path) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                tracing::warn!(
+                    path = %record.path.display(),
+                    error = %error,
+                    "Could not safely inspect owned temporary file during cleanup"
+                );
+                continue;
+            }
+        };
+        match candidate {
+            ConfinedFileOpen::OutsideRoot => continue,
+            ConfinedFileOpen::Retire => {
                 cleanup.retire.push(record.path.clone());
             }
-            OwnedTempInspection::Regular(metadata) => {
-                let Ok(mtime) = metadata.modified() else {
-                    continue;
-                };
-                let mtime_secs = mtime
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
+            ConfinedFileOpen::Regular(file) => {
+                let mtime_secs = file.modified_secs();
                 // A path modified after the completed-sync cutoff no longer
                 // matches the stale claim. Retire the claim without touching
                 // the file so it can never authorize a later deletion.
@@ -4059,7 +4014,8 @@ fn remove_owned_orphan_parts(
                 if is_recently_touched {
                     continue;
                 }
-                match std::fs::remove_file(&record.path) {
+                before_remove(&record.path);
+                match file.remove() {
                     Ok(()) => {
                         cleanup.removed += 1;
                         cleanup.retire.push(record.path.clone());
@@ -20356,6 +20312,43 @@ mod tests {
 
         assert_eq!(cleanup.removed, 0);
         assert_eq!(cleanup.retire, [linked_path]);
+        assert_eq!(std::fs::read(outside_path).unwrap(), b"external");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_orphan_cleanup_resists_ancestor_symlink_swap_before_remove() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let moved_parent = root.path().join("moved-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let owned_path = parent.join("owned.kei-tmp");
+        let outside_path = outside.path().join("owned.kei-tmp");
+        std::fs::write(&owned_path, b"owned").unwrap();
+        std::fs::write(&outside_path, b"external").unwrap();
+        let owned = [crate::state::OwnedTempFile {
+            path: owned_path.clone(),
+            claimed_at: 1,
+        }];
+
+        let cleanup = remove_owned_orphan_parts_with(
+            root.path(),
+            &owned,
+            i64::MAX / 2,
+            i64::MAX / 2,
+            0,
+            |_| {
+                std::fs::rename(&parent, &moved_parent).unwrap();
+                symlink(outside.path(), &parent).unwrap();
+            },
+        );
+
+        assert_eq!(cleanup.removed, 1);
+        assert_eq!(cleanup.retire.as_slice(), std::slice::from_ref(&owned_path));
+        assert!(!moved_parent.join("owned.kei-tmp").exists());
         assert_eq!(std::fs::read(outside_path).unwrap(), b"external");
     }
 
