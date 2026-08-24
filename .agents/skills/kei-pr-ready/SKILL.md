@@ -14,11 +14,15 @@ or change GitHub state.
 1. Read repository-root `AGENTS.md`, then the relevant sections of
    `CONTRIBUTING.md`, `docs/architecture.md`, and `tests/README.md`.
 2. Run `just agent-status`.
-3. Confirm the current branch, upstream, working-tree state, and comparison
-   base. Prefer the remote default branch; fall back to `origin/main` when the
-   default cannot be resolved.
-4. Inspect committed, staged, and unstaged changes. Return a not-ready verdict
-   if unrelated work prevents an attributable review.
+3. Resolve the remote default branch, falling back to `origin/main`, then run
+   `just review-scope BASE=<resolved-base>`.
+4. Record the exact base, merge base, and head. Inspect committed, staged,
+   unstaged, and untracked changes. Return a not-ready verdict if unrelated
+   work prevents an attributable review.
+5. Create a coverage ledger for every changed `(status, path)` entry, including
+   tests, docs, workflows, deletions, and renames. Mark each entry `reviewed` or
+   `skipped` with a concrete reason. Keep unchanged callers and invariant owners
+   in a separate context list. Never silently omit a changed entry.
 
 ## Classify impact
 
@@ -49,6 +53,10 @@ gate or a passing unit test as proof that all consumers were traced.
 6. Investigate every failure. Use bounded output and
    `just agent-failure-summary` when a retained full-test log is relevant.
 
+Treat gate, CI, and full-test results as proof only when their recorded head
+matches the reviewed head. Label results from the same branch at another head
+as `STALE` and results from another branch as `OTHER BRANCH`.
+
 Do not run live tests unless the changed behavior requires them. Follow
 `tests/README.md`, run live suites single-threaded, and preserve rate-limit and
 shared-session constraints.
@@ -62,10 +70,13 @@ documentation.
 Report:
 
 - base, head, and reviewed diff scope
+- merge base and validation provenance
+- changed-file coverage ledger and separate context-file list
 - impact classification, owners, safety contracts, and scenario slices
 - exact validation commands and results
 - unresolved failures, skipped checks, risks, and missing evidence
 - final verdict: ready or not ready
 
 Never report ready when a required check failed, was skipped without a
-documented reason, or could not be attributed to the reviewed diff.
+documented reason, could not be attributed to the reviewed head, or any changed
+file is unaccounted for.

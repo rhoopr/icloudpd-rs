@@ -46,6 +46,22 @@ fn command_text(output: &Output) -> String {
 }
 
 #[cfg(target_os = "linux")]
+fn run_git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|e| panic!("run git {}: {e}", args.join(" ")));
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    command_text(&output).trim().to_owned()
+}
+
+#[cfg(target_os = "linux")]
 fn assert_text_order(output: &str, names: &[&str]) {
     let mut previous = None;
     for name in names {
@@ -1100,6 +1116,11 @@ fn repo_pr_ready_skill_uses_current_validation_workflow() {
         "name: kei-pr-ready",
         "without publishing or changing it",
         "just agent-status",
+        "just review-scope BASE=<resolved-base>",
+        "coverage ledger",
+        "validation provenance",
+        "STALE",
+        "OTHER BRANCH",
         "docs/architecture.md",
         "tests/README.md",
         "just test scenario NAME",
@@ -1116,6 +1137,93 @@ fn repo_pr_ready_skill_uses_current_validation_workflow() {
     assert!(
         metadata.contains("Use $kei-pr-ready"),
         "skill metadata must keep its default invocation aligned with SKILL.md"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn review_scope_reports_exact_diff_workspace_and_validation_provenance() {
+    let temp = tempfile::tempdir().expect("review scope tempdir");
+    let repo = temp.path().join("repo");
+    let runs = temp.path().join("runs");
+    std::fs::create_dir_all(&repo).expect("create fixture repo");
+    std::fs::create_dir_all(&runs).expect("create fixture runs directory");
+
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "Kei Test"]);
+    run_git(&repo, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(repo.join("tracked.txt"), "base\n").expect("write base file");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+    let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    run_git(&repo, &["checkout", "-b", "feature"]);
+    std::fs::write(repo.join("tracked.txt"), "feature\n").expect("write feature file");
+    std::fs::write(repo.join("added.txt"), "added\n").expect("write added file");
+    run_git(&repo, &["add", "tracked.txt", "added.txt"]);
+    run_git(&repo, &["commit", "-m", "feature"]);
+    let head = run_git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("tracked.txt"), "workspace\n").expect("write workspace file");
+    std::fs::write(repo.join("untracked.txt"), "untracked\n").expect("write untracked file");
+
+    let record = runs.join("latest.json");
+    let abbreviated_head = head
+        .get(..7)
+        .expect("git SHA has at least seven ASCII bytes");
+    write_json(
+        &record,
+        &serde_json::json!({"branch": "feature", "head": abbreviated_head}),
+    );
+    let run_scope = || {
+        Command::new(repo_path("scripts/just/review-scope.sh"))
+            .arg("BASE=main")
+            .current_dir(&repo)
+            .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+            .output()
+            .expect("run review scope helper")
+    };
+
+    let current = run_scope();
+    assert!(
+        current.status.success(),
+        "review scope failed: {}",
+        String::from_utf8_lossy(&current.stderr)
+    );
+    let current = command_text(&current);
+    for expected in [
+        "base_ref: main",
+        &format!("base: {base}"),
+        &format!("merge_base: {base}"),
+        &format!("head: {head}"),
+        "commits: 1",
+        "A\tadded.txt",
+        "M\ttracked.txt",
+        " M tracked.txt",
+        "?? untracked.txt",
+        "validation_status: CURRENT",
+    ] {
+        assert!(
+            current.contains(expected),
+            "review scope output missing {expected}:\n{current}"
+        );
+    }
+
+    write_json(
+        &record,
+        &serde_json::json!({"branch": "feature", "head": base}),
+    );
+    assert!(
+        command_text(&run_scope()).contains("validation_status: STALE"),
+        "same-branch result at another head must be stale"
+    );
+
+    write_json(
+        &record,
+        &serde_json::json!({"branch": "other", "head": base}),
+    );
+    assert!(
+        command_text(&run_scope()).contains("validation_status: OTHER BRANCH"),
+        "result from another branch must not prove the current head"
     );
 }
 

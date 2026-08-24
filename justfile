@@ -147,8 +147,14 @@ agent-status:
         echo "(no run records found)"
     fi
     echo
+    scripts/just/review-scope.sh --validation-only
+    echo
     echo "recent full-test history:"
     scripts/full-test/history.sh 3 2>/dev/null || true
+
+# Exact branch review input plus workspace and validation provenance.
+review-scope BASE="origin/main":
+    scripts/just/review-scope.sh "{{BASE}}"
 
 # Summarize the latest full-test phase log, or pass LOG=/path/to/log.
 agent-failure-summary LOG="":
