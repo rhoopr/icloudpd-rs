@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- XMP sidecars now carry the source photo's GPS fix time, speed, speed reference, and horizontal positioning error, read from the media's own EXIF alongside the CloudKit location. A HEIC, AVIF, or PNG without a readable EXIF block still receives its sidecar with the CloudKit metadata. ([#725])
+- XMP sidecars carry the source photo's GPS fix time, speed, speed reference, and horizontal positioning error from the media's own EXIF alongside the CloudKit
+  location. This includes DNG and other TIFF-based RAW content, and uses the standard `exif:GPSTimeStamp` property. A photo without readable EXIF still receives its
+  sidecar with the CloudKit metadata. Source EXIF is read without buffering the complete media file. ([#725])
 
 ### Changed
 

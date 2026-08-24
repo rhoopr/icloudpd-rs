@@ -203,17 +203,25 @@ async fn write_sidecar_metadata(
     let sidecar_path = path.to_path_buf();
     let sidecar_temp_suffix = temp_suffix.to_string();
     let log_path = sidecar_path.clone();
-    match tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        let write = plan_sidecar_write(&sidecar_path, &payload, &created_local)?;
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<anyhow::Error>> {
+        let (write, source_error) = plan_sidecar_write(&sidecar_path, &payload, &created_local);
         if write.is_empty() {
-            return Ok(true);
+            return Ok(source_error);
         }
         super::metadata::write_sidecar(&sidecar_path, &write, &sidecar_temp_suffix)?;
-        Ok(true)
+        Ok(source_error)
     })
     .await
     {
-        Ok(Ok(ok)) => ok,
+        Ok(Ok(None)) => true,
+        Ok(Ok(Some(error))) => {
+            tracing::warn!(
+                path = %log_path.display(),
+                error = %error,
+                "Source GPS read failed after sidecar publication; leaving marker for retry"
+            );
+            false
+        }
         Ok(Err(e)) => {
             tracing::warn!(path = %log_path.display(), error = %e, "Failed to write XMP sidecar");
             false
@@ -256,8 +264,11 @@ fn plan_sidecar_write(
     path: &Path,
     payload: &MetadataPayload,
     created_local: &DateTime<FixedOffset>,
-) -> anyhow::Result<super::metadata::MetadataWrite> {
-    let source_gps = super::metadata::read_source_gps(path)?;
+) -> (super::metadata::MetadataWrite, Option<anyhow::Error>) {
+    let (source_gps, source_error) = match super::metadata::read_source_gps(path) {
+        Ok(metadata) => (metadata, None),
+        Err(error) => (super::metadata::SourceGpsMetadata::default(), Some(error)),
+    };
     let mut write = super::metadata::MetadataWrite {
         datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
         offset_time_original: offset_time_original(payload),
@@ -265,6 +276,7 @@ fn plan_sidecar_write(
         gps_speed: source_gps.speed,
         gps_speed_ref: source_gps.speed_ref,
         gps_h_positioning_error: source_gps.horizontal_positioning_error,
+        preserve_source_gps: source_error.is_some(),
         rating: payload.rating,
         gps: gps_from_payload(payload),
         is_hidden: payload.is_hidden,
@@ -277,7 +289,7 @@ fn plan_sidecar_write(
     write.people.clone_from(&payload.people);
     write.media_subtype.clone_from(&payload.media_subtype);
     write.burst_id.clone_from(&payload.burst_id);
-    Ok(write)
+    (write, source_error)
 }
 
 /// Plan the embed-path write. Per-tag gates:
@@ -940,7 +952,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.jpg");
         std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
-        let w = plan_sidecar_write(&path, &payload, &now_local()).unwrap();
+        let (w, source_error) = plan_sidecar_write(&path, &payload, &now_local());
+        assert!(source_error.is_none());
         // Every payload field should land in the sidecar write, no flag gating.
         assert!(w.datetime.is_some());
         assert_eq!(w.offset_time_original.as_deref(), Some("+11:00"));
@@ -963,7 +976,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.jpg");
         std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
-        let w = plan_sidecar_write(&path, &MetadataPayload::default(), &now_local()).unwrap();
+        let (w, source_error) =
+            plan_sidecar_write(&path, &MetadataPayload::default(), &now_local());
+        assert!(source_error.is_none());
         assert!(w.datetime.is_some());
         assert!(w.gps_datetime.is_none());
         assert!(w.gps_speed.is_none());
@@ -1194,6 +1209,57 @@ mod tests {
 
     #[cfg(feature = "xmp")]
     #[tokio::test]
+    async fn sidecar_write_reads_source_gps_from_dng_content() {
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let media_path = dir.path().join("source.DNG");
+        let source_bytes = crate::test_helpers::minimal_tiff_with_source_gps();
+        std::fs::write(&media_path, &source_bytes).expect("write source DNG");
+        let payload = MetadataPayload {
+            rating: Some(4),
+            latitude: Some(12.3456),
+            longitude: Some(-78.9012),
+            altitude: Some(9.25),
+            ..MetadataPayload::default()
+        };
+
+        let outcome = write_download_metadata(MetadataWriteRequest {
+            final_path: &media_path,
+            embed_path: None,
+            sidecar_path: Some(&media_path),
+            payload: Arc::new(payload),
+            created_local: now_local(),
+            flags: MetadataFlags::XMP_SIDECAR,
+            temp_suffix: ".gps-dng-test",
+        })
+        .await;
+
+        assert!(!outcome.any_failed());
+        let sidecar_path = media_path.with_file_name("source.DNG.xmp");
+        let xmp = std::fs::read_to_string(&sidecar_path)
+            .expect("read DNG sidecar")
+            .parse::<XmpMeta>()
+            .expect("parse DNG sidecar");
+        crate::test_helpers::assert_source_gps_in_xmp(&xmp);
+        let value = |namespace, name| xmp.property(namespace, name).expect(name).value;
+        assert_eq!(value(xmp_ns::XMP, "Rating"), "4");
+        assert_eq!(value(xmp_ns::EXIF, "GPSLatitude"), "12,20.7360N");
+        assert_eq!(value(xmp_ns::EXIF, "GPSLongitude"), "78,54.0720W");
+        assert_eq!(value(xmp_ns::EXIF, "GPSAltitude"), "9250/1000");
+        assert_eq!(
+            std::fs::read(&media_path).expect("read source DNG after sidecar"),
+            source_bytes,
+            "sidecar-only metadata must not alter DNG bytes"
+        );
+        assert!(
+            !media_path
+                .with_file_name("source.DNG.xmp.gps-dng-test")
+                .exists(),
+            "successful sidecar publication must remove its temporary file"
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
     async fn sidecar_retry_recovers_exif_less_media_and_keeps_marker_for_unreadable_source() {
         use crate::state::{AssetMetadata, SqliteStateDb};
 
@@ -1264,10 +1330,10 @@ mod tests {
             "EXIF-less media must still publish its sidecar"
         );
         assert!(
-            !unreadable_path
+            unreadable_path
                 .with_file_name("unreadable.heic.xmp")
                 .exists(),
-            "an unreadable source must not publish a sidecar"
+            "an unreadable source still publishes the CloudKit-only sidecar"
         );
 
         let pending = db

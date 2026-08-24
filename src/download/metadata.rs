@@ -16,11 +16,14 @@ use std::sync::Once;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDateTime};
+#[cfg(any(not(feature = "xmp"), test))]
 use little_exif::exif_tag::ExifTag;
 use little_exif::filetype::FileExtension;
 #[cfg(not(feature = "xmp"))]
 use little_exif::ifd::ExifTagGroup;
+#[cfg(any(not(feature = "xmp"), test))]
 use little_exif::metadata::Metadata;
+#[cfg(any(not(feature = "xmp"), test))]
 use little_exif::rational::uR64;
 #[cfg(feature = "xmp")]
 use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, XmpValue, xmp_ns};
@@ -106,7 +109,7 @@ impl ManagedXmpField {
             Self::DateTimeOriginal => "exif:DateTimeOriginal",
             Self::DateCreated => "photoshop:DateCreated",
             Self::OffsetTimeOriginal => "exifEX:OffsetTimeOriginal",
-            Self::GpsDateTime => "exif:GPSDateTime",
+            Self::GpsDateTime => "exif:GPSTimeStamp",
             Self::GpsSpeed => "exif:GPSSpeed",
             Self::GpsSpeedRef => "exif:GPSSpeedRef",
             Self::GpsHPositioningError => "exif:GPSHPositioningError",
@@ -152,6 +155,13 @@ impl ManagedXmpField {
         }
     }
 
+    const fn is_source_gps(self) -> bool {
+        matches!(
+            self,
+            Self::GpsDateTime | Self::GpsSpeed | Self::GpsSpeedRef | Self::GpsHPositioningError
+        )
+    }
+
     fn delete(self, meta: &mut XmpMeta) -> xmp_toolkit::XmpResult<()> {
         let (namespace, path) = match self {
             Self::CreateDate => (xmp_ns::XMP, "CreateDate"),
@@ -159,7 +169,7 @@ impl ManagedXmpField {
             Self::DateTimeOriginal => (xmp_ns::EXIF, "DateTimeOriginal"),
             Self::DateCreated => (xmp_ns::PHOTOSHOP, "DateCreated"),
             Self::OffsetTimeOriginal => (EXIF_EX_XMP_NS, "OffsetTimeOriginal"),
-            Self::GpsDateTime => (xmp_ns::EXIF, "GPSDateTime"),
+            Self::GpsDateTime => (xmp_ns::EXIF, "GPSTimeStamp"),
             Self::GpsSpeed => (xmp_ns::EXIF, "GPSSpeed"),
             Self::GpsSpeedRef => (xmp_ns::EXIF, "GPSSpeedRef"),
             Self::GpsHPositioningError => (xmp_ns::EXIF, "GPSHPositioningError"),
@@ -351,49 +361,86 @@ fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
 
 #[cfg(feature = "xmp")]
 pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
-    let extension_type = source_file_type_from_extension(path);
-    if path.extension().is_some() && extension_type.is_none() {
+    let mut source = std::fs::File::open(path)
+        .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
+    let mut head = [0_u8; 12];
+    let bytes_read = std::io::Read::read(&mut source, &mut head)
+        .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
+    let Some(file_type) = source_file_type(head.get(..bytes_read).unwrap_or_default()) else {
         return Ok(SourceGpsMetadata::default());
+    };
+
+    if file_type == FileExtension::JPEG {
+        let source_len = source
+            .metadata()
+            .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
+            .len();
+        return match read_jpeg_source_gps(&mut source, source_len) {
+            Ok(metadata) => Ok(metadata),
+            Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
+            Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
+                format!("Could not read {} for source GPS metadata", path.display())
+            }),
+        };
     }
 
-    let mut head = [0_u8; 12];
-    let bytes_read = std::fs::File::open(path)
-        .and_then(|mut file| {
-            use std::io::Read;
-            file.read(&mut head)
-        })
-        .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
-    let file_type = source_file_type(head.get(..bytes_read).unwrap_or_default());
-    let Some(file_type) = file_type else {
-        return Ok(SourceGpsMetadata::default());
-    };
-
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
-    // An absent or unreadable EXIF block is normal: many HEIC, AVIF and PNG
-    // files carry no EXIF, and a truncated media file cannot yield one. The
-    // sidecar still carries the CloudKit payload, so a parse failure degrades
-    // to no source GPS rather than suppressing the whole sidecar and stranding
-    // a retry marker.
-    let Ok(metadata) = Metadata::new_from_vec(&bytes, file_type) else {
-        return Ok(SourceGpsMetadata::default());
-    };
-    Ok(source_gps_from_exif(&metadata))
-}
-
-#[cfg(feature = "xmp")]
-fn source_file_type_from_extension(path: &Path) -> Option<FileExtension> {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .and_then(|extension| match extension.to_ascii_lowercase().as_str() {
-            "heic" | "heif" | "hif" | "avif" => Some(FileExtension::HEIF),
-            "jpg" | "jpeg" => Some(FileExtension::JPEG),
-            "tif" | "tiff" => Some(FileExtension::TIFF),
-            "png" => Some(FileExtension::PNG {
-                as_zTXt_chunk: true,
+    if file_type == FileExtension::TIFF {
+        let source_len = source
+            .metadata()
+            .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
+            .len();
+        return match read_tiff_source_gps(&mut source, 0, source_len) {
+            Ok(metadata) => Ok(metadata),
+            Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
+            Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
+                format!("Could not read {} for source GPS metadata", path.display())
             }),
-            _ => None,
-        })
+        };
+    }
+
+    if matches!(file_type, FileExtension::PNG { .. }) {
+        let source_len = source
+            .metadata()
+            .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
+            .len();
+        return match read_png_source_gps(&mut source, source_len) {
+            Ok(metadata) => Ok(metadata),
+            Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
+            Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
+                format!("Could not read {} for source GPS metadata", path.display())
+            }),
+        };
+    }
+
+    if file_type == FileExtension::HEIF {
+        let source_len = source
+            .metadata()
+            .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
+            .len();
+        let extent = match heif::locate_exif_tiff(&mut source, source_len) {
+            Ok(extent) => extent,
+            Err(heif::HeifExifError::Malformed) => {
+                return Ok(SourceGpsMetadata::default());
+            }
+            Err(heif::HeifExifError::Io(error)) => {
+                return Err(error).with_context(|| {
+                    format!("Could not read {} for source GPS metadata", path.display())
+                });
+            }
+        };
+        let Some((tiff_start, tiff_len)) = extent else {
+            return Ok(SourceGpsMetadata::default());
+        };
+        return match read_tiff_source_gps(&mut source, tiff_start, tiff_len) {
+            Ok(metadata) => Ok(metadata),
+            Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
+            Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
+                format!("Could not read {} for source GPS metadata", path.display())
+            }),
+        };
+    }
+
+    Ok(SourceGpsMetadata::default())
 }
 
 #[cfg(feature = "xmp")]
@@ -416,6 +463,347 @@ fn source_file_type(bytes: &[u8]) -> Option<FileExtension> {
 }
 
 #[cfg(feature = "xmp")]
+fn read_jpeg_source_gps<R: std::io::Read + std::io::Seek>(
+    source: &mut R,
+    source_len: u64,
+) -> Result<SourceGpsMetadata, TiffGpsError> {
+    let mut offset = 2_u64;
+    while offset < source_len {
+        let mut marker = [0_u8; 1];
+        read_exact_file_range(source, source_len, offset, &mut marker)?;
+        if marker[0] != 0xFF {
+            return Err(TiffGpsError::Malformed);
+        }
+        while marker[0] == 0xFF {
+            offset = offset.checked_add(1).ok_or(TiffGpsError::Malformed)?;
+            read_exact_file_range(source, source_len, offset, &mut marker)?;
+        }
+        let marker_code = marker[0];
+        offset = offset.checked_add(1).ok_or(TiffGpsError::Malformed)?;
+        if marker_code == 0xD9 || marker_code == 0xDA {
+            return Ok(SourceGpsMetadata::default());
+        }
+        if marker_code == 0x01 || (0xD0..=0xD7).contains(&marker_code) {
+            continue;
+        }
+
+        let mut length = [0_u8; 2];
+        read_exact_file_range(source, source_len, offset, &mut length)?;
+        let segment_len = u64::from(u16::from_be_bytes(length));
+        if segment_len < 2 {
+            return Err(TiffGpsError::Malformed);
+        }
+        let data_start = offset.checked_add(2).ok_or(TiffGpsError::Malformed)?;
+        let data_len = segment_len - 2;
+        let next = data_start
+            .checked_add(data_len)
+            .filter(|end| *end <= source_len)
+            .ok_or(TiffGpsError::Malformed)?;
+        if marker_code == 0xE1 && data_len >= 6 {
+            let mut signature = [0_u8; 6];
+            read_exact_file_range(source, source_len, data_start, &mut signature)?;
+            if signature == *b"Exif\0\0" {
+                return read_tiff_source_gps(source, data_start + 6, data_len - 6);
+            }
+        }
+        offset = next;
+    }
+    Ok(SourceGpsMetadata::default())
+}
+
+#[cfg(feature = "xmp")]
+fn read_png_source_gps<R: std::io::Read + std::io::Seek>(
+    source: &mut R,
+    source_len: u64,
+) -> Result<SourceGpsMetadata, TiffGpsError> {
+    let mut offset = 8_u64;
+    while offset < source_len {
+        let mut header = [0_u8; 8];
+        read_exact_file_range(source, source_len, offset, &mut header)?;
+        let data_len = u64::from(u32::from_be_bytes([
+            header[0], header[1], header[2], header[3],
+        ]));
+        let data_start = offset.checked_add(8).ok_or(TiffGpsError::Malformed)?;
+        let next = data_start
+            .checked_add(data_len)
+            .and_then(|end| end.checked_add(4))
+            .filter(|end| *end <= source_len)
+            .ok_or(TiffGpsError::Malformed)?;
+        if &header[4..8] == b"eXIf" {
+            return read_tiff_source_gps(source, data_start, data_len);
+        }
+        if &header[4..8] == b"IEND" {
+            return Ok(SourceGpsMetadata::default());
+        }
+        offset = next;
+    }
+    Ok(SourceGpsMetadata::default())
+}
+
+#[cfg(feature = "xmp")]
+fn read_exact_file_range<R: std::io::Read + std::io::Seek>(
+    source: &mut R,
+    source_len: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<(), TiffGpsError> {
+    let output_len = u64::try_from(output.len()).map_err(|_error| TiffGpsError::Malformed)?;
+    offset
+        .checked_add(output_len)
+        .filter(|end| *end <= source_len)
+        .ok_or(TiffGpsError::Malformed)?;
+    source.seek(std::io::SeekFrom::Start(offset))?;
+    source.read_exact(output)?;
+    Ok(())
+}
+
+#[cfg(feature = "xmp")]
+#[derive(Clone, Copy)]
+enum TiffEndian {
+    Little,
+    Big,
+}
+
+#[cfg(feature = "xmp")]
+#[derive(Debug)]
+enum TiffGpsError {
+    Io(std::io::Error),
+    Malformed,
+}
+
+#[cfg(feature = "xmp")]
+impl From<std::io::Error> for TiffGpsError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[cfg(feature = "xmp")]
+struct TiffGpsReader<'a, R> {
+    source: &'a mut R,
+    base: u64,
+    len: u64,
+    endian: TiffEndian,
+}
+
+#[cfg(feature = "xmp")]
+impl<R: std::io::Read + std::io::Seek> TiffGpsReader<'_, R> {
+    fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), TiffGpsError> {
+        let length = u64::try_from(output.len()).map_err(|_error| TiffGpsError::Malformed)?;
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= self.len)
+            .ok_or(TiffGpsError::Malformed)?;
+        let absolute = self
+            .base
+            .checked_add(offset)
+            .filter(|_| end <= self.len)
+            .ok_or(TiffGpsError::Malformed)?;
+        self.source.seek(std::io::SeekFrom::Start(absolute))?;
+        self.source.read_exact(output)?;
+        Ok(())
+    }
+
+    fn read_ifd_entry(&mut self, ifd_offset: u64, index: u16) -> Result<[u8; 12], TiffGpsError> {
+        let entry_offset = u64::from(index)
+            .checked_mul(12)
+            .and_then(|offset| ifd_offset.checked_add(2)?.checked_add(offset))
+            .ok_or(TiffGpsError::Malformed)?;
+        let mut entry = [0_u8; 12];
+        self.read_exact_at(entry_offset, &mut entry)?;
+        Ok(entry)
+    }
+
+    fn entry_value<const N: usize>(
+        &mut self,
+        entry: &[u8; 12],
+        expected_type: u16,
+        expected_count: u32,
+    ) -> Result<Option<[u8; N]>, TiffGpsError> {
+        if tiff_u16(self.endian, [entry[2], entry[3]]) != expected_type
+            || tiff_u32(self.endian, [entry[4], entry[5], entry[6], entry[7]]) != expected_count
+        {
+            return Ok(None);
+        }
+        let mut value = [0_u8; N];
+        if N <= 4 {
+            let inline = entry
+                .get(8..)
+                .and_then(|bytes| bytes.get(..N))
+                .ok_or(TiffGpsError::Malformed)?;
+            value.copy_from_slice(inline);
+        } else {
+            let offset = u64::from(tiff_u32(
+                self.endian,
+                [entry[8], entry[9], entry[10], entry[11]],
+            ));
+            self.read_exact_at(offset, &mut value)?;
+        }
+        Ok(Some(value))
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn read_tiff_source_gps<R: std::io::Read + std::io::Seek>(
+    source: &mut R,
+    base: u64,
+    len: u64,
+) -> Result<SourceGpsMetadata, TiffGpsError> {
+    let mut header = [0_u8; 8];
+    let mut reader = TiffGpsReader {
+        source,
+        base,
+        len,
+        endian: TiffEndian::Little,
+    };
+    reader.read_exact_at(0, &mut header)?;
+    reader.endian = match &header[..2] {
+        b"II" => TiffEndian::Little,
+        b"MM" => TiffEndian::Big,
+        _ => return Err(TiffGpsError::Malformed),
+    };
+    if tiff_u16(reader.endian, [header[2], header[3]]) != 42 {
+        return Err(TiffGpsError::Malformed);
+    }
+    let ifd0_offset = u64::from(tiff_u32(
+        reader.endian,
+        [header[4], header[5], header[6], header[7]],
+    ));
+    let ifd0_count = read_tiff_ifd_count(&mut reader, ifd0_offset)?;
+    let mut gps_ifd_offset = None;
+    for index in 0..ifd0_count {
+        let entry = reader.read_ifd_entry(ifd0_offset, index)?;
+        if tiff_u16(reader.endian, [entry[0], entry[1]]) == 0x8825
+            && tiff_u16(reader.endian, [entry[2], entry[3]]) == 4
+            && tiff_u32(reader.endian, [entry[4], entry[5], entry[6], entry[7]]) == 1
+        {
+            gps_ifd_offset = Some(u64::from(tiff_u32(
+                reader.endian,
+                [entry[8], entry[9], entry[10], entry[11]],
+            )));
+            break;
+        }
+    }
+    let Some(gps_ifd_offset) = gps_ifd_offset else {
+        return Ok(SourceGpsMetadata::default());
+    };
+
+    let gps_count = read_tiff_ifd_count(&mut reader, gps_ifd_offset)?;
+    let mut date = None;
+    let mut time = None;
+    let mut speed = None;
+    let mut speed_ref = None;
+    let mut horizontal_positioning_error = None;
+    for index in 0..gps_count {
+        let entry = reader.read_ifd_entry(gps_ifd_offset, index)?;
+        match tiff_u16(reader.endian, [entry[0], entry[1]]) {
+            0x0007 if time.is_none() => {
+                if let Some(value) = reader.entry_value::<24>(&entry, 5, 3)? {
+                    time = tiff_rational_triplet(reader.endian, &value);
+                }
+            }
+            0x000C if speed_ref.is_none() => {
+                if let Some(value) = reader.entry_value::<2>(&entry, 2, 2)? {
+                    speed_ref = std::str::from_utf8(&value)
+                        .ok()
+                        .map(|value| value.trim_matches('\0').trim().to_ascii_uppercase())
+                        .filter(|value| matches!(value.as_str(), "K" | "M" | "N"));
+                }
+            }
+            0x000D if speed.is_none() => {
+                if let Some(value) = reader.entry_value::<8>(&entry, 5, 1)? {
+                    speed = tiff_rational(reader.endian, &value);
+                }
+            }
+            0x001D if date.is_none() => {
+                if let Some(value) = reader.entry_value::<11>(&entry, 2, 11)? {
+                    date = std::str::from_utf8(&value)
+                        .ok()
+                        .map(|value| value.trim_matches('\0').trim().to_owned());
+                }
+            }
+            0x001F if horizontal_positioning_error.is_none() => {
+                if let Some(value) = reader.entry_value::<8>(&entry, 5, 1)? {
+                    horizontal_positioning_error = tiff_rational(reader.endian, &value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let datetime = date
+        .as_deref()
+        .zip(time.as_ref())
+        .and_then(|(date, time)| source_gps_datetime_values(date, time));
+    let speed = match (speed, speed_ref.as_ref()) {
+        (Some(value), Some(_)) => Some(value),
+        (Some(_), None) => {
+            tracing::warn!("Source EXIF GPSSpeedRef is missing or unsupported");
+            None
+        }
+        (None, _) => None,
+    };
+    let speed_ref = speed.as_ref().and(speed_ref);
+    Ok(SourceGpsMetadata {
+        datetime,
+        speed,
+        speed_ref,
+        horizontal_positioning_error,
+    })
+}
+
+#[cfg(feature = "__fuzz_internals")]
+pub(crate) fn fuzz_tiff_source_gps(bytes: &[u8]) {
+    let mut source = std::io::Cursor::new(bytes);
+    let _ = read_tiff_source_gps(&mut source, 0, bytes.len() as u64);
+}
+
+#[cfg(feature = "xmp")]
+fn read_tiff_ifd_count<R: std::io::Read + std::io::Seek>(
+    reader: &mut TiffGpsReader<'_, R>,
+    offset: u64,
+) -> Result<u16, TiffGpsError> {
+    let mut count = [0_u8; 2];
+    reader.read_exact_at(offset, &mut count)?;
+    Ok(tiff_u16(reader.endian, count))
+}
+
+#[cfg(feature = "xmp")]
+const fn tiff_u16(endian: TiffEndian, bytes: [u8; 2]) -> u16 {
+    match endian {
+        TiffEndian::Little => u16::from_le_bytes(bytes),
+        TiffEndian::Big => u16::from_be_bytes(bytes),
+    }
+}
+
+#[cfg(feature = "xmp")]
+const fn tiff_u32(endian: TiffEndian, bytes: [u8; 4]) -> u32 {
+    match endian {
+        TiffEndian::Little => u32::from_le_bytes(bytes),
+        TiffEndian::Big => u32::from_be_bytes(bytes),
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn tiff_rational(endian: TiffEndian, bytes: &[u8; 8]) -> Option<XmpRational> {
+    let numerator = tiff_u32(endian, [bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let denominator = tiff_u32(endian, [bytes[4], bytes[5], bytes[6], bytes[7]]);
+    (denominator != 0).then_some(XmpRational {
+        numerator,
+        denominator,
+    })
+}
+
+#[cfg(feature = "xmp")]
+fn tiff_rational_triplet(endian: TiffEndian, bytes: &[u8; 24]) -> Option<[XmpRational; 3]> {
+    Some([
+        tiff_rational(endian, bytes[0..8].try_into().ok()?)?,
+        tiff_rational(endian, bytes[8..16].try_into().ok()?)?,
+        tiff_rational(endian, bytes[16..24].try_into().ok()?)?,
+    ])
+}
+
+#[cfg(all(feature = "xmp", test))]
 fn source_gps_from_exif(metadata: &Metadata) -> SourceGpsMetadata {
     let gps_datetime = source_gps_datetime(metadata);
     let speed = first_rational(metadata, ExifTag::GPSSpeed(Vec::new()));
@@ -443,7 +831,7 @@ fn source_gps_from_exif(metadata: &Metadata) -> SourceGpsMetadata {
     }
 }
 
-#[cfg(feature = "xmp")]
+#[cfg(all(feature = "xmp", test))]
 fn first_rational(metadata: &Metadata, requested: ExifTag) -> Option<XmpRational> {
     metadata.get_tag(&requested).next().and_then(|tag| {
         let values = match tag {
@@ -454,7 +842,7 @@ fn first_rational(metadata: &Metadata, requested: ExifTag) -> Option<XmpRational
     })
 }
 
-#[cfg(feature = "xmp")]
+#[cfg(all(feature = "xmp", test))]
 fn first_string(metadata: &Metadata, requested: ExifTag) -> Option<String> {
     metadata
         .get_tag(&requested)
@@ -466,30 +854,9 @@ fn first_string(metadata: &Metadata, requested: ExifTag) -> Option<String> {
         })
 }
 
-/// `uR64` is a pair of `u32`, so a non-zero denominator always yields a finite
-/// non-negative quotient.
-#[cfg(feature = "xmp")]
-fn rational_to_f64(value: &uR64) -> Option<f64> {
-    if value.denominator == 0 {
-        return None;
-    }
-    Some(f64::from(value.nominator) / f64::from(value.denominator))
-}
-
-#[cfg(feature = "xmp")]
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "validated GPS hour, minute, and second ranges make these conversions bounded and non-negative"
-)]
+#[cfg(all(feature = "xmp", test))]
 fn source_gps_datetime(metadata: &Metadata) -> Option<String> {
     let date = first_string(metadata, ExifTag::GPSDateStamp(String::new()))?;
-    let date = chrono::NaiveDate::parse_from_str(date.trim_matches('\0').trim(), "%Y:%m:%d")
-        .ok()
-        .or_else(|| {
-            tracing::warn!("Source EXIF GPSDateStamp is malformed");
-            None
-        })?;
     let time_tag = metadata
         .get_tag(&ExifTag::GPSTimeStamp(Vec::new()))
         .next()?;
@@ -500,18 +867,35 @@ fn source_gps_datetime(metadata: &Metadata) -> Option<String> {
         tracing::warn!("Source EXIF GPSTimeStamp is malformed");
         return None;
     };
-    let Some(hour) = rational_to_f64(hour_value) else {
+    let values = [
+        XmpRational::from_exif(hour_value)?,
+        XmpRational::from_exif(minute_value)?,
+        XmpRational::from_exif(seconds_value)?,
+    ];
+    source_gps_datetime_values(date.trim_matches('\0').trim(), &values)
+}
+
+#[cfg(feature = "xmp")]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "validated GPS hour, minute, and second ranges make these conversions bounded and non-negative"
+)]
+fn source_gps_datetime_values(date: &str, time: &[XmpRational; 3]) -> Option<String> {
+    let date = chrono::NaiveDate::parse_from_str(date, "%Y:%m:%d")
+        .ok()
+        .or_else(|| {
+            tracing::warn!("Source EXIF GPSDateStamp is malformed");
+            None
+        })?;
+    let [hour_value, minute_value, seconds_value] = time;
+    let hour = hour_value.as_f64();
+    let minute = minute_value.as_f64();
+    let seconds = seconds_value.as_f64();
+    if !hour.is_finite() || !minute.is_finite() || !seconds.is_finite() {
         tracing::warn!("Source EXIF GPSTimeStamp is malformed");
         return None;
-    };
-    let Some(minute) = rational_to_f64(minute_value) else {
-        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
-        return None;
-    };
-    let Some(seconds) = rational_to_f64(seconds_value) else {
-        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
-        return None;
-    };
+    }
     if hour.fract() != 0.0
         || minute.fract() != 0.0
         || !(0.0..=23.0).contains(&hour)
@@ -603,11 +987,16 @@ pub(crate) struct XmpRational {
 
 #[cfg(feature = "xmp")]
 impl XmpRational {
+    #[cfg(test)]
     fn from_exif(value: &uR64) -> Option<Self> {
         (value.denominator != 0).then_some(Self {
             numerator: value.nominator,
             denominator: value.denominator,
         })
+    }
+
+    fn as_f64(&self) -> f64 {
+        f64::from(self.numerator) / f64::from(self.denominator)
     }
 
     fn encode(&self) -> String {
@@ -642,6 +1031,9 @@ pub(crate) struct MetadataWrite {
     pub(crate) gps_speed_ref: Option<String>,
     /// Horizontal positioning error in metres as an XMP rational.
     pub(crate) gps_h_positioning_error: Option<XmpRational>,
+    /// Preserve prior kei-owned source GPS fields because the source could not
+    /// be read and their current absence is unknown.
+    pub(crate) preserve_source_gps: bool,
     pub(crate) rating: Option<u8>,
     pub(crate) gps: Option<GpsCoords>,
     pub(crate) title: Option<String>,
@@ -665,6 +1057,7 @@ impl MetadataWrite {
             && self.gps_speed.is_none()
             && self.gps_speed_ref.is_none()
             && self.gps_h_positioning_error.is_none()
+            && !self.preserve_source_gps
             && self.rating.is_none()
             && self.gps.is_none()
             && self.title.is_none()
@@ -888,7 +1281,10 @@ fn apply_to_owned_sidecar(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_tool
         .collect();
 
     for field in MANAGED_XMP_FIELDS {
-        if previous_tokens.contains(&field.token()) && !field.is_present(write) {
+        if previous_tokens.contains(&field.token())
+            && !field.is_present(write)
+            && !(write.preserve_source_gps && field.is_source_gps())
+        {
             field.delete(meta)?;
         }
     }
@@ -898,9 +1294,9 @@ fn apply_to_owned_sidecar(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_tool
     let mut current_tokens: Vec<String> = previous_tokens
         .into_iter()
         .filter(|token| {
-            !MANAGED_XMP_FIELDS
-                .iter()
-                .any(|field| field.token() == *token)
+            !MANAGED_XMP_FIELDS.iter().any(|field| {
+                field.token() == *token && !(write.preserve_source_gps && field.is_source_gps())
+            })
         })
         .map(str::to_owned)
         .collect();
@@ -1208,7 +1604,7 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
     }
 
     if let Some(dt) = &write.gps_datetime {
-        meta.set_property(xmp_ns::EXIF, "GPSDateTime", &XmpValue::new(dt.clone()))?;
+        meta.set_property(xmp_ns::EXIF, "GPSTimeStamp", &XmpValue::new(dt.clone()))?;
     }
 
     if let Some(speed) = &write.gps_speed {
@@ -1435,7 +1831,8 @@ mod tests {
     use crate::test_helpers::{
         SOURCE_GPS_DATETIME, SOURCE_GPS_H_POSITIONING_ERROR, SOURCE_GPS_SPEED,
         SOURCE_GPS_SPEED_REF, exif_with_source_gps, heif_ftyp_without_meta_bytes,
-        minimal_jpeg_with_source_gps, source_gps_without_time_stamp, ur64,
+        minimal_big_endian_tiff_with_source_gps, minimal_jpeg_with_source_gps,
+        minimal_tiff_with_source_gps, source_gps_without_time_stamp, ur64,
     };
 
     fn test_tmp_dir(subdir: &str) -> PathBuf {
@@ -1572,11 +1969,31 @@ mod tests {
     }
 
     #[test]
-    fn source_gps_skips_unsupported_media_before_reading_it() {
+    fn source_gps_rejects_readable_unsupported_content() {
         let dir = tempfile::tempdir().expect("metadata temp dir");
         let path = dir.path().join("video.mov");
+        std::fs::write(&path, b"\0\0\0\x14ftypqt  \0\0\0\0qt  ").expect("write QuickTime header");
         let gps = read_source_gps(&path).expect("unsupported media should be ignored");
         assert_eq!(gps, SourceGpsMetadata::default());
+    }
+
+    #[test]
+    fn source_gps_read_errors_preserve_retry_evidence_for_every_path() {
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        for name in [
+            "video.mov",
+            "source.DNG",
+            "source.NEF",
+            "source.SRW",
+            "extensionless",
+        ] {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).expect("create unreadable source");
+            assert!(
+                read_source_gps(&path).is_err(),
+                "{name} must retain retry evidence after a read failure"
+            );
+        }
     }
 
     #[test]
@@ -1585,17 +2002,25 @@ mod tests {
         // degrade to no source GPS rather than an error, so the sidecar is
         // still written from the CloudKit payload and no retry marker is
         // stranded. Covers a truncated JPEG, an EXIF-less PNG, an `ftyp`-only
-        // HEIC, and a TIFF recognised by extension and magic. The TIFF row is
-        // the format-detection path DNG downloads exercise.
-        let cases: [(&str, Vec<u8>); 4] = [
+        // HEIC, and a DNG recognised by TIFF magic.
+        let cases: [(&str, Vec<u8>); 5] = [
             ("truncated.jpg", vec![0xFF, 0xD8, 0xFF]),
             (
                 "no-exif.png",
                 vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
             ),
+            (
+                "oversized-exif-chunk.png",
+                [
+                    b"\x89PNG\r\n\x1a\n".as_slice(),
+                    &u32::MAX.to_be_bytes(),
+                    b"eXIf",
+                ]
+                .concat(),
+            ),
             ("ftyp-only.heic", heif_ftyp_without_meta_bytes()),
             (
-                "recognised.tif",
+                "recognised.DNG",
                 vec![b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00],
             ),
         ];
@@ -1624,6 +2049,91 @@ mod tests {
         );
     }
 
+    fn png_with_source_gps() -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = u32::MAX;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 0 {
+                        crc >> 1
+                    } else {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    };
+                }
+            }
+            !crc
+        }
+
+        let mut png = std::fs::read("assets/logo3.png").expect("read PNG fixture");
+        let tiff = minimal_tiff_with_source_gps();
+        let ihdr_len = u32::from_be_bytes(png[8..12].try_into().expect("PNG IHDR length")) as usize;
+        let insert_at = 8 + 12 + ihdr_len;
+        let mut chunk = Vec::with_capacity(12 + tiff.len());
+        chunk.extend_from_slice(
+            &u32::try_from(tiff.len())
+                .expect("TIFF fixture length")
+                .to_be_bytes(),
+        );
+        chunk.extend_from_slice(b"eXIf");
+        chunk.extend_from_slice(&tiff);
+        chunk.extend_from_slice(&crc32(&chunk[4..]).to_be_bytes());
+        png.splice(insert_at..insert_at, chunk);
+        png
+    }
+
+    struct CountingCursor {
+        inner: std::io::Cursor<Vec<u8>>,
+        bytes_read: usize,
+    }
+
+    impl std::io::Read for CountingCursor {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let read = std::io::Read::read(&mut self.inner, output)?;
+            self.bytes_read += read;
+            Ok(read)
+        }
+    }
+
+    impl std::io::Seek for CountingCursor {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            std::io::Seek::seek(&mut self.inner, position)
+        }
+    }
+
+    #[test]
+    fn tiff_source_gps_reads_fixed_metadata_not_trailing_media() {
+        let mut bytes = minimal_tiff_with_source_gps();
+        bytes.resize(1024 * 1024, 0);
+        let len = bytes.len() as u64;
+        let mut source = CountingCursor {
+            inner: std::io::Cursor::new(bytes),
+            bytes_read: 0,
+        };
+
+        let gps = read_tiff_source_gps(&mut source, 0, len).expect("stream TIFF GPS");
+
+        assert_standard_source_gps(&gps);
+        assert!(
+            source.bytes_read < 256,
+            "TIFF GPS parsing read {} bytes",
+            source.bytes_read
+        );
+    }
+
+    #[test]
+    fn tiff_source_gps_rejects_attacker_sized_ifd_count_without_allocation() {
+        let mut bytes = minimal_tiff_with_source_gps();
+        bytes[26..28].copy_from_slice(&u16::MAX.to_le_bytes());
+        let len = bytes.len() as u64;
+        let mut source = std::io::Cursor::new(bytes);
+
+        assert!(matches!(
+            read_tiff_source_gps(&mut source, 0, len),
+            Err(TiffGpsError::Malformed)
+        ));
+    }
+
     #[test]
     fn source_gps_composes_utc_timestamps() {
         assert_standard_source_gps(&source_gps_from_exif(&exif_with_source_gps()));
@@ -1640,8 +2150,9 @@ mod tests {
 
     #[test]
     fn source_gps_reads_exif_from_media_path() {
-        // `read_source_gps` recovers the same facts from JPEG and HEIC media,
-        // exercising both magic-byte detections through the public reader.
+        // `read_source_gps` recovers the same facts from JPEG, HEIC, and
+        // TIFF-based DNG media. A DNG path holding JPEG bytes proves content
+        // selects the parser instead of the extension hint.
         let dir = tempfile::tempdir().expect("metadata temp dir");
         let mut heic = std::fs::read("tests/data/sample.heic").expect("read sample HEIC");
         exif_with_source_gps()
@@ -1649,12 +2160,51 @@ mod tests {
             .expect("write HEIC EXIF");
         for (name, bytes) in [
             ("source.jpg", minimal_jpeg_with_source_gps()),
+            ("jpeg-content.DNG", minimal_jpeg_with_source_gps()),
+            ("source.DNG", minimal_tiff_with_source_gps()),
+            ("source.NEF", minimal_tiff_with_source_gps()),
+            ("big-endian.DNG", minimal_big_endian_tiff_with_source_gps()),
+            ("source.png", png_with_source_gps()),
             ("source.heic", heic),
         ] {
             let path = dir.path().join(name);
             std::fs::write(&path, bytes).expect("write source media");
-            assert_standard_source_gps(&read_source_gps(&path).expect("read source EXIF"));
+            let gps = read_source_gps(&path).expect("read source EXIF");
+            assert_eq!(
+                gps.datetime.as_deref(),
+                Some(SOURCE_GPS_DATETIME),
+                "{name}: {gps:?}"
+            );
+            assert_standard_source_gps(&gps);
         }
+    }
+
+    #[test]
+    fn jpeg_source_gps_does_not_substitute_camera_datetime_for_gps_date() {
+        let mut metadata = Metadata::new();
+        metadata.set_tag(ExifTag::DateTimeOriginal("2024:06:16 08:00:00".into()));
+        metadata.set_tag(ExifTag::GPSTimeStamp(vec![
+            ur64(21, 1),
+            ur64(0, 1),
+            ur64(0, 1),
+        ]));
+        metadata.set_tag(ExifTag::GPSSpeedRef("K".into()));
+        metadata.set_tag(ExifTag::GPSSpeed(vec![ur64(12_345, 100)]));
+        let mut bytes = minimal_jpeg();
+        metadata
+            .write_to_vec(&mut bytes, FileExtension::JPEG)
+            .expect("write JPEG EXIF");
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let path = dir.path().join("source.jpg");
+        std::fs::write(&path, bytes).expect("write source JPEG");
+
+        let gps = read_source_gps(&path).expect("read source EXIF");
+
+        assert!(gps.datetime.is_none());
+        assert_eq!(
+            gps.speed.as_ref().map(XmpRational::encode).as_deref(),
+            Some(SOURCE_GPS_SPEED)
+        );
     }
 
     #[test]
@@ -1750,22 +2300,18 @@ mod tests {
     #[test]
     fn gps_datetime_serialises_as_typed_xmp_date() {
         // The sidecar-write test proves the GPS property values reach XMP. This
-        // pins the packet-level detail that GPSDateTime is a typed XMP date, not
-        // plain text, so downstream tools read it as a date.
+        // pins the standard property ID and its typed date value.
         let gps = source_gps_from_exif(&exif_with_source_gps());
         let packet = build_xmp_packet(&MetadataWrite {
             gps_datetime: gps.datetime,
             ..MetadataWrite::default()
         })
         .expect("XMP packet");
-        let meta = std::str::from_utf8(&packet)
-            .expect("XMP UTF-8")
-            .parse::<XmpMeta>()
-            .expect("parse XMP packet");
-        assert!(
-            meta.property_date(xmp_ns::EXIF, "GPSDateTime").is_some(),
-            "GPSDateTime must be serialised as an XMP date"
-        );
+        let packet = std::str::from_utf8(&packet).expect("XMP UTF-8");
+        let meta = packet.parse::<XmpMeta>().expect("parse XMP packet");
+        assert!(packet.contains("<exif:GPSTimeStamp>"));
+        assert!(meta.property_date(xmp_ns::EXIF, "GPSTimeStamp").is_some());
+        assert!(!meta.contains_property(xmp_ns::EXIF, "GPSDateTime"));
     }
 
     fn fresh_jpeg(dir: &Path, name: &str) -> PathBuf {
@@ -2960,6 +3506,7 @@ mod tests {
             gps_speed: Some(xmp_rational(25, 2)),
             gps_speed_ref: Some("K".into()),
             gps_h_positioning_error: Some(xmp_rational(13, 4)),
+            preserve_source_gps: false,
             rating: Some(5),
             gps: Some(GpsCoords {
                 latitude: 37.7,
@@ -2994,7 +3541,7 @@ mod tests {
         for (namespace, property) in [
             (xmp_ns::XMP, "Rating"),
             (EXIF_EX_XMP_NS, "OffsetTimeOriginal"),
-            (xmp_ns::EXIF, "GPSDateTime"),
+            (xmp_ns::EXIF, "GPSTimeStamp"),
             (xmp_ns::EXIF, "GPSSpeed"),
             (xmp_ns::EXIF, "GPSSpeedRef"),
             (xmp_ns::EXIF, "GPSHPositioningError"),
@@ -3023,7 +3570,7 @@ mod tests {
         assert!(managed.contains("exif:GPSLatitude"));
         assert!(!managed.contains("xmp:Rating"));
         assert!(!managed.contains("exifEX:OffsetTimeOriginal"));
-        assert!(!managed.contains("exif:GPSDateTime"));
+        assert!(!managed.contains("exif:GPSTimeStamp"));
         assert!(!managed.contains("exif:GPSSpeed"));
         assert!(!managed.contains("exif:GPSSpeedRef"));
         assert!(!managed.contains("exif:GPSHPositioningError"));
@@ -3059,7 +3606,7 @@ mod tests {
             .unwrap();
         seed.set_property(
             xmp_ns::EXIF,
-            "GPSDateTime",
+            "GPSTimeStamp",
             &XmpValue::new("2024-06-15T10:00:01Z".to_string()),
         )
         .unwrap();
@@ -3099,7 +3646,7 @@ mod tests {
             "an unmarked rating may belong to another application"
         );
         for property in [
-            "GPSDateTime",
+            "GPSTimeStamp",
             "GPSSpeed",
             "GPSSpeedRef",
             "GPSHPositioningError",
@@ -3120,10 +3667,69 @@ mod tests {
         let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
         assert!(!managed.contains("xmp:Rating"));
         assert!(!managed.contains("dc:description"));
-        assert!(!managed.contains("exif:GPSDateTime"));
+        assert!(!managed.contains("exif:GPSTimeStamp"));
         assert!(!managed.contains("exif:GPSSpeed"));
         assert!(!managed.contains("exif:GPSSpeedRef"));
         assert!(!managed.contains("exif:GPSHPositioningError"));
+
+        fs::remove_file(&sidecar_path).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_preserves_owned_source_gps_when_source_state_is_unknown() {
+        let dir = test_tmp_dir("sidecar_preserve_unknown_source_gps");
+        fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("unknown-source.jpg");
+        let sidecar_path = dir.join("unknown-source.jpg.xmp");
+        fs::write(&media_path, b"placeholder").unwrap();
+
+        write_sidecar_with_default_suffix(
+            &media_path,
+            &MetadataWrite {
+                gps_datetime: Some("2024-06-15T10:00:01Z".into()),
+                gps_speed: Some(xmp_rational(25, 2)),
+                gps_speed_ref: Some("K".into()),
+                gps_h_positioning_error: Some(xmp_rational(13, 4)),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        write_sidecar_with_default_suffix(
+            &media_path,
+            &MetadataWrite {
+                rating: Some(5),
+                preserve_source_gps: true,
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+
+        let meta = read_sidecar_meta(&media_path);
+        for property in [
+            "GPSTimeStamp",
+            "GPSSpeed",
+            "GPSSpeedRef",
+            "GPSHPositioningError",
+        ] {
+            assert!(
+                meta.contains_property(xmp_ns::EXIF, property),
+                "unknown source state must preserve {property}"
+            );
+        }
+        let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
+        for token in [
+            "exif:GPSTimeStamp",
+            "exif:GPSSpeed",
+            "exif:GPSSpeedRef",
+            "exif:GPSHPositioningError",
+        ] {
+            assert!(
+                managed.split(',').any(|value| value == token),
+                "unknown source state must preserve {token}"
+            );
+        }
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 5);
 
         fs::remove_file(&sidecar_path).ok();
         fs::remove_file(&media_path).ok();

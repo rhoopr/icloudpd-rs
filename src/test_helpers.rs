@@ -1054,6 +1054,102 @@ pub fn minimal_jpeg_with_source_gps() -> Vec<u8> {
     bytes
 }
 
+/// Minimal little-endian TIFF carrying the standard source GPS EXIF.
+#[cfg(feature = "xmp")]
+pub fn minimal_tiff_with_source_gps() -> Vec<u8> {
+    minimal_tiff_with_source_gps_endian(false)
+}
+
+/// Minimal big-endian TIFF carrying the standard source GPS EXIF.
+#[cfg(feature = "xmp")]
+pub fn minimal_big_endian_tiff_with_source_gps() -> Vec<u8> {
+    minimal_tiff_with_source_gps_endian(true)
+}
+
+#[cfg(feature = "xmp")]
+fn minimal_tiff_with_source_gps_endian(big_endian: bool) -> Vec<u8> {
+    fn push_u16(bytes: &mut Vec<u8>, value: u16, big_endian: bool) {
+        let encoded = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32, big_endian: bool) {
+        let encoded = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+
+    fn push_ifd_entry(
+        bytes: &mut Vec<u8>,
+        tag: u16,
+        value_type: u16,
+        count: u32,
+        value: u32,
+        big_endian: bool,
+    ) {
+        push_u16(bytes, tag, big_endian);
+        push_u16(bytes, value_type, big_endian);
+        push_u32(bytes, count, big_endian);
+        push_u32(bytes, value, big_endian);
+    }
+
+    const IFD0_OFFSET: u32 = 8;
+    const GPS_IFD_OFFSET: u32 = 26;
+    const GPS_DATE_OFFSET: u32 = 92;
+    const GPS_TIME_OFFSET: u32 = 104;
+    const GPS_SPEED_OFFSET: u32 = 128;
+    const GPS_ERROR_OFFSET: u32 = 136;
+
+    let mut bytes = Vec::with_capacity(144);
+    bytes.extend_from_slice(if big_endian { b"MM" } else { b"II" });
+    push_u16(&mut bytes, 42, big_endian);
+    push_u32(&mut bytes, IFD0_OFFSET, big_endian);
+
+    push_u16(&mut bytes, 1, big_endian);
+    push_ifd_entry(&mut bytes, 0x8825, 4, 1, GPS_IFD_OFFSET, big_endian);
+    push_u32(&mut bytes, 0, big_endian);
+
+    push_u16(&mut bytes, 5, big_endian);
+    push_ifd_entry(&mut bytes, 0x0007, 5, 3, GPS_TIME_OFFSET, big_endian);
+    push_ifd_entry(
+        &mut bytes,
+        0x000C,
+        2,
+        2,
+        if big_endian {
+            u32::from_be_bytes([b'K', 0, 0, 0])
+        } else {
+            u32::from_le_bytes([b'K', 0, 0, 0])
+        },
+        big_endian,
+    );
+    push_ifd_entry(&mut bytes, 0x000D, 5, 1, GPS_SPEED_OFFSET, big_endian);
+    push_ifd_entry(&mut bytes, 0x001D, 2, 11, GPS_DATE_OFFSET, big_endian);
+    push_ifd_entry(&mut bytes, 0x001F, 5, 1, GPS_ERROR_OFFSET, big_endian);
+    push_u32(&mut bytes, 0, big_endian);
+
+    bytes.extend_from_slice(b"2024:06:15\0");
+    bytes.push(0);
+    for (numerator, denominator) in [(10, 1), (20, 1), (30_125, 1_000)] {
+        push_u32(&mut bytes, numerator, big_endian);
+        push_u32(&mut bytes, denominator, big_endian);
+    }
+    push_u32(&mut bytes, 12_345, big_endian);
+    push_u32(&mut bytes, 100, big_endian);
+    push_u32(&mut bytes, 3, big_endian);
+    push_u32(&mut bytes, 2, big_endian);
+
+    debug_assert_eq!(bytes.len(), 144);
+    bytes
+}
+
 /// Structurally valid `ftyp`-only HEIC with no `meta` box, so it carries no
 /// EXIF item. Readers must treat it as media with no source GPS, not an error.
 #[cfg(feature = "xmp")]
@@ -1071,7 +1167,7 @@ pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
     use xmp_toolkit::xmp_ns;
 
     let text = |name: &str| meta.property(xmp_ns::EXIF, name).expect(name).value;
-    assert_eq!(text("GPSDateTime"), SOURCE_GPS_DATETIME);
+    assert_eq!(text("GPSTimeStamp"), SOURCE_GPS_DATETIME);
     assert_eq!(text("GPSSpeedRef"), SOURCE_GPS_SPEED_REF);
     assert_eq!(text("GPSSpeed"), SOURCE_GPS_SPEED);
     assert_eq!(text("GPSHPositioningError"), SOURCE_GPS_H_POSITIONING_ERROR);
