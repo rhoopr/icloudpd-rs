@@ -2,6 +2,23 @@
 
 use std::path::Path;
 
+/// Resolve `path` against the current directory and remove lexical `.` and
+/// `..` components without following filesystem symlinks.
+pub(crate) fn absolute_lexical(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 /// Remove `path`, treating `NotFound` as success and logging any other
 /// error at `warn!`. Use this in cleanup paths (`.part` cleanup, corrupt
 /// session-file deletion, EXDEV unwind) where a previous `let _ =` was

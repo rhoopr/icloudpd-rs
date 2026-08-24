@@ -82,7 +82,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 18;
+const HELPER_SCHEMA_VERSION: i32 = 19;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -286,6 +286,11 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
         CREATE INDEX IF NOT EXISTS idx_asset_metadata_capture_revision
             ON asset_metadata_capture_revisions (library, revision);
 
+        CREATE TABLE IF NOT EXISTS owned_temp_files (
+            path BLOB PRIMARY KEY NOT NULL,
+            claimed_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
             provider TEXT NOT NULL,
             account TEXT NOT NULL,
@@ -331,7 +336,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 18). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 19). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -349,7 +354,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 18;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 19;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -3811,6 +3816,19 @@ fn behavioral_helper_carries_every_migrated_column() {
             "v18 table {table} must exist in the behavioral helper's DDL"
         );
     }
+
+    let has_owned_temp_files: bool = conn
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name = 'owned_temp_files'",
+        )
+        .unwrap()
+        .exists([])
+        .unwrap();
+    assert!(
+        has_owned_temp_files,
+        "v19 table owned_temp_files must exist in the behavioral helper's DDL"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

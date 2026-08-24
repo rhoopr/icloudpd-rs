@@ -221,6 +221,13 @@ write or resume .part
   -> finalize SQLite state
 ```
 
+Schema v19 records the exact temporary path before a state-backed download can
+write or resume it. Normal completion and graceful interruption retire that
+claim. A process crash leaves the claim as durable cleanup authority. Later
+cleanup inspects only claimed paths, rejects every symlink in the path, and
+retires the claim after deletion or when the path is missing or no longer the
+claimed stale file. A suffix and file age alone never authorize deletion.
+
 `kei sync --repair-truncated` is the only media-replacement path. Pending
 retry planning requires the durable reconcile truncation marker, confirms the
 recorded file is still truncated, and fingerprints its bytes. After the new
@@ -329,6 +336,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
 | `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. |
+| `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/mod.rs`, `src/download/pipeline.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |

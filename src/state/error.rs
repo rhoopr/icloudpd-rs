@@ -20,6 +20,14 @@ pub enum StateError {
         source: std::io::Error,
     },
 
+    /// Failed to resolve a temporary download path into a stable absolute
+    /// ownership key.
+    #[error("Could not resolve temporary download path {path}: {source}")]
+    TempPath {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     /// Failed to open or create the database file.
     #[error("Could not open the state database at {path}: {source}")]
     Open {
