@@ -41,12 +41,16 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 print(data.get("branch", ""))
 print(data.get("head", ""))
+print(data.get("end_head", ""))
 PY
     )
-    local record_branch record_head validation_status
+    local record_branch record_head record_end_head resolved_head resolved_end_head validation_status
     record_branch=$(sed -n '1p' <<<"$record")
     record_head=$(sed -n '2p' <<<"$record")
-    if [[ -n "$record_head" && ("$current_head" == "$record_head"* || "$record_head" == "$current_head"*) ]]; then
+    record_end_head=$(sed -n '3p' <<<"$record")
+    resolved_head=$(git rev-parse --verify "${record_head}^{commit}" 2>/dev/null || true)
+    resolved_end_head=$(git rev-parse --verify "${record_end_head}^{commit}" 2>/dev/null || true)
+    if [[ -n "$resolved_head" && "$resolved_head" == "$current_head" && "$resolved_end_head" == "$current_head" ]]; then
         validation_status=CURRENT
     elif [[ -n "$record_branch" && "$record_branch" == "$current_branch" ]]; then
         validation_status=STALE
@@ -57,6 +61,7 @@ PY
     echo "latest_full_test: $latest"
     echo "validation_branch: ${record_branch:-(unknown)}"
     echo "validation_head: ${record_head:-(unknown)}"
+    echo "validation_end_head: ${record_end_head:-(unknown)}"
     echo "validation_status: $validation_status"
 }
 

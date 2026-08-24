@@ -388,11 +388,13 @@ fn full_test_run_start_metadata_is_stable_until_finalize() {
 
     for expected in [
         "start_file=\"$runs_dir/.run-started-at\"",
+        "start_head_file=\"$runs_dir/.run-start-head\"",
         "lockfile=\"$runs_dir/.lock\"",
         "flock 9",
         "if [[ $marker_age -lt 3600 ]]; then",
         "staging: $current (no records yet)",
         "date +%Y-%m-%dT%H:%M:%S >\"$start_file\"",
+        "git rev-parse HEAD >\"$start_head_file\"",
     ] {
         assert!(
             begin.contains(expected),
@@ -402,9 +404,13 @@ fn full_test_run_start_metadata_is_stable_until_finalize() {
 
     for expected in [
         "start_file=\"$runs_dir/.run-started-at\"",
+        "start_head_file=\"$runs_dir/.run-start-head\"",
         "if [[ -s \"$start_file\" ]]; then",
         "started_at=$(head -n 1 \"$start_file\")",
-        "rm -f \"$current\" \"$runs_dir/.run-marker\" \"$start_file\"",
+        "head=$(head -n 1 \"$start_head_file\")",
+        "end_head=$(git rev-parse HEAD",
+        "\"end_head\": end_head",
+        "rm -f \"$current\" \"$runs_dir/.run-marker\" \"$start_file\" \"$start_head_file\"",
     ] {
         assert!(
             finalize.contains(expected),
@@ -645,6 +651,9 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     .expect("write phase fixture");
     std::fs::write(runs.join(".run-started-at"), "2026-07-17T12:34:56\n")
         .expect("write start fixture");
+    let head = run_git(&repo_path(""), &["rev-parse", "HEAD"]);
+    std::fs::write(runs.join(".run-start-head"), format!("{head}\n"))
+        .expect("write start head fixture");
     std::fs::write(runs.join(".run-marker"), "fixture\n").expect("write marker fixture");
 
     write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
@@ -674,16 +683,107 @@ fn full_test_finalize_emits_metrics_and_cleans_staging() {
     )
     .expect("parse finalized record");
     assert_eq!(record["started_at"], "2026-07-17T12:34:56");
+    assert_eq!(record["head"], head);
+    assert_eq!(record["end_head"], head);
     assert_eq!(record["phases"]["static_checks"]["status"], "pass");
     assert_eq!(record["phases"]["static_checks"]["tests"], 3);
     assert!(record["metrics"].is_object());
     assert!(record["metrics"]["deps_count"].is_number());
-    for staging in [".current.jsonl", ".run-started-at", ".run-marker"] {
+    for staging in [
+        ".current.jsonl",
+        ".run-started-at",
+        ".run-start-head",
+        ".run-marker",
+    ] {
         assert!(
             !runs.join(staging).exists(),
             "finalize must remove {staging}"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_test_head_change_is_not_current_validation() {
+    let temp = tempfile::tempdir().expect("head change fixture tempdir");
+    let repo = temp.path().join("repo");
+    let runs = temp.path().join("runs");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&repo).expect("create fixture repo");
+    std::fs::create_dir_all(&runs).expect("create fixture runs directory");
+    std::fs::create_dir_all(&bin).expect("create stub bin directory");
+
+    run_git(&repo, &["init", "-b", "feature"]);
+    run_git(&repo, &["config", "user.name", "Kei Test"]);
+    run_git(&repo, &["config", "user.email", "kei-test@example.invalid"]);
+    std::fs::write(repo.join("tracked.txt"), "start\n").expect("write starting file");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "start"]);
+    let start_head = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    let begin = Command::new(repo_path("scripts/full-test/begin_run.sh"))
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .output()
+        .expect("begin full-test fixture run");
+    assert!(
+        begin.status.success(),
+        "begin fixture failed: {}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+    std::fs::write(
+        runs.join(".current.jsonl"),
+        "{\"phase\":\"static_checks\",\"status\":\"pass\",\"wall_s\":1.0}\n",
+    )
+    .expect("write phase fixture");
+
+    std::fs::write(repo.join("tracked.txt"), "end\n").expect("write ending file");
+    run_git(&repo, &["add", "tracked.txt"]);
+    run_git(&repo, &["commit", "-m", "end"]);
+    let end_head = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    write_executable(&bin.join("cargo"), "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(&bin.join("docker"), "#!/usr/bin/env bash\nexit 1\n");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
+    let finalize = Command::new(repo_path("scripts/full-test/finalize_run.sh"))
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .env("PATH", path)
+        .output()
+        .expect("finalize full-test fixture run");
+    assert!(
+        finalize.status.success(),
+        "finalize fixture failed: {}",
+        String::from_utf8_lossy(&finalize.stderr)
+    );
+
+    let record_path = PathBuf::from(command_text(&finalize).trim());
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&record_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", record_path.display())),
+    )
+    .expect("parse head change record");
+    assert_eq!(record["head"], start_head);
+    assert_eq!(record["end_head"], end_head);
+
+    let scope = Command::new(repo_path("scripts/just/review-scope.sh"))
+        .arg("--validation-only")
+        .current_dir(&repo)
+        .env("KEI_FULL_TEST_RUNS_DIR", &runs)
+        .output()
+        .expect("check changed-head validation provenance");
+    assert!(scope.status.success());
+    let scope = command_text(&scope);
+    assert!(scope.contains(&format!("validation_head: {start_head}")));
+    assert!(scope.contains(&format!("validation_end_head: {end_head}")));
+    assert!(
+        scope.contains("validation_status: STALE"),
+        "a run that changed heads must not be current:\n{scope}"
+    );
 }
 
 #[test]
@@ -1172,7 +1272,11 @@ fn review_scope_reports_exact_diff_workspace_and_validation_provenance() {
         .expect("git SHA has at least seven ASCII bytes");
     write_json(
         &record,
-        &serde_json::json!({"branch": "feature", "head": abbreviated_head}),
+        &serde_json::json!({
+            "branch": "feature",
+            "head": abbreviated_head,
+            "end_head": head
+        }),
     );
     let run_scope = || {
         Command::new(repo_path("scripts/just/review-scope.sh"))
@@ -1210,7 +1314,7 @@ fn review_scope_reports_exact_diff_workspace_and_validation_provenance() {
 
     write_json(
         &record,
-        &serde_json::json!({"branch": "feature", "head": base}),
+        &serde_json::json!({"branch": "feature", "head": base, "end_head": base}),
     );
     assert!(
         command_text(&run_scope()).contains("validation_status: STALE"),
@@ -1219,7 +1323,7 @@ fn review_scope_reports_exact_diff_workspace_and_validation_provenance() {
 
     write_json(
         &record,
-        &serde_json::json!({"branch": "other", "head": base}),
+        &serde_json::json!({"branch": "other", "head": base, "end_head": base}),
     );
     assert!(
         command_text(&run_scope()).contains("validation_status: OTHER BRANCH"),

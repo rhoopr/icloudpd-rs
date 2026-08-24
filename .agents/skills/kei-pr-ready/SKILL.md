@@ -53,9 +53,10 @@ gate or a passing unit test as proof that all consumers were traced.
 6. Investigate every failure. Use bounded output and
    `just agent-failure-summary` when a retained full-test log is relevant.
 
-Treat gate, CI, and full-test results as proof only when their recorded head
-matches the reviewed head. Label results from the same branch at another head
-as `STALE` and results from another branch as `OTHER BRANCH`.
+Treat gate, CI, and full-test results as proof only when the record shows that
+the run stayed on one head and that head matches the reviewed head. Label
+results from the same branch at another head as `STALE` and results from
+another branch as `OTHER BRANCH`.
 
 Do not run live tests unless the changed behavior requires them. Follow
 `tests/README.md`, run live suites single-threaded, and preserve rate-limit and
