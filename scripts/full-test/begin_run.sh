@@ -18,6 +18,7 @@ current="$runs_dir/.current.jsonl"
 marker="$runs_dir/.run-marker"
 start_file="$runs_dir/.run-started-at"
 start_head_file="$runs_dir/.run-start-head"
+start_worktree_file="$runs_dir/.run-start-worktree-clean"
 rate_flag="$runs_dir/.rate-limited"
 skip_flag="$runs_dir/.live-skipped"
 lockfile="$runs_dir/.lock"
@@ -63,6 +64,11 @@ run_id=$(date +%Y%m%dT%H%M%S)
     date -u +%s >"$marker"
     date +%Y-%m-%dT%H:%M:%S >"$start_file"
     git rev-parse HEAD >"$start_head_file"
+    if [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+        echo true >"$start_worktree_file"
+    else
+        echo false >"$start_worktree_file"
+    fi
 ) 9>"$lockfile"
 
 echo "$run_id"

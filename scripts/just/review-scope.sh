@@ -42,15 +42,19 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 print(data.get("branch", ""))
 print(data.get("head", ""))
 print(data.get("end_head", ""))
+print("true" if data.get("start_worktree_clean") is True else "false")
+print("true" if data.get("end_worktree_clean") is True else "false")
 PY
     )
-    local record_branch record_head record_end_head resolved_head resolved_end_head validation_status
+    local record_branch record_head record_end_head record_start_clean record_end_clean resolved_head resolved_end_head validation_status
     record_branch=$(sed -n '1p' <<<"$record")
     record_head=$(sed -n '2p' <<<"$record")
     record_end_head=$(sed -n '3p' <<<"$record")
+    record_start_clean=$(sed -n '4p' <<<"$record")
+    record_end_clean=$(sed -n '5p' <<<"$record")
     resolved_head=$(git rev-parse --verify "${record_head}^{commit}" 2>/dev/null || true)
     resolved_end_head=$(git rev-parse --verify "${record_end_head}^{commit}" 2>/dev/null || true)
-    if [[ -n "$resolved_head" && "$resolved_head" == "$current_head" && "$resolved_end_head" == "$current_head" ]]; then
+    if [[ -n "$resolved_head" && "$resolved_head" == "$current_head" && "$resolved_end_head" == "$current_head" && "$record_start_clean" == true && "$record_end_clean" == true ]]; then
         validation_status=CURRENT
     elif [[ -n "$record_branch" && "$record_branch" == "$current_branch" ]]; then
         validation_status=STALE
@@ -62,6 +66,8 @@ PY
     echo "validation_branch: ${record_branch:-(unknown)}"
     echo "validation_head: ${record_head:-(unknown)}"
     echo "validation_end_head: ${record_end_head:-(unknown)}"
+    echo "validation_start_worktree_clean: $record_start_clean"
+    echo "validation_end_worktree_clean: $record_end_clean"
     echo "validation_status: $validation_status"
 }
 
