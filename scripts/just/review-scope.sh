@@ -32,7 +32,8 @@ print_validation_provenance() {
         return
     fi
 
-    record=$(python3 - "$latest" <<'PY'
+    record=$(
+        python3 - "$latest" <<'PY'
 import json
 import sys
 
@@ -41,11 +42,11 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 print(data.get("branch", ""))
 print(data.get("head", ""))
 PY
-)
+    )
     local record_branch record_head validation_status
     record_branch=$(sed -n '1p' <<<"$record")
     record_head=$(sed -n '2p' <<<"$record")
-    if [[ -n "$record_head" && ( "$current_head" == "$record_head"* || "$record_head" == "$current_head"* ) ]]; then
+    if [[ -n "$record_head" && ("$current_head" == "$record_head"* || "$record_head" == "$current_head"*) ]]; then
         validation_status=CURRENT
     elif [[ -n "$record_branch" && "$record_branch" == "$current_branch" ]]; then
         validation_status=STALE
