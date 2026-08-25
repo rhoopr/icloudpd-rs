@@ -200,26 +200,14 @@ async fn write_sidecar_metadata(
     created_local: DateTime<FixedOffset>,
     temp_suffix: &str,
 ) -> bool {
-    let sidecar_path = path.to_path_buf();
-    let sidecar_temp_suffix = temp_suffix.to_string();
-    match tokio::task::spawn_blocking(move || {
-        let write = plan_sidecar_write(&payload, &created_local);
-        if write.is_empty() {
-            return true;
-        }
-        match super::metadata::write_sidecar(&sidecar_path, &write, &sidecar_temp_suffix) {
-            Err(e) => {
-                tracing::warn!(path = %sidecar_path.display(), error = %e, "Failed to write XMP sidecar");
-                false
-            }
-            Ok(()) => true,
-        }
-    })
-    .await
-    {
-        Ok(ok) => ok,
+    let write = plan_sidecar_write(&payload, &created_local);
+    if write.is_empty() {
+        return true;
+    }
+    match super::metadata::write_sidecar(path, &write, temp_suffix).await {
+        Ok(()) => true,
         Err(e) => {
-            tracing::warn!(error = %e, "XMP sidecar task panicked");
+            tracing::warn!(path = %path.display(), error = %e, "Failed to write XMP sidecar");
             false
         }
     }

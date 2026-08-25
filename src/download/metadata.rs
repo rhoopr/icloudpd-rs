@@ -27,7 +27,9 @@ use little_exif::metadata::Metadata;
 #[cfg(not(feature = "xmp"))]
 use little_exif::rational::uR64;
 #[cfg(feature = "xmp")]
-use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, XmpValue, xmp_ns};
+use xmp_toolkit::{
+    FromStrOptions, OpenFileOptions, XmpErrorType, XmpFile, XmpMeta, XmpValue, xmp_ns,
+};
 
 #[cfg(feature = "xmp")]
 use super::heif;
@@ -551,20 +553,65 @@ fn temp_path_for(path: &Path, temp_suffix: &str) -> PathBuf {
 ///
 /// If a sidecar already exists (e.g., from Darktable / Lightroom / digiKam),
 /// its existing XMP properties are read and kei's fields are layered on top
-/// rather than overwriting the whole packet. A malformed existing sidecar
-/// falls back to a fresh packet — kei's enriched view wins over a file we
-/// can't parse.
+/// rather than overwriting the whole packet. Existing bytes must remain
+/// readable, parseable, and unchanged through publication. Otherwise the
+/// write fails without replacing them.
 #[cfg(feature = "xmp")]
-pub(crate) fn write_sidecar(
+pub(crate) async fn write_sidecar(
     media_path: &Path,
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<()> {
+    let media_path = media_path.to_path_buf();
+    let write = write.clone();
+    let temp_suffix = temp_suffix.to_owned();
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_sidecar_write(&media_path, &write, &temp_suffix)
+    })
+    .await
+    .context("XMP sidecar preparation task panicked")??;
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+
+    // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
+    super::file::publish_file_if_unchanged(
+        &prepared.tmp_path,
+        &prepared.sidecar_path,
+        prepared.expected,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Could not install XMP sidecar {} -> {}",
+            prepared.tmp_path.display(),
+            prepared.sidecar_path.display()
+        )
+    })?;
+    tracing::debug!(path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
+    Ok(())
+}
+
+#[cfg(feature = "xmp")]
+struct PreparedSidecar {
+    tmp_path: PathBuf,
+    sidecar_path: PathBuf,
+    expected: Option<super::file::ExistingFileFingerprint>,
+}
+
+#[cfg(feature = "xmp")]
+fn prepare_sidecar_write(
+    media_path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+) -> Result<Option<PreparedSidecar>> {
+    use sha2::{Digest, Sha256};
+
     ensure_initialized();
 
     let Some(name) = media_path.file_name() else {
         if write.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         anyhow::bail!(
             "Cannot write an XMP sidecar because the media path has no filename: {}",
@@ -578,22 +625,30 @@ pub(crate) fn write_sidecar(
 
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
-    let mut meta = match std::fs::read(&sidecar_path) {
-        Ok(existing_bytes) => match std::str::from_utf8(&existing_bytes)
-            .ok()
-            .and_then(|s| s.parse::<XmpMeta>().ok())
-        {
-            Some(parsed) => parsed,
-            None => {
-                tracing::warn!(
-                    path = %sidecar_path.display(),
-                    "Existing XMP sidecar could not be parsed; overwriting with a fresh packet"
-                );
-                XmpMeta::new().context("creating XmpMeta")?
-            }
-        },
+    let (mut meta, expected) = match std::fs::read(&sidecar_path) {
+        Ok(existing_bytes) => {
+            let existing = std::str::from_utf8(&existing_bytes).with_context(|| {
+                format!(
+                    "Existing XMP sidecar is not valid UTF-8: {}",
+                    sidecar_path.display()
+                )
+            })?;
+            let parsed = parse_existing_sidecar(existing).with_context(|| {
+                format!(
+                    "Could not parse existing XMP sidecar {}",
+                    sidecar_path.display()
+                )
+            })?;
+            let size = u64::try_from(existing_bytes.len())
+                .context("Existing XMP sidecar is too large to fingerprint")?;
+            let fingerprint = super::file::ExistingFileFingerprint {
+                size,
+                sha256: Sha256::digest(&existing_bytes).into(),
+            };
+            (parsed, Some(fingerprint))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            XmpMeta::new().context("creating XmpMeta")?
+            (XmpMeta::new().context("creating XmpMeta")?, None)
         }
         Err(e) => {
             return Err(e).with_context(|| {
@@ -605,26 +660,59 @@ pub(crate) fn write_sidecar(
         }
     };
     if write.is_empty() && !meta.contains_property(KEI_XMP_NS, KEI_MANAGED_FIELDS) {
-        return Ok(());
+        return Ok(None);
     }
     apply_to_owned_sidecar(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
 
-    std::fs::write(&tmp_path, &bytes).with_context(|| {
+    let mut temp = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .with_context(|| {
+            format!(
+                "Could not create temporary XMP sidecar {}",
+                tmp_path.display()
+            )
+        })?;
+    let guard = TmpGuard::new(&tmp_path);
+    std::io::Write::write_all(&mut temp, &bytes).with_context(|| {
         format!(
             "Could not write temporary XMP sidecar {}",
             tmp_path.display()
         )
     })?;
-    atomic_install(&tmp_path, &sidecar_path).with_context(|| {
+    temp.sync_all().with_context(|| {
         format!(
-            "Could not install XMP sidecar {} -> {}",
-            tmp_path.display(),
-            sidecar_path.display()
+            "Could not sync temporary XMP sidecar {}",
+            tmp_path.display()
         )
     })?;
-    tracing::debug!(path = %sidecar_path.display(), "Wrote XMP sidecar");
-    Ok(())
+    guard.disarm();
+    Ok(Some(PreparedSidecar {
+        tmp_path,
+        sidecar_path,
+        expected,
+    }))
+}
+
+#[cfg(feature = "xmp")]
+fn parse_existing_sidecar(existing: &str) -> Result<XmpMeta> {
+    match XmpMeta::from_str_with_options(existing, FromStrOptions::default().require_xmp_meta()) {
+        Ok(parsed) => Ok(parsed),
+        Err(error) if error.error_type == XmpErrorType::XmpMetaElementMissing => {
+            let parsed = existing.parse::<XmpMeta>()?;
+            anyhow::ensure!(
+                parsed
+                    .iter(xmp_toolkit::IterOptions::default())
+                    .next()
+                    .is_some(),
+                "sidecar has no recognizable XMP properties"
+            );
+            Ok(parsed)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Apply a complete sidecar snapshot without deleting metadata that kei cannot
@@ -1150,7 +1238,10 @@ mod tests {
         path: &std::path::Path,
         write: &super::MetadataWrite,
     ) -> super::Result<()> {
-        super::write_sidecar(path, write, ".meta-tmp")
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| tokio::runtime::Runtime::new().expect("sidecar test runtime"))
+            .block_on(super::write_sidecar(path, write, ".meta-tmp"))
     }
 
     use super::*;
@@ -2451,6 +2542,124 @@ mod tests {
         fs::remove_file(&media_path).ok();
     }
 
+    #[tokio::test]
+    async fn write_sidecar_refuses_existing_file_changed_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_path = dir.path().join("changed.jpg");
+        let sidecar_path = dir.path().join("changed.jpg.xmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        ensure_initialized();
+        let mut original = XmpMeta::new().unwrap();
+        original
+            .set_property(
+                xmp_ns::DC,
+                "creator",
+                &XmpValue::new("Initial author".to_string()),
+            )
+            .unwrap();
+        std::fs::write(&sidecar_path, original.to_string().into_bytes()).unwrap();
+
+        let prepared = prepare_sidecar_write(
+            &media_path,
+            &MetadataWrite {
+                rating: Some(4),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+        )
+        .unwrap()
+        .expect("sidecar update should be prepared");
+        let temp_path = prepared.tmp_path.clone();
+
+        let external = b"external replacement after initial read";
+        std::fs::write(&sidecar_path, external).unwrap();
+        let error = crate::download::file::publish_file_if_unchanged(
+            &prepared.tmp_path,
+            &prepared.sidecar_path,
+            prepared.expected,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("bytes changed"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&sidecar_path).unwrap(),
+            external,
+            "an external change after the initial read must not be replaced"
+        );
+        assert!(
+            temp_path.exists(),
+            "refused publication retains the prepared file because an exchange failure could have displaced user bytes there"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_sidecar_refuses_file_created_after_missing_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_path = dir.path().join("appeared.jpg");
+        let sidecar_path = dir.path().join("appeared.jpg.xmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        let prepared = prepare_sidecar_write(
+            &media_path,
+            &MetadataWrite {
+                rating: Some(4),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+        )
+        .unwrap()
+        .expect("new sidecar should be prepared");
+        let temp_path = prepared.tmp_path.clone();
+
+        let external = b"sidecar created by another application";
+        std::fs::write(&sidecar_path, external).unwrap();
+        let error = crate::download::file::publish_file_if_unchanged(
+            &prepared.tmp_path,
+            &prepared.sidecar_path,
+            prepared.expected,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("appeared"), "{error:#}");
+        assert_eq!(std::fs::read(&sidecar_path).unwrap(), external);
+        assert!(
+            temp_path.exists(),
+            "refused publication retains the prepared file for operator inspection"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_sidecar_preserves_preexisting_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_path = dir.path().join("temp-conflict.jpg");
+        let sidecar_path = dir.path().join("temp-conflict.jpg.xmp");
+        let temp_path = dir.path().join("temp-conflict.jpg.xmp.meta-tmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+        let existing_temp = b"unowned or displaced bytes";
+        std::fs::write(&temp_path, existing_temp).unwrap();
+
+        let error = super::write_sidecar(
+            &media_path,
+            &MetadataWrite {
+                rating: Some(4),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Could not create temporary XMP sidecar"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&temp_path).unwrap(), existing_temp);
+        assert!(!sidecar_path.exists());
+    }
+
     #[test]
     fn write_sidecar_clears_only_fields_previously_owned_by_kei() {
         let dir = test_tmp_dir("sidecar_tests");
@@ -2711,27 +2920,48 @@ mod tests {
     }
 
     #[test]
-    fn write_sidecar_recovers_from_unparsable_existing() {
-        // A garbage existing sidecar should not block kei's write; we log
-        // and fall back to a fresh packet rather than erroring.
+    fn write_sidecar_preserves_unparsable_existing() {
         let dir = test_tmp_dir("sidecar_tests");
         std::fs::create_dir_all(&dir).unwrap();
         let media_path = dir.join("garbage.jpg");
         let sidecar_path = dir.join("garbage.jpg.xmp");
         std::fs::write(&media_path, b"placeholder").unwrap();
-        std::fs::write(&sidecar_path, b"<<< this is not XMP >>>").unwrap();
+        let original = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF";
+        std::fs::write(&sidecar_path, original).unwrap();
 
         let write = MetadataWrite {
             title: Some("Clean".into()),
             ..MetadataWrite::default()
         };
-        write_sidecar_with_default_suffix(&media_path, &write).expect("fallback to fresh packet");
+        let error = write_sidecar_with_default_suffix(&media_path, &write).unwrap_err();
 
-        let out = fs::read_to_string(&sidecar_path).unwrap();
-        assert!(out.contains("Clean"), "fallback write must land: {out}");
+        assert!(
+            format!("{error:#}").contains("Could not parse existing XMP sidecar"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&sidecar_path).unwrap(),
+            original,
+            "unparsable third-party bytes must remain unchanged"
+        );
 
         fs::remove_file(&sidecar_path).ok();
         fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn parse_existing_sidecar_accepts_bare_rdf_with_properties() {
+        let bare_rdf = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:format>image/jpeg</dc:format>
+</rdf:Description>
+</rdf:RDF>"#;
+
+        let parsed = parse_existing_sidecar(bare_rdf).unwrap();
+        assert_eq!(
+            parsed.property(xmp_ns::DC, "format").unwrap().value,
+            "image/jpeg"
+        );
     }
 
     #[test]
