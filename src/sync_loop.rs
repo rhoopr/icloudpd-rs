@@ -4364,6 +4364,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contract_malformed_required_asset_fields_block_checkpoint() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "stale-enum-config")
+            .await
+            .expect("seed stale enum config hash");
+
+        let mut page = full_album_page("PrimarySync", "", "zone-tok-new");
+        page["records"][0]["recordName"] = serde_json::json!("");
+        page["records"][1]["recordName"] = serde_json::json!("");
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(page),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run malformed identity cycle");
+
+        assert!(result.failed_count > 0);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(result.stats.assets_seen, 0);
+        assert_eq!(result.stats.skipped.total(), 0);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "paired blank identities must replay from the prior checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_invalid_capture_date_preserves_prior_checkpoint() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
+        )
+        .await
+        .expect("seed current enum config hash");
+
+        let mut page = full_album_page("PrimarySync", "bad-date", "zone-tok-new");
+        page["records"][1]["fields"]["assetDate"]["value"] = serde_json::json!("not-a-timestamp");
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "zone-tok-new",
+                    "moreComing": false,
+                    "records": page["records"].clone()
+                }]
+            })),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run malformed capture-date cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON)
+        );
+        assert_eq!(result.stats.assets_seen, 0);
+        assert_eq!(result.stats.skipped.total(), 0);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "invalid capture dates must replay from the prior checkpoint"
+        );
+    }
+
+    #[tokio::test]
     async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
         let mut config = make_run_cycle_config();
         config.filters.recent = Some(20);

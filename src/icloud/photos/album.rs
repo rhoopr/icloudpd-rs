@@ -12,7 +12,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 
-use super::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset, extract_master_ref};
+use super::asset::{
+    ChangeEvent, DeltaRecordBuffer, PhotoAsset, RequiredAssetFields, extract_master_ref,
+};
 use super::cloudkit::ChangesZoneResponse;
 use super::queries::{DESIRED_KEYS_VALUES, build_changes_zone_request, encode_params};
 use super::session::{PhotosSession, check_changes_zone_error};
@@ -292,6 +294,7 @@ enum FetcherRangeRole {
 enum EnumerationFailure {
     FetcherError,
     ConsumerDropped,
+    MalformedRecord,
     UnpairedRecords,
 }
 
@@ -507,6 +510,53 @@ fn should_emit_asset_record(
             owners.insert(record_name.to_owned(), range_start);
             true
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullAssetStateId {
+    Master,
+    Asset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullAssetEmission {
+    Sent,
+    Malformed,
+    ReceiverClosed,
+}
+
+async fn emit_full_asset(
+    tx: &mpsc::Sender<anyhow::Result<PhotoAsset>>,
+    master: super::cloudkit::Record,
+    asset_record: &super::cloudkit::Record,
+    state_id: FullAssetStateId,
+) -> FullAssetEmission {
+    let mut asset =
+        match PhotoAsset::try_from_records(master, asset_record, RequiredAssetFields::Downloadable)
+        {
+            Ok(asset) => asset,
+            Err(error) => {
+                return if tx
+                    .send(Err(anyhow::anyhow!(
+                        "Malformed required CloudKit asset field: {error}"
+                    )))
+                    .await
+                    .is_ok()
+                {
+                    FullAssetEmission::Malformed
+                } else {
+                    FullAssetEmission::ReceiverClosed
+                };
+            }
+        };
+    if state_id == FullAssetStateId::Asset {
+        asset = asset.with_state_record_name(Arc::from(asset_record.record_name.as_str()));
+    }
+    if tx.send(Ok(asset)).await.is_ok() {
+        FullAssetEmission::Sent
+    } else {
+        FullAssetEmission::ReceiverClosed
     }
 }
 
@@ -1026,12 +1076,25 @@ impl PhotoAlbum {
                             if master.record_type == "CPLMaster"
                                 && asset.record_type == "CPLAsset" =>
                         {
-                            let mut photo = PhotoAsset::from_records(master, &asset);
-                            if request.state_id.as_str() != request.master_record_name.as_str() {
-                                photo = photo
-                                    .with_state_record_name(Arc::from(request.state_id.as_str()));
+                            match PhotoAsset::try_from_records(
+                                master,
+                                &asset,
+                                RequiredAssetFields::Downloadable,
+                            ) {
+                                Ok(mut photo) => {
+                                    if request.state_id.as_str()
+                                        != request.master_record_name.as_str()
+                                    {
+                                        photo = photo.with_state_record_name(Arc::from(
+                                            request.state_id.as_str(),
+                                        ));
+                                    }
+                                    RecordResolution::Present(photo)
+                                }
+                                Err(error) => RecordResolution::TransientFailure(
+                                    ProviderLookupError::Malformed(error.to_string()),
+                                ),
                             }
-                            RecordResolution::Present(photo)
                         }
                         (Ok(master), None)
                             if request.asset_record_name.is_none()
@@ -1888,6 +1951,7 @@ impl PhotoAlbum {
             let mut emitted_asset_records: FxHashSet<String> = FxHashSet::default();
             let mut consecutive_empty_pages: u32 = 0;
             let mut enumeration_incomplete = false;
+            let mut malformed_record = false;
             let mut stopped_for_limit = false;
             let url = format!(
                 "{}/records/query?{}",
@@ -2131,17 +2195,22 @@ impl PhotoAlbum {
                                 limit_reached = true;
                                 break;
                             }
-                            let mut asset = PhotoAsset::from_records(master.clone(), &asset_rec);
-                            if sibling_count > 1 && index > 0 {
-                                asset = asset.with_state_record_name(Arc::from(
-                                    asset_rec.record_name.as_str(),
-                                ));
+                            let state_id = if sibling_count > 1 && index > 0 {
+                                FullAssetStateId::Asset
+                            } else {
+                                FullAssetStateId::Master
+                            };
+                            match emit_full_asset(&tx, master.clone(), &asset_rec, state_id).await {
+                                FullAssetEmission::Sent => {
+                                    total_sent += 1;
+                                    page_emitted += 1;
+                                }
+                                FullAssetEmission::Malformed => {
+                                    enumeration_incomplete = true;
+                                    malformed_record = true;
+                                }
+                                FullAssetEmission::ReceiverClosed => return,
                             }
-                            if tx.send(Ok(asset)).await.is_err() {
-                                return;
-                            }
-                            total_sent += 1;
-                            page_emitted += 1;
                         }
                         paired_masters.insert(master.record_name.clone(), master);
                         prune_paired_master_cache(&mut paired_masters, max_pending_records);
@@ -2183,17 +2252,22 @@ impl PhotoAlbum {
                                 limit_reached = true;
                                 break;
                             }
-                            let mut asset = PhotoAsset::from_records(master.clone(), &asset_rec);
-                            if sibling_count > 1 && index > 0 {
-                                asset = asset.with_state_record_name(Arc::from(
-                                    asset_rec.record_name.as_str(),
-                                ));
+                            let state_id = if sibling_count > 1 && index > 0 {
+                                FullAssetStateId::Asset
+                            } else {
+                                FullAssetStateId::Master
+                            };
+                            match emit_full_asset(&tx, master.clone(), &asset_rec, state_id).await {
+                                FullAssetEmission::Sent => {
+                                    total_sent += 1;
+                                    page_emitted += 1;
+                                }
+                                FullAssetEmission::Malformed => {
+                                    enumeration_incomplete = true;
+                                    malformed_record = true;
+                                }
+                                FullAssetEmission::ReceiverClosed => return,
                             }
-                            if tx.send(Ok(asset)).await.is_err() {
-                                return;
-                            }
-                            total_sent += 1;
-                            page_emitted += 1;
                         }
                         paired_masters.insert(master.record_name.clone(), master);
                         prune_paired_master_cache(&mut paired_masters, max_pending_records);
@@ -2214,13 +2288,24 @@ impl PhotoAlbum {
                                 limit_reached = true;
                                 break;
                             }
-                            let asset = PhotoAsset::from_records(master.clone(), &asset_rec)
-                                .with_state_record_name(Arc::from(asset_rec.record_name.as_str()));
-                            if tx.send(Ok(asset)).await.is_err() {
-                                return;
+                            match emit_full_asset(
+                                &tx,
+                                master.clone(),
+                                &asset_rec,
+                                FullAssetStateId::Asset,
+                            )
+                            .await
+                            {
+                                FullAssetEmission::Sent => {
+                                    total_sent += 1;
+                                    page_emitted += 1;
+                                }
+                                FullAssetEmission::Malformed => {
+                                    enumeration_incomplete = true;
+                                    malformed_record = true;
+                                }
+                                FullAssetEmission::ReceiverClosed => return,
                             }
-                            total_sent += 1;
-                            page_emitted += 1;
                         }
                     } else {
                         pending_assets.entry(master_id).or_default().extend(records);
@@ -2296,7 +2381,9 @@ impl PhotoAlbum {
                     (saw_blank_sync_token && behavior.preserve_blank_sync_tokens_for_diagnostics)
                         .then(String::new)
                 });
-                let completion = if enumeration_incomplete {
+                let completion = if malformed_record {
+                    EnumerationCompletion::Incomplete(EnumerationFailure::MalformedRecord)
+                } else if enumeration_incomplete {
                     EnumerationCompletion::Incomplete(EnumerationFailure::UnpairedRecords)
                 } else if stopped_for_limit {
                     EnumerationCompletion::UserBoundReached

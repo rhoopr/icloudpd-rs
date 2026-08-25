@@ -1736,7 +1736,7 @@ pub mod __fuzz {
     /// `()` on success / discard so the harness doesn't name internal types.
     /// Inputs that don't deserialize as a `Record` are skipped.
     pub fn photo_asset_from_record_json(master: Value, asset: Value) {
-        use crate::icloud::photos::asset::PhotoAsset;
+        use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields};
         use crate::icloud::photos::cloudkit::Record;
         let Ok(master) = serde_json::from_value::<Record>(master) else {
             return;
@@ -1744,7 +1744,7 @@ pub mod __fuzz {
         let Ok(asset) = serde_json::from_value::<Record>(asset) else {
             return;
         };
-        let _ = PhotoAsset::from_records(master, &asset);
+        let _ = PhotoAsset::try_from_records(master, &asset, RequiredAssetFields::Downloadable);
     }
 
     /// Run the path-component sanitizers over an arbitrary `&str`. Splits
