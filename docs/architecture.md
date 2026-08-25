@@ -118,6 +118,13 @@ before routing; an inconclusive lookup preserves the prior zone checkpoint.
 Album snapshots and smart folders may require targeted refresh work before or
 alongside the incremental stream.
 
+Downloadable photo records require non-blank `CPLMaster` and `CPLAsset` record names
+and a usable `assetDate` before they enter filtering or path planning. Full
+enumeration reports a malformed record as incomplete. Incremental enumeration
+marks its zone token unsafe. Both routes preserve the prior checkpoint so an
+unchanged provider record remains retryable, and neither route counts the
+record as a policy, filename, or date skip.
+
 Recent and date-bounded runs may advance only when the producer proves the
 bound did not truncate the stream.
 
@@ -341,6 +348,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/mod.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
+| `MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT` | `src/icloud/photos/asset.rs`, `src/icloud/photos/album.rs`, `src/download/mod.rs`, `src/sync_cycle.rs` | A live asset with a missing or invalid required identity or capture date blocks its zone checkpoint before filtering or path planning. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |

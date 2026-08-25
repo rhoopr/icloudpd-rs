@@ -52,7 +52,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::icloud::photos::asset::ChangeEvent;
+use crate::icloud::photos::asset::{ChangeEvent, MALFORMED_REQUIRED_ASSET_FIELDS_REASON};
 use crate::icloud::photos::{
     PhotoAsset, ProviderRecordId, RecordLookupRequest, RecordResolution, SyncTokenError,
 };
@@ -573,6 +573,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | "icloud_blank_sync_token"
         | "icloud_sync_token_mismatch"
         | "icloud_sync_token_missing"
+        | MALFORMED_REQUIRED_ASSET_FIELDS_REASON
         | UNPARSABLE_RELATION_DELTA_REASON
         | UNKNOWN_ALBUM_RELATION_ASSET_REASON
         | UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => "icloud",
@@ -595,6 +596,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
             "iCloud returned a blank sync token, which kei treated as unusable"
         }
         "icloud_sync_token_mismatch" => "iCloud returned conflicting sync tokens across passes",
+        MALFORMED_REQUIRED_ASSET_FIELDS_REASON => {
+            "iCloud returned a photo record without a usable required identity or capture date"
+        }
         "kei_internal_token_receiver_dropped" => {
             "an internal token collection channel closed before completion"
         }
@@ -6681,6 +6685,14 @@ async fn download_photos_full_with_token_policy(
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(
             ICLOUD_ALBUM_COUNT_ERROR_REASON,
         ));
+    } else if token_attempt_allowed
+        && sync_token.is_none()
+        && let Some(reason) = token_block_reason
+    {
+        stats.sync_token_blocked = true;
+        stats.sync_token_blocked_reason = Some(reason);
+        stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
+        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
     }
 
     // Clear enumeration-in-progress markers when the producer reached the

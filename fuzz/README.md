@@ -59,7 +59,7 @@ are gitignored.
 | `heif_xmp_probe` | full `probe_exif_heif` pipeline: extract XMP from HEIC bytes, then parse it through xmp_toolkit | `src/download/heif.rs` + `xmp_toolkit` |
 | `toml_config` | `TomlConfig` deserializer + custom field deserializers (`folder_structure`, `RecentLimit`) + `deny_unknown_fields` boundary checks | `src/config.rs` |
 | `auth_responses` | `SrpInitResponse`, `AccountLoginResponse`, `TwoFactorChallenge` (with custom deserializer for `fsa_challenge` + `service_errors`) | `src/auth/responses.rs` |
-| `photo_asset_from_record` | `PhotoAsset::from_records`: drives `decode_filename`, `resolve_item_type`, `extract_versions`, and `metadata::extract` in one go. Splits input on the first NUL into two CloudKit `Record` JSON values | `src/icloud/photos/asset.rs` |
+| `photo_asset_from_record` | Validated `PhotoAsset` record-pair construction: checks required identity and capture-date fields, then drives `decode_filename`, `resolve_item_type`, `extract_versions`, and `metadata::extract`. Splits input on the first NUL into two CloudKit `Record` JSON values | `src/icloud/photos/asset.rs` |
 | `state_enums_from_str` | inherent `from_str` parsers on `VersionSizeKey`, `AssetStatus`, `MediaType` - inputs come from a sqlite state DB on disk that could be replayed, hand-edited, or corrupted | `src/state/types.rs` |
 
 ## Findings

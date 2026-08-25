@@ -28,6 +28,24 @@ pub(crate) struct MalformedResource {
     pub(crate) reason: Box<str>,
 }
 
+pub(crate) const MALFORMED_REQUIRED_ASSET_FIELDS_REASON: &str = "malformed_required_asset_fields";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequiredAssetFields {
+    Identity,
+    Downloadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MalformedRequiredAssetField {
+    #[error("CPLMaster recordName is missing or blank")]
+    MasterRecordName,
+    #[error("CPLAsset recordName is missing or blank")]
+    AssetRecordName,
+    #[error("CPLAsset assetDate is missing or invalid")]
+    AssetDate,
+}
+
 /// A change event from the `changes/zone` delta API.
 #[derive(Debug)]
 pub struct ChangeEvent {
@@ -412,6 +430,32 @@ impl PhotoAsset {
         Self::from_records_in_zone(master, asset, None)
     }
 
+    pub(crate) fn try_from_records(
+        master: super::cloudkit::Record,
+        asset: &super::cloudkit::Record,
+        required: RequiredAssetFields,
+    ) -> Result<Self, MalformedRequiredAssetField> {
+        // CONTRACT: MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT
+        if master.record_name.trim().is_empty() {
+            return Err(MalformedRequiredAssetField::MasterRecordName);
+        }
+        if asset.record_name.trim().is_empty() {
+            return Err(MalformedRequiredAssetField::AssetRecordName);
+        }
+        if required == RequiredAssetFields::Downloadable
+            && asset
+                .fields
+                .get("assetDate")
+                .and_then(|field| field.get("value"))
+                .and_then(Value::as_f64)
+                .and_then(f64_to_millis_datetime)
+                .is_none()
+        {
+            return Err(MalformedRequiredAssetField::AssetDate);
+        }
+        Ok(Self::from_records(master, asset))
+    }
+
     /// Construct from typed `Record` structs and pin the CloudKit source zone.
     pub(crate) fn from_records_in_zone(
         master: super::cloudkit::Record,
@@ -750,6 +794,17 @@ impl DeltaRecordBuffer {
         for record in records {
             let reason = classify_change_reason(&record);
 
+            if record.record_name.trim().is_empty() {
+                let mut event = ChangeEvent::new(
+                    record.record_name.into_boxed_str(),
+                    (!record.record_type.is_empty()).then(|| record.record_type.into_boxed_str()),
+                    reason,
+                );
+                event.token_unsafe_reason = Some(MALFORMED_REQUIRED_ASSET_FIELDS_REASON);
+                events.push(event);
+                continue;
+            }
+
             match reason {
                 ChangeReason::HardDeleted => {
                     if record.record_type == "CPLContainerRelation" {
@@ -903,11 +958,24 @@ impl DeltaRecordBuffer {
         // Box::from(&str) copies only the bytes, without the String's Vec
         // capacity slack that .clone().into_boxed_str() would drag along.
         let master_name: Box<str> = Box::from(master_record.record_name.as_str());
-        let mut asset = PhotoAsset::from_records(master_record, &asset_record);
+        let required = if reason == ChangeReason::Created {
+            RequiredAssetFields::Downloadable
+        } else {
+            RequiredAssetFields::Identity
+        };
+        let mut event = ChangeEvent::new(master_name, Some("CPLMaster".into()), reason);
+        let mut asset = match PhotoAsset::try_from_records(master_record, &asset_record, required) {
+            Ok(asset) => asset,
+            Err(error) => {
+                tracing::warn!(error = %error, "Malformed required CloudKit asset field");
+                event.token_unsafe_reason = Some(MALFORMED_REQUIRED_ASSET_FIELDS_REASON);
+                events.push(event);
+                return;
+            }
+        };
         if use_asset_state_id {
             asset = asset.with_state_record_name(Arc::from(asset_record.record_name.as_str()));
         }
-        let mut event = ChangeEvent::new(master_name, Some("CPLMaster".into()), reason);
         event.asset = Some(asset);
         events.push(event);
     }
@@ -1508,6 +1576,107 @@ mod tests {
         let mut record = make_asset_record(name, master_ref);
         record.fields["isDeleted"] = json!({"value": 1});
         record
+    }
+
+    #[test]
+    fn required_downloadable_fields_reject_blank_identity_and_invalid_capture_date() {
+        let cases = [
+            (
+                make_master_record(""),
+                make_asset_record("A1", ""),
+                MalformedRequiredAssetField::MasterRecordName,
+            ),
+            (
+                make_master_record("M1"),
+                make_asset_record("", "M1"),
+                MalformedRequiredAssetField::AssetRecordName,
+            ),
+            (
+                make_master_record("M1"),
+                {
+                    let mut asset = make_asset_record("A1", "M1");
+                    asset.fields["assetDate"]["value"] = json!("not-a-timestamp");
+                    asset
+                },
+                MalformedRequiredAssetField::AssetDate,
+            ),
+            (
+                make_master_record("M1"),
+                {
+                    let mut asset = make_asset_record("A1", "M1");
+                    asset
+                        .fields
+                        .as_object_mut()
+                        .expect("asset fields object")
+                        .remove("assetDate");
+                    asset
+                },
+                MalformedRequiredAssetField::AssetDate,
+            ),
+            (
+                make_master_record("M1"),
+                {
+                    let mut asset = make_asset_record("A1", "M1");
+                    asset.fields["assetDate"]["value"] = json!(i64::MAX);
+                    asset
+                },
+                MalformedRequiredAssetField::AssetDate,
+            ),
+        ];
+
+        for (master, asset, expected) in cases {
+            assert_eq!(
+                PhotoAsset::try_from_records(master, &asset, RequiredAssetFields::Downloadable,)
+                    .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn identity_only_records_do_not_require_capture_date() {
+        let master = make_master_record("M_DELETED");
+        let mut asset = make_asset_record("A_DELETED", "M_DELETED");
+        asset
+            .fields
+            .as_object_mut()
+            .expect("asset fields object")
+            .remove("assetDate");
+
+        assert!(
+            PhotoAsset::try_from_records(master, &asset, RequiredAssetFields::Identity).is_ok()
+        );
+    }
+
+    #[test]
+    fn delta_pair_with_invalid_capture_date_is_token_unsafe_not_downloadable() {
+        let mut buffer = DeltaRecordBuffer::new();
+        let master = make_master_record("M_BAD_DATE");
+        let mut asset = make_asset_record("A_BAD_DATE", "M_BAD_DATE");
+        asset.fields["assetDate"]["value"] = Value::Null;
+
+        let events = buffer.process_records(vec![master, asset]);
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].asset.is_none());
+        assert_eq!(
+            events[0].token_unsafe_reason,
+            Some(MALFORMED_REQUIRED_ASSET_FIELDS_REASON)
+        );
+    }
+
+    #[test]
+    fn delta_blank_record_identity_is_token_unsafe() {
+        let mut buffer = DeltaRecordBuffer::new();
+
+        let events = buffer.process_records(vec![make_master_record("")]);
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].asset.is_none());
+        assert_eq!(
+            events[0].token_unsafe_reason,
+            Some(MALFORMED_REQUIRED_ASSET_FIELDS_REASON)
+        );
     }
 
     #[test]
