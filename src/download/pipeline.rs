@@ -2156,6 +2156,7 @@ async fn consume_stream_download_tasks(
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
+            let task_state_db = state_db.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
@@ -2168,6 +2169,7 @@ async fn consume_stream_download_tasks(
                     metadata_flags,
                     DownloadSingleContext {
                         temp_suffix: &temp_suffix,
+                        state_db: task_state_db.as_deref(),
                         rate_limit_counter: Some(rate_limit_counter.as_ref()),
                         bandwidth_limiter: bandwidth_limiter.as_ref(),
                         shutdown_token: &shutdown_token,
@@ -2940,6 +2942,7 @@ pub(super) async fn run_download_pass(
         .take_while(|_| std::future::ready(!pass_shutdown.is_cancelled()))
         .map(|task| {
             let client = client.clone();
+            let task_state_db = state_db.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
@@ -2952,6 +2955,7 @@ pub(super) async fn run_download_pass(
                     metadata_flags,
                     DownloadSingleContext {
                         temp_suffix: &temp_suffix,
+                        state_db: task_state_db.as_deref(),
                         rate_limit_counter: Some(rate_limit_counter.as_ref()),
                         bandwidth_limiter: bandwidth_limiter.as_ref(),
                         shutdown_token: &shutdown_token,
@@ -3164,9 +3168,10 @@ fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
 ///
 /// Returns `Ok(true)` on full success, `Ok(false)` if the download succeeded
 /// but EXIF stamping failed (the file is usable but lacks EXIF metadata).
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct DownloadSingleContext<'a> {
     temp_suffix: &'a str,
+    state_db: Option<&'a dyn DownloadStore>,
     rate_limit_counter: Option<&'a std::sync::atomic::AtomicUsize>,
     bandwidth_limiter: Option<&'a super::BandwidthLimiter>,
     shutdown_token: &'a CancellationToken,
@@ -3214,8 +3219,8 @@ fn log_interrupted_download(pb: &ProgressBar, task: &DownloadTask, error: &anyho
     });
 }
 
-async fn download_single_task(
-    client: &Client,
+async fn download_single_task<C: super::file::DownloadClient>(
+    client: &C,
     task: &DownloadTask,
     retry_config: &RetryConfig,
     metadata_flags: MetadataFlags,
@@ -3239,126 +3244,142 @@ async fn download_single_task(
     // does not hide the media type.
     let needs_embed =
         metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&task.download_path);
+    let owned_part_path =
+        super::file::temp_download_path(&task.download_path, &task.checksum, context.temp_suffix)
+            .context("Could not compute temporary download path")?;
+    if let Some(db) = context.state_db {
+        db.claim_temp_file(&owned_part_path)
+            .await
+            .context("Could not record temporary-file ownership")?;
+    }
 
-    let bytes_downloaded = Box::pin(super::file::download_file_with_mode(
-        client,
-        &task.url,
-        &task.download_path,
-        &task.checksum,
-        retry_config,
-        context.temp_suffix,
-        super::file::DownloadOpts {
-            skip_rename: needs_embed,
-            expected_size: if task.size > 0 { Some(task.size) } else { None },
-            publication: task.publication,
-        },
-        super::file::DownloadLimits {
-            rate_limit_counter: context.rate_limit_counter,
-            bandwidth_limiter: context.bandwidth_limiter,
-            shutdown_token: Some(context.shutdown_token),
-        },
-        context.mode,
-    ))
-    .await?;
+    let result: Result<(bool, String, Option<String>, u64, u64)> = async {
+        let bytes_downloaded = Box::pin(super::file::download_file_with_mode(
+            client,
+            &task.url,
+            &task.download_path,
+            &task.checksum,
+            retry_config,
+            context.temp_suffix,
+            super::file::DownloadOpts {
+                skip_rename: needs_embed,
+                expected_size: if task.size > 0 { Some(task.size) } else { None },
+                publication: task.publication,
+            },
+            super::file::DownloadLimits {
+                rate_limit_counter: context.rate_limit_counter,
+                bandwidth_limiter: context.bandwidth_limiter,
+                shutdown_token: Some(context.shutdown_token),
+            },
+            context.mode,
+        ))
+        .await?;
 
-    // When embed writes are needed, modifications happen on the .part file before
-    // the atomic rename, preventing silent corruption on power loss / SIGKILL.
-    let part_path = if needs_embed {
-        Some(
-            super::file::temp_download_path(
-                &task.download_path,
-                &task.checksum,
-                context.temp_suffix,
+        // When embed writes are needed, modifications happen on the .part file before
+        // the atomic rename, preventing silent corruption on power loss / SIGKILL.
+        let part_path = needs_embed.then_some(owned_part_path.as_path());
+
+        // Compute SHA-256 of the downloaded content before EXIF modification
+        // so we store a hash that reflects the original download bytes.
+        let download_checksum = if let Some(path) = &part_path {
+            Some(super::file::compute_sha256(path).await?)
+        } else {
+            None
+        };
+
+        let mut exif_ok = true;
+        if let Some(part) = &part_path {
+            let outcome = metadata_rewrite::write_download_metadata(
+                metadata_rewrite::MetadataWriteRequest {
+                    final_path: &task.download_path,
+                    embed_path: Some(part),
+                    sidecar_path: None,
+                    payload: Arc::clone(&task.metadata),
+                    created_local: task.created_local,
+                    flags: metadata_flags,
+                    temp_suffix: context.temp_suffix,
+                },
             )
-            .context("Could not compute temporary download path")?,
-        )
-    } else {
-        None
-    };
+            .await;
+            exif_ok = !outcome.any_failed();
+        }
 
-    // Compute SHA-256 of the downloaded content before EXIF modification
-    // so we store a hash that reflects the original download bytes.
-    let download_checksum = if let Some(path) = &part_path {
-        Some(super::file::compute_sha256(path).await?)
-    } else {
-        None
-    };
+        // Set mtime on .part (before rename) or final path directly.
+        // rename() preserves mtime so this works in both cases.
+        let mtime_target = part_path.unwrap_or(&task.download_path).to_path_buf();
+        let ts = task.created_local.timestamp();
+        if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_target, ts)).await?
+        {
+            tracing::warn!(
+                path = %task.download_path.display(),
+                error = %e,
+                "Could not set mtime"
+            );
+        }
 
-    let mut exif_ok = true;
-    if let Some(part) = &part_path {
+        // Atomic rename: .part → final (only when EXIF path was used)
+        if let Some(part) = &part_path {
+            super::file::publish_part_to_final(part, &task.download_path, task.publication).await?;
+        }
+
         let outcome =
             metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
                 final_path: &task.download_path,
-                embed_path: Some(part),
-                sidecar_path: None,
+                embed_path: None,
+                sidecar_path: Some(&task.download_path),
                 payload: Arc::clone(&task.metadata),
                 created_local: task.created_local,
                 flags: metadata_flags,
                 temp_suffix: context.temp_suffix,
             })
             .await;
-        exif_ok = !outcome.any_failed();
-    }
+        exif_ok &= !outcome.any_failed();
 
-    // Set mtime on .part (before rename) or final path directly.
-    // rename() preserves mtime so this works in both cases.
-    let mtime_target = part_path
-        .as_deref()
-        .unwrap_or(&task.download_path)
-        .to_path_buf();
-    let ts = task.created_local.timestamp();
-    if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_target, ts)).await? {
+        let disk_bytes = match tokio::fs::metadata(&task.download_path).await {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                tracing::warn!(path = %task.download_path.display(), error = %e, "Could not stat downloaded file for size tracking");
+                0
+            }
+        };
+
+        tracing::debug!(path = %task.download_path.display(), "Downloaded");
+
+        // Compute SHA-256 of the final file for local storage and verification.
+        let local_checksum = super::file::compute_sha256(&task.download_path).await?;
+
+        // Note: Apple's `fileChecksum` is an MMCS (MobileMe Chunked Storage)
+        // compound signature, not a SHA-1/SHA-256 content hash. It cannot be
+        // compared against a hash of the downloaded bytes.  Content integrity
+        // is verified by size matching (Content-Length + API size field) and
+        // magic-byte validation during download instead.
+
+        Ok((
+            exif_ok,
+            local_checksum,
+            download_checksum,
+            bytes_downloaded,
+            disk_bytes,
+        ))
+    }
+    .await;
+
+    if let Some(db) = context.state_db
+        && let Err(error) = db
+            .retire_temp_files(std::slice::from_ref(&owned_part_path))
+            .await
+    {
+        if result.is_ok() {
+            return Err(error).context("Could not retire temporary-file ownership");
+        }
         tracing::warn!(
-            path = %task.download_path.display(),
-            error = %e,
-            "Could not set mtime"
+            path = %owned_part_path.display(),
+            error = %error,
+            "Could not retire temporary-file ownership after download stopped"
         );
     }
 
-    // Atomic rename: .part → final (only when EXIF path was used)
-    if let Some(part) = &part_path {
-        super::file::publish_part_to_final(part, &task.download_path, task.publication).await?;
-    }
-
-    let outcome =
-        metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
-            final_path: &task.download_path,
-            embed_path: None,
-            sidecar_path: Some(&task.download_path),
-            payload: Arc::clone(&task.metadata),
-            created_local: task.created_local,
-            flags: metadata_flags,
-            temp_suffix: context.temp_suffix,
-        })
-        .await;
-    exif_ok &= !outcome.any_failed();
-
-    let disk_bytes = match tokio::fs::metadata(&task.download_path).await {
-        Ok(meta) => meta.len(),
-        Err(e) => {
-            tracing::warn!(path = %task.download_path.display(), error = %e, "Could not stat downloaded file for size tracking");
-            0
-        }
-    };
-
-    tracing::debug!(path = %task.download_path.display(), "Downloaded");
-
-    // Compute SHA-256 of the final file for local storage and verification.
-    let local_checksum = super::file::compute_sha256(&task.download_path).await?;
-
-    // Note: Apple's `fileChecksum` is an MMCS (MobileMe Chunked Storage)
-    // compound signature, not a SHA-1/SHA-256 content hash. It cannot be
-    // compared against a hash of the downloaded bytes.  Content integrity
-    // is verified by size matching (Content-Length + API size field) and
-    // magic-byte validation during download instead.
-
-    Ok((
-        exif_ok,
-        local_checksum,
-        download_checksum,
-        bytes_downloaded,
-        disk_bytes,
-    ))
+    result
 }
 
 pub(super) fn format_duration(d: Duration) -> String {
@@ -3541,7 +3562,7 @@ mod tests {
     use crate::state::types::SyncSummary;
     use crate::state::{
         AssetRecord, DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore,
-        ReportStateStore, SyncRunStats, SyncTokenStore, VersionSizeKey,
+        ReportStateStore, SyncRunStats, SyncTokenStore, TempFileOwnershipStore, VersionSizeKey,
     };
     use crate::test_helpers::TestPhotoAsset;
     use std::collections::{HashMap, HashSet};
@@ -3553,6 +3574,29 @@ mod tests {
     fn classify_download_task_error_for(err: DownloadError) -> DownloadTaskErrorClass {
         let err = anyhow::Error::new(err);
         classify_download_task_error(&err)
+    }
+
+    struct StaticDownloadClient {
+        body: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::file::DownloadClient for StaticDownloadClient {
+        async fn fetch(
+            &self,
+            _: &str,
+            _: Option<u64>,
+        ) -> Result<super::super::file::DownloadResponse, Box<dyn std::error::Error + Send + Sync>>
+        {
+            let body = bytes::Bytes::copy_from_slice(&self.body);
+            Ok(super::super::file::DownloadResponse {
+                status: 200,
+                content_length: Some(body.len() as u64),
+                content_range: None,
+                content_type: Some("image/jpeg".to_string()),
+                stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            })
+        }
     }
 
     #[test]
@@ -4570,6 +4614,24 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl TempFileOwnershipStore for FailingDownloadStore {
+        async fn claim_temp_file(&self, _: &Path) -> Result<(), StateError> {
+            Ok(())
+        }
+
+        async fn get_owned_temp_files_before(
+            &self,
+            _: i64,
+        ) -> Result<Vec<crate::state::OwnedTempFile>, StateError> {
+            Ok(Vec::new())
+        }
+
+        async fn retire_temp_files(&self, _: &[PathBuf]) -> Result<u64, StateError> {
+            Ok(0)
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ReportStateStore for FailingDownloadStore {
         #[cfg(test)]
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -5137,6 +5199,98 @@ mod tests {
         assert!(
             !crate::sync_cycle::should_store_sync_token(&outcome, false),
             "partial media-download failures must block sync-token advancement"
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_ownership_retires_after_publish_and_interruption() {
+        use base64::Engine as _;
+
+        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = StaticDownloadClient {
+            body: jpeg_body.clone(),
+        };
+
+        let dir = TempDir::new().unwrap();
+        let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let make_task = |name: &str, checksum_byte: u8| DownloadTask {
+            url: format!("https://example.invalid/{name}.jpg").into(),
+            download_path: dir.path().join(format!("{name}.jpg")),
+            publication: crate::download::file::FinalPublication::NoReplace,
+            checksum: base64::engine::general_purpose::STANDARD
+                .encode([checksum_byte; 32])
+                .into(),
+            asset_id: name.into(),
+            asset_record_name: name.into(),
+            library: "PrimarySync".into(),
+            metadata: Arc::new(MetadataPayload::default()),
+            size: jpeg_body.len() as u64,
+            created_local: chrono::Local::now().fixed_offset(),
+            version_size: VersionSizeKey::Original,
+            media_type: crate::state::MediaType::Photo,
+        };
+        let published = make_task("published", 0x41);
+        let running = CancellationToken::new();
+
+        download_single_task(
+            &client,
+            &published,
+            &retry,
+            MetadataFlags::default(),
+            DownloadSingleContext {
+                temp_suffix: ".kei-tmp",
+                state_db: Some(&db),
+                rate_limit_counter: None,
+                bandwidth_limiter: None,
+                shutdown_token: &running,
+                mode: crate::personality::Mode::Off,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(published.download_path.exists());
+        assert!(
+            db.get_owned_temp_files_before(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "published download must retire ownership"
+        );
+
+        let interrupted = make_task("interrupted", 0x42);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = download_single_task(
+            &client,
+            &interrupted,
+            &retry,
+            MetadataFlags::default(),
+            DownloadSingleContext {
+                temp_suffix: ".kei-tmp",
+                state_db: Some(&db),
+                rate_limit_counter: None,
+                bandwidth_limiter: None,
+                shutdown_token: &cancelled,
+                mode: crate::personality::Mode::Off,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            classify_download_task_error(&error),
+            DownloadTaskErrorClass::Interrupted
+        );
+        assert!(
+            db.get_owned_temp_files_before(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "graceful interruption must retire ownership"
         );
     }
 

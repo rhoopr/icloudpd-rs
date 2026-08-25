@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 18;
+pub(crate) const SCHEMA_VERSION: i32 = 19;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -507,6 +507,18 @@ CREATE INDEX IF NOT EXISTS idx_asset_metadata_capture_revision
     ON asset_metadata_capture_revisions (library, revision);
 ";
 
+/// V19 durable ownership ledger for resumable download temporary files.
+///
+/// Cleanup may delete only paths named here. `claimed_at` separates stale
+/// ownership left by an incomplete sync from a path claimed by a current
+/// download attempt.
+const SCHEMA_V19: &str = r"
+CREATE TABLE IF NOT EXISTS owned_temp_files (
+    path BLOB PRIMARY KEY NOT NULL,
+    claimed_at INTEGER NOT NULL
+);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -662,6 +674,7 @@ fn migrate_to_version(
         16 => conn.execute_batch(SCHEMA_V16)?,
         17 => conn.execute_batch(SCHEMA_V17)?,
         18 => conn.execute_batch(SCHEMA_V18)?,
+        19 => conn.execute_batch(SCHEMA_V19)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1971,6 +1984,37 @@ mod tests {
             revisions, 0,
             "pre-v18 catalogue rows must remain visibly stale"
         );
+    }
+
+    #[test]
+    fn test_v19_creates_owned_temp_file_ledger_without_backfill() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=18 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        set_schema_version(&conn, 18).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'owned_temp_files'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        for column in ["path", "claimed_at"] {
+            assert!(column_exists(&conn, "owned_temp_files", column).unwrap());
+        }
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM owned_temp_files", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

@@ -59,7 +59,7 @@ use crate::icloud::photos::{
 use crate::retry::RetryConfig;
 use crate::state::{
     DownloadContextStateStore, DownloadStateStore, MembershipStore, MetadataRewriteStore,
-    ReportStateStore, SyncTokenStore, VersionSizeKey,
+    ReportStateStore, SyncTokenStore, TempFileOwnershipStore, VersionSizeKey,
 };
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
@@ -98,6 +98,7 @@ pub(crate) trait DownloadStore:
     + MetadataRewriteStore
     + ReportStateStore
     + SyncTokenStore
+    + TempFileOwnershipStore
 {
 }
 
@@ -108,6 +109,7 @@ impl<T> DownloadStore for T where
         + MetadataRewriteStore
         + ReportStateStore
         + SyncTokenStore
+        + TempFileOwnershipStore
 {
 }
 
@@ -3934,95 +3936,110 @@ async fn refresh_stale_incremental_tasks_before_download(
 /// filters `ChangeEvent`s to downloadable assets, and feeds them through
 /// the existing download pipeline. Falls back to `SyncMode::Full` if the
 /// token is invalid or expired.
-/// Minimum age (seconds) a `.part` file must have before
-/// `cleanup_orphan_part_files` will remove it, regardless of whether the
-/// file is older than `last_sync_completed`. Defends against the
-/// multi-process race where a *different* kei instance (different data dir,
-/// same download dir) is actively writing a `.part` between download
-/// retries: that instance's fresh `.part` predates *this* instance's
-/// `last_sync_completed`, but it's not orphaned — the other process is
-/// about to resume it.
-///
-/// 10 minutes is comfortably longer than the longest realistic single
-/// HTTP request (CDN connect + TLS + body for a multi-GB Live Photo MOV)
-/// while staying short enough that genuinely stale `.part` files from
-/// crashed runs still get cleaned promptly.
+/// Minimum untouched age before cleanup removes a durably owned temporary
+/// file. A second kei process can share the download root while using another
+/// state database, so recent writes remain protected even when this database
+/// has older completed-sync evidence.
 const PART_FILE_RECENT_GRACE_SECS: i64 = 10 * 60;
 
-/// Walk a tree rooted at `root`, removing files whose name ends with
-/// `suffix` and whose mtime is older than `cutoff_secs`. Files whose
-/// mtime is within the last `recent_grace_secs` of `now_secs` are spared
-/// regardless of `cutoff_secs`. Returns the count of removed files.
-/// A `read_dir` failure on any subdirectory logs a `warn!` and skips that
-/// subtree -- the original code swallowed the error silently, leaving
-/// operators without a breadcrumb when transient FS hiccups (e.g. an
-/// unmount mid-walk) prevented cleanup.
-fn walk_and_remove_orphan_parts(
-    root: std::path::PathBuf,
-    suffix: &str,
+#[derive(Debug, Default)]
+struct OwnedTempCleanup {
+    removed: usize,
+    retire: Vec<PathBuf>,
+}
+
+/// Remove only stale exact paths from kei's durable temporary-file ownership
+/// ledger. No suffix match can authorize deletion, and the removal stays
+/// relative to a verified directory or file handle.
+fn remove_owned_orphan_parts(
+    root: &Path,
+    owned: &[crate::state::OwnedTempFile],
     cutoff_secs: i64,
     now_secs: i64,
     recent_grace_secs: i64,
-) -> usize {
-    let mut cleaned = 0usize;
-    let mut stack = vec![root];
-    while let Some(current) = stack.pop() {
-        let entries = match std::fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(e) => {
+) -> OwnedTempCleanup {
+    remove_owned_orphan_parts_with(
+        root,
+        owned,
+        cutoff_secs,
+        now_secs,
+        recent_grace_secs,
+        |_| {},
+    )
+}
+
+fn remove_owned_orphan_parts_with<F>(
+    root: &Path,
+    owned: &[crate::state::OwnedTempFile],
+    cutoff_secs: i64,
+    now_secs: i64,
+    recent_grace_secs: i64,
+    mut before_remove: F,
+) -> OwnedTempCleanup
+where
+    F: FnMut(&Path),
+{
+    use crate::fs_util::ConfinedFileOpen;
+
+    let mut cleanup = OwnedTempCleanup::default();
+    for record in owned {
+        debug_assert!(record.claimed_at < cutoff_secs);
+        let candidate = match crate::fs_util::open_confined_regular_file(root, &record.path) {
+            Ok(candidate) => candidate,
+            Err(error) => {
                 tracing::warn!(
-                    path = %current.display(),
-                    error = %e,
-                    "failed to read directory during orphan-part cleanup"
+                    path = %record.path.display(),
+                    error = %error,
+                    "Could not safely inspect owned temporary file during cleanup"
                 );
                 continue;
             }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
+        match candidate {
+            ConfinedFileOpen::OutsideRoot => continue,
+            ConfinedFileOpen::Retire => {
+                cleanup.retire.push(record.path.clone());
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.ends_with(suffix) {
-                continue;
-            }
-            let Ok(meta) = path.metadata() else { continue };
-            let Ok(mtime) = meta.modified() else { continue };
-            let mtime_secs = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            // Spare freshly-touched .parts even when they predate
-            // `last_sync_completed`. Another kei process targeting the same
-            // download dir (different data dir) might be actively resuming
-            // this file; deleting it mid-retry would force a
-            // restart-from-zero next attempt.
-            //
-            // `recent_grace_secs <= 0` disables the gate (for tests that
-            // exercise the cutoff branch in isolation; production always
-            // passes the PART_FILE_RECENT_GRACE_SECS constant).
-            let is_recently_touched =
-                recent_grace_secs > 0 && mtime_secs > now_secs.saturating_sub(recent_grace_secs);
-            if is_recently_touched || mtime_secs >= cutoff_secs {
-                continue;
-            }
-            if std::fs::remove_file(&path).is_ok() {
-                cleaned += 1;
+            ConfinedFileOpen::Regular(file) => {
+                let mtime_secs = file.modified_secs();
+                // A path modified after the completed-sync cutoff no longer
+                // matches the stale claim. Retire the claim without touching
+                // the file so it can never authorize a later deletion.
+                if mtime_secs >= cutoff_secs {
+                    cleanup.retire.push(record.path.clone());
+                    continue;
+                }
+                let is_recently_touched = recent_grace_secs > 0
+                    && mtime_secs > now_secs.saturating_sub(recent_grace_secs);
+                if is_recently_touched {
+                    continue;
+                }
+                before_remove(&record.path);
+                match file.remove() {
+                    Ok(()) => {
+                        cleanup.removed += 1;
+                        cleanup.retire.push(record.path.clone());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        cleanup.retire.push(record.path.clone());
+                    }
+                    Err(error) => tracing::warn!(
+                        path = %record.path.display(),
+                        error = %error,
+                        "Failed to remove owned orphan temporary file"
+                    ),
+                }
             }
         }
     }
-    cleaned
+    cleanup
 }
 
 /// Remove orphaned `.part` files from the download directory.
 ///
-/// Scans the download directory for files ending with `temp_suffix` that are
-/// older than the last completed sync. These are leftovers from interrupted
-/// downloads that will never be resumed (new downloads produce fresh .part files).
+/// Loads stale exact-path ownership evidence from SQLite, rejects symlinked
+/// paths, and removes only owned files older than the last completed sync.
+/// CONTRACT: TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP
 async fn cleanup_orphan_part_files(config: &DownloadConfig) {
     let Some(db) = &config.state_db else { return };
     let cutoff = match db.get_summary().await {
@@ -4036,30 +4053,49 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
         }
     };
 
-    let dir = &config.directory;
-    if !dir.exists() {
-        return;
-    }
-
-    let suffix = Arc::clone(&config.temp_suffix);
-    let dir: std::path::PathBuf = dir.to_path_buf();
     let cutoff_secs = cutoff.timestamp();
+    let owned = match db.get_owned_temp_files_before(cutoff_secs).await {
+        Ok(owned) if owned.is_empty() => return,
+        Ok(owned) => owned,
+        Err(error) => {
+            tracing::warn!(error = %error, "Could not load temporary-file ownership for cleanup");
+            return;
+        }
+    };
+    let dir = match crate::fs_util::absolute_lexical(&config.directory) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                path = %config.directory.display(),
+                error = %error,
+                "Could not resolve download root for owned temporary-file cleanup"
+            );
+            return;
+        }
+    };
     let now_secs = chrono::Utc::now().timestamp();
 
-    let cleaned = tokio::task::spawn_blocking(move || {
-        walk_and_remove_orphan_parts(
-            dir,
-            &suffix,
+    let cleanup = tokio::task::spawn_blocking(move || {
+        remove_owned_orphan_parts(
+            &dir,
+            &owned,
             cutoff_secs,
             now_secs,
             PART_FILE_RECENT_GRACE_SECS,
         )
     })
     .await
-    .unwrap_or(0);
+    .unwrap_or_default();
 
-    if cleaned > 0 {
-        tracing::info!(count = cleaned, "Cleaned up orphaned .part files");
+    if let Err(error) = db.retire_temp_files(&cleanup.retire).await {
+        tracing::warn!(error = %error, "Could not retire temporary-file ownership after cleanup");
+    }
+
+    if cleanup.removed > 0 {
+        tracing::info!(
+            count = cleanup.removed,
+            "Cleaned up owned orphan temporary files"
+        );
     }
 }
 
@@ -20235,200 +20271,190 @@ mod tests {
         assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 41 });
     }
 
-    /// The orphan-part walk must remove .part files older
-    /// than the cutoff and leave non-matching files alone. To avoid
-    /// depending on a third-party mtime crate, drive the cutoff itself: a
-    /// cutoff far in the future treats every just-created file as "older",
-    /// while a cutoff in the distant past leaves everything intact.
     #[test]
-    fn walk_and_remove_orphan_parts_removes_part_files_only() {
-        use std::fs::File;
-        use std::io::Write;
+    fn owned_orphan_cleanup_removes_only_the_exact_recorded_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned_path = dir.path().join("owned.kei-tmp");
+        let bystander_path = dir.path().join("bystander.kei-tmp");
+        std::fs::write(&owned_path, b"owned").unwrap();
+        std::fs::write(&bystander_path, b"bystander").unwrap();
+        let owned = [crate::state::OwnedTempFile {
+            path: owned_path.clone(),
+            claimed_at: 1,
+        }];
 
-        let dir = tempfile::Builder::new()
-            .prefix("kei-orphan-parts-")
-            .tempdir()
-            .expect("tempdir");
+        let cleanup = remove_owned_orphan_parts(dir.path(), &owned, i64::MAX / 2, i64::MAX / 2, 0);
 
-        let part = dir.path().join("photo.jpg.part");
-        File::create(&part).unwrap().write_all(b"x").unwrap();
-
-        let unrelated = dir.path().join("photo.jpg");
-        File::create(&unrelated).unwrap().write_all(b"x").unwrap();
-
-        // Cutoff far in the future -> the just-created .part is "older".
-        // `now=0, recent_grace=0` disables the recent-grace check so this test
-        // continues to exercise the cutoff-only behaviour.
-        let future = i64::MAX / 2;
-        let cleaned = walk_and_remove_orphan_parts(dir.path().to_path_buf(), ".part", future, 0, 0);
-        assert_eq!(cleaned, 1, "the .part file must be removed");
-        assert!(!part.exists());
-        assert!(unrelated.exists(), "non-.part file must be retained");
-
-        // Re-create and re-run with cutoff in the distant past; nothing to clean.
-        File::create(&part).unwrap().write_all(b"x").unwrap();
-        let cleaned = walk_and_remove_orphan_parts(dir.path().to_path_buf(), ".part", 0, 0, 0);
-        assert_eq!(cleaned, 0, "cutoff in the past must spare even .part files");
-        assert!(part.exists());
+        assert_eq!(cleanup.removed, 1);
+        assert_eq!(cleanup.retire.as_slice(), std::slice::from_ref(&owned_path));
+        assert!(!owned_path.exists());
+        assert_eq!(std::fs::read(&bystander_path).unwrap(), b"bystander");
     }
 
-    /// A directory the process cannot read must NOT panic the walk
-    /// and MUST NOT abort it. With the fix in place the walk emits a
-    /// `warn!` for the failed `read_dir` and continues; pre-fix it
-    /// silently swallowed the error and produced no log breadcrumb. We
-    /// can't capture log output without an extra dependency, so this test
-    /// pins the structural contract: the walk completes, doesn't panic,
-    /// and still cleans the readable siblings.
     #[cfg(unix)]
     #[test]
-    fn walk_and_remove_orphan_parts_continues_past_unreadable_subdir() {
-        use std::fs::File;
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
+    fn owned_orphan_cleanup_never_follows_a_directory_symlink() {
+        use std::os::unix::fs::symlink;
 
-        let dir = tempfile::Builder::new()
-            .prefix("kei-orphan-parts-unreadable-")
-            .tempdir()
-            .expect("tempdir");
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("external.kei-tmp");
+        std::fs::write(&outside_path, b"external").unwrap();
+        let link = root.path().join("linked");
+        symlink(outside.path(), &link).unwrap();
+        let linked_path = link.join("external.kei-tmp");
+        let owned = [crate::state::OwnedTempFile {
+            path: linked_path.clone(),
+            claimed_at: 1,
+        }];
 
-        // Sibling subdir with a .part file: should be cleaned.
-        let readable = dir.path().join("readable");
-        std::fs::create_dir(&readable).unwrap();
-        let part = readable.join("photo.jpg.part");
-        File::create(&part).unwrap().write_all(b"x").unwrap();
+        let cleanup = remove_owned_orphan_parts(root.path(), &owned, i64::MAX / 2, i64::MAX / 2, 0);
 
-        // Unreadable subdir: read_dir fails. The walk must log a warn and
-        // continue rather than aborting or silently dropping the error.
-        let unreadable = dir.path().join("unreadable");
-        std::fs::create_dir(&unreadable).unwrap();
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let future = i64::MAX / 2;
-        let cleaned = walk_and_remove_orphan_parts(dir.path().to_path_buf(), ".part", future, 0, 0);
-
-        // Restore perms so the tempdir can be cleaned up.
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(
-            cleaned, 1,
-            ".part in the readable sibling must still be cleaned despite \
-             the unreadable subdirectory"
-        );
-        assert!(!part.exists());
+        assert_eq!(cleanup.removed, 0);
+        assert_eq!(cleanup.retire, [linked_path]);
+        assert_eq!(std::fs::read(outside_path).unwrap(), b"external");
     }
 
-    /// A `.part` file whose mtime is within `recent_grace_secs` of
-    /// `now_secs` must be spared even when the cutoff says it's older than
-    /// `last_sync_completed`. Defends against the multi-process race where
-    /// a different kei instance is actively resuming a `.part` between
-    /// retries.
-    ///
-    /// Drives the cutoff parameter directly to avoid taking
-    /// a runtime dependency on a filetime crate.
+    #[cfg(unix)]
     #[test]
-    fn walk_and_remove_orphan_parts_spares_recently_touched_files() {
-        use std::fs::File;
-        use std::io::Write;
+    fn owned_orphan_cleanup_resists_ancestor_symlink_swap_before_remove() {
+        use std::os::unix::fs::symlink;
 
-        let dir = tempfile::Builder::new()
-            .prefix("kei-orphan-parts-recent-")
-            .tempdir()
-            .expect("tempdir");
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let moved_parent = root.path().join("moved-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let owned_path = parent.join("owned.kei-tmp");
+        let outside_path = outside.path().join("owned.kei-tmp");
+        std::fs::write(&owned_path, b"owned").unwrap();
+        std::fs::write(&outside_path, b"external").unwrap();
+        let owned = [crate::state::OwnedTempFile {
+            path: owned_path.clone(),
+            claimed_at: 1,
+        }];
 
-        // Two .part files. We can't easily set mtime without a filetime
-        // crate, so synthesize the test by driving (now_secs, cutoff_secs,
-        // recent_grace_secs) numerically: the just-created file has an
-        // mtime ~= "real now". We pretend `now_secs` is real-now + 1 hour
-        // and cutoff is real-now + 30 minutes (so the file is "older" than
-        // cutoff under the legacy gate). With recent_grace = 90 minutes,
-        // the file's real-now mtime falls inside (now - 90min, now] →
-        // spared. With recent_grace = 0, the file is removed (legacy
-        // behaviour preserved for the existing test above).
-        let recent_part = dir.path().join("recent.jpg.part");
-        File::create(&recent_part).unwrap().write_all(b"x").unwrap();
-        let old_part = dir.path().join("old.jpg.part");
-        File::create(&old_part).unwrap().write_all(b"x").unwrap();
+        let cleanup = remove_owned_orphan_parts_with(
+            root.path(),
+            &owned,
+            i64::MAX / 2,
+            i64::MAX / 2,
+            0,
+            |_| {
+                std::fs::rename(&parent, &moved_parent).unwrap();
+                symlink(outside.path(), &parent).unwrap();
+            },
+        );
 
+        assert_eq!(cleanup.removed, 1);
+        assert_eq!(cleanup.retire.as_slice(), std::slice::from_ref(&owned_path));
+        assert!(!moved_parent.join("owned.kei-tmp").exists());
+        assert_eq!(std::fs::read(outside_path).unwrap(), b"external");
+    }
+
+    #[test]
+    fn owned_orphan_cleanup_spares_recently_touched_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_path = dir.path().join("active.kei-tmp");
+        std::fs::write(&part_path, b"active").unwrap();
+        let owned = [crate::state::OwnedTempFile {
+            path: part_path.clone(),
+            claimed_at: 1,
+        }];
         let real_now = chrono::Utc::now().timestamp();
-        let now_secs = real_now + 3_600; // pretend "now" is 1h ahead
-        let cutoff_secs = real_now + 1_800; // 30 minutes ahead → both .parts older
-        let recent_grace_secs = 90 * 60; // 90 minutes → both .parts inside grace
 
-        let cleaned = walk_and_remove_orphan_parts(
-            dir.path().to_path_buf(),
-            ".part",
-            cutoff_secs,
-            now_secs,
-            recent_grace_secs,
+        let cleanup = remove_owned_orphan_parts(
+            dir.path(),
+            &owned,
+            real_now + 1_800,
+            real_now + 3_600,
+            90 * 60,
         );
-        assert_eq!(
-            cleaned, 0,
-            "files inside the recent-grace window must be spared even when \
-             they predate the cutoff"
-        );
-        assert!(recent_part.exists(), "recent .part must still exist");
-        assert!(old_part.exists(), "old .part also spared by grace window");
 
-        // Now shrink the grace window so the same files fall OUTSIDE it.
-        // 1 second of grace + the simulated "now" 3600s ahead means a real-now
-        // mtime is far outside the window → both files cleaned (legacy
-        // cutoff path).
-        let cleaned = walk_and_remove_orphan_parts(
-            dir.path().to_path_buf(),
-            ".part",
-            cutoff_secs,
-            now_secs,
-            1,
-        );
-        assert_eq!(
-            cleaned, 2,
-            "with a 1-second grace window, both .parts fall back to the \
-             legacy cutoff-only gate and are removed"
-        );
-        assert!(!recent_part.exists());
-        assert!(!old_part.exists());
+        assert_eq!(cleanup.removed, 0);
+        assert!(cleanup.retire.is_empty());
+        assert_eq!(std::fs::read(part_path).unwrap(), b"active");
     }
 
-    /// When the cutoff says "delete" but only one of two `.part`
-    /// files is in the recent-grace window, the test fixture mimics the
-    /// task-spec setup: one mtime ~now, one mtime far in the past. Drive
-    /// the times via the `now_secs` and `cutoff_secs` parameters since
-    /// adjusting filesystem mtimes without a third-party crate is not
-    /// portable across platforms.
     #[test]
-    fn walk_and_remove_orphan_parts_distinguishes_recent_from_aged_via_params() {
-        use std::fs::File;
-        use std::io::Write;
+    fn owned_orphan_cleanup_retires_a_claim_when_the_path_changed_after_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_path = dir.path().join("changed.kei-tmp");
+        std::fs::write(&part_path, b"replacement").unwrap();
+        let owned = [crate::state::OwnedTempFile {
+            path: part_path.clone(),
+            claimed_at: -1,
+        }];
 
-        let dir = tempfile::Builder::new()
-            .prefix("kei-orphan-parts-mixed-")
-            .tempdir()
-            .expect("tempdir");
+        let cleanup = remove_owned_orphan_parts(dir.path(), &owned, 0, 0, 0);
 
-        // Both files have a real-now mtime. We can't backdate one without
-        // a filetime crate, so this test pins the symmetric case:
-        // recent-grace > 0 spares both, recent-grace = 0 removes both.
-        // The asymmetric scenario is covered structurally by the helper's
-        // parameterization (the `is_recently_touched` branch is the only
-        // gate the parameters affect) and by the inline integration with
-        // `cleanup_orphan_part_files`.
-        let p1 = dir.path().join("a.jpg.part");
-        let p2 = dir.path().join("b.jpg.part");
-        File::create(&p1).unwrap().write_all(b"x").unwrap();
-        File::create(&p2).unwrap().write_all(b"x").unwrap();
+        assert_eq!(cleanup.removed, 0);
+        assert_eq!(cleanup.retire.as_slice(), std::slice::from_ref(&part_path));
+        assert_eq!(std::fs::read(part_path).unwrap(), b"replacement");
+    }
 
-        let now_secs = chrono::Utc::now().timestamp() + 60; // 1 min ahead
-        let cutoff_secs = now_secs - 30; // both .parts (real-now mtime) older
-        let recent_grace_secs = 10 * 60; // 10 min grace
-        let cleaned = walk_and_remove_orphan_parts(
-            dir.path().to_path_buf(),
-            ".part",
-            cutoff_secs,
-            now_secs,
-            recent_grace_secs,
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contract_temp_file_delete_requires_durable_ownership() {
+        use std::fs::{File, FileTimes};
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration as StdDuration, UNIX_EPOCH};
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let owned_path = root.path().join("owned.kei-tmp");
+        let bystander_path = root.path().join("bystander.kei-tmp");
+        let outside_path = outside.path().join("external.kei-tmp");
+        std::fs::write(&owned_path, b"owned").unwrap();
+        std::fs::write(&bystander_path, b"bystander").unwrap();
+        std::fs::write(&outside_path, b"external").unwrap();
+        symlink(outside.path(), root.path().join("linked")).unwrap();
+        let old_time = UNIX_EPOCH + StdDuration::from_secs(1);
+        for path in [&owned_path, &bystander_path, &outside_path] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        db.claim_temp_file(&owned_path).await.unwrap();
+        {
+            let conn = db.acquire_lock("seed orphan cleanup").unwrap();
+            conn.execute("UPDATE owned_temp_files SET claimed_at = 1", [])
+                .unwrap();
+        }
+        let run_id = db.start_sync_run().await.unwrap();
+        db.complete_sync_run(run_id, &crate::state::SyncRunStats::default())
+            .await
+            .unwrap();
+
+        let mut config = test_config();
+        config.directory = Arc::from(root.path());
+        config.state_db = Some(db.clone());
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &[],
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(!owned_path.exists(), "owned stale path must be removed");
+        assert_eq!(std::fs::read(&bystander_path).unwrap(), b"bystander");
+        assert_eq!(std::fs::read(&outside_path).unwrap(), b"external");
+        assert!(
+            db.get_owned_temp_files_before(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "cleanup must retire consumed ownership"
         );
-        assert_eq!(cleaned, 0, "both .parts within 10-min grace must be spared");
-        assert!(p1.exists() && p2.exists());
     }
 
     /// Companion: accumulating into an empty `SyncStats` is a faithful copy

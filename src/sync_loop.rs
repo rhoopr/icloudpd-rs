@@ -5043,6 +5043,30 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl state::TempFileOwnershipStore for FailingMetadataSetDb {
+        async fn claim_temp_file(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.claim_temp_file(path).await
+        }
+
+        async fn get_owned_temp_files_before(
+            &self,
+            claimed_before: i64,
+        ) -> Result<Vec<state::OwnedTempFile>, state::error::StateError> {
+            self.inner.get_owned_temp_files_before(claimed_before).await
+        }
+
+        async fn retire_temp_files(
+            &self,
+            paths: &[std::path::PathBuf],
+        ) -> Result<u64, state::error::StateError> {
+            self.inner.retire_temp_files(paths).await
+        }
+    }
+
+    #[async_trait::async_trait]
     impl state::ReportStateStore for FailingMetadataSetDb {
         async fn get_failed(
             &self,

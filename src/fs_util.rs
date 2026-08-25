@@ -2,6 +2,333 @@
 
 use std::path::Path;
 
+pub(crate) enum ConfinedFileOpen {
+    Regular(ConfinedRegularFile),
+    Retire,
+    OutsideRoot,
+}
+
+pub(crate) struct ConfinedRegularFile {
+    modified_secs: i64,
+    #[cfg(unix)]
+    parent: std::os::fd::OwnedFd,
+    #[cfg(unix)]
+    name: std::ffi::CString,
+    #[cfg(windows)]
+    file: std::fs::File,
+}
+
+impl ConfinedRegularFile {
+    pub(crate) fn modified_secs(&self) -> i64 {
+        self.modified_secs
+    }
+
+    pub(crate) fn remove(self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: `parent` is a live directory descriptor, `name` is
+            // NUL-terminated, and both remain valid for the syscall.
+            let result = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            };
+
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+            // SAFETY: the file handle is live and was opened with DELETE
+            // access. `disposition` has the layout and size required by
+            // FileDispositionInfo and outlives the call.
+            let result = unsafe {
+                SetFileInformationByHandle(
+                    self.file.as_raw_handle() as isize,
+                    FileDispositionInfo,
+                    std::ptr::from_ref(&disposition).cast(),
+                    std::mem::size_of_val(&disposition) as u32,
+                )
+            };
+            if result != 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+    }
+}
+
+/// Open a regular file beneath `root` without allowing a directory-link swap
+/// to redirect a later removal. The returned guard retains the verified
+/// directory or file handle through [`ConfinedRegularFile::remove`].
+pub(crate) fn open_confined_regular_file(
+    root: &Path,
+    path: &Path,
+) -> std::io::Result<ConfinedFileOpen> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(ConfinedFileOpen::OutsideRoot);
+    };
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(components) = components else {
+        return Ok(ConfinedFileOpen::Retire);
+    };
+    if components.is_empty() {
+        return Ok(ConfinedFileOpen::Retire);
+    }
+
+    open_confined_regular_file_platform(root, &components)
+}
+
+#[cfg(unix)]
+fn open_confined_regular_file_platform(
+    root: &Path,
+    components: &[&std::ffi::OsStr],
+) -> std::io::Result<ConfinedFileOpen> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn owned_fd(raw: libc::c_int) -> std::io::Result<OwnedFd> {
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a nonnegative descriptor returned by open/openat is newly
+        // owned by this function and is transferred exactly once.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+
+    fn path_target_changed(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) || error.raw_os_error() == Some(libc::ELOOP)
+    }
+
+    fn cstring(value: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+        std::ffi::CString::new(value.as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    }
+
+    let root = cstring(root.as_os_str())?;
+    // SAFETY: `root` is a live NUL-terminated path. No borrowed pointer is
+    // retained after the syscall.
+    let raw = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    let mut parent = match owned_fd(raw) {
+        Ok(fd) => fd,
+        Err(error) if path_target_changed(&error) => return Ok(ConfinedFileOpen::Retire),
+        Err(error) => return Err(error),
+    };
+
+    let Some((file_name, parent_components)) = components.split_last() else {
+        return Ok(ConfinedFileOpen::Retire);
+    };
+    for component in parent_components {
+        let component = cstring(component)?;
+        // SAFETY: `parent` is live and `component` is NUL-terminated. The
+        // returned descriptor, when successful, is newly owned.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        parent = match owned_fd(raw) {
+            Ok(fd) => fd,
+            Err(error) if path_target_changed(&error) => return Ok(ConfinedFileOpen::Retire),
+            Err(error) => return Err(error),
+        };
+    }
+
+    let name = cstring(file_name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `parent` and `name` are live, and `stat` points to writable
+    // storage of the exact type the kernel initializes on success.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        return if path_target_changed(&error) {
+            Ok(ConfinedFileOpen::Retire)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: successful fstatat initialized every field of `stat`.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Ok(ConfinedFileOpen::Retire);
+    }
+
+    Ok(ConfinedFileOpen::Regular(ConfinedRegularFile {
+        modified_secs: stat.st_mtime.max(0),
+        parent,
+        name,
+    }))
+}
+
+#[cfg(windows)]
+fn open_confined_regular_file_platform(
+    root: &Path,
+    components: &[&std::ffi::OsStr],
+) -> std::io::Result<ConfinedFileOpen> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
+
+    fn open(path: &Path, directory: bool) -> std::io::Result<std::fs::File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let access = FILE_READ_ATTRIBUTES | if directory { 0 } else { DELETE };
+        let flags = FILE_FLAG_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                0
+            };
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(flags)
+            .open(path)
+    }
+
+    fn info(file: &std::fs::File) -> std::io::Result<u32> {
+        let mut info = std::mem::MaybeUninit::uninit();
+        // SAFETY: the handle is live and `info` points to writable storage of
+        // the exact structure initialized by GetFileInformationByHandle.
+        let result =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as isize, info.as_mut_ptr()) };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the successful call initialized the full structure.
+        Ok(unsafe { info.assume_init() }.dwFileAttributes)
+    }
+
+    fn final_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+        let mut buffer = vec![0_u16; 512];
+        loop {
+            // SAFETY: the handle and buffer are live, and the buffer length
+            // matches the writable UTF-16 storage supplied to Windows.
+            let written = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle() as isize,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    0,
+                )
+            } as usize;
+            if written == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if written < buffer.len() {
+                buffer.truncate(written);
+                return Ok(std::ffi::OsString::from_wide(&buffer).into());
+            }
+            buffer.resize(written + 1, 0);
+        }
+    }
+
+    let root_file = match open(root, true) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfinedFileOpen::Retire);
+        }
+        Err(error) => return Err(error),
+    };
+    let root_attributes = info(&root_file)?;
+    if root_attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || root_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Ok(ConfinedFileOpen::Retire);
+    }
+    let root_final = final_path(&root_file)?;
+    let path = components
+        .iter()
+        .fold(root.to_path_buf(), |mut path, part| {
+            path.push(part);
+            path
+        });
+    let file = match open(&path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfinedFileOpen::Retire);
+        }
+        Err(error) => return Err(error),
+    };
+    let attributes = info(&file)?;
+    if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Ok(ConfinedFileOpen::Retire);
+    }
+    let file_final = final_path(&file)?;
+    let expected_final = components.iter().fold(root_final, |mut path, part| {
+        path.push(part);
+        path
+    });
+    if file_final != expected_final {
+        return Ok(ConfinedFileOpen::Retire);
+    }
+    let modified_secs = file
+        .metadata()?
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(ConfinedFileOpen::Regular(ConfinedRegularFile {
+        modified_secs,
+        file,
+    }))
+}
+
+/// Resolve `path` against the current directory and remove lexical `.` and
+/// `..` components without following filesystem symlinks.
+pub(crate) fn absolute_lexical(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 /// Remove `path`, treating `NotFound` as success and logging any other
 /// error at `warn!`. Use this in cleanup paths (`.part` cleanup, corrupt
 /// session-file deletion, EXDEV unwind) where a previous `let _ =` was
