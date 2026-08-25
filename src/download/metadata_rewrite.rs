@@ -738,6 +738,41 @@ mod tests {
     }
 
     #[cfg(feature = "xmp")]
+    fn authority_cloudkit_time() -> DateTime<FixedOffset> {
+        FixedOffset::east_opt(39_600)
+            .unwrap()
+            .with_ymd_and_hms(2019, 3, 4, 5, 6, 7)
+            .unwrap()
+    }
+
+    #[cfg(feature = "xmp")]
+    fn assert_cloudkit_authority_with_source_gps(meta: &XmpMeta) {
+        const CAPTURE: &str = "2019-03-04T05:06:07+11:00";
+        for (namespace, property) in [
+            (xmp_ns::XMP, "CreateDate"),
+            (xmp_ns::XMP, "ModifyDate"),
+            (xmp_ns::EXIF, "DateTimeOriginal"),
+            (xmp_ns::PHOTOSHOP, "DateCreated"),
+        ] {
+            assert_eq!(
+                meta.property(namespace, property).expect(property).value,
+                CAPTURE
+            );
+        }
+        let coordinate = |name: &str| meta.property(xmp_ns::EXIF, name).expect(name).value;
+        assert_eq!(coordinate("GPSLatitude"), "12,20.7360N");
+        assert_eq!(coordinate("GPSLongitude"), "78,54.0720W");
+        assert_eq!(coordinate("GPSAltitude"), "9250/1000");
+        crate::test_helpers::assert_source_gps_in_xmp(meta);
+        assert_ne!(
+            meta.property(xmp_ns::EXIF, "GPSTimeStamp")
+                .expect("GPSTimeStamp")
+                .value,
+            CAPTURE
+        );
+    }
+
+    #[cfg(feature = "xmp")]
     fn rich_payload() -> MetadataPayload {
         MetadataPayload {
             timezone_offset: Some(39_600),
@@ -1122,20 +1157,22 @@ mod tests {
     async fn sidecar_write_carries_source_gps_and_corrected_coordinates() {
         let dir = tempfile::tempdir().expect("metadata temp dir");
         let media_path = dir.path().join("source.jpg");
-        let source_bytes = crate::test_helpers::minimal_jpeg_with_source_gps();
+        let source_bytes = crate::test_helpers::minimal_jpeg_with_source_gps_and_location();
         std::fs::write(&media_path, &source_bytes).expect("write source media");
         let payload = MetadataPayload {
+            timezone_offset: Some(39_600),
             latitude: Some(12.3456),
             longitude: Some(-78.9012),
             altitude: Some(9.25),
             ..MetadataPayload::default()
         };
+        let cloudkit_created = authority_cloudkit_time();
         let request = || MetadataWriteRequest {
             final_path: &media_path,
             embed_path: None,
             sidecar_path: Some(&media_path),
             payload: Arc::new(payload.clone()),
-            created_local: now_local(),
+            created_local: cloudkit_created,
             flags: MetadataFlags::XMP_SIDECAR,
             temp_suffix: ".gps-sidecar-test",
         };
@@ -1148,11 +1185,7 @@ mod tests {
             .expect("sidecar UTF-8")
             .parse::<XmpMeta>()
             .expect("parse generated sidecar");
-        crate::test_helpers::assert_source_gps_in_xmp(&xmp);
-        let coord = |name: &str| xmp.property(xmp_ns::EXIF, name).expect(name).value;
-        assert_eq!(coord("GPSLatitude"), "12,20.7360N");
-        assert_eq!(coord("GPSLongitude"), "78,54.0720W");
-        assert_eq!(coord("GPSAltitude"), "9250/1000");
+        assert_cloudkit_authority_with_source_gps(&xmp);
         assert_eq!(
             std::fs::read(&media_path).expect("read media after sidecar"),
             source_bytes
@@ -1178,12 +1211,14 @@ mod tests {
             &media_path,
             &checksum,
             AssetMetadata {
+                timezone_offset: Some(39_600),
                 latitude: Some(12.3456),
                 longitude: Some(-78.9012),
                 altitude: Some(9.25),
                 metadata_hash: Some("gps-retry-hash".into()),
                 ..AssetMetadata::default()
             },
+            Some(cloudkit_created.with_timezone(&chrono::Utc)),
         )
         .await;
         run_pending(
@@ -1204,7 +1239,7 @@ mod tests {
             .expect("read sidecar after retry")
             .parse::<XmpMeta>()
             .expect("parse sidecar after retry");
-        crate::test_helpers::assert_source_gps_in_xmp(&retry_xmp);
+        assert_cloudkit_authority_with_source_gps(&retry_xmp);
     }
 
     #[cfg(feature = "xmp")]
@@ -1294,6 +1329,7 @@ mod tests {
                 metadata_hash: Some("exif-less-hash".into()),
                 ..AssetMetadata::default()
             },
+            None,
         )
         .await;
         seed_downloaded_marker(
@@ -1306,6 +1342,7 @@ mod tests {
                 metadata_hash: Some("unreadable-hash".into()),
                 ..AssetMetadata::default()
             },
+            None,
         )
         .await;
 
@@ -2007,11 +2044,13 @@ mod tests {
         path: &std::path::Path,
         checksum: &str,
         metadata: crate::state::types::AssetMetadata,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) {
-        let record = crate::test_helpers::TestAssetRecord::new(asset_id)
-            .filename(filename)
-            .metadata(metadata)
-            .build();
+        let mut record = crate::test_helpers::TestAssetRecord::new(asset_id).filename(filename);
+        if let Some(created_at) = created_at {
+            record = record.created_at(created_at);
+        }
+        let record = record.metadata(metadata).build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded("PrimarySync", asset_id, "original", path, checksum, None)
             .await
@@ -2051,6 +2090,7 @@ mod tests {
                 metadata_hash: Some("fresh-hash".to_string()),
                 ..AssetMetadata::default()
             },
+            None,
         )
         .await;
 

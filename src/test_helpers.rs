@@ -1054,6 +1054,39 @@ pub fn minimal_jpeg_with_source_gps() -> Vec<u8> {
     bytes
 }
 
+/// Minimal JPEG whose source EXIF location and capture time deliberately
+/// differ from the CloudKit values used by metadata writer tests.
+#[cfg(feature = "xmp")]
+pub fn minimal_jpeg_with_source_gps_and_location() -> Vec<u8> {
+    use little_exif::exif_tag::ExifTag;
+
+    let mut metadata = exif_with_source_gps();
+    metadata.set_tag(ExifTag::DateTimeOriginal("2030:01:02 03:04:05".into()));
+    metadata.set_tag(ExifTag::GPSLatitudeRef("N".into()));
+    metadata.set_tag(ExifTag::GPSLatitude(vec![
+        ur64(1, 1),
+        ur64(30, 1),
+        ur64(0, 1),
+    ]));
+    metadata.set_tag(ExifTag::GPSLongitudeRef("E".into()));
+    metadata.set_tag(ExifTag::GPSLongitude(vec![
+        ur64(2, 1),
+        ur64(30, 1),
+        ur64(0, 1),
+    ]));
+    metadata.set_tag(ExifTag::GPSAltitudeRef(vec![0]));
+    metadata.set_tag(ExifTag::GPSAltitude(vec![ur64(333, 1)]));
+
+    let mut bytes = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+    metadata
+        .write_to_vec(&mut bytes, little_exif::filetype::FileExtension::JPEG)
+        .expect("write conflicting source EXIF into minimal JPEG");
+    bytes
+}
+
 /// Minimal little-endian TIFF carrying the standard source GPS EXIF.
 #[cfg(feature = "xmp")]
 pub fn minimal_tiff_with_source_gps() -> Vec<u8> {
@@ -1170,7 +1203,12 @@ pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
     assert_eq!(text("GPSTimeStamp"), SOURCE_GPS_DATETIME);
     assert_eq!(text("GPSSpeedRef"), SOURCE_GPS_SPEED_REF);
     assert_eq!(text("GPSSpeed"), SOURCE_GPS_SPEED);
-    assert_eq!(text("GPSHPositioningError"), SOURCE_GPS_H_POSITIONING_ERROR);
+    assert_eq!(
+        meta.property("http://cipa.jp/exif/1.0/", "GPSHPositioningError")
+            .expect("GPSHPositioningError")
+            .value,
+        SOURCE_GPS_H_POSITIONING_ERROR
+    );
 }
 
 #[cfg(test)]

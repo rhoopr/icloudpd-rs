@@ -308,6 +308,13 @@ Source GPS facts for sidecars are read through file-backed parsers. JPEG APP1,
 TIFF-based RAW, PNG `eXIf`, and HEIF Exif items use checked seeks and
 fixed-size TIFF fields. HEIF atom and item-location counts are streamed without
 allocating from provider-controlled lengths.
+CloudKit is authoritative for the currently decoded coordinates, altitude, and
+capture timestamps. The location decoder currently maps only `lat`, `lon`, and
+`alt` from `locationEnc`, so source EXIF supplies GPS receiver time, speed,
+speed units, and horizontal positioning error. No coordinate matching or
+tolerance is applied for minor Photos location edits. If kei later decodes
+CloudKit values for those same GPS measurement fields, CloudKit takes
+precedence.
 Source I/O failures still publish current CloudKit metadata, preserve prior
 kei-owned source GPS fields as unknown, and retain the metadata retry marker.
 Readable unsupported or malformed metadata permits a CloudKit-only sidecar.

@@ -112,7 +112,7 @@ impl ManagedXmpField {
             Self::GpsDateTime => "exif:GPSTimeStamp",
             Self::GpsSpeed => "exif:GPSSpeed",
             Self::GpsSpeedRef => "exif:GPSSpeedRef",
-            Self::GpsHPositioningError => "exif:GPSHPositioningError",
+            Self::GpsHPositioningError => "exifEX:GPSHPositioningError",
             Self::Rating => "xmp:Rating",
             Self::GpsLatitude => "exif:GPSLatitude",
             Self::GpsLongitude => "exif:GPSLongitude",
@@ -172,7 +172,7 @@ impl ManagedXmpField {
             Self::GpsDateTime => (xmp_ns::EXIF, "GPSTimeStamp"),
             Self::GpsSpeed => (xmp_ns::EXIF, "GPSSpeed"),
             Self::GpsSpeedRef => (xmp_ns::EXIF, "GPSSpeedRef"),
-            Self::GpsHPositioningError => (xmp_ns::EXIF, "GPSHPositioningError"),
+            Self::GpsHPositioningError => (EXIF_EX_XMP_NS, "GPSHPositioningError"),
             Self::Rating => (xmp_ns::XMP, "Rating"),
             Self::GpsLatitude => (xmp_ns::EXIF, "GPSLatitude"),
             Self::GpsLongitude => (xmp_ns::EXIF, "GPSLongitude"),
@@ -617,12 +617,21 @@ impl<R: std::io::Read + std::io::Seek> TiffGpsReader<'_, R> {
     fn entry_value<const N: usize>(
         &mut self,
         entry: &[u8; 12],
+        tag_name: &'static str,
         expected_type: u16,
         expected_count: u32,
     ) -> Result<Option<[u8; N]>, TiffGpsError> {
-        if tiff_u16(self.endian, [entry[2], entry[3]]) != expected_type
-            || tiff_u32(self.endian, [entry[4], entry[5], entry[6], entry[7]]) != expected_count
-        {
+        let actual_type = tiff_u16(self.endian, [entry[2], entry[3]]);
+        let actual_count = tiff_u32(self.endian, [entry[4], entry[5], entry[6], entry[7]]);
+        if actual_type != expected_type || actual_count != expected_count {
+            tracing::warn!(
+                tag = tag_name,
+                expected_type,
+                actual_type,
+                expected_count,
+                actual_count,
+                "Source EXIF GPS tag has an unexpected type or count"
+            );
             return Ok(None);
         }
         let mut value = [0_u8; N];
@@ -698,12 +707,12 @@ fn read_tiff_source_gps<R: std::io::Read + std::io::Seek>(
         let entry = reader.read_ifd_entry(gps_ifd_offset, index)?;
         match tiff_u16(reader.endian, [entry[0], entry[1]]) {
             0x0007 if time.is_none() => {
-                if let Some(value) = reader.entry_value::<24>(&entry, 5, 3)? {
+                if let Some(value) = reader.entry_value::<24>(&entry, "GPSTimeStamp", 5, 3)? {
                     time = tiff_rational_triplet(reader.endian, &value);
                 }
             }
             0x000C if speed_ref.is_none() => {
-                if let Some(value) = reader.entry_value::<2>(&entry, 2, 2)? {
+                if let Some(value) = reader.entry_value::<2>(&entry, "GPSSpeedRef", 2, 2)? {
                     speed_ref = std::str::from_utf8(&value)
                         .ok()
                         .map(|value| value.trim_matches('\0').trim().to_ascii_uppercase())
@@ -711,19 +720,21 @@ fn read_tiff_source_gps<R: std::io::Read + std::io::Seek>(
                 }
             }
             0x000D if speed.is_none() => {
-                if let Some(value) = reader.entry_value::<8>(&entry, 5, 1)? {
+                if let Some(value) = reader.entry_value::<8>(&entry, "GPSSpeed", 5, 1)? {
                     speed = tiff_rational(reader.endian, &value);
                 }
             }
             0x001D if date.is_none() => {
-                if let Some(value) = reader.entry_value::<11>(&entry, 2, 11)? {
+                if let Some(value) = reader.entry_value::<11>(&entry, "GPSDateStamp", 2, 11)? {
                     date = std::str::from_utf8(&value)
                         .ok()
                         .map(|value| value.trim_matches('\0').trim().to_owned());
                 }
             }
             0x001F if horizontal_positioning_error.is_none() => {
-                if let Some(value) = reader.entry_value::<8>(&entry, 5, 1)? {
+                if let Some(value) =
+                    reader.entry_value::<8>(&entry, "GPSHPositioningError", 5, 1)?
+                {
                     horizontal_positioning_error = tiff_rational(reader.endian, &value);
                 }
             }
@@ -801,78 +812,6 @@ fn tiff_rational_triplet(endian: TiffEndian, bytes: &[u8; 24]) -> Option<[XmpRat
         tiff_rational(endian, bytes[8..16].try_into().ok()?)?,
         tiff_rational(endian, bytes[16..24].try_into().ok()?)?,
     ])
-}
-
-#[cfg(all(feature = "xmp", test))]
-fn source_gps_from_exif(metadata: &Metadata) -> SourceGpsMetadata {
-    let gps_datetime = source_gps_datetime(metadata);
-    let speed = first_rational(metadata, ExifTag::GPSSpeed(Vec::new()));
-    let speed_ref = first_string(metadata, ExifTag::GPSSpeedRef(String::new()))
-        .map(|value| value.trim_matches('\0').trim().to_ascii_uppercase())
-        .filter(|value| matches!(value.as_str(), "K" | "M" | "N"));
-    // A speed without a unit is unusable, and `first_rational` guarantees a
-    // non-zero denominator.
-    let speed = match (speed, speed_ref.as_ref()) {
-        (Some(value), Some(_)) => Some(value),
-        (Some(_), None) => {
-            tracing::warn!("Source EXIF GPSSpeedRef is missing or unsupported");
-            None
-        }
-        (None, _) => None,
-    };
-    let speed_ref = speed.as_ref().and(speed_ref);
-    let horizontal_positioning_error =
-        first_rational(metadata, ExifTag::GPSHPositioningError(Vec::new()));
-    SourceGpsMetadata {
-        datetime: gps_datetime,
-        speed,
-        speed_ref,
-        horizontal_positioning_error,
-    }
-}
-
-#[cfg(all(feature = "xmp", test))]
-fn first_rational(metadata: &Metadata, requested: ExifTag) -> Option<XmpRational> {
-    metadata.get_tag(&requested).next().and_then(|tag| {
-        let values = match tag {
-            ExifTag::GPSSpeed(values) | ExifTag::GPSHPositioningError(values) => values,
-            _ => return None,
-        };
-        values.first().and_then(XmpRational::from_exif)
-    })
-}
-
-#[cfg(all(feature = "xmp", test))]
-fn first_string(metadata: &Metadata, requested: ExifTag) -> Option<String> {
-    metadata
-        .get_tag(&requested)
-        .next()
-        .and_then(|tag| match tag {
-            ExifTag::GPSSpeedRef(value) => Some(value.clone()),
-            ExifTag::GPSDateStamp(value) => Some(value.clone()),
-            _ => None,
-        })
-}
-
-#[cfg(all(feature = "xmp", test))]
-fn source_gps_datetime(metadata: &Metadata) -> Option<String> {
-    let date = first_string(metadata, ExifTag::GPSDateStamp(String::new()))?;
-    let time_tag = metadata
-        .get_tag(&ExifTag::GPSTimeStamp(Vec::new()))
-        .next()?;
-    let ExifTag::GPSTimeStamp(times) = time_tag else {
-        return None;
-    };
-    let [hour_value, minute_value, seconds_value] = times.as_slice() else {
-        tracing::warn!("Source EXIF GPSTimeStamp is malformed");
-        return None;
-    };
-    let values = [
-        XmpRational::from_exif(hour_value)?,
-        XmpRational::from_exif(minute_value)?,
-        XmpRational::from_exif(seconds_value)?,
-    ];
-    source_gps_datetime_values(date.trim_matches('\0').trim(), &values)
 }
 
 #[cfg(feature = "xmp")]
@@ -987,14 +926,6 @@ pub(crate) struct XmpRational {
 
 #[cfg(feature = "xmp")]
 impl XmpRational {
-    #[cfg(test)]
-    fn from_exif(value: &uR64) -> Option<Self> {
-        (value.denominator != 0).then_some(Self {
-            numerator: value.nominator,
-            denominator: value.denominator,
-        })
-    }
-
     fn as_f64(&self) -> f64 {
         f64::from(self.numerator) / f64::from(self.denominator)
     }
@@ -1619,7 +1550,7 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
     }
     if let Some(error) = &write.gps_h_positioning_error {
         meta.set_property(
-            xmp_ns::EXIF,
+            EXIF_EX_XMP_NS,
             "GPSHPositioningError",
             &XmpValue::new(error.encode()),
         )?;
@@ -2049,6 +1980,24 @@ mod tests {
         );
     }
 
+    fn read_source_gps_from_test_exif(metadata: &Metadata, name: &str) -> SourceGpsMetadata {
+        let mut bytes = minimal_jpeg();
+        metadata
+            .write_to_vec(&mut bytes, FileExtension::JPEG)
+            .expect("serialise source EXIF");
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("write source media");
+        read_source_gps(&path).expect("read source EXIF through production parser")
+    }
+
+    fn read_source_gps_from_test_tiff(bytes: &[u8], name: &str) -> SourceGpsMetadata {
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("write source TIFF");
+        read_source_gps(&path).expect("read source TIFF through production parser")
+    }
+
     fn png_with_source_gps() -> Vec<u8> {
         fn crc32(bytes: &[u8]) -> u32 {
             let mut crc = u32::MAX;
@@ -2136,7 +2085,10 @@ mod tests {
 
     #[test]
     fn source_gps_composes_utc_timestamps() {
-        assert_standard_source_gps(&source_gps_from_exif(&exif_with_source_gps()));
+        assert_standard_source_gps(&read_source_gps_from_test_exif(
+            &exif_with_source_gps(),
+            "standard.jpg",
+        ));
         // A whole-second GPS timestamp renders without a fractional part.
         let mut metadata = exif_with_source_gps();
         metadata.set_tag(ExifTag::GPSTimeStamp(vec![
@@ -2144,7 +2096,7 @@ mod tests {
             ur64(22, 1),
             ur64(33, 1),
         ]));
-        let gps = source_gps_from_exif(&metadata);
+        let gps = read_source_gps_from_test_exif(&metadata, "whole-second.jpg");
         assert_eq!(gps.datetime.as_deref(), Some("2024-06-15T11:22:33Z"));
     }
 
@@ -2210,11 +2162,11 @@ mod tests {
     #[test]
     fn source_gps_omits_malformed_timestamp_variants() {
         // A valid date with a malformed GPSTimeStamp, or a malformed date,
-        // yields no GPS datetime while the other source fields survive. One
-        // row per rejection branch: bad date, wrong arity, a non-rational
-        // hour, minute, or second, and an out-of-range hour.
+        // yields no GPS datetime while sibling source fields prove the GPS IFD
+        // was serialised and parsed. `not-a-date` is deliberately ten bytes so
+        // its EXIF ASCII count is the required 11 including the trailing NUL.
         let bad = |n: u32| ur64(n, 0);
-        let cases: [(&str, Option<&str>, Vec<uR64>); 6] = [
+        let cases: [(&str, Option<&str>, Vec<uR64>); 8] = [
             (
                 "malformed date",
                 Some("not-a-date"),
@@ -2222,24 +2174,34 @@ mod tests {
             ),
             ("wrong arity", None, vec![ur64(10, 1), ur64(20, 1)]),
             (
-                "non-rational hour",
+                "zero denominator",
                 None,
                 vec![bad(10), ur64(20, 1), ur64(30, 1)],
             ),
             (
-                "non-rational minute",
+                "fractional hour",
                 None,
-                vec![ur64(10, 1), bad(20), ur64(30, 1)],
+                vec![ur64(21, 2), ur64(20, 1), ur64(30, 1)],
             ),
             (
-                "non-rational seconds",
+                "minute out of range",
                 None,
-                vec![ur64(10, 1), ur64(20, 1), bad(30)],
+                vec![ur64(10, 1), ur64(60, 1), ur64(30, 1)],
+            ),
+            (
+                "seconds out of range",
+                None,
+                vec![ur64(10, 1), ur64(20, 1), ur64(60, 1)],
             ),
             (
                 "hour out of range",
                 None,
                 vec![ur64(25, 1), ur64(20, 1), ur64(30, 1)],
+            ),
+            (
+                "minute zero denominator",
+                None,
+                vec![ur64(10, 1), bad(20), ur64(30, 1)],
             ),
         ];
         for (name, date, times) in cases {
@@ -2248,7 +2210,7 @@ mod tests {
                 metadata.set_tag(ExifTag::GPSDateStamp(date.into()));
             }
             metadata.set_tag(ExifTag::GPSTimeStamp(times));
-            let gps = source_gps_from_exif(&metadata);
+            let gps = read_source_gps_from_test_exif(&metadata, &format!("{name}.jpg"));
             assert_eq!(gps.datetime, None, "{name}");
             assert_eq!(
                 gps.speed.as_ref().map(XmpRational::encode).as_deref(),
@@ -2263,7 +2225,8 @@ mod tests {
         }
 
         // A date with no GPSTimeStamp at all cannot compose a timestamp.
-        let gps = source_gps_from_exif(&source_gps_without_time_stamp());
+        let gps =
+            read_source_gps_from_test_exif(&source_gps_without_time_stamp(), "missing-time.jpg");
         assert_eq!(gps.datetime, None);
         assert_eq!(
             gps.speed.as_ref().map(XmpRational::encode).as_deref(),
@@ -2279,29 +2242,58 @@ mod tests {
         // A zero-denominator positioning error is dropped.
         metadata.set_tag(ExifTag::GPSHPositioningError(vec![ur64(1, 0)]));
 
-        let gps = source_gps_from_exif(&metadata);
+        let gps = read_source_gps_from_test_exif(&metadata, "invalid-speed-error.jpg");
         assert_eq!(gps.speed, None);
         assert_eq!(gps.speed_ref, None);
         assert_eq!(gps.horizontal_positioning_error, None);
+        assert_eq!(gps.datetime.as_deref(), Some(SOURCE_GPS_DATETIME));
     }
 
     #[test]
-    fn source_gps_field_readers_reject_mismatched_tag_types() {
-        let metadata = exif_with_source_gps();
-        // `first_rational` decodes only rational GPS tags; a string tag is None.
-        assert_eq!(
-            first_rational(&metadata, ExifTag::GPSDateStamp(String::new())),
-            None
-        );
-        // `first_string` decodes only string GPS tags; a rational tag is None.
-        assert_eq!(first_string(&metadata, ExifTag::GPSSpeed(Vec::new())), None);
+    fn source_gps_rejects_wrong_tiff_types_and_counts() {
+        let cases = [
+            ("timestamp type", 30, 2_u16, None, true),
+            (
+                "speed reference type",
+                42,
+                5_u16,
+                Some(SOURCE_GPS_DATETIME),
+                false,
+            ),
+            ("speed type", 54, 2_u16, Some(SOURCE_GPS_DATETIME), false),
+        ];
+        for (name, type_offset, value_type, datetime, speed_survives) in cases {
+            let mut bytes = minimal_tiff_with_source_gps();
+            bytes[type_offset..type_offset + 2].copy_from_slice(&value_type.to_le_bytes());
+            let gps = read_source_gps_from_test_tiff(&bytes, &format!("{name}.DNG"));
+            assert_eq!(gps.datetime.as_deref(), datetime, "{name}");
+            assert_eq!(gps.speed.is_some(), speed_survives, "{name}");
+            assert!(
+                gps.horizontal_positioning_error.is_some(),
+                "{name}: sibling field must survive"
+            );
+        }
+
+        for (name, count_offset, count) in
+            [("timestamp count", 32, 2_u32), ("date count", 68, 10_u32)]
+        {
+            let mut bytes = minimal_tiff_with_source_gps();
+            bytes[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+            let gps = read_source_gps_from_test_tiff(&bytes, &format!("{name}.DNG"));
+            assert_eq!(gps.datetime, None, "{name}");
+            assert_eq!(
+                gps.speed.as_ref().map(XmpRational::encode).as_deref(),
+                Some(SOURCE_GPS_SPEED),
+                "{name}: sibling field must survive"
+            );
+        }
     }
 
     #[test]
     fn gps_datetime_serialises_as_typed_xmp_date() {
         // The sidecar-write test proves the GPS property values reach XMP. This
         // pins the standard property ID and its typed date value.
-        let gps = source_gps_from_exif(&exif_with_source_gps());
+        let gps = read_source_gps_from_test_exif(&exif_with_source_gps(), "typed-date.jpg");
         let packet = build_xmp_packet(&MetadataWrite {
             gps_datetime: gps.datetime,
             ..MetadataWrite::default()
@@ -3544,7 +3536,7 @@ mod tests {
             (xmp_ns::EXIF, "GPSTimeStamp"),
             (xmp_ns::EXIF, "GPSSpeed"),
             (xmp_ns::EXIF, "GPSSpeedRef"),
-            (xmp_ns::EXIF, "GPSHPositioningError"),
+            (EXIF_EX_XMP_NS, "GPSHPositioningError"),
             (xmp_ns::EXIF, "GPSAltitude"),
             (xmp_ns::EXIF, "GPSAltitudeRef"),
             (xmp_ns::DC, "subject"),
@@ -3573,7 +3565,7 @@ mod tests {
         assert!(!managed.contains("exif:GPSTimeStamp"));
         assert!(!managed.contains("exif:GPSSpeed"));
         assert!(!managed.contains("exif:GPSSpeedRef"));
-        assert!(!managed.contains("exif:GPSHPositioningError"));
+        assert!(!managed.contains("exifEX:GPSHPositioningError"));
         assert!(!managed.contains("exif:GPSAltitude"));
         assert_eq!(
             meta.property(THIRD_PARTY_NS, "developSettings")
@@ -3615,7 +3607,7 @@ mod tests {
         seed.set_property(xmp_ns::EXIF, "GPSSpeedRef", &XmpValue::new("K".to_string()))
             .unwrap();
         seed.set_property(
-            xmp_ns::EXIF,
+            EXIF_EX_XMP_NS,
             "GPSHPositioningError",
             &XmpValue::new("13/4".to_string()),
         )
@@ -3645,17 +3637,16 @@ mod tests {
             5,
             "an unmarked rating may belong to another application"
         );
-        for property in [
-            "GPSTimeStamp",
-            "GPSSpeed",
-            "GPSSpeedRef",
-            "GPSHPositioningError",
-        ] {
+        for property in ["GPSTimeStamp", "GPSSpeed", "GPSSpeedRef"] {
             assert!(
                 meta.contains_property(xmp_ns::EXIF, property),
                 "an unmarked GPS property may belong to another application: {property}"
             );
         }
+        assert!(
+            meta.contains_property(EXIF_EX_XMP_NS, "GPSHPositioningError"),
+            "an unmarked GPS property may belong to another application: GPSHPositioningError"
+        );
         assert_eq!(
             meta.localized_text(xmp_ns::DC, "description", None, "x-default")
                 .unwrap()
@@ -3670,7 +3661,7 @@ mod tests {
         assert!(!managed.contains("exif:GPSTimeStamp"));
         assert!(!managed.contains("exif:GPSSpeed"));
         assert!(!managed.contains("exif:GPSSpeedRef"));
-        assert!(!managed.contains("exif:GPSHPositioningError"));
+        assert!(!managed.contains("exifEX:GPSHPositioningError"));
 
         fs::remove_file(&sidecar_path).ok();
         fs::remove_file(&media_path).ok();
@@ -3706,23 +3697,22 @@ mod tests {
         .unwrap();
 
         let meta = read_sidecar_meta(&media_path);
-        for property in [
-            "GPSTimeStamp",
-            "GPSSpeed",
-            "GPSSpeedRef",
-            "GPSHPositioningError",
-        ] {
+        for property in ["GPSTimeStamp", "GPSSpeed", "GPSSpeedRef"] {
             assert!(
                 meta.contains_property(xmp_ns::EXIF, property),
                 "unknown source state must preserve {property}"
             );
         }
+        assert!(
+            meta.contains_property(EXIF_EX_XMP_NS, "GPSHPositioningError"),
+            "unknown source state must preserve GPSHPositioningError"
+        );
         let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
         for token in [
             "exif:GPSTimeStamp",
             "exif:GPSSpeed",
             "exif:GPSSpeedRef",
-            "exif:GPSHPositioningError",
+            "exifEX:GPSHPositioningError",
         ] {
             assert!(
                 managed.split(',').any(|value| value == token),
