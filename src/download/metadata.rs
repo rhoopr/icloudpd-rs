@@ -51,6 +51,9 @@ const EXIF_EX_XMP_PREFIX: &str = "exifEX";
 const KEI_MANAGED_FIELDS: &str = "managedFields";
 
 #[cfg(feature = "xmp")]
+static SIDECAR_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "xmp")]
 #[derive(Clone, Copy)]
 enum ManagedXmpField {
     CreateDate,
@@ -621,8 +624,6 @@ fn prepare_sidecar_write(
     let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".xmp");
     let sidecar_path = media_path.with_file_name(&sidecar_name);
-    let tmp_path = temp_path_for(&sidecar_path, temp_suffix);
-
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
     let (mut meta, expected) = match std::fs::read(&sidecar_path) {
@@ -665,16 +666,7 @@ fn prepare_sidecar_write(
     apply_to_owned_sidecar(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
 
-    let mut temp = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-        .with_context(|| {
-            format!(
-                "Could not create temporary XMP sidecar {}",
-                tmp_path.display()
-            )
-        })?;
+    let (mut temp, tmp_path) = create_unique_sidecar_temp(&sidecar_path, temp_suffix)?;
     let guard = TmpGuard::new(&tmp_path);
     std::io::Write::write_all(&mut temp, &bytes).with_context(|| {
         format!(
@@ -694,6 +686,45 @@ fn prepare_sidecar_write(
         sidecar_path,
         expected,
     }))
+}
+
+#[cfg(feature = "xmp")]
+fn sidecar_temp_path(sidecar_path: &Path, temp_suffix: &str, sequence: u64) -> PathBuf {
+    let parent = sidecar_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".kei-xmp-{}-{sequence}{temp_suffix}",
+        std::process::id()
+    ))
+}
+
+#[cfg(feature = "xmp")]
+fn create_unique_sidecar_temp(
+    sidecar_path: &Path,
+    temp_suffix: &str,
+) -> Result<(std::fs::File, PathBuf)> {
+    loop {
+        let candidate = sidecar_temp_path(
+            sidecar_path,
+            temp_suffix,
+            SIDECAR_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not create temporary XMP sidecar {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 #[cfg(feature = "xmp")]
@@ -2510,9 +2541,8 @@ mod tests {
 
     #[test]
     fn write_sidecar_is_atomic_rewrite() {
-        let dir = test_tmp_dir("sidecar_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let media_path = dir.join("rewrite.jpg");
+        let dir = tempfile::tempdir().unwrap();
+        let media_path = dir.path().join("rewrite.jpg");
         std::fs::write(&media_path, b"placeholder").unwrap();
 
         let first = MetadataWrite {
@@ -2527,7 +2557,7 @@ mod tests {
         };
         write_sidecar_with_default_suffix(&media_path, &second).unwrap();
 
-        let sidecar = dir.join("rewrite.jpg.xmp");
+        let sidecar = dir.path().join("rewrite.jpg.xmp");
         let s = fs::read_to_string(&sidecar).unwrap();
         assert!(s.contains("After"), "second write should replace first");
         assert!(
@@ -2535,11 +2565,15 @@ mod tests {
             "previous title must not leak through"
         );
 
-        let tmp = dir.join("rewrite.jpg.xmp.meta-tmp");
-        assert!(!tmp.exists(), "temp sidecar file must be cleaned up");
-
-        fs::remove_file(&sidecar).ok();
-        fs::remove_file(&media_path).ok();
+        let retained_temps: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".kei-xmp-"))
+            .collect();
+        assert!(
+            retained_temps.is_empty(),
+            "successful writes must remove their unique temp files: {retained_temps:?}"
+        );
     }
 
     #[tokio::test]
@@ -2632,16 +2666,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_sidecar_preserves_preexisting_temp_path() {
+    async fn write_sidecar_retries_after_retained_conflict_temp() {
         let dir = tempfile::tempdir().unwrap();
         let media_path = dir.path().join("temp-conflict.jpg");
         let sidecar_path = dir.path().join("temp-conflict.jpg.xmp");
-        let temp_path = dir.path().join("temp-conflict.jpg.xmp.meta-tmp");
         std::fs::write(&media_path, b"placeholder").unwrap();
-        let existing_temp = b"unowned or displaced bytes";
-        std::fs::write(&temp_path, existing_temp).unwrap();
 
-        let error = super::write_sidecar(
+        let prepared = prepare_sidecar_write(
+            &media_path,
+            &MetadataWrite {
+                rating: Some(4),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+        )
+        .unwrap()
+        .expect("initial sidecar should be prepared");
+        let retained_path = prepared.tmp_path.clone();
+        let retained_bytes = std::fs::read(&retained_path).unwrap();
+
+        ensure_initialized();
+        let mut external = XmpMeta::new().unwrap();
+        external
+            .set_property(
+                xmp_ns::DC,
+                "creator",
+                &XmpValue::new("External author".to_string()),
+            )
+            .unwrap();
+        std::fs::write(&sidecar_path, external.to_string().into_bytes()).unwrap();
+        crate::download::file::publish_file_if_unchanged(
+            &prepared.tmp_path,
+            &prepared.sidecar_path,
+            prepared.expected,
+        )
+        .await
+        .unwrap_err();
+
+        super::write_sidecar(
             &media_path,
             &MetadataWrite {
                 rating: Some(4),
@@ -2650,14 +2712,16 @@ mod tests {
             ".meta-tmp",
         )
         .await
-        .unwrap_err();
+        .expect("a retained conflict file must not block a later attempt");
 
-        assert!(
-            format!("{error:#}").contains("Could not create temporary XMP sidecar"),
-            "{error:#}"
+        assert_eq!(
+            std::fs::read(&retained_path).unwrap(),
+            retained_bytes,
+            "the later attempt must not overwrite or delete ambiguous retained bytes"
         );
-        assert_eq!(std::fs::read(&temp_path).unwrap(), existing_temp);
-        assert!(!sidecar_path.exists());
+        let written = std::fs::read_to_string(&sidecar_path).unwrap();
+        assert!(written.contains("External author"), "{written}");
+        assert!(written.contains("Rating"), "{written}");
     }
 
     #[test]

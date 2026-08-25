@@ -7442,6 +7442,73 @@ mod tests {
         );
     }
 
+    /// #752: ambiguous bytes retained from a refused sidecar publication must
+    /// not block the durable marker from succeeding on a later drain.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn retained_sidecar_temp_does_not_block_pending_rewrite_retry() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let download_dir = dir.path().join("downloads");
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(download_dir.as_path());
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let stored = jpeg_asset("RETAINED_SIDECAR_TEMP", "retained.jpg", true);
+        let derived = seed_downloaded_jpeg_asset(&db, &config, &stored).await;
+        db.record_metadata_write_failure(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+        )
+        .await
+        .unwrap();
+
+        let retained_path = derived.path.parent().unwrap().join(format!(
+            ".kei-xmp-{}-{}.kei-tmp",
+            std::process::id(),
+            u64::MAX
+        ));
+        let retained_bytes = b"ambiguous bytes from an earlier publication";
+        fs::write(&retained_path, retained_bytes).unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::empty::<Result<PhotoAsset, anyhow::Error>>(),
+            &config,
+            DownloadControls::download_hidden(),
+            0,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.exif_failures, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&retained_path).unwrap(), retained_bytes);
+        let sidecar = fs::read_to_string(sidecar_path_for(&derived.path)).unwrap();
+        assert!(sidecar.contains("<xmp:Rating>5</xmp:Rating>"), "{sidecar}");
+    }
+
     /// Data-sacred regression for the trust-state fast-skip removal.
     ///
     /// When the state DB says an asset is `downloaded` and the config_hash
