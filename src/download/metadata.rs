@@ -112,7 +112,9 @@ impl ManagedXmpField {
             Self::GpsDateTime => "exif:GPSTimeStamp",
             Self::GpsSpeed => "exif:GPSSpeed",
             Self::GpsSpeedRef => "exif:GPSSpeedRef",
-            Self::GpsHPositioningError => "exifEX:GPSHPositioningError",
+            // CIPA Table 17 and Apple Photos retain GPS tag 31 in exif,
+            // unlike the exifEX-only OffsetTime fields above.
+            Self::GpsHPositioningError => "exif:GPSHPositioningError",
             Self::Rating => "xmp:Rating",
             Self::GpsLatitude => "exif:GPSLatitude",
             Self::GpsLongitude => "exif:GPSLongitude",
@@ -172,7 +174,7 @@ impl ManagedXmpField {
             Self::GpsDateTime => (xmp_ns::EXIF, "GPSTimeStamp"),
             Self::GpsSpeed => (xmp_ns::EXIF, "GPSSpeed"),
             Self::GpsSpeedRef => (xmp_ns::EXIF, "GPSSpeedRef"),
-            Self::GpsHPositioningError => (EXIF_EX_XMP_NS, "GPSHPositioningError"),
+            Self::GpsHPositioningError => (xmp_ns::EXIF, "GPSHPositioningError"),
             Self::Rating => (xmp_ns::XMP, "Rating"),
             Self::GpsLatitude => (xmp_ns::EXIF, "GPSLatitude"),
             Self::GpsLongitude => (xmp_ns::EXIF, "GPSLongitude"),
@@ -1550,7 +1552,7 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
     }
     if let Some(error) = &write.gps_h_positioning_error {
         meta.set_property(
-            EXIF_EX_XMP_NS,
+            xmp_ns::EXIF,
             "GPSHPositioningError",
             &XmpValue::new(error.encode()),
         )?;
@@ -3536,7 +3538,7 @@ mod tests {
             (xmp_ns::EXIF, "GPSTimeStamp"),
             (xmp_ns::EXIF, "GPSSpeed"),
             (xmp_ns::EXIF, "GPSSpeedRef"),
-            (EXIF_EX_XMP_NS, "GPSHPositioningError"),
+            (xmp_ns::EXIF, "GPSHPositioningError"),
             (xmp_ns::EXIF, "GPSAltitude"),
             (xmp_ns::EXIF, "GPSAltitudeRef"),
             (xmp_ns::DC, "subject"),
@@ -3565,7 +3567,7 @@ mod tests {
         assert!(!managed.contains("exif:GPSTimeStamp"));
         assert!(!managed.contains("exif:GPSSpeed"));
         assert!(!managed.contains("exif:GPSSpeedRef"));
-        assert!(!managed.contains("exifEX:GPSHPositioningError"));
+        assert!(!managed.contains("exif:GPSHPositioningError"));
         assert!(!managed.contains("exif:GPSAltitude"));
         assert_eq!(
             meta.property(THIRD_PARTY_NS, "developSettings")
@@ -3607,7 +3609,7 @@ mod tests {
         seed.set_property(xmp_ns::EXIF, "GPSSpeedRef", &XmpValue::new("K".to_string()))
             .unwrap();
         seed.set_property(
-            EXIF_EX_XMP_NS,
+            xmp_ns::EXIF,
             "GPSHPositioningError",
             &XmpValue::new("13/4".to_string()),
         )
@@ -3644,7 +3646,8 @@ mod tests {
             );
         }
         assert!(
-            meta.contains_property(EXIF_EX_XMP_NS, "GPSHPositioningError"),
+            meta.property(xmp_ns::EXIF, "GPSHPositioningError")
+                .is_some_and(|property| property.value == "13/4"),
             "an unmarked GPS property may belong to another application: GPSHPositioningError"
         );
         assert_eq!(
@@ -3661,7 +3664,7 @@ mod tests {
         assert!(!managed.contains("exif:GPSTimeStamp"));
         assert!(!managed.contains("exif:GPSSpeed"));
         assert!(!managed.contains("exif:GPSSpeedRef"));
-        assert!(!managed.contains("exifEX:GPSHPositioningError"));
+        assert!(!managed.contains("exif:GPSHPositioningError"));
 
         fs::remove_file(&sidecar_path).ok();
         fs::remove_file(&media_path).ok();
@@ -3704,7 +3707,7 @@ mod tests {
             );
         }
         assert!(
-            meta.contains_property(EXIF_EX_XMP_NS, "GPSHPositioningError"),
+            meta.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
             "unknown source state must preserve GPSHPositioningError"
         );
         let managed = meta.property(KEI_XMP_NS, KEI_MANAGED_FIELDS).unwrap().value;
@@ -3712,7 +3715,7 @@ mod tests {
             "exif:GPSTimeStamp",
             "exif:GPSSpeed",
             "exif:GPSSpeedRef",
-            "exifEX:GPSHPositioningError",
+            "exif:GPSHPositioningError",
         ] {
             assert!(
                 managed.split(',').any(|value| value == token),

@@ -1203,11 +1203,10 @@ pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
     assert_eq!(text("GPSTimeStamp"), SOURCE_GPS_DATETIME);
     assert_eq!(text("GPSSpeedRef"), SOURCE_GPS_SPEED_REF);
     assert_eq!(text("GPSSpeed"), SOURCE_GPS_SPEED);
-    assert_eq!(
-        meta.property("http://cipa.jp/exif/1.0/", "GPSHPositioningError")
-            .expect("GPSHPositioningError")
-            .value,
-        SOURCE_GPS_H_POSITIONING_ERROR
+    assert_eq!(text("GPSHPositioningError"), SOURCE_GPS_H_POSITIONING_ERROR);
+    assert!(
+        !meta.contains_property("http://cipa.jp/exif/1.0/", "GPSHPositioningError"),
+        "Apple-compatible sidecars must not duplicate GPSHPositioningError in exifEX"
     );
 }
 
