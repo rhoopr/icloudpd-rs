@@ -296,6 +296,9 @@ pub struct SyncStats {
     pub metadata_capture_refreshed: usize,
     pub metadata_capture_failures: usize,
     pub metadata_capture_remaining: u64,
+    /// True when this cycle durably reduced metadata-capture work.
+    #[serde(skip)]
+    pub(crate) metadata_capture_progressed: bool,
     pub state_write_failures: usize,
     pub enumeration_errors: usize,
     /// Best-effort count-probe failures observed before full enumeration.
@@ -422,9 +425,8 @@ impl SyncStats {
     /// `sync_loop::run_cycle` to fold each library's stats into a cycle-wide
     /// total.
     ///
-    /// All numeric counters sum; `interrupted` ORs (any library being
-    /// interrupted means the cycle was interrupted); `skipped` delegates to
-    /// [`SkipBreakdown::accumulate`].
+    /// All numeric counters sum; boolean cycle facts OR; `skipped` delegates
+    /// to [`SkipBreakdown::accumulate`].
     ///
     /// Adding a new field to `SyncStats` requires updating this method too --
     /// otherwise the new counter silently zeros out across multi-library
@@ -454,6 +456,7 @@ impl SyncStats {
         self.metadata_capture_refreshed += other.metadata_capture_refreshed;
         self.metadata_capture_failures += other.metadata_capture_failures;
         self.metadata_capture_remaining += other.metadata_capture_remaining;
+        self.metadata_capture_progressed |= other.metadata_capture_progressed;
         self.state_write_failures += other.state_write_failures;
         self.enumeration_errors += other.enumeration_errors;
         self.count_probe_failures += other.count_probe_failures;
@@ -4537,7 +4540,11 @@ async fn run_metadata_capture_repair(
         .complete_metadata_capture_revision(library, crate::state::METADATA_CAPTURE_REVISION)
         .await
     {
-        Ok(status) => repair.stats.metadata_capture_remaining = status.remaining_assets,
+        Ok(status) => {
+            repair.stats.metadata_capture_progressed =
+                status.remaining_assets < initial.remaining_assets;
+            repair.stats.metadata_capture_remaining = status.remaining_assets;
+        }
         Err(error) => {
             repair.stats.state_write_failures = repair.stats.state_write_failures.saturating_add(1);
             repair.failures = repair.failures.saturating_add(1);
@@ -15471,6 +15478,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_capture_source_deletions_count_as_clean_progress() {
+        const DELETED_ASSETS: usize = 500;
+        const STALE_ASSETS: usize = DELETED_ASSETS + 1;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut provider_records = Vec::with_capacity(DELETED_ASSETS * 2);
+        for index in 0..STALE_ASSETS {
+            let master_id = format!("CAPTURE_DELETED_{index:04}");
+            let asset_id = format!("asset-{master_id}");
+            if index < DELETED_ASSETS {
+                let master = incremental_photo_records(&master_id)
+                    .into_iter()
+                    .next()
+                    .expect("master record");
+                provider_records.push(master);
+                provider_records.push(json!({
+                    "recordName": asset_id,
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                }));
+            }
+
+            let record = TestAssetRecord::new(&asset_id)
+                .filename("metadata-capture-deleted.jpg")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&record).await.expect("seed state row");
+            db.mark_downloaded(
+                "PrimarySync",
+                &asset_id,
+                "original",
+                Path::new("/photos/metadata-capture-deleted.jpg"),
+                "seeded-local-sha256",
+                None,
+            )
+            .await
+            .expect("mark state row downloaded");
+            db.upsert_asset_master_mapping("PrimarySync", &asset_id, &master_id)
+                .await
+                .expect("seed provider mapping");
+        }
+        db.acquire_lock("test_metadata_capture_deleted_stale")
+            .expect("state lock")
+            .execute("DELETE FROM asset_metadata_capture_revisions", [])
+            .expect("mark every asset stale");
+
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(provider_records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("source-deleted capture batch");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.metadata_capture_refreshed, 0);
+        assert_eq!(result.stats.metadata_capture_failures, 0);
+        assert_eq!(result.stats.metadata_capture_remaining, 1);
+        assert!(result.stats.metadata_capture_progressed);
+        assert_eq!(
+            db.get_summary().await.expect("summary").source_deleted,
+            u64::try_from(DELETED_ASSETS).expect("deleted count fits u64")
+        );
+    }
+
+    #[tokio::test]
     async fn current_capture_revision_adds_no_provider_lookup_requests() {
         #[derive(Clone, Debug)]
         struct CountingCaptureSession {
@@ -19014,6 +19109,7 @@ mod tests {
             metadata_capture_refreshed: 2,
             metadata_capture_failures: 1,
             metadata_capture_remaining: 5,
+            metadata_capture_progressed: false,
             state_write_failures: 2,
             enumeration_errors: 3,
             count_probe_failures: 4,
@@ -19085,6 +19181,7 @@ mod tests {
             metadata_capture_refreshed: 3,
             metadata_capture_failures: 2,
             metadata_capture_remaining: 7,
+            metadata_capture_progressed: true,
             state_write_failures: 5,
             enumeration_errors: 6,
             count_probe_failures: 7,
@@ -19151,6 +19248,7 @@ mod tests {
         assert_eq!(acc.metadata_capture_refreshed, 5);
         assert_eq!(acc.metadata_capture_failures, 3);
         assert_eq!(acc.metadata_capture_remaining, 12);
+        assert!(acc.metadata_capture_progressed);
         assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
         assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");
         assert_eq!(

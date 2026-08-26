@@ -478,7 +478,7 @@ fn metadata_capture_watch_interval(
     configured_interval.map(|interval| {
         if cycle_failed_count == 0
             && stats.metadata_capture_remaining > 0
-            && stats.metadata_capture_refreshed > 0
+            && stats.metadata_capture_progressed
         {
             interval.min(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
         } else {
@@ -2517,6 +2517,7 @@ mod tests {
         let stats = download::SyncStats {
             metadata_capture_refreshed: 500,
             metadata_capture_remaining: 701,
+            metadata_capture_progressed: true,
             ..download::SyncStats::default()
         };
 
@@ -2529,6 +2530,16 @@ mod tests {
             Some(60)
         );
         assert_eq!(metadata_capture_watch_interval(None, &stats, 0), None);
+
+        let deleted_batch = download::SyncStats {
+            metadata_capture_remaining: 1,
+            metadata_capture_progressed: true,
+            ..download::SyncStats::default()
+        };
+        assert_eq!(
+            metadata_capture_watch_interval(default_interval, &deleted_batch, 0),
+            Some(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
+        );
     }
 
     #[test]
@@ -2546,6 +2557,7 @@ mod tests {
                     metadata_capture_refreshed: 499,
                     metadata_capture_failures: 1,
                     metadata_capture_remaining: 701,
+                    metadata_capture_progressed: true,
                     ..download::SyncStats::default()
                 },
                 1,
@@ -2553,6 +2565,7 @@ mod tests {
             (
                 download::SyncStats {
                     metadata_capture_refreshed: 500,
+                    metadata_capture_progressed: true,
                     ..download::SyncStats::default()
                 },
                 0,
