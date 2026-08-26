@@ -154,6 +154,7 @@ pub(crate) enum RecordResolution {
 pub(crate) struct RecordResolutionBatch {
     pub(crate) results: Vec<(ProviderRecordId, RecordResolution)>,
     pub(crate) complete: bool,
+    pub(crate) rate_limit_observations: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -960,6 +961,7 @@ impl PhotoAlbum {
         requests: &[RecordLookupRequest],
     ) -> RecordResolutionBatch {
         let mut results = Vec::with_capacity(requests.len());
+        let mut rate_limit_observations = 0usize;
         let url = format!(
             "{}/records/lookup?{}",
             self.service_endpoint,
@@ -994,7 +996,11 @@ impl PhotoAlbum {
             )
             .await
             {
-                Ok(response) => response,
+                Ok(retried) => {
+                    rate_limit_observations =
+                        rate_limit_observations.saturating_add(retried.rate_limit_observations);
+                    retried.response
+                }
                 Err(error) => {
                     let error = classify_provider_lookup_error(&error);
                     crate::metrics::record_targeted_lookup("transient_failure", batch.len());
@@ -1156,6 +1162,7 @@ impl PhotoAlbum {
         RecordResolutionBatch {
             results: grouped,
             complete,
+            rate_limit_observations,
         }
     }
 

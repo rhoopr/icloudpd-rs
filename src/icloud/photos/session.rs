@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -353,6 +354,21 @@ fn classify_api_error(e: &anyhow::Error) -> RetryAction {
     RetryAction::Abort
 }
 
+fn classify_rate_limit_error(e: &anyhow::Error) -> bool {
+    if let Some(http_err) = e.downcast_ref::<HttpStatusError>() {
+        return matches!(http_err.status, 429 | 503);
+    }
+    e.downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        .is_some_and(|status| matches!(status.as_u16(), 429 | 503))
+}
+
+#[derive(Debug)]
+pub(crate) struct RetriedPostResponse {
+    pub(crate) response: Value,
+    pub(crate) rate_limit_observations: usize,
+}
+
 /// Retry a `session.post()` call with default exponential backoff.
 ///
 /// Inspects each response for `CloudKit` server errors (`serverErrorCode`)
@@ -388,11 +404,23 @@ pub(crate) async fn retry_post_allowing_record_errors(
     body: &str,
     headers: &[(&str, &str)],
     retry_config: &RetryConfig,
-) -> anyhow::Result<Value> {
-    retry::retry_with_backoff(retry_config, classify_api_error, || async {
-        session.post(url, body.to_owned(), headers).await
+) -> anyhow::Result<RetriedPostResponse> {
+    let rate_limit_observations = AtomicUsize::new(0);
+    let response = retry::retry_with_backoff(
+        retry_config,
+        |error| {
+            if classify_rate_limit_error(error) {
+                rate_limit_observations.fetch_add(1, Ordering::Relaxed);
+            }
+            classify_api_error(error)
+        },
+        || async { session.post(url, body.to_owned(), headers).await },
+    )
+    .await?;
+    Ok(RetriedPostResponse {
+        response,
+        rate_limit_observations: rate_limit_observations.load(Ordering::Relaxed),
     })
-    .await
 }
 
 /// Errors from `changes/zone` when syncToken is invalid.
@@ -896,18 +924,21 @@ mod tests {
     fn test_post_503_is_retryable() {
         let err = reqwest_status_error(503);
         assert_eq!(classify_api_error(&err), RetryAction::Retry);
+        assert!(classify_rate_limit_error(&err));
     }
 
     #[test]
     fn test_post_429_is_retryable() {
         let err = reqwest_status_error(429);
         assert_eq!(classify_api_error(&err), RetryAction::Retry);
+        assert!(classify_rate_limit_error(&err));
     }
 
     #[test]
     fn test_post_421_aborts() {
         let err = reqwest_status_error(421);
         assert_eq!(classify_api_error(&err), RetryAction::Abort);
+        assert!(!classify_rate_limit_error(&err));
     }
 
     // ── Gap: empty records array passes through cleanly ──────────────

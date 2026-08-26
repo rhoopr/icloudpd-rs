@@ -479,6 +479,7 @@ fn metadata_capture_watch_interval(
         if cycle_failed_count == 0
             && stats.metadata_capture_remaining > 0
             && stats.metadata_capture_progressed
+            && !stats.has_rate_limit_pressure()
         {
             interval.min(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
         } else {
@@ -2531,6 +2532,16 @@ mod tests {
         );
         assert_eq!(metadata_capture_watch_interval(None, &stats, 0), None);
 
+        let absorbed_rate_limit = download::SyncStats {
+            assets_seen: 100,
+            rate_limited: 9,
+            ..stats
+        };
+        assert_eq!(
+            metadata_capture_watch_interval(default_interval, &absorbed_rate_limit, 0),
+            Some(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
+        );
+
         let deleted_batch = download::SyncStats {
             metadata_capture_remaining: 1,
             metadata_capture_progressed: true,
@@ -2576,6 +2587,34 @@ mod tests {
                     Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL),
                     &stats,
                     cycle_failed_count,
+                ),
+                Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL)
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limited_metadata_capture_keeps_the_configured_interval() {
+        for stats in [
+            download::SyncStats {
+                rate_limited: 1,
+                metadata_capture_remaining: 701,
+                metadata_capture_progressed: true,
+                ..download::SyncStats::default()
+            },
+            download::SyncStats {
+                assets_seen: 100,
+                rate_limited: 10,
+                metadata_capture_remaining: 701,
+                metadata_capture_progressed: true,
+                ..download::SyncStats::default()
+            },
+        ] {
+            assert_eq!(
+                metadata_capture_watch_interval(
+                    Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL),
+                    &stats,
+                    0,
                 ),
                 Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL)
             );

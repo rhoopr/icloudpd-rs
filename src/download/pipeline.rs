@@ -3138,7 +3138,7 @@ pub(super) async fn run_download_pass(
 /// at/above it, the operator should adjust cadence to avoid prolonged
 /// back-off behavior and possible hard lockouts.
 fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
-    if stats.rate_limited == 0 {
+    if !stats.has_rate_limit_pressure() {
         return;
     }
     if stats.assets_seen == 0 {
@@ -3965,19 +3965,14 @@ mod tests {
 
     #[test]
     fn rate_limit_pressure_triggers_at_exactly_10_percent() {
-        // 10/100 = 10% → triggers
         let stats = stats_with_rl(100, 10);
-        let pct = stats.rate_limited as u64 * 100 / stats.assets_seen.max(1);
-        assert_eq!(pct, 10);
-        assert!(pct >= 10);
+        assert!(stats.has_rate_limit_pressure());
     }
 
     #[test]
     fn rate_limit_pressure_below_10_percent_does_not_trigger() {
         let stats = stats_with_rl(100, 9);
-        let pct = stats.rate_limited as u64 * 100 / stats.assets_seen.max(1);
-        assert_eq!(pct, 9);
-        assert!(pct < 10);
+        assert!(!stats.has_rate_limit_pressure());
     }
 
     #[test]
@@ -3986,12 +3981,14 @@ mod tests {
         // would produce a misleading "300%" for 3 observations) and emit a
         // separate no-anchor warn path.
         let stats = stats_with_rl(0, 3);
+        assert!(stats.has_rate_limit_pressure());
         maybe_warn_rate_limit_pressure(&stats);
     }
 
     #[test]
     fn rate_limit_pressure_zero_observations_skips_quickly() {
         let stats = stats_with_rl(100, 0);
+        assert!(!stats.has_rate_limit_pressure());
         maybe_warn_rate_limit_pressure(&stats); // no panic, no denom needed
     }
 

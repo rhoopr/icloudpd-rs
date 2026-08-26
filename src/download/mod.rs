@@ -420,7 +420,24 @@ pub struct SyncStats {
     pub recap: recap::RunRecap,
 }
 
+const RATE_LIMIT_PRESSURE_PERCENT: u64 = 10;
+const RATE_LIMIT_PERCENT_SCALE: u64 = 100;
+
 impl SyncStats {
+    /// Whether observed HTTP 429/503 retries crossed the operator-warning threshold.
+    #[must_use]
+    pub(crate) fn has_rate_limit_pressure(&self) -> bool {
+        if self.rate_limited == 0 {
+            return false;
+        }
+        if self.assets_seen == 0 {
+            return true;
+        }
+        let observations = u64::try_from(self.rate_limited).unwrap_or(u64::MAX);
+        observations.saturating_mul(RATE_LIMIT_PERCENT_SCALE) / self.assets_seen
+            >= RATE_LIMIT_PRESSURE_PERCENT
+    }
+
     /// Add `other` into `self`, field by field. Used by the per-cycle loop in
     /// `sync_loop::run_cycle` to fold each library's stats into a cycle-wide
     /// total.
@@ -4334,6 +4351,10 @@ async fn run_metadata_capture_repair(
         })
         .collect();
     let resolutions = provider_pass.album.resolve_records(&requests).await;
+    repair.stats.rate_limited = repair
+        .stats
+        .rate_limited
+        .saturating_add(resolutions.rate_limit_observations);
     let mut legacy_masters = FxHashSet::default();
     for (state_id, resolution) in resolutions.results {
         if shutdown_token.is_cancelled() {
@@ -10012,6 +10033,22 @@ mod tests {
         container_id: Option<&str>,
         session: Box<dyn PhotosSession>,
     ) -> PhotoAlbum {
+        album_with_session_and_retry_config(
+            zone,
+            name,
+            container_id,
+            RetryConfig::default(),
+            session,
+        )
+    }
+
+    fn album_with_session_and_retry_config(
+        zone: &str,
+        name: &str,
+        container_id: Option<&str>,
+        retry_config: RetryConfig,
+        session: Box<dyn PhotosSession>,
+    ) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -10022,7 +10059,7 @@ mod tests {
                 query_filter: None,
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": zone})),
-                retry_config: RetryConfig::default(),
+                retry_config,
                 container_id: container_id.map(Arc::from),
                 cross_zone_sources: Vec::new(),
             },
@@ -15335,6 +15372,7 @@ mod tests {
         #[derive(Clone, Debug)]
         struct CaptureScaleSession {
             records: Arc<HashMap<String, Value>>,
+            rate_limited_once: Arc<AtomicBool>,
         }
 
         #[async_trait::async_trait]
@@ -15351,6 +15389,15 @@ mod tests {
                     } else {
                         json!({"records": [], "syncToken": "ignored-query-token"})
                     });
+                }
+                if !self.rate_limited_once.swap(true, Ordering::SeqCst) {
+                    return Err(crate::icloud::photos::session::HttpStatusError {
+                        status: 429,
+                        url: url.to_owned(),
+                        retry_after: None,
+                        body: None,
+                    }
+                    .into());
                 }
                 let request: Value = serde_json::from_str(&body)?;
                 let records = request["records"]
@@ -15411,11 +15458,18 @@ mod tests {
 
         let pass = AlbumPass {
             kind: PassKind::Unfiled,
-            album: album_with_session(
+            album: album_with_session_and_retry_config(
                 "PrimarySync",
                 "",
+                None,
+                RetryConfig {
+                    max_retries: 1,
+                    base_delay_secs: 0,
+                    max_delay_secs: 0,
+                },
                 Box::new(CaptureScaleSession {
                     records: Arc::new(provider_records),
+                    rate_limited_once: Arc::new(AtomicBool::new(false)),
                 }),
             ),
             exclude_ids: Arc::new(FxHashSet::default()),
@@ -15428,10 +15482,10 @@ mod tests {
             zone_sync_token: "zone-token-prev".to_string(),
         };
 
-        for (cycle, refreshed, remaining, active_revision) in [
-            (1, 500, 701, 0),
-            (2, 500, 201, 0),
-            (3, 201, 0, crate::state::METADATA_CAPTURE_REVISION),
+        for (cycle, refreshed, remaining, active_revision, rate_limited) in [
+            (1, 500, 701, 0, 1),
+            (2, 500, 201, 0, 0),
+            (3, 201, 0, crate::state::METADATA_CAPTURE_REVISION, 0),
         ] {
             let result = download_photos_with_sync(
                 &Client::new(),
@@ -15454,6 +15508,12 @@ mod tests {
             );
             assert_eq!(
                 result.stats.metadata_capture_remaining, remaining,
+                "cycle {cycle}"
+            );
+            assert_eq!(result.stats.rate_limited, rate_limited, "cycle {cycle}");
+            assert_eq!(
+                result.stats.has_rate_limit_pressure(),
+                rate_limited > 0,
                 "cycle {cycle}"
             );
             let summary = db.get_summary().await.expect("capture status");
