@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- XMP sidecars carry the source photo's GPS fix time, speed, speed reference, and horizontal positioning error from the media's own EXIF alongside the CloudKit
+  location. This includes DNG and other TIFF-based RAW content, and uses the standard `exif:GPSTimeStamp` and `exif:GPSHPositioningError` properties. A photo without
+  readable EXIF still receives its sidecar with the CloudKit metadata. Source EXIF is read without buffering the complete media file. ([#725])
+
 ### Changed
 
 - State databases now use schema version 17 to record which iCloud asset owns an adopted legacy master row. Older kei versions reject a version 17 database instead of opening it. To downgrade, restore a state DB backup made before the upgrade; downloaded media files are unchanged. ([#721])
@@ -41,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#719]: https://github.com/rhoopr/kei/issues/719
 [#720]: https://github.com/rhoopr/kei/pull/720
 [#721]: https://github.com/rhoopr/kei/pull/721
+[#725]: https://github.com/rhoopr/kei/issues/725
 [#691]: https://github.com/rhoopr/kei/issues/691
 [@mmenanno]: https://github.com/mmenanno
 
