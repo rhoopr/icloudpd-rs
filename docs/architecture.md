@@ -304,6 +304,20 @@ A later rewrite deletes a cleared property only when that marker proves kei
 owned the prior value. Unmarked standard properties and unrelated third-party
 namespaces remain unchanged.
 
+Source GPS facts for sidecars are read through file-backed parsers. JPEG APP1,
+TIFF-based RAW, PNG `eXIf`, and HEIF Exif items use checked seeks and
+fixed-size TIFF fields. HEIF atom and item-location counts are streamed without
+allocating from provider-controlled lengths.
+CloudKit is authoritative for the currently decoded coordinates, altitude, and
+capture timestamps. The location decoder currently maps only `lat`, `lon`, and
+`alt` from `locationEnc`, so source EXIF supplies GPS receiver time, speed,
+speed units, and horizontal positioning error. No coordinate matching or
+tolerance is applied for minor Photos location edits.
+Source I/O failures still publish current CloudKit metadata, preserve prior
+kei-owned source GPS fields as unknown, and retain the metadata retry marker.
+Readable unsupported or malformed metadata permits a CloudKit-only sidecar.
+Source media is never opened for writing on this path.
+
 A drain only rewrites a file whose bytes still match the checksum on its row,
 because the alternative is embedding into damage and then vouching for it. A
 file that no longer matches keeps its marker and its recorded checksum, so

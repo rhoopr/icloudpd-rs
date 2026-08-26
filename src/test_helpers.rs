@@ -984,6 +984,232 @@ impl PhotosSession for MockPhotosSession {
     }
 }
 
+// ── Source EXIF GPS fixtures ────────────────────────────────────────
+
+/// Facts that `exif_with_source_gps` yields once read and composed.
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_DATETIME: &str = "2024-06-15T10:20:30.125Z";
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_SPEED: &str = "12345/100";
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_SPEED_REF: &str = "K";
+#[cfg(feature = "xmp")]
+pub const SOURCE_GPS_H_POSITIONING_ERROR: &str = "3/2";
+
+/// EXIF `uR64` rational from a numerator and denominator.
+#[cfg(feature = "xmp")]
+pub fn ur64(nominator: u32, denominator: u32) -> little_exif::rational::uR64 {
+    little_exif::rational::uR64 {
+        nominator,
+        denominator,
+    }
+}
+
+/// EXIF metadata carrying the standard source GPS facts: GPSDateStamp
+/// 2024:06:15, GPSTimeStamp 10:20:30.125, GPSSpeedRef K, GPSSpeed 123.45,
+/// GPSHPositioningError 1.5.
+#[cfg(feature = "xmp")]
+pub fn exif_with_source_gps() -> little_exif::metadata::Metadata {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::metadata::Metadata;
+
+    let mut metadata = Metadata::new();
+    metadata.set_tag(ExifTag::GPSDateStamp("2024:06:15".into()));
+    metadata.set_tag(ExifTag::GPSTimeStamp(vec![
+        ur64(10, 1),
+        ur64(20, 1),
+        ur64(30_125, 1_000),
+    ]));
+    metadata.set_tag(ExifTag::GPSSpeedRef("K".into()));
+    metadata.set_tag(ExifTag::GPSSpeed(vec![ur64(12_345, 100)]));
+    metadata.set_tag(ExifTag::GPSHPositioningError(vec![ur64(3, 2)]));
+    metadata
+}
+
+/// The standard source GPS EXIF without a `GPSTimeStamp`, so a date alone
+/// cannot compose a timestamp.
+#[cfg(feature = "xmp")]
+pub fn source_gps_without_time_stamp() -> little_exif::metadata::Metadata {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::metadata::Metadata;
+
+    let mut metadata = Metadata::new();
+    metadata.set_tag(ExifTag::GPSDateStamp("2024:06:15".into()));
+    metadata.set_tag(ExifTag::GPSSpeedRef("K".into()));
+    metadata.set_tag(ExifTag::GPSSpeed(vec![ur64(12_345, 100)]));
+    metadata.set_tag(ExifTag::GPSHPositioningError(vec![ur64(3, 2)]));
+    metadata
+}
+
+/// Minimal JPEG (SOI + APP0 JFIF + EOI) carrying the standard source GPS EXIF.
+#[cfg(feature = "xmp")]
+pub fn minimal_jpeg_with_source_gps() -> Vec<u8> {
+    let mut bytes = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+    exif_with_source_gps()
+        .write_to_vec(&mut bytes, little_exif::filetype::FileExtension::JPEG)
+        .expect("write source GPS EXIF into minimal JPEG");
+    bytes
+}
+
+/// Minimal JPEG whose source EXIF location and capture time deliberately
+/// differ from the CloudKit values used by metadata writer tests.
+#[cfg(feature = "xmp")]
+pub fn minimal_jpeg_with_source_gps_and_location() -> Vec<u8> {
+    use little_exif::exif_tag::ExifTag;
+
+    let mut metadata = exif_with_source_gps();
+    metadata.set_tag(ExifTag::DateTimeOriginal("2030:01:02 03:04:05".into()));
+    metadata.set_tag(ExifTag::GPSLatitudeRef("N".into()));
+    metadata.set_tag(ExifTag::GPSLatitude(vec![
+        ur64(1, 1),
+        ur64(30, 1),
+        ur64(0, 1),
+    ]));
+    metadata.set_tag(ExifTag::GPSLongitudeRef("E".into()));
+    metadata.set_tag(ExifTag::GPSLongitude(vec![
+        ur64(2, 1),
+        ur64(30, 1),
+        ur64(0, 1),
+    ]));
+    metadata.set_tag(ExifTag::GPSAltitudeRef(vec![0]));
+    metadata.set_tag(ExifTag::GPSAltitude(vec![ur64(333, 1)]));
+
+    let mut bytes = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+    metadata
+        .write_to_vec(&mut bytes, little_exif::filetype::FileExtension::JPEG)
+        .expect("write conflicting source EXIF into minimal JPEG");
+    bytes
+}
+
+/// Minimal little-endian TIFF carrying the standard source GPS EXIF.
+#[cfg(feature = "xmp")]
+pub fn minimal_tiff_with_source_gps() -> Vec<u8> {
+    minimal_tiff_with_source_gps_endian(false)
+}
+
+/// Minimal big-endian TIFF carrying the standard source GPS EXIF.
+#[cfg(feature = "xmp")]
+pub fn minimal_big_endian_tiff_with_source_gps() -> Vec<u8> {
+    minimal_tiff_with_source_gps_endian(true)
+}
+
+#[cfg(feature = "xmp")]
+fn minimal_tiff_with_source_gps_endian(big_endian: bool) -> Vec<u8> {
+    fn push_u16(bytes: &mut Vec<u8>, value: u16, big_endian: bool) {
+        let encoded = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32, big_endian: bool) {
+        let encoded = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+
+    fn push_ifd_entry(
+        bytes: &mut Vec<u8>,
+        tag: u16,
+        value_type: u16,
+        count: u32,
+        value: u32,
+        big_endian: bool,
+    ) {
+        push_u16(bytes, tag, big_endian);
+        push_u16(bytes, value_type, big_endian);
+        push_u32(bytes, count, big_endian);
+        push_u32(bytes, value, big_endian);
+    }
+
+    const IFD0_OFFSET: u32 = 8;
+    const GPS_IFD_OFFSET: u32 = 26;
+    const GPS_DATE_OFFSET: u32 = 92;
+    const GPS_TIME_OFFSET: u32 = 104;
+    const GPS_SPEED_OFFSET: u32 = 128;
+    const GPS_ERROR_OFFSET: u32 = 136;
+
+    let mut bytes = Vec::with_capacity(144);
+    bytes.extend_from_slice(if big_endian { b"MM" } else { b"II" });
+    push_u16(&mut bytes, 42, big_endian);
+    push_u32(&mut bytes, IFD0_OFFSET, big_endian);
+
+    push_u16(&mut bytes, 1, big_endian);
+    push_ifd_entry(&mut bytes, 0x8825, 4, 1, GPS_IFD_OFFSET, big_endian);
+    push_u32(&mut bytes, 0, big_endian);
+
+    push_u16(&mut bytes, 5, big_endian);
+    push_ifd_entry(&mut bytes, 0x0007, 5, 3, GPS_TIME_OFFSET, big_endian);
+    push_ifd_entry(
+        &mut bytes,
+        0x000C,
+        2,
+        2,
+        if big_endian {
+            u32::from_be_bytes([b'K', 0, 0, 0])
+        } else {
+            u32::from_le_bytes([b'K', 0, 0, 0])
+        },
+        big_endian,
+    );
+    push_ifd_entry(&mut bytes, 0x000D, 5, 1, GPS_SPEED_OFFSET, big_endian);
+    push_ifd_entry(&mut bytes, 0x001D, 2, 11, GPS_DATE_OFFSET, big_endian);
+    push_ifd_entry(&mut bytes, 0x001F, 5, 1, GPS_ERROR_OFFSET, big_endian);
+    push_u32(&mut bytes, 0, big_endian);
+
+    bytes.extend_from_slice(b"2024:06:15\0");
+    bytes.push(0);
+    for (numerator, denominator) in [(10, 1), (20, 1), (30_125, 1_000)] {
+        push_u32(&mut bytes, numerator, big_endian);
+        push_u32(&mut bytes, denominator, big_endian);
+    }
+    push_u32(&mut bytes, 12_345, big_endian);
+    push_u32(&mut bytes, 100, big_endian);
+    push_u32(&mut bytes, 3, big_endian);
+    push_u32(&mut bytes, 2, big_endian);
+
+    debug_assert_eq!(bytes.len(), 144);
+    bytes
+}
+
+/// Structurally valid `ftyp`-only HEIC with no `meta` box, so it carries no
+/// EXIF item. Readers must treat it as media with no source GPS, not an error.
+#[cfg(feature = "xmp")]
+pub fn heif_ftyp_without_meta_bytes() -> Vec<u8> {
+    vec![
+        0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'h', b'e', b'i',
+        b'c', b'm', b'i', b'f', b'1',
+    ]
+}
+
+/// Asserts an XMP packet carries the standard source GPS facts with the values
+/// `exif_with_source_gps` yields.
+#[cfg(feature = "xmp")]
+pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
+    use xmp_toolkit::xmp_ns;
+
+    let text = |name: &str| meta.property(xmp_ns::EXIF, name).expect(name).value;
+    assert_eq!(text("GPSTimeStamp"), SOURCE_GPS_DATETIME);
+    assert_eq!(text("GPSSpeedRef"), SOURCE_GPS_SPEED_REF);
+    assert_eq!(text("GPSSpeed"), SOURCE_GPS_SPEED);
+    assert_eq!(text("GPSHPositioningError"), SOURCE_GPS_H_POSITIONING_ERROR);
+    assert!(
+        !meta.contains_property("http://cipa.jp/exif/1.0/", "GPSHPositioningError"),
+        "Apple-compatible sidecars must not duplicate GPSHPositioningError in exifEX"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

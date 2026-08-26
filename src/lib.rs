@@ -1776,6 +1776,17 @@ pub mod __fuzz {
         crate::download::heif::extract_xmp_bytes(bytes)
     }
 
+    /// Locate a HEIF EXIF TIFF range through the file-backed parser.
+    pub fn heif_locate_exif(bytes: &[u8]) {
+        let mut source = std::io::Cursor::new(bytes);
+        let _ = crate::download::heif::locate_exif_tiff(&mut source, bytes.len() as u64);
+    }
+
+    /// Parse arbitrary bytes through the fixed-buffer TIFF GPS reader.
+    pub fn tiff_source_gps(bytes: &[u8]) {
+        crate::download::metadata::fuzz_tiff_source_gps(bytes);
+    }
+
     /// Cheap content-sniff check for HEIC/HEIF/AVIF magic bytes.
     pub fn heif_is_heif_content(bytes: &[u8]) -> bool {
         crate::download::heif::is_heif_content(bytes)
