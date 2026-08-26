@@ -1072,9 +1072,13 @@ fn is_heif_file(path: &Path) -> bool {
     }
 }
 
-/// Whether this path's extension is one the in-place embedded-metadata writer
-/// can patch. JPEG / PNG / TIFF / MP4 / MOV go through XMP Toolkit;
-/// HEIC / HEIF / AVIF go through [`super::heif`].
+/// Whether the in-place embedded-metadata writer can patch this file.
+///
+/// The first 12 bytes take precedence over the extension so downloaded part
+/// files and misleading extensions route safely. HEIC / HEIF / AVIF writes
+/// remain disabled and stop here before the complete-file metadata probe.
+/// JPEG / PNG / TIFF / MP4 / MOV continue through XMP Toolkit.
+#[must_use]
 pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
     let mut head = [0u8; 12];
     if let Ok(n) = std::fs::File::open(path).and_then(|mut f| {
@@ -1090,7 +1094,8 @@ pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
         }
         #[cfg(feature = "xmp")]
         if heif::is_heif_content(head) {
-            return true;
+            skip_heif_embed_write(path);
+            return false;
         }
     }
     let ext = path
@@ -1105,7 +1110,8 @@ pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
     }
     #[cfg(feature = "xmp")]
     if heif::is_heif_path(path) {
-        return true;
+        skip_heif_embed_write(path);
+        return false;
     }
     #[cfg(feature = "xmp")]
     {
@@ -3493,10 +3499,22 @@ mod tests {
     #[test]
     fn is_embed_writable_path_recognises_supported_formats() {
         for ext in [
-            "jpg", "jpeg", "JPG", "png", "PNG", "tif", "tiff", "mp4", "MOV", "heic", "HEIF", "avif",
+            "jpg", "jpeg", "JPG", "png", "PNG", "tif", "tiff", "mp4", "MOV",
         ] {
             let p = PathBuf::from(format!("/a/b.{ext}"));
             assert!(is_embed_writable_path(&p), "{ext} should be writable");
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    #[test]
+    fn is_embed_writable_path_rejects_disabled_heif_formats() {
+        for ext in ["heic", "HEIF", "hif", "avif"] {
+            let p = PathBuf::from(format!("/a/b.{ext}"));
+            assert!(
+                !is_embed_writable_path(&p),
+                "{ext} embedded writes should be disabled"
+            );
         }
     }
 
