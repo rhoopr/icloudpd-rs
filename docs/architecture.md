@@ -302,7 +302,11 @@ planned from, so it records a marker on failure but never retires one.
 XMP sidecars record the exact properties that kei writes in the kei namespace.
 A later rewrite deletes a cleared property only when that marker proves kei
 owned the prior value. Unmarked standard properties and unrelated third-party
-namespaces remain unchanged.
+namespaces remain unchanged. An existing sidecar must be readable and parseable,
+and its bytes must still match the writer's initial read at publication. A
+failed check preserves the sidecar and its durable rewrite marker. Each attempt
+uses a new temporary path so retained ambiguous bytes cannot block a later
+retry.
 
 Source GPS facts for sidecars are read through file-backed parsers. JPEG APP1,
 TIFF-based RAW, PNG `eXIf`, and HEIF Exif items use checked seeks and
@@ -366,6 +370,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
+| `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
 ## Change-impact checklist

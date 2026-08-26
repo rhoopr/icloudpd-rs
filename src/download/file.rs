@@ -551,7 +551,7 @@ pub(super) async fn publish_part_to_final(
     publication: FinalPublication,
 ) -> anyhow::Result<()> {
     if let FinalPublication::ReplaceTruncated(expected) = publication {
-        return replace_truncated_file(part_path, final_path, expected).await;
+        return replace_file_if_unchanged(part_path, final_path, expected).await;
     }
 
     match publish_part_no_replace(part_path, final_path).await {
@@ -591,7 +591,39 @@ pub(super) async fn publish_part_to_final(
     }
 }
 
-async fn replace_truncated_file(
+/// Publish a prepared file only while the destination still matches the
+/// caller's initial observation. `None` means the destination did not exist;
+/// `Some` authorizes replacement of exactly those bytes and no others.
+#[cfg(feature = "xmp")]
+pub(super) async fn publish_file_if_unchanged(
+    part_path: &Path,
+    final_path: &Path,
+    expected: Option<ExistingFileFingerprint>,
+) -> anyhow::Result<()> {
+    if let Some(expected) = expected {
+        return replace_file_if_unchanged(part_path, final_path, expected).await;
+    }
+
+    match publish_part_no_replace(part_path, final_path).await {
+        Ok(PublishResult::Published) => {
+            crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
+            Ok(())
+        }
+        Ok(PublishResult::DestinationExists) => anyhow::bail!(
+            "Refusing to publish {} because it appeared after write planning",
+            final_path.display()
+        ),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Could not publish prepared file {} -> {}",
+                part_path.display(),
+                final_path.display()
+            )
+        }),
+    }
+}
+
+async fn replace_file_if_unchanged(
     part_path: &Path,
     final_path: &Path,
     expected: ExistingFileFingerprint,
@@ -600,13 +632,13 @@ async fn replace_truncated_file(
         .await
         .with_context(|| {
             format!(
-                "Could not verify truncated repair target {}",
+                "Could not verify replacement target {}",
                 final_path.display()
             )
         })?;
     anyhow::ensure!(
         current == expected,
-        "Refusing to replace {} because its bytes changed after repair planning",
+        "Refusing to replace {} because its bytes changed after write planning",
         final_path.display()
     );
 
@@ -647,23 +679,27 @@ async fn replace_truncated_file(
         }
     };
     if displaced != expected {
-        let restored =
-            restore_repair_target_if_unchanged(part_path, final_path, &displaced_path, replacement)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Could not restore {} after its bytes changed during repair publication",
-                        final_path.display()
-                    )
-                })?;
+        let restored = restore_repair_target_if_unchanged(
+            part_path,
+            final_path,
+            &displaced_path,
+            replacement,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Could not restore {} after its bytes changed during conditional publication",
+                final_path.display()
+            )
+        })?;
         if restored {
             anyhow::bail!(
-                "Refusing to replace {} because its bytes changed during repair publication; the original target was restored",
+                "Refusing to replace {} because its bytes changed during conditional publication; the original target was restored",
                 final_path.display()
             );
         }
         anyhow::bail!(
-            "Refusing to replace {} because its bytes changed during repair publication; the displaced bytes remain at {}",
+            "Refusing to replace {} because its bytes changed during conditional publication; the displaced bytes remain at {}",
             final_path.display(),
             displaced_path.display()
         );
@@ -673,7 +709,7 @@ async fn replace_truncated_file(
         tracing::warn!(
             path = %displaced_path.display(),
             %error,
-            "Failed to remove displaced truncated file after verified replacement"
+            "Failed to remove displaced file after verified replacement"
         );
     }
     crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
@@ -1211,25 +1247,25 @@ pub(super) async fn fingerprint_file(path: &Path) -> anyhow::Result<ExistingFile
     .await?
 }
 
-/// Fingerprint a repair entry and reject links or special files.
+/// Fingerprint a replacement entry and reject links or special files.
 pub(super) async fn fingerprint_regular_file(
     path: &Path,
 ) -> anyhow::Result<ExistingFileFingerprint> {
     let before = fs::symlink_metadata(path)
         .await
-        .with_context(|| format!("Could not inspect repair file {}", path.display()))?;
+        .with_context(|| format!("Could not inspect replacement file {}", path.display()))?;
     anyhow::ensure!(
         before.file_type().is_file(),
-        "Repair path is not a regular file: {}",
+        "Replacement path is not a regular file: {}",
         path.display()
     );
     let fingerprint = fingerprint_file(path).await?;
     let after = fs::symlink_metadata(path)
         .await
-        .with_context(|| format!("Could not recheck repair file {}", path.display()))?;
+        .with_context(|| format!("Could not recheck replacement file {}", path.display()))?;
     anyhow::ensure!(
         after.file_type().is_file(),
-        "Repair path changed away from a regular file: {}",
+        "Replacement path changed away from a regular file: {}",
         path.display()
     );
     Ok(fingerprint)

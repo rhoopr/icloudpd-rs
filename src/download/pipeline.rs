@@ -7364,6 +7364,151 @@ mod tests {
         );
     }
 
+    /// #741: the normal pending-rewrite owner must treat an unparsable
+    /// third-party sidecar as visible retryable work, not successful output.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn contract_xmp_sidecar_rewrite_requires_stable_input() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let download_dir = dir.path().join("downloads");
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(download_dir.as_path());
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let stored = jpeg_asset("UNPARSABLE_SIDECAR", "unparsable.jpg", true);
+        let derived = seed_downloaded_jpeg_asset(&db, &config, &stored).await;
+        db.record_metadata_write_failure(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+        )
+        .await
+        .unwrap();
+        let sidecar_path = sidecar_path_for(&derived.path);
+        let original = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF";
+        fs::write(&sidecar_path, original).unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::empty::<Result<PhotoAsset, anyhow::Error>>(),
+            &config,
+            DownloadControls::download_hidden(),
+            0,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.exif_failures, 1);
+        assert_eq!(fs::read(&sidecar_path).unwrap(), original);
+        assert_eq!(
+            db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+            1,
+            "failed sidecar rewrite must keep its durable marker"
+        );
+
+        let (outcome, stats) = build_download_outcome(
+            &reqwest::Client::new(),
+            &[],
+            &config,
+            DownloadControls::download_hidden(),
+            result,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, DownloadOutcome::PartialFailure { .. }));
+        assert_eq!(stats.exif_failures, 1);
+        assert_eq!(
+            serde_json::to_value(&stats).unwrap()["exif_failures"],
+            1,
+            "sync report statistics must expose the sidecar failure"
+        );
+    }
+
+    /// #752: ambiguous bytes retained from a refused sidecar publication must
+    /// not block the durable marker from succeeding on a later drain.
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn retained_sidecar_temp_does_not_block_pending_rewrite_retry() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let download_dir = dir.path().join("downloads");
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(download_dir.as_path());
+        config.metadata.xmp_sidecar = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let stored = jpeg_asset("RETAINED_SIDECAR_TEMP", "retained.jpg", true);
+        let derived = seed_downloaded_jpeg_asset(&db, &config, &stored).await;
+        db.record_metadata_write_failure(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+        )
+        .await
+        .unwrap();
+
+        let retained_path = derived.path.parent().unwrap().join(format!(
+            ".kei-xmp-{}-{}.kei-tmp",
+            std::process::id(),
+            u64::MAX
+        ));
+        let retained_bytes = b"ambiguous bytes from an earlier publication";
+        fs::write(&retained_path, retained_bytes).unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::empty::<Result<PhotoAsset, anyhow::Error>>(),
+            &config,
+            DownloadControls::download_hidden(),
+            0,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.exif_failures, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&retained_path).unwrap(), retained_bytes);
+        let sidecar = fs::read_to_string(sidecar_path_for(&derived.path)).unwrap();
+        assert!(sidecar.contains("<xmp:Rating>5</xmp:Rating>"), "{sidecar}");
+    }
+
     /// Data-sacred regression for the trust-state fast-skip removal.
     ///
     /// When the state DB says an asset is `downloaded` and the config_hash

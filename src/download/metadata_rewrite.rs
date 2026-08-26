@@ -201,20 +201,26 @@ async fn write_sidecar_metadata(
     temp_suffix: &str,
 ) -> bool {
     let sidecar_path = path.to_path_buf();
-    let sidecar_temp_suffix = temp_suffix.to_string();
     let log_path = sidecar_path.clone();
-    match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<anyhow::Error>> {
-        let (write, source_error) = plan_sidecar_write(&sidecar_path, &payload, &created_local);
-        if write.is_empty() {
-            return Ok(source_error);
-        }
-        super::metadata::write_sidecar(&sidecar_path, &write, &sidecar_temp_suffix)?;
-        Ok(source_error)
+    let planned = tokio::task::spawn_blocking(move || {
+        plan_sidecar_write(&sidecar_path, &payload, &created_local)
     })
-    .await
-    {
-        Ok(Ok(None)) => true,
-        Ok(Ok(Some(error))) => {
+    .await;
+    let (write, source_error) = match planned {
+        Ok(planned) => planned,
+        Err(error) => {
+            tracing::warn!(error = %error, "XMP sidecar planning task panicked");
+            return false;
+        }
+    };
+    if write.is_empty() {
+        return source_error.is_none();
+    }
+    match Box::pin(super::metadata::write_sidecar(path, &write, temp_suffix)).await {
+        Ok(()) => {
+            let Some(error) = source_error else {
+                return true;
+            };
             tracing::warn!(
                 path = %log_path.display(),
                 error = %error,
@@ -222,12 +228,8 @@ async fn write_sidecar_metadata(
             );
             false
         }
-        Ok(Err(e)) => {
-            tracing::warn!(path = %log_path.display(), error = %e, "Failed to write XMP sidecar");
-            false
-        }
         Err(e) => {
-            tracing::warn!(error = %e, "XMP sidecar task panicked");
+            tracing::warn!(path = %log_path.display(), error = %e, "Failed to write XMP sidecar");
             false
         }
     }
