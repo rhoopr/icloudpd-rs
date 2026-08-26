@@ -296,6 +296,9 @@ pub struct SyncStats {
     pub metadata_capture_refreshed: usize,
     pub metadata_capture_failures: usize,
     pub metadata_capture_remaining: u64,
+    /// True when this cycle durably reduced metadata-capture work.
+    #[serde(skip)]
+    pub(crate) metadata_capture_progressed: bool,
     pub state_write_failures: usize,
     pub enumeration_errors: usize,
     /// Best-effort count-probe failures observed before full enumeration.
@@ -417,14 +420,30 @@ pub struct SyncStats {
     pub recap: recap::RunRecap,
 }
 
+const RATE_LIMIT_PRESSURE_PERCENT: u64 = 10;
+const RATE_LIMIT_PERCENT_SCALE: u64 = 100;
+
 impl SyncStats {
+    /// Whether observed HTTP 429/503 retries crossed the operator-warning threshold.
+    #[must_use]
+    pub(crate) fn has_rate_limit_pressure(&self) -> bool {
+        if self.rate_limited == 0 {
+            return false;
+        }
+        if self.assets_seen == 0 {
+            return true;
+        }
+        let observations = u64::try_from(self.rate_limited).unwrap_or(u64::MAX);
+        observations.saturating_mul(RATE_LIMIT_PERCENT_SCALE) / self.assets_seen
+            >= RATE_LIMIT_PRESSURE_PERCENT
+    }
+
     /// Add `other` into `self`, field by field. Used by the per-cycle loop in
     /// `sync_loop::run_cycle` to fold each library's stats into a cycle-wide
     /// total.
     ///
-    /// All numeric counters sum; `interrupted` ORs (any library being
-    /// interrupted means the cycle was interrupted); `skipped` delegates to
-    /// [`SkipBreakdown::accumulate`].
+    /// All numeric counters sum; boolean cycle facts OR; `skipped` delegates
+    /// to [`SkipBreakdown::accumulate`].
     ///
     /// Adding a new field to `SyncStats` requires updating this method too --
     /// otherwise the new counter silently zeros out across multi-library
@@ -454,6 +473,7 @@ impl SyncStats {
         self.metadata_capture_refreshed += other.metadata_capture_refreshed;
         self.metadata_capture_failures += other.metadata_capture_failures;
         self.metadata_capture_remaining += other.metadata_capture_remaining;
+        self.metadata_capture_progressed |= other.metadata_capture_progressed;
         self.state_write_failures += other.state_write_failures;
         self.enumeration_errors += other.enumeration_errors;
         self.count_probe_failures += other.count_probe_failures;
@@ -4331,6 +4351,10 @@ async fn run_metadata_capture_repair(
         })
         .collect();
     let resolutions = provider_pass.album.resolve_records(&requests).await;
+    repair.stats.rate_limited = repair
+        .stats
+        .rate_limited
+        .saturating_add(resolutions.rate_limit_observations);
     let mut legacy_masters = FxHashSet::default();
     for (state_id, resolution) in resolutions.results {
         if shutdown_token.is_cancelled() {
@@ -4537,7 +4561,11 @@ async fn run_metadata_capture_repair(
         .complete_metadata_capture_revision(library, crate::state::METADATA_CAPTURE_REVISION)
         .await
     {
-        Ok(status) => repair.stats.metadata_capture_remaining = status.remaining_assets,
+        Ok(status) => {
+            repair.stats.metadata_capture_progressed =
+                status.remaining_assets < initial.remaining_assets;
+            repair.stats.metadata_capture_remaining = status.remaining_assets;
+        }
         Err(error) => {
             repair.stats.state_write_failures = repair.stats.state_write_failures.saturating_add(1);
             repair.failures = repair.failures.saturating_add(1);
@@ -10005,6 +10033,22 @@ mod tests {
         container_id: Option<&str>,
         session: Box<dyn PhotosSession>,
     ) -> PhotoAlbum {
+        album_with_session_and_retry_config(
+            zone,
+            name,
+            container_id,
+            RetryConfig::default(),
+            session,
+        )
+    }
+
+    fn album_with_session_and_retry_config(
+        zone: &str,
+        name: &str,
+        container_id: Option<&str>,
+        retry_config: RetryConfig,
+        session: Box<dyn PhotosSession>,
+    ) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -10015,7 +10059,7 @@ mod tests {
                 query_filter: None,
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": zone})),
-                retry_config: RetryConfig::default(),
+                retry_config,
                 container_id: container_id.map(Arc::from),
                 cross_zone_sources: Vec::new(),
             },
@@ -15324,6 +15368,264 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_capture_revision_repair_progresses_across_bounded_cycles() {
+        #[derive(Clone, Debug)]
+        struct CaptureScaleSession {
+            records: Arc<HashMap<String, Value>>,
+            rate_limited_once: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for CaptureScaleSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                if !url.contains("/records/lookup?") {
+                    return Ok(if url.contains("/changes/zone?") {
+                        changes_zone_response(Vec::new(), "zone-token-next")
+                    } else {
+                        json!({"records": [], "syncToken": "ignored-query-token"})
+                    });
+                }
+                if !self.rate_limited_once.swap(true, Ordering::SeqCst) {
+                    return Err(crate::icloud::photos::session::HttpStatusError {
+                        status: 429,
+                        url: url.to_owned(),
+                        retry_after: None,
+                        body: None,
+                    }
+                    .into());
+                }
+                let request: Value = serde_json::from_str(&body)?;
+                let records = request["records"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|record| record["recordName"].as_str())
+                    .filter_map(|record_name| self.records.get(record_name).cloned())
+                    .collect::<Vec<_>>();
+                Ok(json!({"records": records}))
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        const STALE_ASSETS: usize = 1_201;
+        let stale_assets = u64::try_from(STALE_ASSETS).expect("asset count fits u64");
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut provider_records = HashMap::with_capacity(STALE_ASSETS * 2);
+        for index in 0..STALE_ASSETS {
+            let master_id = format!("CAPTURE_SCALE_{index:04}");
+            let asset_id = format!("asset-{master_id}");
+            for record in incremental_photo_records_with_favorite(&master_id, true) {
+                provider_records.insert(
+                    record["recordName"]
+                        .as_str()
+                        .expect("provider record name")
+                        .to_owned(),
+                    record,
+                );
+            }
+            let record = TestAssetRecord::new(&asset_id)
+                .filename("metadata-capture-scale.jpg")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&record).await.expect("seed state row");
+            db.mark_downloaded(
+                "PrimarySync",
+                &asset_id,
+                "original",
+                Path::new("/photos/metadata-capture-scale.jpg"),
+                "seeded-local-sha256",
+                None,
+            )
+            .await
+            .expect("mark state row downloaded");
+            db.upsert_asset_master_mapping("PrimarySync", &asset_id, &master_id)
+                .await
+                .expect("seed provider mapping");
+        }
+        db.acquire_lock("test_metadata_capture_scale_stale")
+            .expect("state lock")
+            .execute("DELETE FROM asset_metadata_capture_revisions", [])
+            .expect("mark every asset stale");
+
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session_and_retry_config(
+                "PrimarySync",
+                "",
+                None,
+                RetryConfig {
+                    max_retries: 1,
+                    base_delay_secs: 0,
+                    max_delay_secs: 0,
+                },
+                Box::new(CaptureScaleSession {
+                    records: Arc::new(provider_records),
+                    rate_limited_once: Arc::new(AtomicBool::new(false)),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        for (cycle, refreshed, remaining, active_revision, rate_limited) in [
+            (1, 500, 701, 0, 1),
+            (2, 500, 201, 0, 0),
+            (3, 201, 0, crate::state::METADATA_CAPTURE_REVISION, 0),
+        ] {
+            let result = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("metadata-capture cycle");
+
+            assert!(
+                matches!(result.outcome, DownloadOutcome::Success),
+                "cycle {cycle}: {:?}",
+                result.stats
+            );
+            assert_eq!(
+                result.stats.metadata_capture_refreshed, refreshed,
+                "cycle {cycle}"
+            );
+            assert_eq!(
+                result.stats.metadata_capture_remaining, remaining,
+                "cycle {cycle}"
+            );
+            assert_eq!(result.stats.rate_limited, rate_limited, "cycle {cycle}");
+            assert_eq!(
+                result.stats.has_rate_limit_pressure(),
+                rate_limited > 0,
+                "cycle {cycle}"
+            );
+            let summary = db.get_summary().await.expect("capture status");
+            let capture = summary
+                .metadata_capture
+                .iter()
+                .find(|status| status.library == "PrimarySync")
+                .expect("primary capture status");
+            assert_eq!(capture.active_revision, active_revision, "cycle {cycle}");
+            assert_eq!(
+                capture.pending_revision,
+                (remaining > 0).then_some(crate::state::METADATA_CAPTURE_REVISION),
+                "cycle {cycle}"
+            );
+            assert_eq!(
+                capture.processed_assets,
+                stale_assets - remaining,
+                "cycle {cycle}"
+            );
+            assert_eq!(capture.remaining_assets, remaining, "cycle {cycle}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_capture_source_deletions_count_as_clean_progress() {
+        const DELETED_ASSETS: usize = 500;
+        const STALE_ASSETS: usize = DELETED_ASSETS + 1;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut provider_records = Vec::with_capacity(DELETED_ASSETS * 2);
+        for index in 0..STALE_ASSETS {
+            let master_id = format!("CAPTURE_DELETED_{index:04}");
+            let asset_id = format!("asset-{master_id}");
+            if index < DELETED_ASSETS {
+                let master = incremental_photo_records(&master_id)
+                    .into_iter()
+                    .next()
+                    .expect("master record");
+                provider_records.push(master);
+                provider_records.push(json!({
+                    "recordName": asset_id,
+                    "serverErrorCode": "UNKNOWN_ITEM",
+                    "reason": "record not found"
+                }));
+            }
+
+            let record = TestAssetRecord::new(&asset_id)
+                .filename("metadata-capture-deleted.jpg")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&record).await.expect("seed state row");
+            db.mark_downloaded(
+                "PrimarySync",
+                &asset_id,
+                "original",
+                Path::new("/photos/metadata-capture-deleted.jpg"),
+                "seeded-local-sha256",
+                None,
+            )
+            .await
+            .expect("mark state row downloaded");
+            db.upsert_asset_master_mapping("PrimarySync", &asset_id, &master_id)
+                .await
+                .expect("seed provider mapping");
+        }
+        db.acquire_lock("test_metadata_capture_deleted_stale")
+            .expect("state lock")
+            .execute("DELETE FROM asset_metadata_capture_revisions", [])
+            .expect("mark every asset stale");
+
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(provider_records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("source-deleted capture batch");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.metadata_capture_refreshed, 0);
+        assert_eq!(result.stats.metadata_capture_failures, 0);
+        assert_eq!(result.stats.metadata_capture_remaining, 1);
+        assert!(result.stats.metadata_capture_progressed);
+        assert_eq!(
+            db.get_summary().await.expect("summary").source_deleted,
+            u64::try_from(DELETED_ASSETS).expect("deleted count fits u64")
+        );
+    }
+
+    #[tokio::test]
     async fn current_capture_revision_adds_no_provider_lookup_requests() {
         #[derive(Clone, Debug)]
         struct CountingCaptureSession {
@@ -18867,6 +19169,7 @@ mod tests {
             metadata_capture_refreshed: 2,
             metadata_capture_failures: 1,
             metadata_capture_remaining: 5,
+            metadata_capture_progressed: false,
             state_write_failures: 2,
             enumeration_errors: 3,
             count_probe_failures: 4,
@@ -18938,6 +19241,7 @@ mod tests {
             metadata_capture_refreshed: 3,
             metadata_capture_failures: 2,
             metadata_capture_remaining: 7,
+            metadata_capture_progressed: true,
             state_write_failures: 5,
             enumeration_errors: 6,
             count_probe_failures: 7,
@@ -19004,6 +19308,7 @@ mod tests {
         assert_eq!(acc.metadata_capture_refreshed, 5);
         assert_eq!(acc.metadata_capture_failures, 3);
         assert_eq!(acc.metadata_capture_remaining, 12);
+        assert!(acc.metadata_capture_progressed);
         assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
         assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");
         assert_eq!(

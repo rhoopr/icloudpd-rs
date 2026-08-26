@@ -1584,6 +1584,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_exit_error",
         "classify_incremental_error",
         "classify_provider_lookup_error",
+        "classify_rate_limit_error",
         "classify_srp_post_error",
         "classify_sync_auth_error",
         "is_session_error",

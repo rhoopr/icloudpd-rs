@@ -466,6 +466,28 @@ async fn maybe_notify_shared_libraries(
 /// value set. 24 hours, matching the Docker image's always-on service shape.
 pub(crate) const SERVICE_MODE_DEFAULT_WATCH_INTERVAL: u64 = 86400;
 
+/// Maximum idle delay between clean metadata-capture repair batches.
+const METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS: u64 = 60;
+
+#[must_use]
+fn metadata_capture_watch_interval(
+    configured_interval: Option<u64>,
+    stats: &download::SyncStats,
+    cycle_failed_count: usize,
+) -> Option<u64> {
+    configured_interval.map(|interval| {
+        if cycle_failed_count == 0
+            && stats.metadata_capture_remaining > 0
+            && stats.metadata_capture_progressed
+            && !stats.has_rate_limit_pressure()
+        {
+            interval.min(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
+        } else {
+            interval
+        }
+    })
+}
+
 /// Decide whether to apply the service-mode watch-interval fallback.
 ///
 /// Returns `Some(interval)` only when `service_mode` is true AND the
@@ -1232,6 +1254,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             break;
         }
         cycle_index = cycle_index.saturating_add(1);
+        let mut next_watch_interval = config.watch.interval;
 
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check before refreshing album plans or running a sync.
@@ -1404,6 +1427,23 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 )
                 .await;
 
+            next_watch_interval = metadata_capture_watch_interval(
+                config.watch.interval,
+                &cycle_result.stats,
+                cycle_result.failed_count,
+            );
+            if let (Some(configured_interval), Some(follow_up_interval)) =
+                (config.watch.interval, next_watch_interval)
+                && follow_up_interval < configured_interval
+            {
+                tracing::info!(
+                    refreshed = cycle_result.stats.metadata_capture_refreshed,
+                    remaining = cycle_result.stats.metadata_capture_remaining,
+                    interval_secs = follow_up_interval,
+                    "Metadata-capture repair scheduled a bounded follow-up cycle"
+                );
+            }
+
             // Handle aggregate outcome across all libraries
             if cycle_result.session_expired {
                 reauth_attempts += 1;
@@ -1510,7 +1550,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             run_periodic_reconcile(db.as_ref() as &dyn state::ReportStateStore, cycle_index).await;
         }
 
-        if let Some(interval) = config.watch.interval {
+        if let Some(interval) = next_watch_interval {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
                 break;
@@ -2470,6 +2510,115 @@ mod tests {
         // Plain `kei sync` must remain single-shot when no interval is
         // configured. Only the service entry point applies the fallback.
         assert_eq!(service_mode_default_interval(None, false), None);
+    }
+
+    #[test]
+    fn progressing_metadata_capture_shortens_the_watch_interval() {
+        let default_interval = Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL);
+        let stats = download::SyncStats {
+            metadata_capture_refreshed: 500,
+            metadata_capture_remaining: 701,
+            metadata_capture_progressed: true,
+            ..download::SyncStats::default()
+        };
+
+        assert_eq!(
+            metadata_capture_watch_interval(default_interval, &stats, 0),
+            Some(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
+        );
+        assert_eq!(
+            metadata_capture_watch_interval(Some(60), &stats, 0),
+            Some(60)
+        );
+        assert_eq!(metadata_capture_watch_interval(None, &stats, 0), None);
+
+        let absorbed_rate_limit = download::SyncStats {
+            assets_seen: 100,
+            rate_limited: 9,
+            ..stats
+        };
+        assert_eq!(
+            metadata_capture_watch_interval(default_interval, &absorbed_rate_limit, 0),
+            Some(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
+        );
+
+        let deleted_batch = download::SyncStats {
+            metadata_capture_remaining: 1,
+            metadata_capture_progressed: true,
+            ..download::SyncStats::default()
+        };
+        assert_eq!(
+            metadata_capture_watch_interval(default_interval, &deleted_batch, 0),
+            Some(METADATA_CAPTURE_FOLLOW_UP_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn stalled_or_failed_metadata_capture_keeps_the_configured_interval() {
+        for (stats, cycle_failed_count) in [
+            (
+                download::SyncStats {
+                    metadata_capture_remaining: 701,
+                    ..download::SyncStats::default()
+                },
+                0,
+            ),
+            (
+                download::SyncStats {
+                    metadata_capture_refreshed: 499,
+                    metadata_capture_failures: 1,
+                    metadata_capture_remaining: 701,
+                    metadata_capture_progressed: true,
+                    ..download::SyncStats::default()
+                },
+                1,
+            ),
+            (
+                download::SyncStats {
+                    metadata_capture_refreshed: 500,
+                    metadata_capture_progressed: true,
+                    ..download::SyncStats::default()
+                },
+                0,
+            ),
+        ] {
+            assert_eq!(
+                metadata_capture_watch_interval(
+                    Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL),
+                    &stats,
+                    cycle_failed_count,
+                ),
+                Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL)
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limited_metadata_capture_keeps_the_configured_interval() {
+        for stats in [
+            download::SyncStats {
+                rate_limited: 1,
+                metadata_capture_remaining: 701,
+                metadata_capture_progressed: true,
+                ..download::SyncStats::default()
+            },
+            download::SyncStats {
+                assets_seen: 100,
+                rate_limited: 10,
+                metadata_capture_remaining: 701,
+                metadata_capture_progressed: true,
+                ..download::SyncStats::default()
+            },
+        ] {
+            assert_eq!(
+                metadata_capture_watch_interval(
+                    Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL),
+                    &stats,
+                    0,
+                ),
+                Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL)
+            );
+        }
     }
 
     #[test]
