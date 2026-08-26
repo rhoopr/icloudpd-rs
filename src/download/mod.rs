@@ -15324,6 +15324,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_capture_revision_repair_progresses_across_bounded_cycles() {
+        #[derive(Clone, Debug)]
+        struct CaptureScaleSession {
+            records: Arc<HashMap<String, Value>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for CaptureScaleSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                if !url.contains("/records/lookup?") {
+                    return Ok(if url.contains("/changes/zone?") {
+                        changes_zone_response(Vec::new(), "zone-token-next")
+                    } else {
+                        json!({"records": [], "syncToken": "ignored-query-token"})
+                    });
+                }
+                let request: Value = serde_json::from_str(&body)?;
+                let records = request["records"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|record| record["recordName"].as_str())
+                    .filter_map(|record_name| self.records.get(record_name).cloned())
+                    .collect::<Vec<_>>();
+                Ok(json!({"records": records}))
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        const STALE_ASSETS: usize = 1_201;
+        let stale_assets = u64::try_from(STALE_ASSETS).expect("asset count fits u64");
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut provider_records = HashMap::with_capacity(STALE_ASSETS * 2);
+        for index in 0..STALE_ASSETS {
+            let master_id = format!("CAPTURE_SCALE_{index:04}");
+            let asset_id = format!("asset-{master_id}");
+            for record in incremental_photo_records_with_favorite(&master_id, true) {
+                provider_records.insert(
+                    record["recordName"]
+                        .as_str()
+                        .expect("provider record name")
+                        .to_owned(),
+                    record,
+                );
+            }
+            let record = TestAssetRecord::new(&asset_id)
+                .filename("metadata-capture-scale.jpg")
+                .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .size(1024)
+                .build();
+            db.upsert_seen(&record).await.expect("seed state row");
+            db.mark_downloaded(
+                "PrimarySync",
+                &asset_id,
+                "original",
+                Path::new("/photos/metadata-capture-scale.jpg"),
+                "seeded-local-sha256",
+                None,
+            )
+            .await
+            .expect("mark state row downloaded");
+            db.upsert_asset_master_mapping("PrimarySync", &asset_id, &master_id)
+                .await
+                .expect("seed provider mapping");
+        }
+        db.acquire_lock("test_metadata_capture_scale_stale")
+            .expect("state lock")
+            .execute("DELETE FROM asset_metadata_capture_revisions", [])
+            .expect("mark every asset stale");
+
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(CaptureScaleSession {
+                    records: Arc::new(provider_records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        for (cycle, refreshed, remaining, active_revision) in [
+            (1, 500, 701, 0),
+            (2, 500, 201, 0),
+            (3, 201, 0, crate::state::METADATA_CAPTURE_REVISION),
+        ] {
+            let result = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("metadata-capture cycle");
+
+            assert!(
+                matches!(result.outcome, DownloadOutcome::Success),
+                "cycle {cycle}: {:?}",
+                result.stats
+            );
+            assert_eq!(
+                result.stats.metadata_capture_refreshed, refreshed,
+                "cycle {cycle}"
+            );
+            assert_eq!(
+                result.stats.metadata_capture_remaining, remaining,
+                "cycle {cycle}"
+            );
+            let summary = db.get_summary().await.expect("capture status");
+            let capture = summary
+                .metadata_capture
+                .iter()
+                .find(|status| status.library == "PrimarySync")
+                .expect("primary capture status");
+            assert_eq!(capture.active_revision, active_revision, "cycle {cycle}");
+            assert_eq!(
+                capture.pending_revision,
+                (remaining > 0).then_some(crate::state::METADATA_CAPTURE_REVISION),
+                "cycle {cycle}"
+            );
+            assert_eq!(
+                capture.processed_assets,
+                stale_assets - remaining,
+                "cycle {cycle}"
+            );
+            assert_eq!(capture.remaining_assets, remaining, "cycle {cycle}");
+        }
+    }
+
+    #[tokio::test]
     async fn current_capture_revision_adds_no_provider_lookup_requests() {
         #[derive(Clone, Debug)]
         struct CountingCaptureSession {

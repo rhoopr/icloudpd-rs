@@ -275,6 +275,17 @@ Only an identity that cannot be resolved from durable asset/master evidence
 uses the bounded legacy hydration path. Unselected libraries keep separate
 pending state and do not force work in selected libraries.
 
+Automatic repair processes at most 500 stale assets per library in one sync
+cycle. When a clean batch makes progress and work remains, watch and service
+mode wait at most 60 seconds before the next cycle. A stalled or failed batch
+uses the configured watch interval so persistent provider failures do not cause
+rapid retries. A one-shot sync processes one batch. `kei status` reads durable
+remaining counts, and `sync_report.json` reports the current cycle's refreshed,
+failed, and remaining counts. Revision storage uses one row per distinct asset.
+A synthetic one-million-asset database grew by 87.363 MiB, or 17.51 percent.
+One library with one million stale assets needs 2,000 successful batches, which
+adds about 33 hours of follow-up waits plus provider and cycle processing time.
+
 The watch pre-check includes only libraries with pending capture work or
 serviceable rewrite work, even when iCloud reports no provider changes. A
 rewrite marker is serviceable only when a metadata writer is enabled. A capture
