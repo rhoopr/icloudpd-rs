@@ -101,8 +101,10 @@ impl MetadataWriteOutcome {
 
 /// Request describing metadata work for one file. `embed_path` is the path to
 /// mutate in place, usually the `.part` file before promotion. `final_path` is
-/// the intended media path and is used for extension gating. `sidecar_path` is
-/// the media path next to which the `.xmp` sidecar should be written.
+/// the intended media path and is used for initial format routing. The actual
+/// embed path is checked again so its content takes precedence over a
+/// misleading final extension. `sidecar_path` is the media path next to which
+/// the `.xmp` sidecar should be written.
 pub(super) struct MetadataWriteRequest<'a> {
     pub(super) final_path: &'a Path,
     pub(super) embed_path: Option<&'a Path>,
@@ -125,8 +127,9 @@ pub(super) async fn write_download_metadata(
     let mut outcome = MetadataWriteOutcome::default();
 
     if request.flags.any_embed()
-        && super::metadata::is_embed_writable_path(request.final_path)
         && let Some(embed_path) = request.embed_path
+        && super::metadata::is_embed_writable_path(request.final_path)
+        && (embed_path == request.final_path || super::metadata::is_embed_writable_path(embed_path))
     {
         outcome.embed_failed = !write_embed_metadata(
             embed_path,
@@ -579,7 +582,9 @@ where
         // Only an embedded write touches media bytes, so the drain needs the
         // pre-write hash to tell its own rewrite apart from damage that
         // arrived some other way.
-        let pre_rewrite_checksum = if metadata_flags.any_embed() {
+        let pre_rewrite_checksum = if metadata_flags.any_embed()
+            && super::metadata::is_embed_writable_path(&path)
+        {
             match super::file::compute_sha256(&path).await {
                 Ok(checksum) => Some(checksum),
                 Err(e) => {
@@ -1068,6 +1073,80 @@ mod tests {
             .expect("read metadata temp dir")
             .count();
         assert_eq!(files, 1, "disabled metadata options created another file");
+    }
+
+    #[cfg(all(feature = "xmp", target_os = "linux"))]
+    #[test]
+    fn disabled_heif_embed_reads_only_routing_header() {
+        const INNER_RUN: &str = "KEI_TEST_HEIF_EMBED_READ_BUDGET_INNER";
+        const FIXTURE_LEN: u64 = 32 * 1024 * 1024;
+        const READ_BUDGET: u64 = 4096;
+
+        if std::env::var_os(INNER_RUN).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current unit-test executable"),
+            )
+            .arg("disabled_heif_embed_reads_only_routing_header")
+            .arg("--test-threads=1")
+            .env(INNER_RUN, "1")
+            .output()
+            .expect("run isolated HEIF read-budget regression");
+            assert!(
+                output.status.success(),
+                "isolated HEIF read-budget regression failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        fn process_read_chars() -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .expect("read process I/O counters")
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar:"))
+                .map(str::trim)
+                .expect("rchar process I/O counter")
+                .parse()
+                .expect("numeric rchar process I/O counter")
+        }
+
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let photo_path = dir.path().join("large.heic");
+        let mut file = std::fs::File::create(&photo_path).expect("create sparse HEIF fixture");
+        std::io::Write::write_all(&mut file, b"\0\0\0\x18ftypheic\0\0\0\0heicmif1")
+            .expect("write HEIF routing header");
+        file.set_len(FIXTURE_LEN)
+            .expect("extend sparse HEIF fixture");
+        drop(file);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("metadata test runtime");
+        let before = process_read_chars();
+        let outcome = runtime.block_on(write_download_metadata(MetadataWriteRequest {
+            final_path: &photo_path,
+            embed_path: Some(&photo_path),
+            sidecar_path: None,
+            payload: Arc::new(MetadataPayload::default()),
+            created_local: now_local(),
+            flags: MetadataFlags::DATETIME,
+            temp_suffix: ".metadata-test",
+        }));
+        let bytes_read = process_read_chars().saturating_sub(before);
+
+        assert!(!outcome.any_failed());
+        assert_eq!(
+            std::fs::metadata(&photo_path)
+                .expect("stat sparse HEIF fixture")
+                .len(),
+            FIXTURE_LEN,
+            "disabled embedding must leave the HEIF file unchanged"
+        );
+        assert!(
+            bytes_read <= READ_BUDGET,
+            "disabled HEIF embedding read {bytes_read} bytes; expected only the routing header within a {READ_BUDGET}-byte process I/O budget"
+        );
     }
 
     /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). XMP Toolkit can write
