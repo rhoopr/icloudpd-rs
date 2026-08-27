@@ -1094,6 +1094,9 @@ fn apply_metadata_heif_with_installer(
     install: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<()> {
     ensure_initialized();
+    let source_permissions = std::fs::metadata(path)
+        .with_context(|| format!("Could not inspect permissions of {}", path.display()))?
+        .permissions();
     let input = std::fs::read(path)
         .with_context(|| format!("Could not read {} for HEIC XMP update", path.display()))?;
     let existing = heif::extract_xmp_strict(&input)
@@ -1166,14 +1169,33 @@ fn apply_metadata_heif_with_installer(
             rewritten_xmp.len()
         );
     }
+    let temp_permissions = file
+        .metadata()
+        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
+        .permissions();
+    file.set_permissions(source_permissions)
+        .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Could not fsync permissions on {}", tmp_path.display()))?;
     drop(file);
-    install(&tmp_path, path).with_context(|| {
-        format!(
-            "Could not install HEIC metadata update {} -> {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    if let Err(install_error) = install(&tmp_path, path) {
+        if tmp_path.exists()
+            && let Err(permission_error) = std::fs::set_permissions(&tmp_path, temp_permissions)
+        {
+            anyhow::bail!(
+                "Could not install HEIC metadata update {} -> {}: {install_error}; could not restore temporary permissions for cleanup: {permission_error}",
+                tmp_path.display(),
+                path.display()
+            );
+        }
+        return Err(install_error).with_context(|| {
+            format!(
+                "Could not install HEIC metadata update {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
     guard.disarm();
     tracing::debug!(path = %path.display(), "Applied HEIC XMP metadata");
     Ok(())
@@ -3036,6 +3058,7 @@ mod tests {
     }
 
     const SAMPLE_HEIC: &[u8] = include_bytes!("../../tests/data/sample.heic");
+    const SAMPLE_AVIF: &[u8] = include_bytes!("../../tests/data/white_1x1.avif");
 
     fn fresh_heic(dir: &Path, name: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
@@ -3059,12 +3082,12 @@ mod tests {
         path
     }
 
-    fn read_heic_meta(bytes: &[u8]) -> XmpMeta {
-        let xmp = extract_xmp_from_heic(bytes).expect("HEIC XMP missing");
+    fn read_heif_meta(bytes: &[u8]) -> XmpMeta {
+        let xmp = extract_xmp_from_heic(bytes).expect("HEIF XMP missing");
         std::str::from_utf8(&xmp)
-            .expect("HEIC XMP is not UTF-8")
+            .expect("HEIF XMP is not UTF-8")
             .parse()
-            .expect("HEIC XMP is not valid")
+            .expect("HEIF XMP is not valid")
     }
 
     fn heif_ftyp_without_meta() -> Vec<u8> {
@@ -3092,7 +3115,7 @@ mod tests {
             },
         )
         .expect("HEIC metadata write");
-        let meta = read_heic_meta(&fs::read(&path).unwrap());
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
         assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 5);
         assert_eq!(
             meta.localized_text(xmp_ns::DC, "title", None, "x-default")
@@ -3126,7 +3149,7 @@ mod tests {
             },
         )
         .expect("HEIC GPS metadata write");
-        let meta = read_heic_meta(&fs::read(&path).unwrap());
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
         assert!(meta.property(xmp_ns::EXIF, "GPSLatitude").is_some());
         assert!(meta.property(xmp_ns::EXIF, "GPSLongitude").is_some());
         fs::remove_file(&path).ok();
@@ -3155,6 +3178,39 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    #[test]
+    fn apply_metadata_avif_inserts_xmp_and_preserves_image_data() {
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("white_1x1.avif");
+        fs::write(&path, SAMPLE_AVIF).unwrap();
+        let source = fs::read(&path).unwrap();
+
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(4),
+                title: Some("White pixel".into()),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("AVIF metadata write");
+
+        let rewritten = fs::read(&path).unwrap();
+        let meta = read_heif_meta(&rewritten);
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 4);
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "White pixel"
+        );
+        heif::validate_rewrite_preserves_non_xmp_items(&source, &rewritten)
+            .expect("AVIF image payload and item metadata must remain byte-for-byte stable");
+        fs::remove_file(&path).ok();
+    }
+
     /// Existing XMP is layered with the requested fields without changing the
     /// HEIC item count or image payload.
     #[test]
@@ -3178,7 +3234,7 @@ mod tests {
         .expect("HEIC metadata update");
 
         let rewritten = fs::read(&path).unwrap();
-        let meta = read_heic_meta(&rewritten);
+        let meta = read_heif_meta(&rewritten);
         assert_eq!(
             meta.localized_text(xmp_ns::DC, "title", None, "x-default")
                 .unwrap()
@@ -3275,7 +3331,7 @@ mod tests {
         .expect("HEIC metadata update");
 
         let rewritten = fs::read(&path).unwrap();
-        let meta = read_heic_meta(&rewritten);
+        let meta = read_heif_meta(&rewritten);
         assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 5);
         assert_eq!(
             meta.localized_text(xmp_ns::DC, "description", None, "x-default")
@@ -3397,6 +3453,72 @@ mod tests {
     }
 
     #[test]
+    fn apply_metadata_heic_temp_preserves_readonly_permission() {
+        let dir = test_tmp_dir("meta_heic_tests");
+        let path = fresh_heic(&dir, "readonly.heic");
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_readonly(true);
+        fs::set_permissions(&path, readonly_permissions).unwrap();
+
+        let result = apply_metadata_heif_with_installer(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            |src, _dst| {
+                assert!(
+                    fs::metadata(src).unwrap().permissions().readonly(),
+                    "the validated temp file must carry the source read-only permission"
+                );
+                Err(std::io::Error::other("stop after permission check"))
+            },
+        );
+
+        assert!(result.is_err(), "the injected install failure must surface");
+        fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(
+            !temp_path_for(&path, ".meta-tmp").exists(),
+            "the permission check must not leave a temp file"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_metadata_heic_preserves_unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_tmp_dir("meta_heic_tests");
+        let path = fresh_heic(&dir, "mode.heic");
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC metadata write");
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the installed file must preserve the source mode"
+        );
+        fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(
+            !temp_path_for(&path, ".meta-tmp").exists(),
+            "the mode check must not leave a temp file"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn apply_metadata_heic_is_idempotent_on_rewrite() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "idempotent.heic");
@@ -3453,7 +3575,7 @@ mod tests {
             },
         )
         .expect("HEIC rating change");
-        let meta = read_heic_meta(&fs::read(&path).unwrap());
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
         assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 2);
         assert_eq!(
             meta.localized_text(xmp_ns::DC, "title", None, "x-default")
@@ -3470,7 +3592,7 @@ mod tests {
             },
         )
         .expect("HEIC rating clear");
-        let cleared = read_heic_meta(&fs::read(&path).unwrap());
+        let cleared = read_heif_meta(&fs::read(&path).unwrap());
         assert_eq!(
             cleared.property_i32(xmp_ns::XMP, "Rating").unwrap().value,
             0
@@ -3495,7 +3617,7 @@ mod tests {
             after.ends_with(b" "),
             "the reused extent must be padded to its original length"
         );
-        let shrunk = read_heic_meta(&fs::read(&path).unwrap());
+        let shrunk = read_heif_meta(&fs::read(&path).unwrap());
         assert_eq!(
             shrunk
                 .localized_text(xmp_ns::DC, "title", None, "x-default")
@@ -3751,7 +3873,7 @@ mod tests {
             },
         )
         .expect("HEIC metadata write must succeed on .kei-tmp part file");
-        let meta = read_heic_meta(&fs::read(&path).unwrap());
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
         assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 4);
         assert!(
             !temp_path_for(&path, ".meta-tmp").exists(),
@@ -3861,7 +3983,7 @@ mod tests {
         .expect("HEIC metadata write must preserve a `uri ` infe item");
 
         let rewritten = fs::read(&path).unwrap();
-        let meta = read_heic_meta(&rewritten);
+        let meta = read_heif_meta(&rewritten);
         assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 3);
         assert_eq!(
             find_mdat_bytes(&bytes),

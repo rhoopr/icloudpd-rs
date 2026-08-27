@@ -548,8 +548,13 @@ pub(crate) fn extract_xmp_strict(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifEr
 pub(crate) fn extract_exif_tiff_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifError> {
     let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes)?;
     let iinf_layout = parse_iinf(bytes, iinf)?;
-    let Some(exif_item_id) =
-        select_exif_item_id(bytes, iref, primary_item_id, &iinf_layout.exif_item_ids)?
+    let Some(exif_item_id) = select_exif_item_id(
+        bytes,
+        iref,
+        primary_item_id,
+        &iinf_layout.exif_item_ids,
+        &iinf_layout.item_ids,
+    )?
     else {
         return Ok(None);
     };
@@ -626,6 +631,7 @@ struct IlocExtent {
 struct IlocItem {
     item_id: u32,
     construction_method: u8,
+    data_reference_index: u16,
     base_offset_pos: Option<usize>,
     base_offset: u64,
     extents: Vec<IlocExtent>,
@@ -984,7 +990,8 @@ fn parse_iloc(bytes: &[u8], iloc: RawBox) -> Result<IlocLayout, HeifError> {
             let packed = read_uint(body, &mut cursor, 2)?;
             (packed & 0x0f) as u8
         };
-        let _data_reference_index = read_uint(body, &mut cursor, 2)?;
+        let data_reference_index = u16::try_from(read_uint(body, &mut cursor, 2)?)
+            .map_err(|_| invalid_layout("iloc data reference index is too large"))?;
         let base_offset_pos = if base_offset_size == 0 {
             None
         } else {
@@ -1027,6 +1034,7 @@ fn parse_iloc(bytes: &[u8], iloc: RawBox) -> Result<IlocLayout, HeifError> {
         items.push(IlocItem {
             item_id,
             construction_method,
+            data_reference_index,
             base_offset_pos,
             base_offset,
             extents,
@@ -1034,6 +1042,9 @@ fn parse_iloc(bytes: &[u8], iloc: RawBox) -> Result<IlocLayout, HeifError> {
     }
     if cursor != body.len() {
         return Err(invalid_layout("iloc contains an unparsed tail"));
+    }
+    if items.iter().any(|item| item.data_reference_index != 0) {
+        return Err(invalid_layout("HEIC item uses an external data reference"));
     }
     Ok(IlocLayout {
         version,
@@ -1495,19 +1506,6 @@ fn cdsc_pairs(bytes: &[u8], iref: RawBox) -> Result<Vec<(u32, Vec<u32>)>, HeifEr
     Ok(pairs)
 }
 
-/// Item IDs that describe some other item through a `cdsc` reference.
-fn cdsc_sources_for_target(
-    bytes: &[u8],
-    iref: RawBox,
-    target_item_id: u32,
-) -> Result<Vec<u32>, HeifError> {
-    Ok(cdsc_pairs(bytes, iref)?
-        .into_iter()
-        .filter(|(_, targets)| targets.contains(&target_item_id))
-        .map(|(from_item_id, _)| from_item_id)
-        .collect())
-}
-
 /// Resolve which XMP item holds the primary image's metadata.
 ///
 /// A `cdsc` reference binds a descriptive item to the image it describes, so
@@ -1571,33 +1569,56 @@ fn select_exif_item_id(
     iref: Option<RawBox>,
     primary_item_id: u32,
     exif_item_ids: &[u32],
+    known_item_ids: &[u32],
 ) -> Result<Option<u32>, HeifError> {
-    match exif_item_ids {
-        [] => Ok(None),
-        [item_id] => Ok(Some(*item_id)),
-        _ => {
-            let Some(iref) = iref else {
-                return Err(invalid_layout(
-                    "multiple Exif items have no primary-image association",
-                ));
-            };
-            let associated = cdsc_sources_for_target(bytes, iref, primary_item_id)?;
-            let mut matches = exif_item_ids
+    let Some((first, rest)) = exif_item_ids.split_first() else {
+        return Ok(None);
+    };
+    let Some(iref) = iref else {
+        return if rest.is_empty() {
+            Ok(Some(*first))
+        } else {
+            Err(invalid_layout(
+                "multiple Exif items have no primary-image association",
+            ))
+        };
+    };
+    let pairs = cdsc_pairs(bytes, iref)?;
+    let known_item_ids: HashSet<u32> = known_item_ids.iter().copied().collect();
+    if pairs.iter().any(|(from, targets)| {
+        exif_item_ids.contains(from)
+            && targets
                 .iter()
-                .copied()
-                .filter(|item_id| associated.contains(item_id));
-            let Some(item_id) = matches.next() else {
-                return Err(invalid_layout(
-                    "multiple Exif items have no primary-image association",
-                ));
-            };
-            if matches.next().is_some() {
-                return Err(invalid_layout(
-                    "multiple Exif items describe the primary image",
-                ));
-            }
+                .any(|target| !known_item_ids.contains(target))
+    }) {
+        return Err(invalid_layout(
+            "Exif item describes an item absent from iinf",
+        ));
+    }
+    let mut primary = exif_item_ids.iter().copied().filter(|item_id| {
+        pairs
+            .iter()
+            .any(|(from, targets)| from == item_id && targets.contains(&primary_item_id))
+    });
+    if let Some(item_id) = primary.next() {
+        return if primary.next().is_some() {
+            Err(invalid_layout(
+                "multiple Exif items describe the primary image",
+            ))
+        } else {
             Ok(Some(item_id))
-        }
+        };
+    }
+    let mut unattributed = exif_item_ids
+        .iter()
+        .copied()
+        .filter(|item_id| !pairs.iter().any(|(from, _)| from == item_id));
+    match (unattributed.next(), unattributed.next()) {
+        (None, _) => Ok(None),
+        (Some(item_id), None) => Ok(Some(item_id)),
+        (Some(_), Some(_)) => Err(invalid_layout(
+            "multiple Exif items have no primary-image association",
+        )),
     }
 }
 
@@ -2160,13 +2181,12 @@ pub(crate) fn rewrite_xmp<W: Write>(
         ));
     }
     ensure_insertion_layout(input)?;
-    // An HDR capture from iPhone 15 onward carries a `tmap` tone-mapped image
-    // alongside the primary, and Apple names both from every descriptive
-    // reference it writes. A description bound to the primary alone stops Apple
-    // Preview showing the gain map, which is the defect ExifTool 13.09 fixed.
-    let described_item_ids: Vec<u32> = std::iter::once(primary_item_id)
-        .chain(parse_iinf(input, iinf)?.tone_map_item_ids)
-        .collect();
+    if !parse_iinf(input, iinf)?.tone_map_item_ids.is_empty() {
+        return Err(invalid_layout(
+            "HEIC XMP insertion with a tone-mapped image is unsupported",
+        ));
+    }
+    let described_item_ids = [primary_item_id];
     let new_item_id = max_item_id
         .checked_add(1)
         .ok_or_else(|| invalid_layout("no free HEIC item id remains"))?;
@@ -2387,6 +2407,9 @@ fn extract_xmp_from_meta(
     else {
         return Ok(None);
     };
+    if loc.data_reference_index != 0 {
+        return Err(invalid_layout("XMP item uses an external data reference"));
+    }
     if loc.construction_method != 0 {
         return Ok(None);
     }
@@ -3895,6 +3918,10 @@ mod tests {
                 "apple-hdr-gainmap.heic",
                 include_bytes!("../../tests/data/apple-hdr-gainmap.heic").as_slice(),
             ),
+            (
+                "white_1x1.avif",
+                include_bytes!("../../tests/data/white_1x1.avif").as_slice(),
+            ),
         ] {
             let mut output = Vec::new();
             rewrite_xmp(source, xmp, &mut output).expect("rewrite for reader check");
@@ -4815,12 +4842,8 @@ mod tests {
         }
     }
 
-    /// An HDR capture from iPhone 15 onward carries a `tmap` tone-mapped image,
-    /// and Apple names both it and the primary from every descriptive reference
-    /// it writes. ExifTool 13.09 fixed the same defect: a description bound to
-    /// the primary alone stopped Apple Preview showing the gain map.
     #[test]
-    fn rewrite_xmp_describes_the_tone_map_beside_the_primary() {
+    fn rewrite_xmp_refuses_unproved_tone_map_insertion() {
         let tone_map = || ItemSpec {
             item_id: 7,
             item_type: *b"tmap",
@@ -4839,29 +4862,12 @@ mod tests {
             "the fixture must carry no XMP so the writer takes the insertion path"
         );
         let mut output = Vec::new();
-        rewrite_xmp(&input, MATRIX_XMP, &mut output).expect("insert beside a tone-mapped image");
-        let xmp_id = xmp_and_primary_item_ids(&output).0;
-        let references = cdsc_references(&output);
+        let result = rewrite_xmp(&input, MATRIX_XMP, &mut output);
         assert!(
-            references.contains(&(xmp_id, 1)),
-            "the inserted packet must describe the primary image"
+            result.is_err(),
+            "insertion must fail until the relevant tone map can be selected from real relationship evidence"
         );
-        assert!(
-            references.contains(&(xmp_id, 7)),
-            "the inserted packet must also describe the tone-mapped image, or Apple stops \
-             rendering the gain map"
-        );
-        assert_eq!(
-            extract_xmp_raw(&output)
-                .as_deref()
-                .map(<[u8]>::trim_ascii_end),
-            Some(MATRIX_XMP)
-        );
-        assert_eq!(
-            resolve_item_data(&output, 7),
-            (0u8..24).collect::<Vec<u8>>(),
-            "the tone-mapped image must survive byte-for-byte"
-        );
+        assert!(output.is_empty(), "a refused rewrite must emit no bytes");
 
         let mut replacement = apple_multi_xmp_spec(
             vec![xmp_item(6, PRIMARY_XMP)],
@@ -4888,6 +4894,51 @@ mod tests {
             (0u8..24).collect::<Vec<u8>>(),
             "the tone-mapped image must survive byte-for-byte"
         );
+    }
+
+    #[test]
+    fn rewrite_xmp_rejects_external_data_references() {
+        for construction_method in 0..=2 {
+            let spec = HeicSpec {
+                iloc_version: 1,
+                offset_size: 4,
+                length_size: 4,
+                base_offset_size: 4,
+                index_size: 0,
+                primary_id: 1,
+                items: vec![ItemSpec {
+                    item_id: 1,
+                    item_type: *b"hvc1",
+                    infe_version: 2,
+                    construction_method,
+                    data: if construction_method == 0 {
+                        (0u8..32).collect()
+                    } else {
+                        Vec::new()
+                    },
+                    offset: 0,
+                    length: 0,
+                }],
+                idat: None,
+                iref_children: Vec::new(),
+            };
+            let mut input = build_heic(&spec);
+            let (_, _, iloc, _, _, _) = find_meta_layout(&input).expect("meta layout");
+            let data_reference_pos = iloc.body_start() + 12;
+            input[data_reference_pos..data_reference_pos + 2].copy_from_slice(&1u16.to_be_bytes());
+            assert!(
+                parse_iloc(&input, iloc).is_err(),
+                "construction method {construction_method} must reject an external data reference"
+            );
+
+            let mut output = Vec::new();
+            let result = rewrite_xmp(&input, MATRIX_XMP, &mut output);
+            assert!(
+                result.is_err(),
+                "the writer cannot resolve or preserve externally referenced item bytes"
+            );
+            assert!(output.is_empty(), "a refused rewrite must emit no bytes");
+        }
     }
 
     #[test]
@@ -5001,7 +5052,7 @@ mod tests {
                 },
                 ItemSpec {
                     item_id: 2,
-                    item_type: *b"tmap",
+                    item_type: *b"hvc1",
                     infe_version: 2,
                     construction_method: 0,
                     data: (0u8..16).collect(),
@@ -5034,9 +5085,10 @@ mod tests {
             references.contains(&(xmp_id, 1)),
             "synthesised iref must carry a cdsc from the XMP item to the primary"
         );
-        assert!(
-            references.contains(&(xmp_id, 2)),
-            "a synthesised cdsc must name the tone-mapped image too"
+        assert_eq!(
+            references,
+            vec![(xmp_id, 1)],
+            "a synthesised cdsc must describe only the proven primary image"
         );
 
         let mut again = Vec::new();
@@ -5182,6 +5234,49 @@ mod tests {
         );
     }
 
+    fn heic_with_exif_items(exif_items: &[(u32, &[u8])], iref_children: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut items = vec![
+            ItemSpec {
+                item_id: 1,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (0u8..32).collect(),
+                offset: 0,
+                length: 0,
+            },
+            ItemSpec {
+                item_id: 4,
+                item_type: *b"hvc1",
+                infe_version: 2,
+                construction_method: 0,
+                data: (32u8..48).collect(),
+                offset: 0,
+                length: 0,
+            },
+        ];
+        items.extend(exif_items.iter().map(|(item_id, data)| ItemSpec {
+            item_id: *item_id,
+            item_type: *b"Exif",
+            infe_version: 2,
+            construction_method: 0,
+            data: data.to_vec(),
+            offset: 0,
+            length: 0,
+        }));
+        build_heic(&HeicSpec {
+            iloc_version: 0,
+            offset_size: 4,
+            length_size: 4,
+            base_offset_size: 4,
+            index_size: 0,
+            primary_id: 1,
+            items,
+            idat: None,
+            iref_children,
+        })
+    }
+
     #[test]
     fn multiple_exif_items_do_not_block_xmp_rewrite() {
         let spec = HeicSpec {
@@ -5226,6 +5321,10 @@ mod tests {
         let input = build_heic(&spec);
         let mut output = Vec::new();
 
+        assert!(
+            extract_exif_tiff_bytes(&input).is_err(),
+            "several Exif items naming the primary image are ambiguous"
+        );
         rewrite_xmp(&input, MATRIX_XMP, &mut output)
             .expect("multiple Exif items must not block an unrelated XMP rewrite");
         assert_eq!(extract_xmp_raw(&output).as_deref(), Some(MATRIX_XMP));
@@ -5277,6 +5376,37 @@ mod tests {
         assert_eq!(
             extract_exif_tiff_bytes(&input).unwrap().as_deref(),
             Some(b"II*\0".as_slice())
+        );
+    }
+
+    #[test]
+    fn exif_probe_ignores_lone_item_associated_with_an_auxiliary_image() {
+        let input = heic_with_exif_items(&[(2, b"\0\0\0\0MM\0*")], vec![ref_box(b"cdsc", 2, &[4])]);
+
+        assert!(
+            extract_exif_tiff_bytes(&input).unwrap().is_none(),
+            "an auxiliary image's Exif item must not answer for the primary image"
+        );
+    }
+
+    #[test]
+    fn exif_probe_accepts_lone_unattributed_item() {
+        let input = heic_with_exif_items(&[(2, b"\0\0\0\0MM\0*")], vec![ref_box(b"dimg", 1, &[4])]);
+
+        assert_eq!(
+            extract_exif_tiff_bytes(&input).unwrap().as_deref(),
+            Some(b"MM\0*".as_slice()),
+            "a lone unattributed Exif item remains compatible with ordinary HEIF files"
+        );
+    }
+
+    #[test]
+    fn exif_probe_rejects_dangling_association() {
+        let input = heic_with_exif_items(&[(2, b"\0\0\0\0MM\0*")], vec![ref_box(b"cdsc", 2, &[5])]);
+
+        assert!(
+            extract_exif_tiff_bytes(&input).is_err(),
+            "a dangling association cannot prove whether Exif belongs to the primary image"
         );
     }
 

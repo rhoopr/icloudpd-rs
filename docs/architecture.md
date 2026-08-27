@@ -273,16 +273,17 @@ data. A file may hold one XMP item per image, so probe and write both resolve
 the packet through its `cdsc` association with the primary image and refuse
 item maps where several are equally plausible. An unassociated packet answers
 for the primary only when it is the sole candidate. The HEIF probe reads both
-XMP and the standalone Exif item before planning datetime or GPS writes. A new
-XMP item receives a `cdsc` reference naming the primary image and any `tmap`
-tone-mapped image, matching how a capture describes its own images; naming the
-primary alone costs an HDR capture its gain map rendition. Insertion rejects
-top-level boxes whose absolute offsets are not adjusted. Before publication,
-validation confirms that every construction-method-0 item other than the
-resolved XMP packet, and every opaque `meta` sub-box, remains byte-identical,
-and that re-reading the rewritten file resolves the packet just written,
-allowing for the space padding an in-place replacement leaves in the reused
-extent.
+XMP and the standalone Exif item associated with the primary image before
+planning datetime or GPS writes. A new XMP item receives a `cdsc` reference
+naming the primary image. Insertion fails closed when a tone-mapped image is
+present because selecting the related `tmap` item without proven relationship
+evidence can remove an HDR rendition. External item data references and
+top-level boxes whose absolute offsets are not adjusted are also rejected.
+Before publication, validation confirms that every construction-method-0 item
+other than the resolved XMP packet, and every opaque `meta` sub-box, remains
+byte-identical, and that re-reading the rewritten file resolves the packet just
+written, allowing for the space padding an in-place replacement leaves in the
+reused extent. The replacement file retains the source permissions.
 
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active

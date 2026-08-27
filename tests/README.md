@@ -98,13 +98,14 @@ cargo test --all-features --test sync --test state_auth -- --ignored --test-thre
 
 ## Media fixtures
 
-`tests/data/` holds real camera files, not synthesised containers, so the
-metadata writers are exercised against layouts Apple actually produces.
+`tests/data/` holds real camera and encoder outputs, not hand-built containers,
+so metadata writers are exercised against independently produced item maps.
 
 | Fixture | Origin | Licence | Covers |
 |---------|--------|---------|--------|
 | `sample.heic` | iPhone capture | repository fixture | single `hvc1` primary, Exif item, thumbnail, no XMP |
 | `apple-hdr-gainmap.heic` | [`johncf/apple-hdr-heic`](https://github.com/johncf/apple-hdr-heic/blob/master/tests/data/hdr-sample.heic), iOS 17.6.1 | MIT, reproduced in `tests/data/LICENSE-apple-hdr-gainmap` | `grid` primary over six tiles, HDR gain map, `idat`, and two XMP items |
+| `white_1x1.avif` | [`libavif` encoder output](https://github.com/AOMediaCodec/libavif/blob/cbb391c194ee15cf9607e517c269ed99e6bf0197/tests/data/white_1x1.avif) | BSD 2-Clause, reproduced in `tests/data/LICENSE-libavif-white-1x1` | primary `av01` item with no XMP, exercising AVIF insertion |
 
 `apple-hdr-gainmap.heic` is the multi-image case. Item 9 is the XMP describing
 the primary image and item 11 describes the gain map, so a writer that picks
