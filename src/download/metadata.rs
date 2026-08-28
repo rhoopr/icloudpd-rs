@@ -16,12 +16,10 @@ use std::sync::Once;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDateTime};
-#[cfg(any(not(feature = "xmp"), test))]
 use little_exif::exif_tag::ExifTag;
 use little_exif::filetype::FileExtension;
 #[cfg(not(feature = "xmp"))]
 use little_exif::ifd::ExifTagGroup;
-#[cfg(any(not(feature = "xmp"), test))]
 use little_exif::metadata::Metadata;
 #[cfg(any(not(feature = "xmp"), test))]
 use little_exif::rational::uR64;
@@ -49,6 +47,8 @@ const EXIF_EX_XMP_PREFIX: &str = "exifEX";
 #[cfg(feature = "xmp")]
 const KEI_MANAGED_FIELDS: &str = "managedFields";
 
+#[cfg(feature = "xmp")]
+static HEIF_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "xmp")]
 static SIDECAR_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -206,8 +206,6 @@ impl ManagedXmpField {
 
 #[cfg(feature = "xmp")]
 static INIT: Once = Once::new();
-#[cfg(feature = "xmp")]
-static HEIF_EMBED_DISABLED_WARNING: Once = Once::new();
 
 #[cfg(feature = "xmp")]
 fn ensure_initialized() {
@@ -220,8 +218,9 @@ fn ensure_initialized() {
     });
 }
 
-/// Snapshot of existing metadata fields that gate write decisions. Populated
-/// from XMP Toolkit in default builds or native EXIF in no-`xmp` builds.
+/// Snapshot of existing metadata fields that gate write decisions. HEIF
+/// probes merge XMP with the standalone Exif item. Other formats use XMP
+/// Toolkit in default builds or native EXIF without the `xmp` feature.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExifProbe {
     pub(crate) datetime_original: Option<String>,
@@ -277,13 +276,11 @@ fn parse_capture_timestamp(value: &str) -> Option<(NaiveDateTime, Option<FixedOf
 ///
 /// Dispatch is content-based, mirroring [`apply_metadata`]: the first 12 bytes
 /// are inspected for an ISO-BMFF `ftyp` box with a HEIF-family brand. HEIF
-/// inputs get parsed via [`heif::extract_xmp_bytes`] + `s.parse::<XmpMeta>()`
-/// because XMP Toolkit ships no HEIF handler — it can parse an XMP packet,
-/// just not extract one from a HEIC container. Non-HEIF inputs go through the
-/// XMP Toolkit smart handler so JPEG/PNG/TIFF/MP4/MOV reconciled EXIF/IPTC is
-/// visible. On any read failure, we degrade silently to `ExifProbe::default()`
-/// (today's behavior); callers gate retries on the planned write being
-/// non-empty, so a false-negative probe is recoverable.
+/// inputs get parsed through their XMP and Exif items because XMP Toolkit
+/// ships no HEIF handler. Non-HEIF inputs go through the XMP Toolkit smart
+/// handler so JPEG/PNG/TIFF/MP4/MOV reconciled EXIF/IPTC is visible. An
+/// unreadable HEIF Exif item is treated as existing metadata so a derived
+/// datetime or GPS value cannot compete with data kei could not inspect.
 pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
     #[cfg(feature = "xmp")]
     {
@@ -329,20 +326,40 @@ fn probe_exif_heif(path: &Path) -> ExifProbe {
             return ExifProbe::default();
         }
     };
-    let Some(xmp_bytes) = heif::extract_xmp_bytes(&bytes) else {
-        return ExifProbe::default();
+    let mut probe = match heif::extract_xmp_bytes(&bytes) {
+        Some(xmp_bytes) => match std::str::from_utf8(&xmp_bytes) {
+            Ok(text) => match text.parse::<XmpMeta>() {
+                Ok(meta) => probe_from_meta(&meta),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "Failed to parse HEIF XMP packet");
+                    ExifProbe::default()
+                }
+            },
+            Err(_) => {
+                tracing::warn!(path = %path.display(), "HEIF XMP packet is not UTF-8; treating it as absent");
+                ExifProbe::default()
+            }
+        },
+        None => ExifProbe::default(),
     };
-    let Ok(s) = std::str::from_utf8(&xmp_bytes) else {
-        tracing::warn!(path = %path.display(), "HEIF XMP packet is not UTF-8; treating as no probe");
-        return ExifProbe::default();
-    };
-    match s.parse::<XmpMeta>() {
-        Ok(meta) => probe_from_meta(&meta),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "Failed to parse HEIF XMP packet");
-            ExifProbe::default()
+    match heif::extract_exif_tiff_bytes(&bytes) {
+        Ok(Some(tiff)) => match Metadata::new_from_vec(&tiff, FileExtension::TIFF) {
+            Ok(metadata) => {
+                let exif_probe = probe_from_native_metadata(&metadata);
+                merge_probe(&mut probe, exif_probe);
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Failed to parse HEIF Exif item");
+                mark_heif_exif_unreadable(&mut probe);
+            }
+        },
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "Failed to resolve HEIF Exif item");
+            mark_heif_exif_unreadable(&mut probe);
         }
     }
+    probe
 }
 
 #[cfg(feature = "xmp")]
@@ -868,29 +885,39 @@ fn source_gps_datetime_values(date: &str, time: &[XmpRational; 3]) -> Option<Str
     ))
 }
 
-#[cfg(not(feature = "xmp"))]
-fn probe_exif_native(path: &Path) -> ExifProbe {
-    let Ok(input) = std::fs::read(path) else {
-        return ExifProbe::default();
-    };
-    let Some(file_type) = native_file_type(&input, path) else {
-        return ExifProbe::default();
-    };
-    let Ok(meta) = Metadata::new_from_vec(&input, file_type) else {
-        return ExifProbe::default();
-    };
+#[cfg(feature = "xmp")]
+fn merge_probe(target: &mut ExifProbe, source: ExifProbe) {
+    if target.datetime_original.is_none() {
+        target.datetime_original = source.datetime_original;
+    }
+    if target.offset_time_original.is_none() {
+        target.offset_time_original = source.offset_time_original;
+    }
+    target.has_other_datetime_offset |= source.has_other_datetime_offset;
+    target.has_gps |= source.has_gps;
+}
+
+#[cfg(feature = "xmp")]
+fn mark_heif_exif_unreadable(probe: &mut ExifProbe) {
+    probe
+        .datetime_original
+        .get_or_insert_with(|| "unreadable HEIF Exif item".to_string());
+    probe.has_gps = true;
+}
+
+fn probe_from_native_metadata(meta: &Metadata) -> ExifProbe {
     let datetime_original = meta
         .get_tag(&ExifTag::DateTimeOriginal(String::new()))
         .next()
         .and_then(|tag| match tag {
-            ExifTag::DateTimeOriginal(s) => Some(s.clone()),
+            ExifTag::DateTimeOriginal(value) => Some(value.clone()),
             _ => None,
         });
     let offset_time_original = meta
         .get_tag(&ExifTag::OffsetTimeOriginal(String::new()))
         .next()
         .and_then(|tag| match tag {
-            ExifTag::OffsetTimeOriginal(s) => Some(s.clone()),
+            ExifTag::OffsetTimeOriginal(value) => Some(value.clone()),
             _ => None,
         });
     let has_other_datetime_offset = meta
@@ -915,6 +942,20 @@ fn probe_exif_native(path: &Path) -> ExifProbe {
         has_other_datetime_offset,
         has_gps,
     }
+}
+
+#[cfg(not(feature = "xmp"))]
+fn probe_exif_native(path: &Path) -> ExifProbe {
+    let Ok(input) = std::fs::read(path) else {
+        return ExifProbe::default();
+    };
+    let Some(file_type) = native_file_type(&input, path) else {
+        return ExifProbe::default();
+    };
+    let Ok(meta) = Metadata::new_from_vec(&input, file_type) else {
+        return ExifProbe::default();
+    };
+    probe_from_native_metadata(&meta)
 }
 
 /// GPS triple passed to [`apply_metadata`].
@@ -1012,14 +1053,12 @@ impl MetadataWrite {
 /// Write the requested metadata into the file, using XMP Toolkit in default
 /// builds and native EXIF for JPEG/TIFF in no-`xmp` builds.
 ///
-/// HEIF-family embedded writes are intentionally disabled. The previous
-/// mp4-atom-backed rewrite path could corrupt Apple HEIC item graphs by
-/// re-encoding metadata boxes lossy, so HEIC/HEIF/AVIF inputs are left
-/// unchanged after emitting a warning. Sidecar writes remain available.
+/// HEIF-family embedded writes use a byte-preserving XMP item update. The
+/// writer rejects layouts it cannot update without re-encoding the item graph.
 ///
-/// Atomic: we copy the input to a sibling temp file named with `temp_suffix`,
-/// patch it in place, then rename over the target. A crash mid-write leaves the
-/// original untouched.
+/// Atomic: we write to an exclusively created unique sibling, then replace the
+/// target only while it still matches the bytes initially read. A crash or
+/// concurrent edit leaves the original untouched.
 ///
 /// Dispatch is content-based: the first 12 bytes are inspected for an
 /// ISO-BMFF `ftyp` box with a HEIF-family brand. The download pipeline
@@ -1029,33 +1068,222 @@ impl MetadataWrite {
 /// callers operating on a transient/unreadable file degrade to today's
 /// behavior rather than spuriously routing everything to XMP Toolkit.
 pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
+    apply_metadata_with_expected_fingerprint(path, write, temp_suffix, None).map(|_| ())
+}
+
+pub(super) fn apply_metadata_with_expected_fingerprint(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+) -> Result<Option<super::file::ExistingFileFingerprint>> {
     if write.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     #[cfg(not(feature = "xmp"))]
+    let _ = expected_fingerprint;
+    #[cfg(not(feature = "xmp"))]
     {
-        apply_metadata_native(path, write, temp_suffix)
+        apply_metadata_native(path, write, temp_suffix).map(|_| None)
     }
     #[cfg(feature = "xmp")]
-    if is_heif_file(path) {
-        skip_heif_embed_write(path);
-        Ok(())
+    let is_heif = if let Some(expected) = expected_fingerprint {
+        let snapshot = match super::file::fingerprint_regular_file_snapshot_blocking(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(error).context(
+                    super::file::ConditionalPublishTargetChanged::Unverifiable {
+                        path: path.to_path_buf(),
+                    },
+                );
+            }
+        };
+        if snapshot.fingerprint != expected {
+            return Err(
+                super::file::ConditionalPublishTargetChanged::AfterPlanning {
+                    path: path.to_path_buf(),
+                }
+                .into(),
+            );
+        }
+        heif::is_heif_content(
+            snapshot
+                .prefix
+                .get(..snapshot.prefix_len)
+                .unwrap_or_default(),
+        )
     } else {
-        apply_metadata_xmp_toolkit(path, write, temp_suffix)
+        is_heif_file(path)
+    };
+    #[cfg(feature = "xmp")]
+    if is_heif {
+        apply_metadata_heif(path, write, temp_suffix, expected_fingerprint).map(Some)
+    } else {
+        apply_metadata_xmp_toolkit(path, write, temp_suffix).map(|_| None)
     }
 }
 
 #[cfg(feature = "xmp")]
-fn skip_heif_embed_write(path: &Path) {
-    HEIF_EMBED_DISABLED_WARNING.call_once(|| {
-        tracing::warn!(
-            path = %path.display(),
-            "Embedded HEIC/HEIF/AVIF metadata writes are temporarily disabled because the previous \
-             HEIF rewrite path can corrupt Apple HEIC item graphs; leaving HEIC/HEIF/AVIF files \
-             unchanged. Enable xmp_sidecar for HEIC metadata export until the embedded writer \
-             is replaced."
+fn apply_metadata_heif(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+) -> Result<super::file::ExistingFileFingerprint> {
+    apply_metadata_heif_with_installer(
+        path,
+        write,
+        temp_suffix,
+        expected_fingerprint,
+        |tmp, dst, expected, expected_replacement| {
+            // CONTRACT: HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT
+            super::file::publish_file_if_unchanged_blocking(
+                tmp,
+                dst,
+                expected,
+                expected_replacement,
+            )
+        },
+    )
+}
+
+#[cfg(feature = "xmp")]
+fn apply_metadata_heif_with_installer(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+    install: impl FnOnce(
+        &Path,
+        &Path,
+        super::file::ExistingFileFingerprint,
+        super::file::ExistingFileFingerprint,
+    ) -> anyhow::Result<()>,
+) -> Result<super::file::ExistingFileFingerprint> {
+    use std::io::Read;
+
+    ensure_initialized();
+    let mut source = std::fs::File::open(path)
+        .with_context(|| format!("Could not open {} for HEIC XMP update", path.display()))?;
+    let source_permissions = source
+        .metadata()
+        .with_context(|| format!("Could not inspect permissions of {}", path.display()))?
+        .permissions();
+    let mut input = Vec::new();
+    source
+        .read_to_end(&mut input)
+        .with_context(|| format!("Could not read {} for HEIC XMP update", path.display()))?;
+    let expected = fingerprint_bytes(&input)?;
+    if expected_fingerprint.is_some_and(|approved| approved != expected) {
+        return Err(
+            super::file::ConditionalPublishTargetChanged::AfterPlanning {
+                path: path.to_path_buf(),
+            }
+            .into(),
         );
-    });
+    }
+    let existing = heif::extract_xmp_strict(&input)
+        .with_context(|| format!("Could not inspect existing XMP in {}", path.display()))?;
+    let mut meta = match existing.as_deref() {
+        Some(bytes) => {
+            let text = std::str::from_utf8(bytes)
+                .with_context(|| format!("Existing HEIC XMP in {} is not UTF-8", path.display()))?;
+            text.parse::<XmpMeta>().with_context(|| {
+                format!("Existing HEIC XMP in {} is not valid XMP", path.display())
+            })?
+        }
+        None => XmpMeta::new().context("Could not create XMP metadata")?,
+    };
+    apply_to_xmp(&mut meta, write)?;
+    let xmp = meta.to_string().into_bytes();
+
+    let (file, tmp_path) = create_unique_heif_temp(path, temp_suffix)?;
+    let guard = TmpGuard::new(&tmp_path);
+    let mut writer = std::io::BufWriter::new(file);
+    heif::rewrite_xmp(&input, &xmp, &mut writer)
+        .with_context(|| format!("Could not update XMP in {}", path.display()))?;
+    let file = writer
+        .into_inner()
+        .with_context(|| format!("Could not flush {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
+    let mut file = file;
+    validate_heif_post_rewrite(&mut file, &tmp_path)?;
+    let rewritten = std::fs::read(&tmp_path)
+        .with_context(|| format!("Could not validate {}", tmp_path.display()))?;
+    let rewritten_fingerprint = fingerprint_bytes(&rewritten)?;
+    heif::validate_rewrite_preserves_non_xmp_items(&input, &rewritten).with_context(|| {
+        format!(
+            "HEIC metadata rewrite changed non-XMP media data in {}",
+            tmp_path.display()
+        )
+    })?;
+    let Some(rewritten_xmp) = heif::extract_xmp_strict(&rewritten)
+        .with_context(|| format!("Could not inspect rewritten XMP in {}", tmp_path.display()))?
+    else {
+        anyhow::bail!(
+            "HEIC XMP rewrite produced no XMP item: {}",
+            tmp_path.display()
+        );
+    };
+    std::str::from_utf8(&rewritten_xmp)
+        .with_context(|| format!("Rewritten HEIC XMP is not UTF-8: {}", tmp_path.display()))?
+        .parse::<XmpMeta>()
+        .with_context(|| format!("Rewritten HEIC XMP is invalid: {}", tmp_path.display()))?;
+    // A multi-image HEIC holds one XMP packet per image, so reader and writer
+    // must resolve the same item or a merge moves an auxiliary image's metadata
+    // onto the photograph. Replacing in place leaves the extent length alone and
+    // pads the tail with spaces, so the written packet is a prefix rather than
+    // the whole extent.
+    let resolves_to_written_packet = rewritten_xmp
+        .split_at_checked(xmp.len())
+        .is_some_and(|(written, padding)| written == xmp && padding.iter().all(|b| *b == b' '));
+    if !resolves_to_written_packet {
+        anyhow::bail!(
+            "HEIC XMP rewrite resolved a different item than it wrote in {}: wrote {} bytes, read back {} bytes. Refusing to replace the user's file.",
+            tmp_path.display(),
+            xmp.len(),
+            rewritten_xmp.len()
+        );
+    }
+    let temp_permissions = file
+        .metadata()
+        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
+        .permissions();
+    file.set_permissions(source_permissions)
+        .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Could not fsync permissions on {}", tmp_path.display()))?;
+    drop(file);
+    if let Err(install_error) = install(&tmp_path, path, expected, rewritten_fingerprint) {
+        let disposition = super::file::classify_conditional_publish_error(&install_error);
+        if disposition
+            .retained_paths
+            .iter()
+            .any(|displaced| displaced == &tmp_path)
+        {
+            guard.disarm();
+        } else if tmp_path.exists()
+            && let Err(permission_error) = std::fs::set_permissions(&tmp_path, temp_permissions)
+        {
+            guard.disarm();
+            anyhow::bail!(
+                "Could not install HEIC metadata update {} -> {}: {install_error:#}; could not restore temporary permissions for safe cleanup: {permission_error}. The temporary path was retained.",
+                tmp_path.display(),
+                path.display()
+            );
+        }
+        return Err(install_error).with_context(|| {
+            format!(
+                "Could not install HEIC metadata update {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
+    guard.disarm();
+    tracing::debug!(path = %path.display(), "Applied HEIC XMP metadata");
+    Ok(rewritten_fingerprint)
 }
 
 /// Read the first 12 bytes of `path` and dispatch to [`heif::is_heif_content`].
@@ -1075,9 +1303,9 @@ fn is_heif_file(path: &Path) -> bool {
 /// Whether the in-place embedded-metadata writer can patch this file.
 ///
 /// The first 12 bytes take precedence over the extension so downloaded part
-/// files and misleading extensions route safely. HEIC / HEIF / AVIF writes
-/// remain disabled and stop here before the complete-file metadata probe.
-/// JPEG / PNG / TIFF / MP4 / MOV continue through XMP Toolkit.
+/// files and misleading extensions route safely. HEIC / HEIF / AVIF use the
+/// byte-preserving item-map writer. JPEG / PNG / TIFF / MP4 / MOV continue
+/// through XMP Toolkit.
 #[must_use]
 pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
     let mut head = [0u8; 12];
@@ -1094,8 +1322,7 @@ pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
         }
         #[cfg(feature = "xmp")]
         if heif::is_heif_content(head) {
-            skip_heif_embed_write(path);
-            return false;
+            return true;
         }
     }
     let ext = path
@@ -1110,8 +1337,7 @@ pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
     }
     #[cfg(feature = "xmp")]
     if heif::is_heif_path(path) {
-        skip_heif_embed_write(path);
-        return false;
+        return true;
     }
     #[cfg(feature = "xmp")]
     {
@@ -1128,6 +1354,60 @@ fn temp_path_for(path: &Path, temp_suffix: &str) -> PathBuf {
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(temp_suffix);
     path.with_file_name(tmp_name)
+}
+
+#[cfg(feature = "xmp")]
+fn fingerprint_bytes(bytes: &[u8]) -> Result<super::file::ExistingFileFingerprint> {
+    use sha2::{Digest, Sha256};
+
+    Ok(super::file::ExistingFileFingerprint {
+        size: u64::try_from(bytes.len()).context("Metadata source is too large to fingerprint")?,
+        sha256: Sha256::digest(bytes).into(),
+    })
+}
+
+#[cfg(feature = "xmp")]
+fn heif_temp_path(path: &Path, temp_suffix: &str, sequence: u64) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".kei-heif-{}-{sequence}{temp_suffix}",
+        std::process::id()
+    ))
+}
+
+#[cfg(feature = "xmp")]
+fn create_unique_heif_temp(path: &Path, temp_suffix: &str) -> Result<(std::fs::File, PathBuf)> {
+    create_unique_heif_temp_with_sequence(path, temp_suffix, || {
+        HEIF_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+#[cfg(feature = "xmp")]
+fn create_unique_heif_temp_with_sequence(
+    path: &Path,
+    temp_suffix: &str,
+    mut next_sequence: impl FnMut() -> u64,
+) -> Result<(std::fs::File, PathBuf)> {
+    loop {
+        let candidate = heif_temp_path(path, temp_suffix, next_sequence());
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not create temporary HEIC metadata file {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// Write `write` as a `.xmp` sidecar next to the media file, atomically.
@@ -1186,8 +1466,6 @@ fn prepare_sidecar_write(
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<Option<PreparedSidecar>> {
-    use sha2::{Digest, Sha256};
-
     ensure_initialized();
 
     let Some(name) = media_path.file_name() else {
@@ -1218,12 +1496,7 @@ fn prepare_sidecar_write(
                     sidecar_path.display()
                 )
             })?;
-            let size = u64::try_from(existing_bytes.len())
-                .context("Existing XMP sidecar is too large to fingerprint")?;
-            let fingerprint = super::file::ExistingFileFingerprint {
-                size,
-                sha256: Sha256::digest(&existing_bytes).into(),
-            };
+            let fingerprint = fingerprint_bytes(&existing_bytes)?;
             (parsed, Some(fingerprint))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1762,12 +2035,11 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
 
 /// Read the first 12 bytes of `file` and verify it starts with an
 /// ISO-BMFF `ftyp` box whose major brand is in the HEIF family. Used as
-/// a sanity check between `insert_xmp` and the atomic rename so a
+/// a sanity check between `rewrite_xmp` and the atomic rename so a
 /// malformed rewrite never lands on disk. Reads from the still-open
 /// rewrite handle (seeks back to 0) to avoid reopening `tmp_path`
 /// immediately after `sync_all`; the path is only used for diagnostics.
 #[cfg(feature = "xmp")]
-#[cfg(test)]
 fn validate_heif_post_rewrite(file: &mut std::fs::File, tmp_path: &Path) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(0)).with_context(|| {
@@ -2918,6 +3190,7 @@ mod tests {
     }
 
     const SAMPLE_HEIC: &[u8] = include_bytes!("../../tests/data/sample.heic");
+    const SAMPLE_AVIF: &[u8] = include_bytes!("../../tests/data/white_1x1.avif");
 
     fn fresh_heic(dir: &Path, name: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
@@ -2926,9 +3199,66 @@ mod tests {
         path
     }
 
+    fn heif_temp_entries(dir: &Path, temp_suffix: &str) -> Vec<PathBuf> {
+        let prefix = format!(".kei-heif-{}-", std::process::id());
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with(&prefix) && name.ends_with(temp_suffix)).then(|| entry.path())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_unique_heif_temp_preserves_regular_file_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.heic");
+        let collision = heif_temp_path(&path, ".meta-tmp", 41);
+        let unique = heif_temp_path(&path, ".meta-tmp", 42);
+        fs::write(&collision, b"unrelated bytes").unwrap();
+        let mut sequences = [41, 42].into_iter();
+
+        let (file, created) =
+            create_unique_heif_temp_with_sequence(&path, ".meta-tmp", || sequences.next().unwrap())
+                .unwrap();
+        drop(file);
+
+        assert_eq!(created, unique);
+        assert_eq!(fs::read(&collision).unwrap(), b"unrelated bytes");
+        fs::remove_file(created).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_unique_heif_temp_preserves_symlink_collision() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.heic");
+        let target = dir.path().join("unrelated");
+        let collision = heif_temp_path(&path, ".meta-tmp", 51);
+        let unique = heif_temp_path(&path, ".meta-tmp", 52);
+        fs::write(&target, b"unrelated bytes").unwrap();
+        symlink(&target, &collision).unwrap();
+        let mut sequences = [51, 52].into_iter();
+
+        let (file, created) =
+            create_unique_heif_temp_with_sequence(&path, ".meta-tmp", || sequences.next().unwrap())
+                .unwrap();
+        drop(file);
+
+        assert_eq!(created, unique);
+        assert_eq!(fs::read_link(&collision).unwrap(), target);
+        assert_eq!(fs::read(&target).unwrap(), b"unrelated bytes");
+        fs::remove_file(created).unwrap();
+    }
+
     fn heic_with_xmp_packet(xmp: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        heif::insert_xmp(SAMPLE_HEIC, xmp, &mut bytes)
+        heif::rewrite_xmp(SAMPLE_HEIC, xmp, &mut bytes)
             .expect("sample HEIC should accept a seed XMP packet");
         bytes
     }
@@ -2941,25 +3271,30 @@ mod tests {
         path
     }
 
-    fn assert_heif_embed_skip_preserves(path: &Path, write: &MetadataWrite) {
-        let original = fs::read(path).unwrap();
-        apply_metadata_with_default_suffix(path, write).expect("HEIC metadata skip should succeed");
-        assert_eq!(
-            fs::read(path).unwrap(),
-            original,
-            "skipped HEIC metadata write must leave media bytes unchanged"
-        );
-        assert!(
-            !temp_path_for(path, ".meta-tmp").exists(),
-            "skipped HEIC metadata write must not leave a metadata temp file behind"
-        );
+    fn read_heif_meta(bytes: &[u8]) -> XmpMeta {
+        let xmp = extract_xmp_from_heic(bytes).expect("HEIF XMP missing");
+        std::str::from_utf8(&xmp)
+            .expect("HEIF XMP is not UTF-8")
+            .parse()
+            .expect("HEIF XMP is not valid")
+    }
+
+    fn heif_ftyp_without_meta() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&24u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(b"mif1");
+        bytes
     }
 
     #[test]
     fn apply_metadata_heic_rating_and_title() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "rating.heic");
-        assert_heif_embed_skip_preserves(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(5),
@@ -2967,15 +3302,31 @@ mod tests {
                 keywords: vec!["beach".into()],
                 ..MetadataWrite::default()
             },
+        )
+        .expect("HEIC metadata write");
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 5);
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "Vacation"
+        );
+        assert_eq!(
+            meta.property_array(xmp_ns::DC, "subject")
+                .map(|value| value.value)
+                .collect::<Vec<_>>(),
+            vec!["beach"]
         );
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn apply_metadata_heic_gps_skip_leaves_file_unchanged() {
+    fn apply_metadata_heic_gps_roundtrips() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "gps.heic");
-        assert_heif_embed_skip_preserves(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 gps: Some(GpsCoords {
@@ -2985,7 +3336,11 @@ mod tests {
                 }),
                 ..MetadataWrite::default()
             },
-        );
+        )
+        .expect("HEIC GPS metadata write");
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
+        assert!(meta.property(xmp_ns::EXIF, "GPSLatitude").is_some());
+        assert!(meta.property(xmp_ns::EXIF, "GPSLongitude").is_some());
         fs::remove_file(&path).ok();
     }
 
@@ -2993,22 +3348,62 @@ mod tests {
     fn apply_metadata_heic_preserves_image_data() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "preserve.heic");
-        assert_heif_embed_skip_preserves(
+        let source = fs::read(&path).unwrap();
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(3),
                 ..MetadataWrite::default()
             },
+        )
+        .expect("HEIC rating metadata write");
+        let rewritten = fs::read(&path).unwrap();
+        assert_eq!(
+            find_mdat_bytes(&source),
+            find_mdat_bytes(&rewritten),
+            "HEIC image payload must remain byte-for-byte stable"
         );
 
         fs::remove_file(&path).ok();
     }
 
-    /// Skipped HEIC writes must preserve pre-existing XMP byte-for-byte. The
-    /// temporary mitigation is safer than a lossy rewrite: kei does not add new
-    /// embedded fields, but it also does not drop Apple's existing metadata.
     #[test]
-    fn apply_metadata_heic_preserves_existing_xmp_on_skip() {
+    fn apply_metadata_avif_inserts_xmp_and_preserves_image_data() {
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("white_1x1.avif");
+        fs::write(&path, SAMPLE_AVIF).unwrap();
+        let source = fs::read(&path).unwrap();
+
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(4),
+                title: Some("White pixel".into()),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("AVIF metadata write");
+
+        let rewritten = fs::read(&path).unwrap();
+        let meta = read_heif_meta(&rewritten);
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 4);
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "White pixel"
+        );
+        heif::validate_rewrite_preserves_non_xmp_items(&source, &rewritten)
+            .expect("AVIF image payload and item metadata must remain byte-for-byte stable");
+        fs::remove_file(&path).ok();
+    }
+
+    /// Existing XMP is layered with the requested fields without changing the
+    /// HEIC item count or image payload.
+    #[test]
+    fn apply_metadata_heic_preserves_existing_xmp() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = write_seeded_heic(
             &dir,
@@ -3018,26 +3413,85 @@ mod tests {
                 ..MetadataWrite::default()
             },
         );
-        assert_heif_embed_skip_preserves(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
             },
-        );
+        )
+        .expect("HEIC metadata update");
 
         let rewritten = fs::read(&path).unwrap();
-        let xmp = extract_xmp_from_heic(&rewritten).expect("XMP missing");
-        let s = std::str::from_utf8(&xmp).unwrap();
-        assert!(
-            s.contains("First"),
-            "seeded title should survive skipped rewrite"
+        let meta = read_heif_meta(&rewritten);
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "First"
         );
-        assert!(
-            !s.contains("xmp:Rating"),
-            "skipped HEIC metadata write must not add new embedded fields"
-        );
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 4);
+        assert_eq!(count_xmp_items_in_heic(&rewritten), 1);
         fs::remove_file(&path).ok();
+    }
+
+    /// An iOS HDR capture carries an XMP packet per image. Writing the
+    /// photograph's metadata into an auxiliary image's packet would attach it
+    /// to a gain map, and no later read could tell.
+    #[test]
+    fn apply_metadata_heic_writes_past_auxiliary_image_xmp() {
+        const AUX_XMP: &[u8] = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description xmlns:HDRGainMap='http://ns.apple.com/HDRGainMap/1.0/' HDRGainMap:HDRGainMapHeadroom='2.67'/></rdf:RDF></x:xmpmeta>";
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let seed = build_xmp_packet(&MetadataWrite {
+            title: Some("First".into()),
+            ..MetadataWrite::default()
+        })
+        .expect("seed XMP packet");
+
+        for (name, primary) in [
+            ("aux_and_primary_xmp.heic", Some(seed.as_slice())),
+            ("aux_xmp_only.heic", None),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, heif::apple_multi_xmp_heic(primary, AUX_XMP)).unwrap();
+
+            apply_metadata_with_default_suffix(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+            )
+            .expect("HEIC metadata update");
+
+            let rewritten = fs::read(&path).unwrap();
+            let packets = xmp_packets_in_heic(&rewritten);
+            assert_eq!(packets.len(), 2, "{name} must keep both XMP items");
+            assert!(
+                packets.iter().any(|(_, packet)| packet == AUX_XMP),
+                "{name} must leave the auxiliary image's packet byte-for-byte"
+            );
+            let photo = packets
+                .iter()
+                .find(|(_, packet)| packet != AUX_XMP)
+                .map(|(_, packet)| packet.clone())
+                .expect("photograph's packet");
+            let meta: XmpMeta = std::str::from_utf8(&photo).unwrap().parse().unwrap();
+            assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 4);
+            if primary.is_some() {
+                assert_eq!(
+                    meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                        .unwrap()
+                        .0
+                        .value,
+                    "First",
+                    "{name} must merge into the photograph's own packet"
+                );
+            }
+            fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
@@ -3054,7 +3508,7 @@ mod tests {
             },
         );
         let source = fs::read(&path).unwrap();
-        assert_heif_embed_skip_preserves(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(5),
@@ -3062,27 +3516,43 @@ mod tests {
                 keywords: vec!["Favorites".into()],
                 ..MetadataWrite::default()
             },
-        );
+        )
+        .expect("HEIC metadata update");
 
         let rewritten = fs::read(&path).unwrap();
-        let xmp = extract_xmp_from_heic(&rewritten).expect("XMP missing after skip");
-        let s = std::str::from_utf8(&xmp).unwrap();
-        assert!(
-            s.contains("Original iOS caption"),
-            "seeded description should survive skipped rewrite"
+        let meta = read_heif_meta(&rewritten);
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 5);
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "description", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "Original iOS caption"
         );
-        assert!(s.contains("Casey"), "seeded person should survive rewrite");
-        assert!(
-            s.contains("portrait"),
-            "seeded kei media subtype should survive rewrite"
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "Kei rewrite"
         );
-        assert!(!s.contains("xmp:Rating"), "skipped rewrite added rating");
-        assert!(!s.contains("Kei rewrite"), "skipped rewrite added title");
-        assert!(!s.contains("Favorites"), "skipped rewrite added keyword");
+        assert_eq!(
+            meta.property_array(xmp_ns::DC, "subject")
+                .map(|value| value.value)
+                .collect::<Vec<_>>(),
+            vec!["Favorites"]
+        );
+        assert_eq!(
+            meta.property_array(xmp_ns::IPTC_EXT, "PersonInImage")
+                .map(|value| value.value)
+                .collect::<Vec<_>>(),
+            vec!["Casey"]
+        );
+        assert!(meta.property(KEI_XMP_NS, "mediaSubtype").is_some());
         assert_eq!(
             count_xmp_items_in_heic(&rewritten),
             1,
-            "skipped rewrite must not append duplicate XMP items"
+            "repeat HEIC metadata updates must retain one XMP item"
         );
         assert_eq!(
             find_mdat_bytes(&source),
@@ -3094,25 +3564,295 @@ mod tests {
 
     #[test]
     fn apply_metadata_heic_failure_leaves_media_bytes_intact() {
-        let dir = test_tmp_dir("meta_heic_tests");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("missing_meta.heic");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_meta.heic");
         let original = heif_ftyp_without_meta_bytes();
         fs::write(&path, &original).unwrap();
 
-        assert_heif_embed_skip_preserves(
+        let result = apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(3),
                 ..MetadataWrite::default()
             },
         );
+        assert!(
+            result.is_err(),
+            "HEIC files without a meta box must be rejected"
+        );
         assert_eq!(
             fs::read(&path).unwrap(),
             original,
-            "skipped HEIC rewrite must leave original media bytes untouched"
+            "rejected HEIC rewrites must leave original media bytes untouched"
         );
-        fs::remove_file(&path).ok();
+        assert!(
+            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            "rejected HEIC rewrites must clean the metadata temp file"
+        );
+    }
+
+    #[test]
+    fn apply_metadata_heic_install_failure_leaves_original_intact_and_cleans_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "install_fault.heic");
+        let original = fs::read(&path).unwrap();
+
+        // Inject a failure at the exact boundary where the temp file has been
+        // written, fsynced and validated, but the atomic install has not yet
+        // renamed over the original.
+        let install_calls = std::cell::Cell::new(0u32);
+        let result = apply_metadata_heif_with_installer(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            None,
+            |src, _dst, _expected, _expected_replacement| {
+                install_calls.set(install_calls.get() + 1);
+                assert!(src.exists(), "temp file must exist at the install boundary");
+                Err(std::io::Error::other("simulated crash before publication").into())
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "an install failure must surface as an error"
+        );
+        assert_eq!(
+            install_calls.get(),
+            1,
+            "the install boundary must be reached"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "a crash before publication must leave the original byte-identical"
+        );
+        assert!(
+            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            "a failure before exchange must clean its uniquely owned temp file"
+        );
+    }
+
+    #[test]
+    fn contract_heif_embed_rewrite_requires_stable_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "concurrent_edit.heic");
+        let external = b"external edit at the install boundary";
+
+        let result = apply_metadata_heif_with_installer(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            None,
+            |src, dst, expected, expected_replacement| {
+                fs::write(dst, external)?;
+                crate::download::file::publish_file_if_unchanged_blocking(
+                    src,
+                    dst,
+                    expected,
+                    expected_replacement,
+                )
+            },
+        );
+
+        let error = result.expect_err("a concurrent edit must block HEIC publication");
+        assert!(
+            crate::download::file::classify_conditional_publish_error(&error).target_changed,
+            "the caller must preserve checksum evidence for a concurrent edit"
+        );
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("bytes changed"), "{error_chain}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            external,
+            "a concurrent edit must not be overwritten by the stale HEIC rewrite"
+        );
+        assert!(
+            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            "a refused pre-exchange publication must clean its uniquely owned temp file"
+        );
+    }
+
+    #[test]
+    fn apply_metadata_heic_refuses_temp_changed_after_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "changed_temp.heic");
+        let original = fs::read(&path).unwrap();
+
+        let error = apply_metadata_heif_with_installer(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            None,
+            |src, dst, expected, expected_replacement| {
+                fs::write(src, b"unapproved temporary bytes")?;
+                crate::download::file::publish_file_if_unchanged_blocking(
+                    src,
+                    dst,
+                    expected,
+                    expected_replacement,
+                )
+            },
+        )
+        .expect_err("temporary bytes changed after validation must not be published");
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let retained = heif_temp_entries(dir.path(), ".meta-tmp");
+        assert_eq!(retained.len(), 1);
+        let disposition = crate::download::file::classify_conditional_publish_error(&error);
+        assert!(disposition.retained_paths.contains(&retained[0]));
+        fs::remove_file(&retained[0]).unwrap();
+    }
+
+    #[test]
+    fn apply_metadata_heic_refuses_change_after_approved_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "changed_before_read.heic");
+        let original = fs::read(&path).unwrap();
+        let approved = fingerprint_bytes(&original).unwrap();
+        let changed = heic_with_xmp_packet(
+            &build_xmp_packet(&MetadataWrite {
+                title: Some("External edit".into()),
+                ..MetadataWrite::default()
+            })
+            .unwrap(),
+        );
+        fs::write(&path, &changed).unwrap();
+
+        let error = apply_metadata_with_expected_fingerprint(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            Some(approved),
+        )
+        .expect_err("bytes changed after retry approval must not be rewritten");
+
+        assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
+        assert_eq!(fs::read(&path).unwrap(), changed);
+        assert!(heif_temp_entries(dir.path(), ".meta-tmp").is_empty());
+    }
+
+    #[test]
+    fn apply_metadata_heic_refuses_format_change_after_approved_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "changed_format.heic");
+        let approved = fingerprint_bytes(&fs::read(&path).unwrap()).unwrap();
+        let changed = minimal_jpeg();
+        fs::write(&path, &changed).unwrap();
+
+        let error = apply_metadata_with_expected_fingerprint(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            Some(approved),
+        )
+        .expect_err("a format change after retry approval must not be rewritten");
+
+        assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
+        assert_eq!(fs::read(&path).unwrap(), changed);
+        assert!(!temp_path_for(&path, ".meta-tmp").exists());
+        assert!(heif_temp_entries(dir.path(), ".meta-tmp").is_empty());
+    }
+
+    #[test]
+    fn apply_metadata_heic_returns_installed_output_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "output_fingerprint.heic");
+        let approved = fingerprint_bytes(&fs::read(&path).unwrap()).unwrap();
+
+        let output = apply_metadata_with_expected_fingerprint(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            Some(approved),
+        )
+        .expect("HEIC metadata write")
+        .expect("HEIC writes return their installed fingerprint");
+
+        assert_eq!(
+            fingerprint_bytes(&fs::read(&path).unwrap()).unwrap(),
+            output
+        );
+    }
+
+    #[test]
+    fn apply_metadata_heic_temp_preserves_readonly_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "readonly.heic");
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_readonly(true);
+        fs::set_permissions(&path, readonly_permissions).unwrap();
+
+        let result = apply_metadata_heif_with_installer(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            None,
+            |src, _dst, _expected, _expected_replacement| {
+                assert!(
+                    fs::metadata(src).unwrap().permissions().readonly(),
+                    "the validated temp file must carry the source read-only permission"
+                );
+                Err(std::io::Error::other("stop after permission check").into())
+            },
+        );
+
+        assert!(result.is_err(), "the injected install failure must surface");
+        fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(heif_temp_entries(dir.path(), ".meta-tmp").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_metadata_heic_preserves_unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_heic(dir.path(), "mode.heic");
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC metadata write");
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the installed file must preserve the source mode"
+        );
+        fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(
+            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            "the mode check must not leave a temp file"
+        );
     }
 
     #[test]
@@ -3131,49 +3871,154 @@ mod tests {
         apply_metadata_with_default_suffix(&path, &write).unwrap();
         let second = fs::read(&path).unwrap();
 
-        assert_eq!(
+        assert_ne!(
             first, original,
-            "first skipped HEIC metadata write must leave bytes unchanged"
+            "HEIC metadata write must update the XMP item"
         );
         assert_eq!(
             second, first,
-            "repeated skipped HEIC metadata writes must stay idempotent"
+            "repeated HEIC metadata writes must stay idempotent"
         );
         fs::remove_file(&path).ok();
     }
 
-    /// Walk a HEIC file's top-level atoms and return the XMP packet bytes.
-    /// The write path puts XMP in a trailing `mdat`; the iloc entry is
-    /// construction_method=0 with a file-absolute offset, so we slice the
-    /// file bytes directly.
+    /// Each write merges into the packet the reader resolved, so unrelated
+    /// fields must survive. A shrinking packet also reuses the existing extent
+    /// and pads the tail, which is the layout the post-write identity check has
+    /// to tolerate.
+    #[test]
+    fn apply_metadata_heic_changes_one_field_without_rewriting_other_xmp() {
+        let dir = test_tmp_dir("meta_heic_tests");
+        let path = write_seeded_heic(
+            &dir,
+            "change_rating.heic",
+            &MetadataWrite {
+                rating: Some(5),
+                title: Some("Keep this".into()),
+                keywords: vec![
+                    "alpha".into(),
+                    "beta".into(),
+                    "gamma".into(),
+                    "delta".into(),
+                ],
+                ..MetadataWrite::default()
+            },
+        );
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(2),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC rating change");
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 2);
+        assert_eq!(
+            meta.localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "Keep this"
+        );
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(0),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC rating clear");
+        let cleared = read_heif_meta(&fs::read(&path).unwrap());
+        assert_eq!(
+            cleared.property_i32(xmp_ns::XMP, "Rating").unwrap().value,
+            0
+        );
+
+        let before = extract_xmp_from_heic(&fs::read(&path).unwrap()).expect("packet before");
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                keywords: vec!["alpha".into()],
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC keyword removal");
+        let after = extract_xmp_from_heic(&fs::read(&path).unwrap()).expect("packet after");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a shrinking packet must reuse the existing extent"
+        );
+        assert!(
+            after.ends_with(b" "),
+            "the reused extent must be padded to its original length"
+        );
+        let shrunk = read_heif_meta(&fs::read(&path).unwrap());
+        assert_eq!(
+            shrunk
+                .localized_text(xmp_ns::DC, "title", None, "x-default")
+                .unwrap()
+                .0
+                .value,
+            "Keep this",
+            "removing a keyword must not disturb the rest of the packet"
+        );
+        assert_eq!(
+            shrunk.property_array(xmp_ns::DC, "subject").count(),
+            1,
+            "stale keywords must not accumulate"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The first XMP packet in a HEIC file. Single-packet fixtures only; use
+    /// [`xmp_packets_in_heic`] where several images each carry one.
     fn extract_xmp_from_heic(bytes: &[u8]) -> Option<Vec<u8>> {
+        xmp_packets_in_heic(bytes)
+            .into_iter()
+            .next()
+            .map(|(_, packet)| packet)
+    }
+
+    /// Walk a HEIC file's top-level atoms and return every XMP packet with its
+    /// item ID. The write path puts XMP in a trailing `mdat`; the iloc entry is
+    /// construction_method=0 with a file-absolute offset, so we slice the
+    /// file bytes directly. Parsed independently of kei's own reader so a test
+    /// cannot confirm the reader against itself.
+    fn xmp_packets_in_heic(bytes: &[u8]) -> Vec<(u32, Vec<u8>)> {
         use mp4_atom::{Any, DecodeMaybe, FourCC, Iinf, Iloc};
         let mut cursor: &[u8] = bytes;
         while let Ok(Some(atom)) = Any::decode_maybe(&mut cursor) {
-            if let Any::Meta(meta) = atom {
-                let iinf = meta.get::<Iinf>()?;
-                let iloc = meta.get::<Iloc>()?;
-                let xmp_entry = iinf.item_infos.iter().find(|e| {
+            let Any::Meta(meta) = atom else {
+                continue;
+            };
+            let (Some(iinf), Some(iloc)) = (meta.get::<Iinf>(), meta.get::<Iloc>()) else {
+                return Vec::new();
+            };
+            return iinf
+                .item_infos
+                .iter()
+                .filter(|e| {
                     e.item_type == Some(FourCC::new(b"mime"))
                         && e.content_type.as_deref() == Some("application/rdf+xml")
-                })?;
-                let loc = iloc
-                    .item_locations
-                    .iter()
-                    .find(|l| l.item_id == xmp_entry.item_id)?;
-                if loc.construction_method != 0 {
-                    return None;
-                }
-                let extent = loc.extents.first()?;
-                let start = loc.base_offset.saturating_add(extent.offset) as usize;
-                let end = start + extent.length as usize;
-                if end > bytes.len() {
-                    return None;
-                }
-                return Some(bytes[start..end].to_vec());
-            }
+                })
+                .filter_map(|entry| {
+                    let loc = iloc
+                        .item_locations
+                        .iter()
+                        .find(|l| l.item_id == entry.item_id)?;
+                    if loc.construction_method != 0 {
+                        return None;
+                    }
+                    let extent = loc.extents.first()?;
+                    let start = loc.base_offset.saturating_add(extent.offset) as usize;
+                    let end = start + extent.length as usize;
+                    Some((entry.item_id, bytes.get(start..end)?.to_vec()))
+                })
+                .collect();
         }
-        None
+        Vec::new()
     }
 
     fn count_xmp_items_in_heic(bytes: &[u8]) -> usize {
@@ -3213,21 +4058,8 @@ mod tests {
         None
     }
 
-    // ── Regression: probe_exif HEIF dispatch (issue #272) ─────────────
-    //
-    // Pre-fix, `probe_exif` always routed through XMP Toolkit's
-    // `XmpFile::open_file`, which has no HEIF handler — every HEIC probe
-    // silently returned `ExifProbe::default()`. `plan_metadata_write`
-    // therefore couldn't honor the "field already present, skip" gate on
-    // any HEIC, so kei rewrote DateTimeOriginal/GPS on every iPhone HEIC
-    // even when the file already carried the same value. Content-sniff
-    // dispatch + XMP packet parsing fixes the read path symmetric with #271.
-    //
-    // These tests seed XMP directly rather than relying on the fixture having
-    // pre-existing EXIF, so they pin the read path independent of whatever XMP
-    // `tests/data/sample.heic` ships with. Embedded HEIC writes are currently
-    // disabled, so `apply_metadata` is intentionally not part of this probe
-    // regression.
+    // HEIF probes merge the standalone Exif item with embedded XMP. Content
+    // sniffing keeps the same behaviour on final paths and `.kei-tmp` files.
     #[test]
     fn probe_exif_heic_reports_seeded_datetime() {
         let dir = test_tmp_dir("probe_heic_tests");
@@ -3272,26 +4104,29 @@ mod tests {
             probe.has_gps,
             "probe must report GPS present after writing GPS to HEIC"
         );
-        assert!(
-            probe.datetime_original.is_none(),
-            "probe must report no datetime when none was written, got {:?}",
-            probe.datetime_original,
+        assert_eq!(
+            probe.datetime_original.as_deref(),
+            Some("2023:09:03 09:28:14"),
+            "probe must retain the native HEIF Exif datetime when XMP does not replace it",
         );
+        assert_eq!(probe.offset_time_original.as_deref(), Some("+03:00"));
         fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn probe_exif_heic_with_no_xmp_returns_default() {
+    fn probe_exif_heic_reads_native_exif_without_xmp() {
         let dir = test_tmp_dir("probe_heic_tests");
         let path = fresh_heic(&dir, "probe_empty.heic");
         let probe = probe_exif(&path).expect("probe_exif must succeed on HEIC");
-        assert!(
-            probe.datetime_original.is_none(),
-            "fresh HEIC carries no XMP, datetime must be None"
+        assert_eq!(
+            probe.datetime_original.as_deref(),
+            Some("2023:09:03 09:28:14"),
+            "HEIF probe must retain DateTimeOriginal from the Exif item"
         );
+        assert_eq!(probe.offset_time_original.as_deref(), Some("+03:00"));
         assert!(
             !probe.has_gps,
-            "fresh HEIC carries no XMP, has_gps must be false"
+            "sample HEIC Exif carries no GPS coordinates"
         );
         fs::remove_file(&path).ok();
     }
@@ -3352,12 +4187,11 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    // ── Regression: HEIC skips must work on part-file paths (issue #552) ──
+    // ── Regression: HEIC writes must work on part-file paths (issue #552) ──
     //
     // The download pipeline writes embedded metadata onto the `<base32>.kei-tmp`
-    // part file before the atomic rename to the final `.HEIC` name. While the
-    // HEIC embedded writer is disabled, content sniffing must still route that
-    // extension-shadowed part file to the safe skip path, not XMP Toolkit.
+    // part file before the atomic rename to the final `.HEIC` name. Content
+    // sniffing must route that extension-shadowed part file to the HEIF writer.
 
     #[test]
     fn apply_metadata_skips_heif_on_extension_less_part_file() {
@@ -3367,7 +4201,6 @@ mod tests {
         // suffix shadowing the real `.heic` extension.
         let path = dir.join("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.kei-tmp");
         fs::write(&path, SAMPLE_HEIC).unwrap();
-        let original = fs::read(&path).unwrap();
         apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
@@ -3376,15 +4209,12 @@ mod tests {
                 ..MetadataWrite::default()
             },
         )
-        .expect("HEIC metadata skip must succeed on .kei-tmp part file");
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            original,
-            "extension-shadowed HEIC part files must be skipped without modification"
-        );
+        .expect("HEIC metadata write must succeed on .kei-tmp part file");
+        let meta = read_heif_meta(&fs::read(&path).unwrap());
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 4);
         assert!(
             !temp_path_for(&path, ".meta-tmp").exists(),
-            "skipped extension-shadowed HEIC part files must not leave a temp file"
+            "extension-shadowed HEIC part files must not leave a temp file"
         );
         fs::remove_file(&path).ok();
     }
@@ -3403,7 +4233,7 @@ mod tests {
 
     #[test]
     fn apply_metadata_succeeds_on_heic_with_uri_infe_item() {
-        use mp4_atom::{Any, DecodeMaybe, Encode, FourCC, Iinf, ItemInfoEntry};
+        use mp4_atom::{Any, DecodeMaybe, Encode, FourCC, Iinf, Iloc, ItemInfoEntry};
 
         // Build a HEIC variant that carries a `uri ` infe entry by parsing
         // the sample, injecting a synthetic Apple-style entry into iinf,
@@ -3437,11 +4267,47 @@ mod tests {
                 .expect("re-encode of synthetic uri-bearing HEIC must succeed");
         }
 
+        // mp4-atom writes iloc offsets verbatim, so adding the uri entry grows
+        // meta and shifts the mdat without repointing the item offsets. Repoint
+        // every item at the re-encoded mdat so the fixture stays a valid HEIC
+        // whose image data lives after meta, not inside it.
+        let mdat_start = {
+            let mut pos = 0usize;
+            loop {
+                let size = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                if &bytes[pos + 4..pos + 8] == b"mdat" {
+                    break pos as u64;
+                }
+                pos += size;
+            }
+        };
+        let meta = atoms
+            .iter_mut()
+            .find_map(|a| if let Any::Meta(m) = a { Some(m) } else { None })
+            .expect("sample HEIC has a meta box");
+        let iloc = meta
+            .get_mut::<Iloc>()
+            .expect("sample HEIC has an iloc inside meta");
+        let min_base = iloc
+            .item_locations
+            .iter()
+            .map(|loc| loc.base_offset)
+            .min()
+            .expect("iloc has at least one item");
+        let shift = (mdat_start + 8) - min_base;
+        for loc in &mut iloc.item_locations {
+            loc.base_offset += shift;
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        for atom in &atoms {
+            atom.encode(&mut bytes)
+                .expect("re-encode of repointed uri-bearing HEIC must succeed");
+        }
+
         let dir = test_tmp_dir("meta_heic_tests");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("uri_infe.heic");
         fs::write(&path, &bytes).unwrap();
-        let original = fs::read(&path).unwrap();
 
         apply_metadata_with_default_suffix(
             &path,
@@ -3451,12 +4317,15 @@ mod tests {
                 ..MetadataWrite::default()
             },
         )
-        .expect("disabled HEIC metadata write must skip a file with a `uri ` infe item");
+        .expect("HEIC metadata write must preserve a `uri ` infe item");
 
+        let rewritten = fs::read(&path).unwrap();
+        let meta = read_heif_meta(&rewritten);
+        assert_eq!(meta.property_i32(xmp_ns::XMP, "Rating").unwrap().value, 3);
         assert_eq!(
-            fs::read(&path).unwrap(),
-            original,
-            "disabled HEIC metadata writes must not round-trip uri-bearing item graphs"
+            find_mdat_bytes(&bytes),
+            find_mdat_bytes(&rewritten),
+            "HEIC image data must survive a `uri ` item update"
         );
         fs::remove_file(&path).ok();
     }
@@ -3508,14 +4377,17 @@ mod tests {
 
     #[cfg(feature = "xmp")]
     #[test]
-    fn is_embed_writable_path_rejects_disabled_heif_formats() {
+    fn is_embed_writable_path_recognises_heif_formats() {
         for ext in ["heic", "HEIF", "hif", "avif"] {
             let p = PathBuf::from(format!("/a/b.{ext}"));
-            assert!(
-                !is_embed_writable_path(&p),
-                "{ext} embedded writes should be disabled"
-            );
+            assert!(is_embed_writable_path(&p), "{ext} should be writable");
         }
+
+        let dir = test_tmp_dir("embed_writable_heif");
+        fs::create_dir_all(&dir).unwrap();
+        let part_path = dir.join("image.kei-tmp");
+        fs::write(&part_path, heif_ftyp_without_meta()).unwrap();
+        assert!(is_embed_writable_path(&part_path));
     }
 
     #[test]

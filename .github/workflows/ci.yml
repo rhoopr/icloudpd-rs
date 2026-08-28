@@ -168,9 +168,14 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libimage-exiftool-perl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --all-features
+        env:
+          # ExifTool is the independent reader for the HEIF item-map writer.
+          # Requiring it where it is installed stops a failed install quietly
+          # retiring that coverage.
+          KEI_REQUIRE_HEIF_ORACLE: ${{ runner.os == 'Linux' && '1' || '' }}
 
   # Ensures documentation builds without warnings
   # Important for maintaining quality docs, especially for published crates

@@ -267,6 +267,33 @@ recovery work needed after that checkpoint is durable.
 
 Provider metadata may be captured in SQLite without changing local media.
 Embedding EXIF/XMP or writing sidecars requires explicit configuration.
+HEIF-family embedded XMP updates use the byte-preserving item-map writer and
+reject layouts that cannot be changed without re-encoding unknown item-graph
+data. A file may hold one XMP item per image, so probe and write both resolve
+the packet through its `cdsc` association with the primary image and refuse
+item maps where several are equally plausible. An unassociated packet answers
+for the primary only when it is the sole candidate. The HEIF probe reads both
+XMP and the standalone Exif item associated with the primary image before
+planning datetime or GPS writes. A new XMP item receives a `cdsc` reference
+naming the primary image. Insertion fails closed when a tone-mapped image is
+present because selecting the related `tmap` item without proven relationship
+evidence can remove an HDR rendition. External item data references and
+top-level boxes whose absolute offsets are not adjusted are also rejected.
+Before publication, validation confirms that every construction-method-0 item
+other than the resolved XMP packet, and every opaque `meta` sub-box, remains
+byte-identical, and that re-reading the rewritten file resolves the packet just
+written, allowing for the space padding an in-place replacement leaves in the
+reused extent. Each attempt exclusively creates a unique sibling and replaces
+the source only while an atomic exchange proves the displaced bytes still
+match the input fingerprint. Metadata-only retries also pass the checksum-gate
+fingerprint into the writer, closing the interval between catalogue validation
+and the writer's read. Existing regular files and links at candidate temporary
+paths remain untouched. Safe pre-exchange failures remove only the uniquely
+owned prepared file. Concurrent edits preserve the source and its catalogue
+checksum evidence, keep the durable rewrite marker, and leave any ambiguously
+displaced entry at its reported sibling path. The replacement file retains the
+source permissions.
+
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active
 and pending repair state. A normal sync hydrates stale downloaded rows in
@@ -292,10 +319,10 @@ rewrite marker is serviceable only when a metadata writer is enabled. A capture
 refresh preserves download status, paths, checksums, and media bytes. It stores
 corrected catalogue metadata, the current revision, and any configured rewrite
 marker before the library revision can become active. Lookup or state failures
-leave the row stale, report the remaining work, and preserve the affected provider
-checkpoint. A library promotes its active revision only when every live
-downloaded row is current. Persisted rewrite markers may drain later because
-they are durable recovery evidence.
+leave the row stale, report the remaining work, and preserve the affected
+provider checkpoint. A library promotes its active revision only when every
+live downloaded row is current. Persisted rewrite markers may drain later
+because they are durable recovery evidence.
 
 Metadata failure markers must survive so a later run can retry metadata
 without downloading the media again. Full enumeration, single-pass incremental,
@@ -305,10 +332,10 @@ deciding whether unchanged media needs downloading. A failed commit preserves
 the provider checkpoint. Queued rewrites drain once per cycle, after every
 producer has finished, so a single writer owns each file. Read-only runs never
 drain. Only that drain retires a marker on success, because it writes the file
-from the same row it then clears. Each bounded rewrite batch loads current album
-and people rows for its library-scoped asset IDs. A grouping-read failure leaves
-the affected markers pending. A completed download writes the snapshot it was
-planned from, so it records a marker on failure but never retires one.
+from the same row it then clears. Each bounded rewrite batch loads current
+album and people rows for its library-scoped asset IDs. A grouping-read failure
+leaves the affected markers pending. A completed download writes the snapshot
+it was planned from, so it records a marker on failure but never retires one.
 
 XMP sidecars record the exact properties that kei writes in the kei namespace.
 A later rewrite deletes a cleared property only when that marker proves kei
@@ -381,6 +408,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
+| `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite uses an exclusively created unique sibling and replaces the media only while the destination still matches the initially read bytes. Failure preserves concurrent edits and durable retry evidence. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 

@@ -1580,6 +1580,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_auth_flow_error",
         "classify_auth_retry_error",
         "classify_cli_parse_exit",
+        "classify_conditional_publish_error",
         "classify_download_task_error",
         "classify_exit_error",
         "classify_incremental_error",
