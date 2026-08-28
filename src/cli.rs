@@ -272,6 +272,11 @@ pub struct SyncArgs {
     )]
     pub refresh_metadata: bool,
 
+    /// Replace existing embedded capture timestamps with Apple's capture-local timestamp and
+    /// matching offset. This can overwrite camera metadata and requires --refresh-metadata.
+    #[arg(long, requires = "refresh_metadata")]
+    pub repair_capture_timestamps: bool,
+
     /// Replace a recorded local file only when reconcile marked it truncated.
     /// The replacement is verified before it atomically takes the recorded path.
     #[arg(
@@ -1518,6 +1523,25 @@ mod tests {
             panic!("expected Sync command");
         };
         assert!(sync.refresh_metadata);
+    }
+
+    #[test]
+    fn sync_repair_capture_timestamps_requires_metadata_refresh() {
+        assert!(Cli::try_parse_from(["kei", "sync", "--repair-capture-timestamps"]).is_err());
+
+        let Command::Sync { sync, .. } = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--refresh-metadata",
+            "--repair-capture-timestamps",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected Sync command");
+        };
+        assert!(sync.refresh_metadata);
+        assert!(sync.repair_capture_timestamps);
     }
 
     #[test]

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `kei sync --refresh-metadata --repair-capture-timestamps`, an explicit repair for embedded timestamps written before capture-local resolution. It replaces an existing timestamp only for a state-recorded downloaded file with a usable Apple offset, writes the capture-local timestamp and offset together, and keeps ordinary metadata refreshes non-destructive. The command requires `metadata.set_exif_datetime = true` and can overwrite camera-supplied metadata. ([#726])
 - XMP sidecars carry the source photo's GPS fix time, speed, speed reference, and horizontal positioning error from the media's own EXIF alongside the CloudKit
   location. This includes DNG and other TIFF-based RAW content, and uses the standard `exif:GPSTimeStamp` and `exif:GPSHPositioningError` properties. A photo without
   readable EXIF still receives its sidecar with the CloudKit metadata. Source EXIF is read without buffering the complete media file. ([#725])
@@ -33,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [#698]: https://github.com/rhoopr/kei/issues/698
 [#703]: https://github.com/rhoopr/kei/issues/703
+[#726]: https://github.com/rhoopr/kei/issues/726
 
 ## [0.23.1] - 2026-08-16
 

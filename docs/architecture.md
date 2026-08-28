@@ -174,7 +174,12 @@ already renders the capture-local instant. When writing a timestamp into a
 file that has orphaned datetime offsets, the writer clears those offsets before
 installing the timestamp and its resolved offset. Attaching an offset to a
 wall clock left by host-local rendering would assert an instant the asset never
-had.
+had. `sync --refresh-metadata --repair-capture-timestamps` explicitly relaxes
+the no-overwrite gate for state-recorded downloaded files. It requires embedded
+datetime output, a usable Apple offset, and bytes that still match the recorded
+checksum. The writer replaces the timestamp and its offsets together through
+the stable-input publication path. Normal downloads and ordinary metadata
+refreshes still preserve an existing timestamp.
 
 ### Durable pending retry
 

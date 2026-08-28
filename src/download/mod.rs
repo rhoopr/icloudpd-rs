@@ -19,6 +19,7 @@ pub(crate) mod recap;
 mod retry;
 
 pub(crate) use limiter::BandwidthLimiter;
+pub(crate) use metadata_rewrite::CaptureTimestampRepair;
 
 use pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, PassResult, StreamRuntime, StreamingResult,
@@ -4129,6 +4130,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
 pub(crate) async fn drain_pending_metadata_rewrites(
     db: &dyn DownloadStore,
     metadata: &crate::config::MetadataConfig,
+    capture_timestamp_repair: CaptureTimestampRepair,
     library_scope: &[&str],
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
@@ -4143,6 +4145,7 @@ pub(crate) async fn drain_pending_metadata_rewrites(
         let pass = metadata_rewrite::run_pending_page(
             db,
             flags,
+            capture_timestamp_repair,
             Arc::clone(&temp_suffix),
             shutdown_token,
             Some(library_scope),

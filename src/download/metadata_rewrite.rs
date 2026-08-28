@@ -18,6 +18,16 @@ use crate::state::{MembershipStore, MetadataRewriteStore, VersionSizeKey};
 
 use super::{AssetGroupings, DownloadConfig, DownloadContext};
 
+/// Whether an explicitly requested metadata repair may replace an existing
+/// embedded capture timestamp.
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CaptureTimestampRepair {
+    #[default]
+    Preserve,
+    ReplaceWithCaptureLocal,
+}
+
 bitflags::bitflags! {
     /// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
     /// flow; individual flags gate which fields get embedded into the media file.
@@ -107,7 +117,8 @@ impl MetadataWriteOutcome {
 /// the intended media path and is used for initial format routing. The actual
 /// embed path is checked again so its content takes precedence over a
 /// misleading final extension. `sidecar_path` is the media path next to which
-/// the `.xmp` sidecar should be written.
+/// the `.xmp` sidecar should be written. `capture_timestamp_repair` applies
+/// only to the embedded path.
 pub(super) struct MetadataWriteRequest<'a> {
     pub(super) final_path: &'a Path,
     pub(super) embed_path: Option<&'a Path>,
@@ -117,6 +128,7 @@ pub(super) struct MetadataWriteRequest<'a> {
     pub(super) payload: Arc<MetadataPayload>,
     pub(super) created_local: DateTime<FixedOffset>,
     pub(super) flags: MetadataFlags,
+    pub(super) capture_timestamp_repair: CaptureTimestampRepair,
     pub(super) temp_suffix: &'a str,
 }
 
@@ -143,6 +155,7 @@ pub(super) async fn write_download_metadata(
             Arc::clone(&request.payload),
             request.created_local,
             request.flags,
+            request.capture_timestamp_repair,
             request.temp_suffix,
         )
         .await
@@ -189,6 +202,7 @@ async fn write_embed_metadata(
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     flags: MetadataFlags,
+    capture_timestamp_repair: CaptureTimestampRepair,
     temp_suffix: &str,
 ) -> EmbedWriteResult {
     let embed_path = path.to_path_buf();
@@ -201,7 +215,13 @@ async fn write_embed_metadata(
                 super::metadata::ExifProbe::default()
             }
         };
-        let write = plan_metadata_write(flags, &payload, &created_local, &probe);
+        let write = plan_metadata_write_with_repair(
+            flags,
+            &payload,
+            &created_local,
+            capture_timestamp_repair,
+            &probe,
+        );
         if write.is_empty() {
             return EmbedWriteResult::NoWrite;
         }
@@ -348,22 +368,54 @@ fn plan_sidecar_write(
 /// Plan the embed-path write. Per-tag gates:
 ///
 /// - datetime / GPS: only when the flag is on AND the file has no existing
-///   value (probe gate preserves camera-supplied data).
+///   value (probe gate preserves camera-supplied data). Explicit capture-time
+///   repair may replace an existing datetime only with a usable matching offset.
 /// - offset: only alongside a timestamp this pass writes, or one the probe
 ///   proves already renders the capture-local instant.
 /// - rating / description: flag gate only - iCloud is the source of truth.
 /// - XMP-only fields (title, keywords, people, hidden/archived,
 ///   media_subtype, burst_id): gated on the `EMBED_XMP` flag.
+#[cfg(test)]
 fn plan_metadata_write(
     flags: MetadataFlags,
     payload: &MetadataPayload,
     created_local: &DateTime<FixedOffset>,
     probe: &super::metadata::ExifProbe,
 ) -> super::metadata::MetadataWrite {
+    plan_metadata_write_with_repair(
+        flags,
+        payload,
+        created_local,
+        CaptureTimestampRepair::Preserve,
+        probe,
+    )
+}
+
+fn plan_metadata_write_with_repair(
+    flags: MetadataFlags,
+    payload: &MetadataPayload,
+    created_local: &DateTime<FixedOffset>,
+    capture_timestamp_repair: CaptureTimestampRepair,
+    probe: &super::metadata::ExifProbe,
+) -> super::metadata::MetadataWrite {
     let mut write = super::metadata::MetadataWrite::default();
 
     if flags.contains(MetadataFlags::DATETIME) {
-        if probe.datetime_original.is_none() {
+        let offset_time_original = offset_time_original(payload);
+        let replace_existing = matches!(
+            capture_timestamp_repair,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal
+        ) && offset_time_original.as_deref().is_some_and(
+            |expected_offset| {
+                probe.datetime_original.is_some()
+                    && (!probe.denotes_capture_time(created_local)
+                        || probe
+                            .offset_time_original
+                            .as_deref()
+                            .is_some_and(|existing_offset| existing_offset != expected_offset))
+            },
+        );
+        if probe.datetime_original.is_none() || replace_existing {
             write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
             write.clear_datetime_offsets = probe.has_any_datetime_offset();
         }
@@ -373,7 +425,7 @@ fn plan_metadata_write(
         if write.datetime.is_some()
             || (probe.offset_time_original.is_none() && probe.denotes_capture_time(created_local))
         {
-            write.offset_time_original = offset_time_original(payload);
+            write.offset_time_original = offset_time_original;
         }
     }
     if flags.contains(MetadataFlags::RATING) {
@@ -468,7 +520,16 @@ pub(super) async fn run_pending<D>(
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
 {
-    run_pending_page(db, metadata_flags, temp_suffix, shutdown_token, None, 0).await
+    run_pending_page(
+        db,
+        metadata_flags,
+        CaptureTimestampRepair::Preserve,
+        temp_suffix,
+        shutdown_token,
+        None,
+        0,
+    )
+    .await
 }
 
 async fn load_pending_groupings<D>(
@@ -542,6 +603,7 @@ async fn forget_stale_checksum<D>(
 pub(super) async fn run_pending_page<D>(
     db: &D,
     metadata_flags: MetadataFlags,
+    capture_timestamp_repair: CaptureTimestampRepair,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
     library_scope: Option<&[&str]>,
@@ -687,6 +749,7 @@ where
             payload,
             created_local,
             flags: metadata_flags,
+            capture_timestamp_repair,
             temp_suffix: &temp_suffix,
         })
         .await;
@@ -1081,6 +1144,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capture_timestamp_repair_requires_an_offset_and_replaces_the_pair() {
+        let created_local = now_local();
+        let probe = crate::download::metadata::ExifProbe {
+            datetime_original: Some("2024:06:14 23:00:00".into()),
+            offset_time_original: Some("+05:00".into()),
+            has_other_datetime_offset: true,
+            has_gps: false,
+        };
+        let write = plan_metadata_write_with_repair(
+            MetadataFlags::DATETIME,
+            &MetadataPayload {
+                timezone_offset: Some(39_600),
+                ..MetadataPayload::default()
+            },
+            &created_local,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            &probe,
+        );
+        assert_eq!(write.datetime.as_deref(), Some("2024:06:15 10:00:00"));
+        assert_eq!(write.offset_time_original.as_deref(), Some("+11:00"));
+        assert!(write.clear_datetime_offsets);
+
+        let correct_probe = crate::download::metadata::ExifProbe {
+            datetime_original: write.datetime.clone(),
+            offset_time_original: write.offset_time_original.clone(),
+            has_other_datetime_offset: false,
+            has_gps: false,
+        };
+        let already_repaired = plan_metadata_write_with_repair(
+            MetadataFlags::DATETIME,
+            &MetadataPayload {
+                timezone_offset: Some(39_600),
+                ..MetadataPayload::default()
+            },
+            &created_local,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            &correct_probe,
+        );
+        assert!(already_repaired.is_empty());
+
+        let write_without_offset = plan_metadata_write_with_repair(
+            MetadataFlags::DATETIME,
+            &MetadataPayload::default(),
+            &created_local,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            &probe,
+        );
+        assert!(write_without_offset.datetime.is_none());
+        assert!(write_without_offset.offset_time_original.is_none());
+        assert!(!write_without_offset.clear_datetime_offsets);
+    }
+
     /// XMP stores capture times as ISO 8601, and kei's own writer appends the
     /// offset. Such a timestamp is already capture-local, so it still accepts
     /// the offset tag.
@@ -1205,6 +1321,7 @@ mod tests {
             payload: Arc::new(MetadataPayload::default()),
             created_local: now_local(),
             flags: MetadataFlags::default(),
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             temp_suffix: ".metadata-test",
         })
         .await;
@@ -1244,6 +1361,7 @@ mod tests {
             }),
             created_local: now_local(),
             flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             temp_suffix: ".metadata-test",
         })
         .await;
@@ -1291,6 +1409,7 @@ mod tests {
             }),
             created_local: now_local(),
             flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             temp_suffix: ".metadata-test",
         })
         .await;
@@ -1324,6 +1443,7 @@ mod tests {
             }),
             created_local: now_local(),
             flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             temp_suffix: ".metadata-test",
         })
         .await;
@@ -1417,6 +1537,7 @@ mod tests {
                 }),
                 now_local(),
                 MetadataFlags::DATETIME,
+                CaptureTimestampRepair::Preserve,
                 ".metadata-test",
             )
             .await,
@@ -1426,6 +1547,137 @@ mod tests {
         let after = crate::download::metadata::probe_exif(&photo_path).unwrap();
         assert_eq!(after.datetime_original, before.datetime_original);
         assert!(after.offset_time_original.is_none());
+    }
+
+    #[tokio::test]
+    async fn embed_path_repairs_host_local_timestamp_and_offset_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("host-local-repair.jpg");
+        std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
+        crate::download::metadata::apply_metadata(
+            &photo_path,
+            &crate::download::metadata::MetadataWrite {
+                datetime: Some("2024:06:14 23:00:00".into()),
+                offset_time_original: Some("+05:00".into()),
+                ..crate::download::metadata::MetadataWrite::default()
+            },
+            ".seed-tmp",
+        )
+        .unwrap();
+
+        let created_local = now_local();
+        assert_eq!(
+            write_embed_metadata(
+                &photo_path,
+                None,
+                Arc::new(MetadataPayload {
+                    timezone_offset: Some(39_600),
+                    ..MetadataPayload::default()
+                }),
+                created_local,
+                MetadataFlags::DATETIME,
+                CaptureTimestampRepair::ReplaceWithCaptureLocal,
+                ".metadata-test",
+            )
+            .await,
+            EmbedWriteResult::Applied(None)
+        );
+
+        let after = crate::download::metadata::probe_exif(&photo_path).unwrap();
+        assert!(after.denotes_capture_time(&created_local));
+        assert_eq!(after.offset_time_original.as_deref(), Some("+11:00"));
+
+        assert_eq!(
+            write_embed_metadata(
+                &photo_path,
+                None,
+                Arc::new(MetadataPayload {
+                    timezone_offset: Some(39_600),
+                    ..MetadataPayload::default()
+                }),
+                created_local,
+                MetadataFlags::DATETIME,
+                CaptureTimestampRepair::ReplaceWithCaptureLocal,
+                ".metadata-test",
+            )
+            .await,
+            EmbedWriteResult::NoWrite,
+            "a repaired timestamp and offset must be idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_drain_repairs_a_state_recorded_host_local_timestamp() {
+        use crate::config::MetadataConfig;
+        use crate::download::DownloadStore;
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("host-local-drain.jpg");
+        std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
+        crate::download::metadata::apply_metadata(
+            &photo_path,
+            &crate::download::metadata::MetadataWrite {
+                datetime: Some("2024:06:14 23:00:00".into()),
+                ..crate::download::metadata::MetadataWrite::default()
+            },
+            ".seed-tmp",
+        )
+        .unwrap();
+        let checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+
+        let created_local = now_local();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("CAPTURE_REPAIR")
+            .filename("host-local-drain.jpg")
+            .checksum("provider-checksum")
+            .created_at(created_local.with_timezone(&chrono::Utc))
+            .metadata(AssetMetadata {
+                timezone_offset: Some(39_600),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "CAPTURE_REPAIR",
+            "original",
+            &photo_path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "CAPTURE_REPAIR", "original")
+            .await
+            .unwrap();
+
+        let residual = crate::download::drain_pending_metadata_rewrites(
+            &db as &dyn DownloadStore,
+            &MetadataConfig {
+                set_exif_datetime: true,
+                ..MetadataConfig::default()
+            },
+            CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            &["PrimarySync"],
+            Arc::from(".metadata-test"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(residual, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let probe = crate::download::metadata::probe_exif(&photo_path).unwrap();
+        assert!(probe.denotes_capture_time(&created_local));
+        assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
     }
 
     #[tokio::test]
@@ -1457,6 +1709,7 @@ mod tests {
                 }),
                 created_local,
                 MetadataFlags::DATETIME,
+                CaptureTimestampRepair::Preserve,
                 ".metadata-test",
             )
             .await,
@@ -1491,6 +1744,7 @@ mod tests {
             payload: Arc::new(payload.clone()),
             created_local: cloudkit_created,
             flags: MetadataFlags::XMP_SIDECAR,
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             temp_suffix: ".gps-sidecar-test",
         };
 
@@ -1582,6 +1836,7 @@ mod tests {
             payload: Arc::new(payload),
             created_local: now_local(),
             flags: MetadataFlags::XMP_SIDECAR,
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             temp_suffix: ".gps-dng-test",
         })
         .await;
@@ -1922,6 +2177,7 @@ mod tests {
             payload: Arc::new(normal_payload),
             created_local: record.metadata.capture_local(record.created_at),
             flags: MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             temp_suffix: ".meta-tmp",
         })
         .await;
@@ -2304,6 +2560,7 @@ mod tests {
         let residual = crate::download::drain_pending_metadata_rewrites(
             &db as &dyn DownloadStore,
             &cfg,
+            CaptureTimestampRepair::Preserve,
             &["PrimarySync"],
             std::sync::Arc::from(".meta-tmp"),
             &token,
@@ -2362,6 +2619,7 @@ mod tests {
         let residual = crate::download::drain_pending_metadata_rewrites(
             &db as &dyn DownloadStore,
             &cfg,
+            CaptureTimestampRepair::Preserve,
             &["PrimarySync"],
             std::sync::Arc::from(".meta-tmp"),
             &token,
@@ -2415,6 +2673,7 @@ mod tests {
                 embed_xmp: true,
                 ..MetadataConfig::default()
             },
+            CaptureTimestampRepair::Preserve,
             &["PrimarySync"],
             Arc::from(".meta-tmp"),
             &CancellationToken::new(),
@@ -2521,6 +2780,7 @@ mod tests {
         let pass = run_pending_page(
             &db,
             embedded_rating_flags() | MetadataFlags::XMP_SIDECAR,
+            CaptureTimestampRepair::Preserve,
             Arc::from(".meta-tmp"),
             &CancellationToken::new(),
             None,
@@ -3029,6 +3289,7 @@ mod tests {
         let residual = crate::download::drain_pending_metadata_rewrites(
             &db as &dyn DownloadStore,
             &cfg,
+            CaptureTimestampRepair::Preserve,
             &["PrimarySync"],
             std::sync::Arc::from(".meta-tmp"),
             &token,

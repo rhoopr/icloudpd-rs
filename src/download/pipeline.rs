@@ -3298,6 +3298,7 @@ async fn download_single_task<C: super::file::DownloadClient>(
                     payload: Arc::clone(&task.metadata),
                     created_local: task.created_local,
                     flags: metadata_flags,
+                    capture_timestamp_repair: super::CaptureTimestampRepair::Preserve,
                     temp_suffix: context.temp_suffix,
                 },
             )
@@ -3332,6 +3333,7 @@ async fn download_single_task<C: super::file::DownloadClient>(
                 payload: Arc::clone(&task.metadata),
                 created_local: task.created_local,
                 flags: metadata_flags,
+                capture_timestamp_repair: super::CaptureTimestampRepair::Preserve,
                 temp_suffix: context.temp_suffix,
             })
             .await;

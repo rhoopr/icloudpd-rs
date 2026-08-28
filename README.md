@@ -185,6 +185,19 @@ is configured, a file with no capture timestamp receives one, with the offset
 when Apple supplied it. The command does not move existing media between date
 folders.
 
+To replace embedded timestamps written by an older kei version, run:
+
+```sh
+kei sync --refresh-metadata --repair-capture-timestamps
+```
+
+Set `metadata.set_exif_datetime = true` before you run this command. It can
+overwrite a camera-supplied timestamp. It changes only downloaded files that
+kei tracks in state and for which Apple supplies a usable capture offset. The
+rewrite uses kei's checksum and stable-input guards. It writes the capture-local
+timestamp and matching offset together. Files without a usable offset keep
+their existing timestamp.
+
 ### Replace a truncated local file
 
 First, mark missing and truncated files for retry:

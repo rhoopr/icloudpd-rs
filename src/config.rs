@@ -509,6 +509,7 @@ pub struct RuntimeConfig {
     pub dry_run: bool,
     pub only_print_filenames: bool,
     pub refresh_metadata: bool,
+    pub repair_capture_timestamps: bool,
     pub repair_truncated: bool,
 }
 
@@ -1696,6 +1697,7 @@ impl Config {
                 dry_run: sync.dry_run,
                 only_print_filenames: sync.only_print_filenames,
                 refresh_metadata: sync.refresh_metadata,
+                repair_capture_timestamps: sync.repair_capture_timestamps,
                 repair_truncated: sync.repair_truncated,
             },
         })
@@ -4273,8 +4275,20 @@ mod tests {
         assert!(!cfg.runtime.dry_run);
         assert!(!cfg.runtime.only_print_filenames);
         assert!(!cfg.runtime.refresh_metadata);
+        assert!(!cfg.runtime.repair_capture_timestamps);
         // Notifications
         assert!(cfg.notifications.script.is_none());
+    }
+
+    #[test]
+    fn test_build_carries_capture_timestamp_repair_request() {
+        let mut sync = default_sync();
+        sync.refresh_metadata = true;
+        sync.repair_capture_timestamps = true;
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+
+        assert!(cfg.runtime.refresh_metadata);
+        assert!(cfg.runtime.repair_capture_timestamps);
     }
 
     #[test]
