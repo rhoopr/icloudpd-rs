@@ -90,6 +90,9 @@ pub(crate) fn writers_enabled(metadata: &crate::config::MetadataConfig) -> bool 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataWriteOutcome {
     embed_failed: bool,
+    embed_input_changed: bool,
+    embed_no_write: bool,
+    embed_output_fingerprint: Option<super::file::ExistingFileFingerprint>,
     sidecar_failed: bool,
 }
 
@@ -108,6 +111,7 @@ impl MetadataWriteOutcome {
 pub(super) struct MetadataWriteRequest<'a> {
     pub(super) final_path: &'a Path,
     pub(super) embed_path: Option<&'a Path>,
+    pub(super) expected_embed_fingerprint: Option<super::file::ExistingFileFingerprint>,
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     pub(super) sidecar_path: Option<&'a Path>,
     pub(super) payload: Arc<MetadataPayload>,
@@ -128,17 +132,31 @@ pub(super) async fn write_download_metadata(
 
     if request.flags.any_embed()
         && let Some(embed_path) = request.embed_path
-        && super::metadata::is_embed_writable_path(request.final_path)
-        && (embed_path == request.final_path || super::metadata::is_embed_writable_path(embed_path))
+        && (request.expected_embed_fingerprint.is_some()
+            || (super::metadata::is_embed_writable_path(request.final_path)
+                && (embed_path == request.final_path
+                    || super::metadata::is_embed_writable_path(embed_path))))
     {
-        outcome.embed_failed = !write_embed_metadata(
+        match write_embed_metadata(
             embed_path,
+            request.expected_embed_fingerprint,
             Arc::clone(&request.payload),
             request.created_local,
             request.flags,
             request.temp_suffix,
         )
-        .await;
+        .await
+        {
+            EmbedWriteResult::Applied(output_fingerprint) => {
+                outcome.embed_output_fingerprint = output_fingerprint;
+            }
+            EmbedWriteResult::NoWrite => outcome.embed_no_write = true,
+            EmbedWriteResult::Failed => outcome.embed_failed = true,
+            EmbedWriteResult::InputChanged => {
+                outcome.embed_failed = true;
+                outcome.embed_input_changed = true;
+            }
+        }
     }
 
     #[cfg(feature = "xmp")]
@@ -157,13 +175,22 @@ pub(super) async fn write_download_metadata(
     outcome
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbedWriteResult {
+    Applied(Option<super::file::ExistingFileFingerprint>),
+    NoWrite,
+    Failed,
+    InputChanged,
+}
+
 async fn write_embed_metadata(
     path: &Path,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     flags: MetadataFlags,
     temp_suffix: &str,
-) -> bool {
+) -> EmbedWriteResult {
     let embed_path = path.to_path_buf();
     let metadata_temp_suffix = temp_suffix.to_string();
     match tokio::task::spawn_blocking(move || {
@@ -176,22 +203,43 @@ async fn write_embed_metadata(
         };
         let write = plan_metadata_write(flags, &payload, &created_local, &probe);
         if write.is_empty() {
-            return true;
+            return EmbedWriteResult::NoWrite;
         }
-        match super::metadata::apply_metadata(&embed_path, &write, &metadata_temp_suffix) {
+        let result = match expected_fingerprint {
+            Some(expected) => super::metadata::apply_metadata_with_expected_fingerprint(
+                &embed_path,
+                &write,
+                &metadata_temp_suffix,
+                Some(expected),
+            ),
+            None => super::metadata::apply_metadata(&embed_path, &write, &metadata_temp_suffix)
+                .map(|_| None),
+        };
+        match result {
             Err(e) => {
-                tracing::warn!(path = %embed_path.display(), error = %e, "Failed to write metadata");
-                false
+                let disposition = super::file::classify_conditional_publish_error(&e);
+                let result = if disposition.target_changed {
+                    EmbedWriteResult::InputChanged
+                } else {
+                    EmbedWriteResult::Failed
+                };
+                tracing::warn!(
+                    path = %embed_path.display(),
+                    error = %e,
+                    retained_paths = ?disposition.retained_paths,
+                    "Failed to write metadata"
+                );
+                result
             }
-            Ok(()) => true,
+            Ok(output_fingerprint) => EmbedWriteResult::Applied(output_fingerprint),
         }
     })
     .await
     {
-        Ok(ok) => ok,
+        Ok(result) => result,
         Err(e) => {
             tracing::warn!(error = %e, "EXIF task panicked");
-            false
+            EmbedWriteResult::Failed
         }
     }
 }
@@ -582,11 +630,11 @@ where
         // Only an embedded write touches media bytes, so the drain needs the
         // pre-write hash to tell its own rewrite apart from damage that
         // arrived some other way.
-        let pre_rewrite_checksum = if metadata_flags.any_embed()
-            && super::metadata::is_embed_writable_path(&path)
-        {
-            match super::file::compute_sha256(&path).await {
-                Ok(checksum) => Some(checksum),
+        let embed_writable =
+            metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&path);
+        let pre_rewrite_fingerprint = if metadata_flags.any_embed() {
+            match super::file::fingerprint_regular_file(&path).await {
+                Ok(fingerprint) => Some(fingerprint),
                 Err(e) => {
                     tracing::warn!(
                         asset_id = %record.id,
@@ -601,6 +649,9 @@ where
         } else {
             None
         };
+        let pre_rewrite_checksum = pre_rewrite_fingerprint
+            .as_ref()
+            .map(|fingerprint| data_encoding::HEXLOWER.encode(&fingerprint.sha256));
 
         // A file that no longer matches the recorded hash is not kei's to
         // rewrite: embedding would overwrite the evidence that `verify` and
@@ -620,9 +671,18 @@ where
             skipped_drifted += 1;
         }
 
-        let outcome = write_download_metadata(MetadataWriteRequest {
+        let mut outcome = write_download_metadata(MetadataWriteRequest {
             final_path: &path,
-            embed_path: if drifted { None } else { Some(&path) },
+            embed_path: if drifted || !embed_writable {
+                None
+            } else {
+                Some(&path)
+            },
+            expected_embed_fingerprint: if drifted || !embed_writable {
+                None
+            } else {
+                pre_rewrite_fingerprint
+            },
             sidecar_path: Some(&path),
             payload,
             created_local,
@@ -646,13 +706,90 @@ where
         // without a recorded checksum establishes `local_checksum` alone and
         // stays visible to reconcile's size check.
         let verified_before = record.local_checksum.is_some();
-        if let Some(before) = &pre_rewrite_checksum {
-            match super::file::compute_sha256(&path).await {
+        if outcome.embed_input_changed {
+            tracing::warn!(
+                asset_id = %record.id,
+                path = %path.display(),
+                "File changed while its metadata rewrite was being prepared; leaving its checksum and rewrite marker unchanged"
+            );
+        } else if outcome.embed_no_write {
+            match (
+                pre_rewrite_fingerprint,
+                super::file::fingerprint_regular_file(&path).await,
+            ) {
+                (Some(before), Ok(after)) if after == before => {}
+                (_, Ok(_)) => {
+                    outcome.embed_failed = true;
+                    outcome.embed_input_changed = true;
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        "File changed after metadata inspection; leaving its checksum and rewrite marker unchanged"
+                    );
+                }
+                (_, Err(e)) => {
+                    outcome.embed_failed = true;
+                    outcome.embed_input_changed = true;
+                    tracing::warn!(
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        error = %e,
+                        "Could not verify the file after metadata inspection; leaving its checksum and rewrite marker unchanged"
+                    );
+                }
+            }
+        } else if let Some(before) = &pre_rewrite_checksum {
+            let after = if let Some(expected_output) = outcome.embed_output_fingerprint {
+                match super::file::fingerprint_regular_file(&path).await {
+                    Ok(actual) if actual == expected_output => {
+                        Some(data_encoding::HEXLOWER.encode(&actual.sha256))
+                    }
+                    Ok(_) => {
+                        outcome.embed_failed = true;
+                        outcome.embed_input_changed = true;
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            path = %path.display(),
+                            "File changed after HEIF metadata publication; leaving its checksum and rewrite marker unchanged"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        outcome.embed_failed = true;
+                        outcome.embed_input_changed = true;
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            path = %path.display(),
+                            error = %e,
+                            "Could not verify the HEIF metadata publication; leaving its checksum and rewrite marker unchanged"
+                        );
+                        None
+                    }
+                }
+            } else {
+                match super::file::compute_sha256(&path).await {
+                    Ok(after) => Some(after),
+                    Err(e) => {
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            path = %path.display(),
+                            error = %e,
+                            "Could not hash file after metadata rewrite; leaving marker for future retry"
+                        );
+                        // The rewrite may already have replaced the bytes, so the
+                        // recorded hash can no longer be trusted either way.
+                        forget_stale_checksum(db, &record, version_size.as_str()).await;
+                        errored += 1;
+                        continue;
+                    }
+                }
+            };
+            match after {
                 // Stored before the marker retires below, so a later failure
                 // cannot leave a rewritten file behind a stale hash. An
                 // unchanged file is left alone: kei only vouches for bytes it
                 // wrote.
-                Ok(after) if after != *before => {
+                Some(after) if after != *before => {
                     if let Err(e) = db
                         .set_metadata_rewrite_checksums(
                             &record.library,
@@ -669,20 +806,7 @@ where
                         continue;
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        asset_id = %record.id,
-                        path = %path.display(),
-                        error = %e,
-                        "Could not hash file after metadata rewrite; leaving marker for future retry"
-                    );
-                    // The rewrite may already have replaced the bytes, so the
-                    // recorded hash can no longer be trusted either way.
-                    forget_stale_checksum(db, &record, version_size.as_str()).await;
-                    errored += 1;
-                    continue;
-                }
+                Some(_) | None => {}
             }
         }
 
@@ -701,6 +825,8 @@ where
                 asset_id = %record.id,
                 path = %path.display(),
                 embed_failed = outcome.embed_failed,
+                embed_input_changed = outcome.embed_input_changed,
+                embed_no_write = outcome.embed_no_write,
                 sidecar_failed = outcome.sidecar_failed,
                 "Metadata rewrite failed; leaving marker for future retry"
             );
@@ -1074,6 +1200,7 @@ mod tests {
         write_download_metadata(MetadataWriteRequest {
             final_path: &photo_path,
             embed_path: Some(&photo_path),
+            expected_embed_fingerprint: None,
             sidecar_path: Some(&photo_path),
             payload: Arc::new(MetadataPayload::default()),
             created_local: now_local(),
@@ -1109,6 +1236,7 @@ mod tests {
         let outcome = write_download_metadata(MetadataWriteRequest {
             final_path: &photo_path,
             embed_path: Some(&photo_path),
+            expected_embed_fingerprint: None,
             sidecar_path: None,
             payload: Arc::new(MetadataPayload {
                 rating: Some(5),
@@ -1138,6 +1266,120 @@ mod tests {
         assert!(!dir.path().join("large.heic.metadata-test").exists());
     }
 
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn heif_embed_reports_change_after_approved_retry_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("changed-after-approval.heic");
+        let original = include_bytes!("../../tests/data/sample.heic");
+        std::fs::write(&photo_path, original).unwrap();
+        let approved = crate::download::file::fingerprint_regular_file(&photo_path)
+            .await
+            .unwrap();
+        let mut changed = original.to_vec();
+        changed.push(0);
+        std::fs::write(&photo_path, &changed).unwrap();
+
+        let outcome = write_download_metadata(MetadataWriteRequest {
+            final_path: &photo_path,
+            embed_path: Some(&photo_path),
+            expected_embed_fingerprint: Some(approved),
+            sidecar_path: None,
+            payload: Arc::new(MetadataPayload {
+                rating: Some(5),
+                ..MetadataPayload::default()
+            }),
+            created_local: now_local(),
+            flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            temp_suffix: ".metadata-test",
+        })
+        .await;
+
+        assert!(outcome.any_failed());
+        assert!(outcome.embed_input_changed);
+        assert_eq!(std::fs::read(&photo_path).unwrap(), changed);
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn approved_heif_fingerprint_bypasses_changed_format_routing_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("extensionless-asset");
+        let original = include_bytes!("../../tests/data/sample.heic");
+        std::fs::write(&photo_path, original).unwrap();
+        let approved = crate::download::file::fingerprint_regular_file(&photo_path)
+            .await
+            .unwrap();
+        let changed = b"unsupported concurrent replacement";
+        std::fs::write(&photo_path, changed).unwrap();
+
+        let outcome = write_download_metadata(MetadataWriteRequest {
+            final_path: &photo_path,
+            embed_path: Some(&photo_path),
+            expected_embed_fingerprint: Some(approved),
+            sidecar_path: None,
+            payload: Arc::new(MetadataPayload {
+                rating: Some(5),
+                ..MetadataPayload::default()
+            }),
+            created_local: now_local(),
+            flags: MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            temp_suffix: ".metadata-test",
+        })
+        .await;
+
+        assert!(outcome.any_failed());
+        assert!(outcome.embed_input_changed);
+        assert_eq!(std::fs::read(&photo_path).unwrap(), changed);
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn pending_heif_rewrite_detects_drift_before_format_routing() {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("extensionless-asset");
+        let original = include_bytes!("../../tests/data/sample.heic");
+        std::fs::write(&photo_path, original).unwrap();
+        let recorded = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_downloaded_marker(
+            &db,
+            "ROUTING_DRIFT",
+            "extensionless-asset",
+            &photo_path,
+            &recorded,
+            AssetMetadata {
+                rating: Some(5),
+                metadata_hash: Some("routing-drift".into()),
+                ..AssetMetadata::default()
+            },
+            None,
+        )
+        .await;
+        let changed = b"unsupported concurrent replacement";
+        std::fs::write(&photo_path, changed).unwrap();
+
+        let pass = run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".metadata-test"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(pass.failed, 1);
+        assert_eq!(std::fs::read(&photo_path).unwrap(), changed);
+        assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+        let (local, download) = stored_checksums(&db).await;
+        assert_eq!(local.as_deref(), Some(recorded.as_str()));
+        assert_eq!(download, None);
+    }
+
     /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). XMP Toolkit can write
     /// into this container; small enough to keep the test hermetic.
     fn minimal_jpeg_bytes() -> Vec<u8> {
@@ -1165,9 +1407,10 @@ mod tests {
         assert!(before.datetime_original.is_some());
         assert!(before.offset_time_original.is_none());
 
-        assert!(
+        assert_eq!(
             write_embed_metadata(
                 &photo_path,
+                None,
                 Arc::new(MetadataPayload {
                     timezone_offset: Some(39_600),
                     ..MetadataPayload::default()
@@ -1176,7 +1419,8 @@ mod tests {
                 MetadataFlags::DATETIME,
                 ".metadata-test",
             )
-            .await
+            .await,
+            EmbedWriteResult::NoWrite
         );
 
         let after = crate::download::metadata::probe_exif(&photo_path).unwrap();
@@ -1203,9 +1447,10 @@ mod tests {
         assert_eq!(before.offset_time_original.as_deref(), Some("+10:00"));
 
         let created_local = now_local();
-        assert!(
+        assert_eq!(
             write_embed_metadata(
                 &photo_path,
+                None,
                 Arc::new(MetadataPayload {
                     timezone_offset: Some(39_600),
                     ..MetadataPayload::default()
@@ -1214,7 +1459,8 @@ mod tests {
                 MetadataFlags::DATETIME,
                 ".metadata-test",
             )
-            .await
+            .await,
+            EmbedWriteResult::Applied(None)
         );
 
         let after = crate::download::metadata::probe_exif(&photo_path).unwrap();
@@ -1240,6 +1486,7 @@ mod tests {
         let request = || MetadataWriteRequest {
             final_path: &media_path,
             embed_path: None,
+            expected_embed_fingerprint: None,
             sidecar_path: Some(&media_path),
             payload: Arc::new(payload.clone()),
             created_local: cloudkit_created,
@@ -1330,6 +1577,7 @@ mod tests {
         let outcome = write_download_metadata(MetadataWriteRequest {
             final_path: &media_path,
             embed_path: None,
+            expected_embed_fingerprint: None,
             sidecar_path: Some(&media_path),
             payload: Arc::new(payload),
             created_local: now_local(),
@@ -1669,6 +1917,7 @@ mod tests {
         let normal_outcome = write_download_metadata(MetadataWriteRequest {
             final_path: &normal_path,
             embed_path: Some(&normal_path),
+            expected_embed_fingerprint: None,
             sidecar_path: Some(&normal_path),
             payload: Arc::new(normal_payload),
             created_local: record.metadata.capture_local(record.created_at),

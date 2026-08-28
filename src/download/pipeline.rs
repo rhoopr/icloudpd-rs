@@ -3293,6 +3293,7 @@ async fn download_single_task<C: super::file::DownloadClient>(
                 metadata_rewrite::MetadataWriteRequest {
                     final_path: &task.download_path,
                     embed_path: Some(part),
+                    expected_embed_fingerprint: None,
                     sidecar_path: None,
                     payload: Arc::clone(&task.metadata),
                     created_local: task.created_local,
@@ -3326,6 +3327,7 @@ async fn download_single_task<C: super::file::DownloadClient>(
             metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
                 final_path: &task.download_path,
                 embed_path: None,
+                expected_embed_fingerprint: None,
                 sidecar_path: Some(&task.download_path),
                 payload: Arc::clone(&task.metadata),
                 created_local: task.created_local,

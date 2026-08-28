@@ -283,7 +283,16 @@ Before publication, validation confirms that every construction-method-0 item
 other than the resolved XMP packet, and every opaque `meta` sub-box, remains
 byte-identical, and that re-reading the rewritten file resolves the packet just
 written, allowing for the space padding an in-place replacement leaves in the
-reused extent. The replacement file retains the source permissions.
+reused extent. Each attempt exclusively creates a unique sibling and replaces
+the source only while an atomic exchange proves the displaced bytes still
+match the input fingerprint. Metadata-only retries also pass the checksum-gate
+fingerprint into the writer, closing the interval between catalogue validation
+and the writer's read. Existing regular files and links at candidate temporary
+paths remain untouched. Safe pre-exchange failures remove only the uniquely
+owned prepared file. Concurrent edits preserve the source and its catalogue
+checksum evidence, keep the durable rewrite marker, and leave any ambiguously
+displaced entry at its reported sibling path. The replacement file retains the
+source permissions.
 
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active
@@ -399,6 +408,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
+| `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite uses an exclusively created unique sibling and replaces the media only while the destination still matches the initially read bytes. Failure preserves concurrent edits and durable retry evidence. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
