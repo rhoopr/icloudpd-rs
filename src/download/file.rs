@@ -689,7 +689,6 @@ async fn replace_file_if_unchanged(
     .map_err(std::io::Error::other)?
 }
 
-#[cfg(feature = "xmp")]
 pub(super) fn publish_file_if_unchanged_blocking(
     part_path: &Path,
     final_path: &Path,

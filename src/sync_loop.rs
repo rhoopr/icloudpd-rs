@@ -1081,6 +1081,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             skip_created_after,
             metadata: config.metadata,
             refresh_metadata: config.runtime.refresh_metadata,
+            capture_timestamp_repair,
             repair_truncated: config.runtime.repair_truncated,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
@@ -5114,6 +5115,7 @@ mod tests {
                         id,
                         newer,
                         true,
+                        false,
                         state::METADATA_CAPTURE_REVISION,
                     )
                     .await?;
@@ -5713,6 +5715,7 @@ mod tests {
             asset_id: &str,
             metadata: &state::AssetMetadata,
             mark_for_rewrite: bool,
+            mark_capture_repair: bool,
             capture_revision: i64,
         ) -> Result<usize, state::error::StateError> {
             if self.fail_refresh_downloaded_metadata {
@@ -5726,6 +5729,7 @@ mod tests {
                     asset_id,
                     metadata,
                     mark_for_rewrite,
+                    mark_capture_repair,
                     capture_revision,
                 )
                 .await
@@ -5762,14 +5766,52 @@ mod tests {
                 .await
         }
 
-        async fn clear_metadata_write_failure(
+        async fn get_pending_metadata_rewrites_page_for_queue(
             &self,
-            library: &str,
-            asset_id: &str,
-            version_size: &str,
-        ) -> Result<(), state::error::StateError> {
+            queue: state::db::MetadataRewriteQueue,
+            library_scope: Option<&[&str]>,
+            offset: usize,
+            limit: usize,
+        ) -> Result<Vec<state::db::PendingMetadataRewrite>, state::error::StateError> {
+            if offset == 0 {
+                self.drains
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.inner
-                .clear_metadata_write_failure(library, asset_id, version_size)
+                .get_pending_metadata_rewrites_page_for_queue(queue, library_scope, offset, limit)
+                .await
+        }
+
+        async fn record_capture_repair_prepared(
+            &self,
+            pending: &state::db::PendingMetadataRewrite,
+            output_checksum: &str,
+            output_size: u64,
+        ) -> Result<Option<state::db::CaptureRepairReceipt>, state::error::StateError> {
+            self.inner
+                .record_capture_repair_prepared(pending, output_checksum, output_size)
+                .await
+        }
+
+        async fn finish_metadata_rewrite(
+            &self,
+            pending: &state::db::PendingMetadataRewrite,
+            selected_queue: state::db::MetadataRewriteQueue,
+            local_checksum: Option<&str>,
+            pre_rewrite_checksum: Option<&str>,
+            completion: state::db::MetadataRewriteCompletion,
+        ) -> Result<bool, state::error::StateError> {
+            if self.fail_metadata_checksum_write {
+                return Err(state::error::StateError::LockPoisoned(self.message.into()));
+            }
+            self.inner
+                .finish_metadata_rewrite(
+                    pending,
+                    selected_queue,
+                    local_checksum,
+                    pre_rewrite_checksum,
+                    completion,
+                )
                 .await
         }
 

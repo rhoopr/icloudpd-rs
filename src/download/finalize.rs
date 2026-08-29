@@ -25,6 +25,7 @@ pub(super) struct PendingStateWrite {
     pub(super) download_path: PathBuf,
     pub(super) local_checksum: String,
     pub(super) download_checksum: Option<String>,
+    pub(super) mark_capture_repair: bool,
 }
 
 /// Maximum retry attempts for deferred state writes.
@@ -61,18 +62,20 @@ pub(super) async fn finalize_downloaded<D>(
     local_checksum: String,
     download_checksum: Option<String>,
     exif_ok: bool,
+    mark_capture_repair: bool,
 ) -> DownloadedFinalization
 where
     D: DownloadFinalizationStore + ?Sized,
 {
     match db
-        .mark_downloaded(
+        .mark_downloaded_with_capture_repair(
             library,
             &task.asset_id,
             task.version_size.as_str(),
             &task.download_path,
             &local_checksum,
             download_checksum.as_deref(),
+            mark_capture_repair,
         )
         .await
     {
@@ -95,6 +98,7 @@ where
                 download_path: task.download_path.clone(),
                 local_checksum,
                 download_checksum,
+                mark_capture_repair,
             },
             error,
         },
@@ -170,13 +174,14 @@ where
 
     for attempt in 1..=STATE_WRITE_MAX_RETRIES {
         match db
-            .mark_downloaded(
+            .mark_downloaded_with_capture_repair(
                 &write.library,
                 &write.asset_id,
                 write.version_size.as_str(),
                 &write.download_path,
                 &write.local_checksum,
                 write.download_checksum.as_deref(),
+                write.mark_capture_repair,
             )
             .await
         {
@@ -383,6 +388,7 @@ mod tests {
             "local_checksum".to_string(),
             Some("download_checksum".to_string()),
             true,
+            false,
         )
         .await;
 
@@ -401,6 +407,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_downloaded_requeues_capture_repair_for_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("capture-replacement.jpg");
+        write_file(&path).await;
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_pending(&db, "FINAL_CAPTURE", "capture-replacement.jpg").await;
+
+        let result = finalize_downloaded(
+            &db,
+            &Arc::from(LIBRARY),
+            &task("FINAL_CAPTURE", path),
+            "replacement_checksum".to_string(),
+            None,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(matches!(result, DownloadedFinalization::Persisted));
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                crate::state::db::MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].asset.id.as_ref(), "FINAL_CAPTURE");
+        assert_eq!(
+            pending[0].asset.local_checksum.as_deref(),
+            Some("replacement_checksum")
+        );
+    }
+
+    #[tokio::test]
     async fn finalize_downloaded_failure_defers_write() {
         let path = TempDir::new().unwrap().path().join("missing-row.jpg");
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -412,6 +455,7 @@ mod tests {
             "local_checksum".to_string(),
             None,
             true,
+            false,
         )
         .await;
 
@@ -424,6 +468,7 @@ mod tests {
         assert_eq!(write.download_path, path);
         assert_eq!(write.local_checksum, "local_checksum");
         assert_eq!(write.download_checksum, None);
+        assert!(!write.mark_capture_repair);
     }
 
     #[tokio::test]
@@ -440,6 +485,7 @@ mod tests {
             &task("FINAL_REWRITE", path),
             "local_checksum".to_string(),
             None,
+            false,
             false,
         )
         .await;

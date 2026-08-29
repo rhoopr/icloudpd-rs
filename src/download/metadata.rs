@@ -30,7 +30,6 @@ use xmp_toolkit::{
 
 #[cfg(feature = "xmp")]
 use super::heif;
-use crate::fs_util::atomic_install;
 
 /// Custom XMP namespace for kei-specific fields that don't fit standard
 /// schemas (`hidden`, `archived`, `mediaSubtype`, `burstId`). Consumers that
@@ -49,6 +48,7 @@ const KEI_MANAGED_FIELDS: &str = "managedFields";
 
 #[cfg(feature = "xmp")]
 static HEIF_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EMBED_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "xmp")]
 static SIDECAR_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1140,10 +1140,12 @@ impl MetadataWrite {
 /// back to extension-based dispatch only when the read itself fails, so
 /// callers operating on a transient/unreadable file degrade to today's
 /// behavior rather than spuriously routing everything to XMP Toolkit.
+#[cfg(test)]
 pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
     apply_metadata_with_expected_fingerprint(path, write, temp_suffix, None).map(|_| ())
 }
 
+#[cfg(test)]
 pub(super) fn apply_metadata_with_expected_fingerprint(
     path: &Path,
     write: &MetadataWrite,
@@ -1154,10 +1156,23 @@ pub(super) fn apply_metadata_with_expected_fingerprint(
         return Ok(None);
     }
     #[cfg(not(feature = "xmp"))]
-    let _ = expected_fingerprint;
+    if !is_embed_writable_path(path) {
+        return Ok(None);
+    }
+    prepare_metadata_with_expected_fingerprint(path, write, temp_suffix, expected_fingerprint)?
+        .publish(path)
+        .map(Some)
+}
+
+pub(super) fn prepare_metadata_with_expected_fingerprint(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+) -> Result<PreparedMetadataFile> {
     #[cfg(not(feature = "xmp"))]
     {
-        apply_metadata_native(path, write, temp_suffix).map(|_| None)
+        prepare_metadata_native(path, write, temp_suffix, expected_fingerprint)
     }
     #[cfg(feature = "xmp")]
     let is_heif = if let Some(expected) = expected_fingerprint {
@@ -1190,37 +1205,28 @@ pub(super) fn apply_metadata_with_expected_fingerprint(
     };
     #[cfg(feature = "xmp")]
     if is_heif {
-        apply_metadata_heif(path, write, temp_suffix, expected_fingerprint).map(Some)
+        prepare_metadata_heif(path, write, temp_suffix, expected_fingerprint)
     } else {
-        apply_metadata_xmp_toolkit(path, write, temp_suffix).map(|_| None)
+        prepare_metadata_xmp_toolkit(path, write, temp_suffix, expected_fingerprint)
     }
 }
 
-#[cfg(feature = "xmp")]
-fn apply_metadata_heif(
-    path: &Path,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
-) -> Result<super::file::ExistingFileFingerprint> {
-    apply_metadata_heif_with_installer(
-        path,
-        write,
-        temp_suffix,
-        expected_fingerprint,
-        |tmp, dst, expected, expected_replacement| {
-            // CONTRACT: HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT
-            super::file::publish_file_if_unchanged_blocking(
-                tmp,
-                dst,
-                expected,
-                expected_replacement,
-            )
-        },
+fn publish_prepared_embed(
+    temp_path: &Path,
+    final_path: &Path,
+    expected: super::file::ExistingFileFingerprint,
+    expected_replacement: super::file::ExistingFileFingerprint,
+) -> anyhow::Result<()> {
+    // CONTRACT: METADATA_EMBED_REWRITE_REQUIRES_STABLE_INPUT
+    super::file::publish_file_if_unchanged_blocking(
+        temp_path,
+        final_path,
+        expected,
+        expected_replacement,
     )
 }
 
-#[cfg(feature = "xmp")]
+#[cfg(all(feature = "xmp", test))]
 fn apply_metadata_heif_with_installer(
     path: &Path,
     write: &MetadataWrite,
@@ -1233,8 +1239,20 @@ fn apply_metadata_heif_with_installer(
         super::file::ExistingFileFingerprint,
     ) -> anyhow::Result<()>,
 ) -> Result<super::file::ExistingFileFingerprint> {
+    prepare_metadata_heif(path, write, temp_suffix, expected_fingerprint)?
+        .publish_with(path, install)
+}
+
+#[cfg(feature = "xmp")]
+fn prepare_metadata_heif(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+) -> Result<PreparedMetadataFile> {
     use std::io::Read;
 
+    // CONTRACT: HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT
     ensure_initialized();
     let mut source = std::fs::File::open(path)
         .with_context(|| format!("Could not open {} for HEIC XMP update", path.display()))?;
@@ -1303,7 +1321,11 @@ fn apply_metadata_heif_with_installer(
     let rewrite_input = native_input.as_deref().unwrap_or(&input);
 
     let (file, tmp_path) = create_unique_heif_temp(path, temp_suffix)?;
-    let guard = TmpGuard::new(&tmp_path);
+    let cleanup_permissions = file
+        .metadata()
+        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
+        .permissions();
+    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
     let mut writer = std::io::BufWriter::new(file);
     heif::rewrite_xmp(rewrite_input, &xmp, &mut writer)
         .with_context(|| format!("Could not update XMP in {}", path.display()))?;
@@ -1384,44 +1406,16 @@ fn apply_metadata_heif_with_installer(
             rewritten_xmp.len()
         );
     }
-    let temp_permissions = file
-        .metadata()
-        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
-        .permissions();
     file.set_permissions(source_permissions)
         .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
     file.sync_all()
         .with_context(|| format!("Could not fsync permissions on {}", tmp_path.display()))?;
     drop(file);
-    if let Err(install_error) = install(&tmp_path, path, expected, rewritten_fingerprint) {
-        let disposition = super::file::classify_conditional_publish_error(&install_error);
-        if disposition
-            .retained_paths
-            .iter()
-            .any(|displaced| displaced == &tmp_path)
-        {
-            guard.disarm();
-        } else if tmp_path.exists()
-            && let Err(permission_error) = std::fs::set_permissions(&tmp_path, temp_permissions)
-        {
-            guard.disarm();
-            anyhow::bail!(
-                "Could not install HEIC metadata update {} -> {}: {install_error:#}; could not restore temporary permissions for safe cleanup: {permission_error}. The temporary path was retained.",
-                tmp_path.display(),
-                path.display()
-            );
-        }
-        return Err(install_error).with_context(|| {
-            format!(
-                "Could not install HEIC metadata update {} -> {}",
-                tmp_path.display(),
-                path.display()
-            )
-        });
-    }
-    guard.disarm();
-    tracing::debug!(path = %path.display(), "Applied HEIC XMP metadata");
-    Ok(rewritten_fingerprint)
+    Ok(PreparedMetadataFile {
+        guard,
+        expected_input: expected,
+        expected_output: rewritten_fingerprint,
+    })
 }
 
 /// Read the first 12 bytes of `path` and dispatch to [`heif::is_heif_content`].
@@ -1488,13 +1482,13 @@ pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
     }
 }
 
+#[cfg(all(test, feature = "xmp"))]
 fn temp_path_for(path: &Path, temp_suffix: &str) -> PathBuf {
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(temp_suffix);
     path.with_file_name(tmp_name)
 }
 
-#[cfg(feature = "xmp")]
 fn fingerprint_bytes(bytes: &[u8]) -> Result<super::file::ExistingFileFingerprint> {
     use sha2::{Digest, Sha256};
 
@@ -1502,6 +1496,47 @@ fn fingerprint_bytes(bytes: &[u8]) -> Result<super::file::ExistingFileFingerprin
         size: u64::try_from(bytes.len()).context("Metadata source is too large to fingerprint")?,
         sha256: Sha256::digest(bytes).into(),
     })
+}
+
+fn embed_temp_path(path: &Path, temp_suffix: &str, sequence: u64) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".kei-metadata-{}-{sequence}{temp_suffix}",
+        std::process::id()
+    ))
+}
+
+fn create_unique_embed_temp(path: &Path, temp_suffix: &str) -> Result<(std::fs::File, PathBuf)> {
+    create_unique_embed_temp_with_sequence(path, temp_suffix, || {
+        EMBED_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+fn create_unique_embed_temp_with_sequence(
+    path: &Path,
+    temp_suffix: &str,
+    mut next_sequence: impl FnMut() -> u64,
+) -> Result<(std::fs::File, PathBuf)> {
+    loop {
+        let candidate = embed_temp_path(path, temp_suffix, next_sequence());
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not create temporary embedded metadata file {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 #[cfg(feature = "xmp")]
@@ -1792,14 +1827,28 @@ fn apply_to_owned_sidecar(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_tool
 /// Remove the tmp file on drop unless disarmed. Protects metadata temp files
 /// against panics or writer failures; no orphan sweep matches this suffix.
 #[derive(Debug)]
-struct TmpGuard<'a> {
-    path: &'a Path,
+struct TmpGuard {
+    path: PathBuf,
     armed: bool,
+    cleanup_permissions: Option<std::fs::Permissions>,
 }
 
-impl<'a> TmpGuard<'a> {
-    fn new(path: &'a Path) -> Self {
-        Self { path, armed: true }
+impl TmpGuard {
+    #[cfg(any(test, feature = "xmp"))]
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            armed: true,
+            cleanup_permissions: None,
+        }
+    }
+
+    fn with_cleanup_permissions(path: &Path, permissions: std::fs::Permissions) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            armed: true,
+            cleanup_permissions: Some(permissions),
+        }
     }
 
     fn disarm(mut self) {
@@ -1807,29 +1856,127 @@ impl<'a> TmpGuard<'a> {
     }
 }
 
-impl Drop for TmpGuard<'_> {
+impl Drop for TmpGuard {
     fn drop(&mut self) {
         if self.armed {
-            crate::fs_util::log_remove(self.path);
+            if self.path.exists()
+                && let Some(permissions) = self.cleanup_permissions.take()
+                && let Err(error) = std::fs::set_permissions(&self.path, permissions)
+            {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "Could not restore temporary metadata permissions for cleanup; retaining file"
+                );
+                return;
+            }
+            crate::fs_util::log_remove(&self.path);
         }
     }
 }
 
-#[cfg(feature = "xmp")]
-fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
-    apply_metadata_xmp_toolkit_with_installer(path, write, temp_suffix, atomic_install)
+pub(super) struct PreparedMetadataFile {
+    guard: TmpGuard,
+    expected_input: super::file::ExistingFileFingerprint,
+    expected_output: super::file::ExistingFileFingerprint,
 }
 
-#[cfg(feature = "xmp")]
+impl PreparedMetadataFile {
+    pub(super) fn output_fingerprint(&self) -> super::file::ExistingFileFingerprint {
+        self.expected_output
+    }
+
+    pub(super) fn publish(self, final_path: &Path) -> Result<super::file::ExistingFileFingerprint> {
+        self.publish_with(final_path, publish_prepared_embed)
+    }
+
+    fn publish_with(
+        self,
+        final_path: &Path,
+        install: impl FnOnce(
+            &Path,
+            &Path,
+            super::file::ExistingFileFingerprint,
+            super::file::ExistingFileFingerprint,
+        ) -> anyhow::Result<()>,
+    ) -> Result<super::file::ExistingFileFingerprint> {
+        let Self {
+            guard,
+            expected_input,
+            expected_output,
+        } = self;
+        let temp_path = guard.path.clone();
+        if let Err(error) = install(&temp_path, final_path, expected_input, expected_output) {
+            let disposition = super::file::classify_conditional_publish_error(&error);
+            if disposition
+                .retained_paths
+                .iter()
+                .any(|retained| retained == &temp_path)
+            {
+                guard.disarm();
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "Could not install metadata update {} -> {}",
+                    temp_path.display(),
+                    final_path.display()
+                )
+            });
+        }
+        guard.disarm();
+        Ok(expected_output)
+    }
+}
+
+#[cfg(all(feature = "xmp", test))]
 fn apply_metadata_xmp_toolkit_with_installer(
     path: &Path,
     write: &MetadataWrite,
     temp_suffix: &str,
-    install: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<()> {
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+    install: impl FnOnce(
+        &Path,
+        &Path,
+        super::file::ExistingFileFingerprint,
+        super::file::ExistingFileFingerprint,
+    ) -> anyhow::Result<()>,
+) -> Result<super::file::ExistingFileFingerprint> {
+    prepare_metadata_xmp_toolkit(path, write, temp_suffix, expected_fingerprint)?
+        .publish_with(path, install)
+}
+
+#[cfg(feature = "xmp")]
+fn prepare_metadata_xmp_toolkit(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+) -> Result<PreparedMetadataFile> {
     ensure_initialized();
 
-    let tmp_path = temp_path_for(path, temp_suffix);
+    let expected = super::file::fingerprint_regular_file_snapshot_blocking(path)
+        .with_context(|| {
+            format!(
+                "Could not fingerprint {} for metadata update",
+                path.display()
+            )
+        })?
+        .fingerprint;
+    if expected_fingerprint.is_some_and(|approved| approved != expected) {
+        return Err(
+            super::file::ConditionalPublishTargetChanged::AfterPlanning {
+                path: path.to_path_buf(),
+            }
+            .into(),
+        );
+    }
+    let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
+    let cleanup_permissions = file
+        .metadata()
+        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
+        .permissions();
+    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
+    drop(file);
     std::fs::copy(path, &tmp_path).with_context(|| {
         format!(
             "Could not copy {} to {}",
@@ -1837,8 +1984,17 @@ fn apply_metadata_xmp_toolkit_with_installer(
             tmp_path.display()
         )
     })?;
-
-    let guard = TmpGuard::new(&tmp_path);
+    let copied = super::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
+        .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
+        .fingerprint;
+    if copied != expected {
+        return Err(
+            super::file::ConditionalPublishTargetChanged::AfterPlanning {
+                path: path.to_path_buf(),
+            }
+            .into(),
+        );
+    }
 
     let result: Result<()> = (|| {
         let mut file = XmpFile::new().context("Could not create XMP handle")?;
@@ -1867,28 +2023,76 @@ fn apply_metadata_xmp_toolkit_with_installer(
     })();
 
     result?;
-    install(&tmp_path, path).with_context(|| {
-        format!(
-            "Could not install metadata update {} -> {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-    guard.disarm();
-    tracing::debug!(path = %path.display(), "Applied metadata");
-    Ok(())
+    let temp = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&tmp_path)
+        .with_context(|| {
+            format!(
+                "Could not reopen {} after metadata update",
+                tmp_path.display()
+            )
+        })?;
+    temp.sync_all()
+        .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
+    drop(temp);
+    let output = super::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
+        .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
+        .fingerprint;
+    Ok(PreparedMetadataFile {
+        guard,
+        expected_input: expected,
+        expected_output: output,
+    })
+}
+
+#[cfg(all(not(feature = "xmp"), test))]
+fn apply_metadata_native_with_installer(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+    install: impl FnOnce(
+        &Path,
+        &Path,
+        super::file::ExistingFileFingerprint,
+        super::file::ExistingFileFingerprint,
+    ) -> anyhow::Result<()>,
+) -> Result<super::file::ExistingFileFingerprint> {
+    prepare_metadata_native(path, write, temp_suffix, expected_fingerprint)?
+        .publish_with(path, install)
 }
 
 #[cfg(not(feature = "xmp"))]
-fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
+fn prepare_metadata_native(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
+) -> Result<PreparedMetadataFile> {
     let input = std::fs::read(path)
         .with_context(|| format!("Could not read {} for native EXIF update", path.display()))?;
+    let expected = fingerprint_bytes(&input)?;
+    if expected_fingerprint.is_some_and(|approved| approved != expected) {
+        return Err(
+            super::file::ConditionalPublishTargetChanged::AfterPlanning {
+                path: path.to_path_buf(),
+            }
+            .into(),
+        );
+    }
+    let source_permissions = std::fs::metadata(path)
+        .with_context(|| format!("Could not inspect permissions of {}", path.display()))?
+        .permissions();
     let Some(file_type) = native_file_type(&input, path) else {
         tracing::debug!(
             path = %path.display(),
             "Native EXIF writer supports JPEG/TIFF only; skipping metadata write"
         );
-        return Ok(());
+        anyhow::bail!(
+            "Native EXIF writer does not support embedded metadata in {}",
+            path.display()
+        );
     };
 
     let mut metadata = match Metadata::new_from_vec(&input, file_type) {
@@ -1957,23 +2161,33 @@ fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) 
     metadata
         .write_to_vec(&mut output, file_type)
         .with_context(|| format!("Could not write native EXIF into {}", path.display()))?;
-    let tmp_path = temp_path_for(path, temp_suffix);
-    std::fs::write(&tmp_path, &output).with_context(|| {
+    let output_fingerprint = fingerprint_bytes(&output)?;
+    let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
+    let cleanup_permissions = file
+        .metadata()
+        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
+        .permissions();
+    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
+    let mut writer = std::io::BufWriter::new(file);
+    std::io::Write::write_all(&mut writer, &output).with_context(|| {
         format!(
             "Could not write native EXIF temp file {}",
             tmp_path.display()
         )
     })?;
-    let guard = TmpGuard::new(&tmp_path);
-    atomic_install(&tmp_path, path).with_context(|| {
-        format!(
-            "Could not install native EXIF update for {}",
-            path.display()
-        )
-    })?;
-    guard.disarm();
-    tracing::debug!(path = %path.display(), "Applied native EXIF metadata");
-    Ok(())
+    let file = writer
+        .into_inner()
+        .with_context(|| format!("Could not flush {}", tmp_path.display()))?;
+    file.set_permissions(source_permissions)
+        .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
+    drop(file);
+    Ok(PreparedMetadataFile {
+        guard,
+        expected_input: expected,
+        expected_output: output_fingerprint,
+    })
 }
 
 #[cfg(not(feature = "xmp"))]
@@ -3226,14 +3440,15 @@ mod tests {
                 ..MetadataWrite::default()
             },
             ".meta-tmp",
-            move |tmp, dst| {
+            None,
+            move |tmp, dst, _expected, _replacement| {
                 install_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
                 assert!(
                     tmp.exists(),
                     "metadata temp file must exist before durable install"
                 );
                 assert_eq!(dst, expected_path.as_path());
-                Err(std::io::Error::other("simulated durable install failure"))
+                Err(std::io::Error::other("simulated durable install failure").into())
             },
         );
 
@@ -3251,10 +3466,36 @@ mod tests {
             "failed metadata publish must leave original bytes intact"
         );
         assert!(
-            !path.with_file_name("durable_install.jpg.meta-tmp").exists(),
+            embed_temp_entries(&dir, ".meta-tmp").is_empty(),
             "metadata temp file must be cleaned up on durable install failure"
         );
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn contract_metadata_embed_rewrite_requires_stable_input() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "concurrent_edit.jpg");
+        let external = b"external edit".to_vec();
+
+        let result = apply_metadata_xmp_toolkit_with_installer(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            None,
+            |src, dst, expected, expected_replacement| {
+                fs::write(dst, &external)?;
+                publish_prepared_embed(src, dst, expected, expected_replacement)
+            },
+        );
+
+        let error = result.expect_err("a concurrent edit must block metadata publication");
+        assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
+        assert_eq!(fs::read(&path).unwrap(), external);
+        assert!(embed_temp_entries(&dir, ".meta-tmp").is_empty());
     }
 
     #[test]
@@ -3348,6 +3589,39 @@ mod tests {
                 (name.starts_with(&prefix) && name.ends_with(temp_suffix)).then(|| entry.path())
             })
             .collect()
+    }
+
+    fn embed_temp_entries(dir: &Path, temp_suffix: &str) -> Vec<PathBuf> {
+        let prefix = format!(".kei-metadata-{}-", std::process::id());
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with(&prefix) && name.ends_with(temp_suffix)).then(|| entry.path())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_unique_embed_temp_preserves_regular_file_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        let collision = embed_temp_path(&path, ".meta-tmp", 31);
+        let unique = embed_temp_path(&path, ".meta-tmp", 32);
+        fs::write(&collision, b"unrelated bytes").unwrap();
+        let mut sequences = [31, 32].into_iter();
+
+        let (file, created) = create_unique_embed_temp_with_sequence(&path, ".meta-tmp", || {
+            sequences.next().unwrap()
+        })
+        .unwrap();
+        drop(file);
+
+        assert_eq!(created, unique);
+        assert_eq!(fs::read(&collision).unwrap(), b"unrelated bytes");
+        fs::remove_file(created).unwrap();
     }
 
     #[test]
@@ -5280,6 +5554,31 @@ mod native_tests {
             first_unknown_int16(&metadata, WINDOWS_RATING_PERCENT_TAG),
             Some(99)
         );
+    }
+
+    #[test]
+    fn native_metadata_rewrite_refuses_concurrent_target_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_jpeg(dir.path(), "native-concurrent.jpg");
+        let external = b"external native edit";
+
+        let result = apply_metadata_native_with_installer(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+            None,
+            |src, dst, expected, expected_replacement| {
+                fs::write(dst, external)?;
+                publish_prepared_embed(src, dst, expected, expected_replacement)
+            },
+        );
+
+        let error = result.expect_err("a concurrent edit must block native EXIF publication");
+        assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
+        assert_eq!(fs::read(&path).unwrap(), external);
     }
 
     #[test]

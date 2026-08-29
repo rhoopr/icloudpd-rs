@@ -183,7 +183,10 @@ and its offsets together through the stable-input publication path. For HEIF
 media, an existing native Exif timestamp is patched in place with its paired
 offset before XMP is written; ambiguous, shared, or unsupported native layouts
 remain pending. Normal downloads and ordinary metadata refreshes still preserve
-an existing timestamp.
+an existing timestamp. Capture repair is separate durable debt, so an ordinary
+metadata drain cannot retire it. If ordinary embedded metadata would change the
+same media while capture debt is pending, that embed waits for the explicit
+repair; verified no-write and sidecar-only work may complete independently.
 
 ### Durable pending retry
 
@@ -292,16 +295,16 @@ Before publication, validation confirms that every construction-method-0 item
 other than the resolved XMP packet, and every opaque `meta` sub-box, remains
 byte-identical, and that re-reading the rewritten file resolves the packet just
 written, allowing for the space padding an in-place replacement leaves in the
-reused extent. Each attempt exclusively creates a unique sibling and replaces
-the source only while an atomic exchange proves the displaced bytes still
-match the input fingerprint. Metadata-only retries also pass the checksum-gate
-fingerprint into the writer, closing the interval between catalogue validation
-and the writer's read. Existing regular files and links at candidate temporary
-paths remain untouched. Safe pre-exchange failures remove only the uniquely
-owned prepared file. Concurrent edits preserve the source and its catalogue
-checksum evidence, keep the durable rewrite marker, and leave any ambiguously
-displaced entry at its reported sibling path. The replacement file retains the
-source permissions.
+reused extent. Every embedded writer exclusively creates a unique sibling and
+replaces the source only while an atomic exchange proves the displaced bytes
+and prepared replacement still match their approved fingerprints. Metadata-only
+retries also pass the checksum-gate fingerprint into the writer, closing the
+interval between catalogue validation and the writer's read. Existing regular
+files and links at candidate temporary paths remain untouched. Safe pre-exchange
+failures remove only the uniquely owned prepared file. Concurrent edits preserve
+the source and its catalogue checksum evidence, keep the durable rewrite marker,
+and leave any ambiguously displaced entry at its reported sibling path. The
+replacement file retains the source permissions.
 
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active
@@ -378,6 +381,21 @@ retires, and the pre-rewrite hash is kept as the provider download checksum so
 reconcile can still tell an intentional rewrite from a truncated file. A
 retired marker therefore implies the row describes the bytes on disk.
 
+Capture timestamp repair records the current provider metadata hash as durable
+intent. Before publishing changed media, it records the exact prepared output
+checksum and size. If publication succeeds but state finalization is
+interrupted, a later explicit repair can recognize that exact output and finish
+the checksum transition without trusting unrelated bytes. Input bytes matching
+neither the recorded local checksum nor the prepared receipt remain drifted.
+Provider metadata updates that would invalidate a prepared receipt remain
+retryable until the published bytes are finalised in state. Source-deletion
+transitions follow the same rule so a tombstone cannot hide the only proof of
+published repair bytes.
+Provider-version or non-metadata file replacement invalidates the repair state;
+byte-identical re-adoption preserves it. When replacement or adoption occurs
+during the explicit repair run, downloaded-state finalization creates fresh
+pending repair debt for the installed checksum.
+
 A rewrite whose result could not be measured records the checksum as unknown
 rather than leaving the superseded value in place, because a known-stale hash
 would make the next pass read kei's own rewrite as damage and refuse it. A row
@@ -419,6 +437,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/download/retry.rs` | Inconclusive provider identity retains the pending row and records verification evidence. |
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
+| `METADATA_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | Every embedded metadata rewrite prepares a uniquely owned sibling and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
 | `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite uses an exclusively created unique sibling and replaces the media only while the destination still matches the initially read bytes. Failure preserves concurrent edits and durable retry evidence. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
