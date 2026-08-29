@@ -222,11 +222,27 @@ fn ensure_initialized() {
 /// probes merge XMP with the standalone Exif item. Other formats use XMP
 /// Toolkit in default builds or native EXIF without the `xmp` feature.
 #[derive(Debug, Clone, Default)]
+pub(super) enum HeifNativeCaptureTime {
+    #[default]
+    NotApplicable,
+    #[cfg(feature = "xmp")]
+    Missing,
+    #[cfg(feature = "xmp")]
+    Present {
+        datetime_original: Option<String>,
+        offset_time_original: Option<String>,
+    },
+    #[cfg(feature = "xmp")]
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ExifProbe {
     pub(crate) datetime_original: Option<String>,
     pub(crate) offset_time_original: Option<String>,
     pub(crate) has_other_datetime_offset: bool,
     pub(crate) has_gps: bool,
+    pub(super) native_heif_capture_time: HeifNativeCaptureTime,
 }
 
 impl ExifProbe {
@@ -250,6 +266,44 @@ impl ExifProbe {
         };
         wall_clock == created_local.naive_local()
             && zone.is_none_or(|zone| zone == *created_local.offset())
+    }
+
+    pub(crate) fn native_heif_capture_time_repair_required(
+        &self,
+        created_local: &DateTime<FixedOffset>,
+        expected_offset: &str,
+    ) -> std::result::Result<Option<bool>, &'static str> {
+        #[cfg(not(feature = "xmp"))]
+        let _ = (created_local, expected_offset);
+        match &self.native_heif_capture_time {
+            HeifNativeCaptureTime::NotApplicable => Ok(None),
+            #[cfg(feature = "xmp")]
+            HeifNativeCaptureTime::Missing => Err("HEIF file has no native Exif item"),
+            #[cfg(feature = "xmp")]
+            HeifNativeCaptureTime::Unreadable => Err("HEIF native Exif item is unreadable"),
+            #[cfg(feature = "xmp")]
+            HeifNativeCaptureTime::Present {
+                datetime_original: None,
+                ..
+            } => Err("HEIF native Exif item has no DateTimeOriginal"),
+            #[cfg(feature = "xmp")]
+            HeifNativeCaptureTime::Present {
+                offset_time_original: None,
+                ..
+            } => Err("HEIF native Exif item has no OffsetTimeOriginal"),
+            #[cfg(feature = "xmp")]
+            HeifNativeCaptureTime::Present {
+                datetime_original: Some(datetime),
+                offset_time_original: Some(offset),
+            } => {
+                let denotes_capture_time =
+                    parse_capture_timestamp(datetime).is_some_and(|(wall_clock, zone)| {
+                        wall_clock == created_local.naive_local()
+                            && zone.is_none_or(|zone| zone == *created_local.offset())
+                    });
+                Ok(Some(!denotes_capture_time || offset != expected_offset))
+            }
+        }
     }
 }
 
@@ -342,6 +396,20 @@ fn probe_exif_heif(path: &Path) -> ExifProbe {
         },
         None => ExifProbe::default(),
     };
+    match heif::extract_exif_capture_time(&bytes) {
+        Ok(Some(capture_time)) => {
+            probe.native_heif_capture_time = HeifNativeCaptureTime::Present {
+                datetime_original: capture_time.datetime_original,
+                offset_time_original: capture_time.offset_time_original,
+            };
+        }
+        Ok(None) => probe.native_heif_capture_time = HeifNativeCaptureTime::Missing,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "Failed to inspect native HEIF Exif capture time");
+            mark_heif_exif_unreadable(&mut probe);
+            return probe;
+        }
+    }
     match heif::extract_exif_tiff_bytes(&bytes) {
         Ok(Some(tiff)) => match Metadata::new_from_vec(&tiff, FileExtension::TIFF) {
             Ok(metadata) => {
@@ -380,6 +448,7 @@ fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
         offset_time_original,
         has_other_datetime_offset,
         has_gps,
+        ..ExifProbe::default()
     }
 }
 
@@ -899,6 +968,7 @@ fn merge_probe(target: &mut ExifProbe, source: ExifProbe) {
 
 #[cfg(feature = "xmp")]
 fn mark_heif_exif_unreadable(probe: &mut ExifProbe) {
+    probe.native_heif_capture_time = HeifNativeCaptureTime::Unreadable;
     probe
         .datetime_original
         .get_or_insert_with(|| "unreadable HEIF Exif item".to_string());
@@ -941,6 +1011,7 @@ fn probe_from_native_metadata(meta: &Metadata) -> ExifProbe {
         offset_time_original,
         has_other_datetime_offset,
         has_gps,
+        ..ExifProbe::default()
     }
 }
 
@@ -1002,6 +1073,8 @@ pub(crate) struct MetadataWrite {
     pub(crate) offset_time_original: Option<String>,
     /// Remove offset tags before writing a replacement timestamp.
     pub(crate) clear_datetime_offsets: bool,
+    /// Require a native HEIF Exif timestamp pair to be updated or verified.
+    pub(crate) require_native_heif_capture_time: bool,
     /// GPS fix timestamp in ISO 8601 UTC form.
     pub(crate) gps_datetime: Option<String>,
     /// GPS receiver speed as an XMP rational in the units named by `gps_speed_ref`.
@@ -1196,11 +1269,43 @@ fn apply_metadata_heif_with_installer(
     };
     apply_to_xmp(&mut meta, write)?;
     let xmp = meta.to_string().into_bytes();
+    let native_input = if write.require_native_heif_capture_time {
+        heif::validate_capture_repair_item_ownership(&input).with_context(|| {
+            format!(
+                "Could not prove HEIC capture metadata belongs only to the primary image in {}",
+                path.display()
+            )
+        })?;
+        let (Some(datetime), Some(offset)) = (
+            write.datetime.as_deref(),
+            write.offset_time_original.as_deref(),
+        ) else {
+            anyhow::bail!(
+                "HEIC capture timestamp repair has no complete timestamp pair for {}",
+                path.display()
+            );
+        };
+        heif::rewrite_exif_capture_time(&input, datetime, offset).with_context(|| {
+            format!(
+                "Could not update native HEIC Exif capture time in {}",
+                path.display()
+            )
+        })?
+    } else {
+        None
+    };
+    if write.require_native_heif_capture_time && native_input.is_none() {
+        anyhow::bail!(
+            "HEIC capture timestamp repair could not update a native Exif timestamp pair in {}",
+            path.display()
+        );
+    }
+    let rewrite_input = native_input.as_deref().unwrap_or(&input);
 
     let (file, tmp_path) = create_unique_heif_temp(path, temp_suffix)?;
     let guard = TmpGuard::new(&tmp_path);
     let mut writer = std::io::BufWriter::new(file);
-    heif::rewrite_xmp(&input, &xmp, &mut writer)
+    heif::rewrite_xmp(rewrite_input, &xmp, &mut writer)
         .with_context(|| format!("Could not update XMP in {}", path.display()))?;
     let file = writer
         .into_inner()
@@ -1212,12 +1317,45 @@ fn apply_metadata_heif_with_installer(
     let rewritten = std::fs::read(&tmp_path)
         .with_context(|| format!("Could not validate {}", tmp_path.display()))?;
     let rewritten_fingerprint = fingerprint_bytes(&rewritten)?;
-    heif::validate_rewrite_preserves_non_xmp_items(&input, &rewritten).with_context(|| {
-        format!(
-            "HEIC metadata rewrite changed non-XMP media data in {}",
-            tmp_path.display()
-        )
-    })?;
+    heif::validate_rewrite_preserves_non_xmp_items(rewrite_input, &rewritten).with_context(
+        || {
+            format!(
+                "HEIC metadata rewrite changed non-XMP media data in {}",
+                tmp_path.display()
+            )
+        },
+    )?;
+    if native_input.is_some() {
+        let native_tiff = heif::extract_exif_tiff_bytes(&rewritten)
+            .with_context(|| {
+                format!(
+                    "Could not inspect rewritten native HEIC Exif in {}",
+                    tmp_path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Rewritten HEIC lost its native Exif item: {}",
+                    tmp_path.display()
+                )
+            })?;
+        let native_metadata = Metadata::new_from_vec(&native_tiff, FileExtension::TIFF)
+            .with_context(|| {
+                format!(
+                    "Could not parse rewritten native HEIC Exif in {}",
+                    tmp_path.display()
+                )
+            })?;
+        let native_probe = probe_from_native_metadata(&native_metadata);
+        if native_probe.datetime_original.as_deref() != write.datetime.as_deref()
+            || native_probe.offset_time_original.as_deref() != write.offset_time_original.as_deref()
+        {
+            anyhow::bail!(
+                "Rewritten HEIC native Exif does not contain the requested capture timestamp and offset: {}",
+                tmp_path.display()
+            );
+        }
+    }
     let Some(rewritten_xmp) = heif::extract_xmp_strict(&rewritten)
         .with_context(|| format!("Could not inspect rewritten XMP in {}", tmp_path.display()))?
     else {
@@ -4659,6 +4797,7 @@ mod tests {
             datetime: Some("2024:06:15 10:00:00".into()),
             offset_time_original: Some("+10:00".into()),
             clear_datetime_offsets: false,
+            require_native_heif_capture_time: false,
             gps_datetime: Some("2024-06-15T10:00:01Z".into()),
             gps_speed: Some(xmp_rational(25, 2)),
             gps_speed_ref: Some("K".into()),

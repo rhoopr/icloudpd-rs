@@ -177,9 +177,13 @@ wall clock left by host-local rendering would assert an instant the asset never
 had. `sync --refresh-metadata --repair-capture-timestamps` explicitly relaxes
 the no-overwrite gate for state-recorded downloaded files. It requires embedded
 datetime output, a usable Apple offset, and bytes that still match the recorded
-checksum. The writer replaces the timestamp and its offsets together through
-the stable-input publication path. Normal downloads and ordinary metadata
-refreshes still preserve an existing timestamp.
+checksum. Rows without that provenance, and files whose embedded format is not
+supported by the active build, remain pending. The writer replaces the timestamp
+and its offsets together through the stable-input publication path. For HEIF
+media, an existing native Exif timestamp is patched in place with its paired
+offset before XMP is written; ambiguous, shared, or unsupported native layouts
+remain pending. Normal downloads and ordinary metadata refreshes still preserve
+an existing timestamp.
 
 ### Durable pending retry
 
@@ -377,8 +381,10 @@ retired marker therefore implies the row describes the bytes on disk.
 A rewrite whose result could not be measured records the checksum as unknown
 rather than leaving the superseded value in place, because a known-stale hash
 would make the next pass read kei's own rewrite as damage and refuse it. A row
-that never recorded a checksum is rewritten but claims no provider download
-hash, so reconcile keeps reporting a file that is short of its provider size.
+that never recorded a checksum is rewritten by ordinary metadata refresh but
+claims no provider download hash, so reconcile keeps reporting a file that is
+short of its provider size. Capture timestamp repair instead leaves that row
+pending because it cannot prove file provenance.
 
 ### State and serialization
 
