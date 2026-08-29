@@ -3882,6 +3882,36 @@ mod tests {
     }
 
     #[test]
+    fn apply_metadata_heic_rejects_conflicting_tone_map_xmp_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflicting_tone_map_xmp.heic");
+        let original = heif::apple_tmap_conflicting_xmp_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+            b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description xmlns:HDRGainMap='http://ns.apple.com/HDRGainMap/1.0/' HDRGainMap:HDRGainMapHeadroom='2.67'/></rdf:RDF></x:xmpmeta>",
+        );
+        fs::write(&path, &original).unwrap();
+
+        let result = apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                ..MetadataWrite::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "conflicting XMP ownership must leave original media bytes untouched"
+        );
+        assert!(
+            embed_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            "a refused rewrite must clean its uniquely owned temp file"
+        );
+    }
+
+    #[test]
     fn apply_metadata_heic_install_failure_leaves_original_intact_and_cleans_temp() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_heic(dir.path(), "install_fault.heic");

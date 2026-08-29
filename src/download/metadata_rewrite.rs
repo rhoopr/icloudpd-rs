@@ -3460,6 +3460,71 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn run_pending_keeps_marker_for_conflicting_tone_map_xmp_ownership() {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("conflicting_tone_map_xmp.heic");
+        let source = crate::download::heif::apple_tmap_conflicting_xmp_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+            b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description xmlns:HDRGainMap='http://ns.apple.com/HDRGainMap/1.0/' HDRGainMap:HDRGainMapHeadroom='2.67'/></rdf:RDF></x:xmpmeta>",
+        );
+        std::fs::write(&photo_path, &source).unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let seeded_checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("CONFLICTING_TMAP_XMP")
+            .filename("conflicting_tone_map_xmp.heic")
+            .checksum("conflicting_tmap_xmp_ck")
+            .size(source.len() as u64)
+            .metadata(AssetMetadata {
+                rating: Some(5),
+                metadata_hash: Some("conflicting_tmap_xmp_hash".to_string()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "CONFLICTING_TMAP_XMP",
+            "original",
+            &photo_path,
+            &seeded_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "CONFLICTING_TMAP_XMP", "original")
+            .await
+            .unwrap();
+
+        let pass = run_pending(
+            &db,
+            MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(pass.applied, 0);
+        assert_eq!(pass.failed, 1);
+        assert_eq!(std::fs::read(&photo_path).unwrap(), source);
+        assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+        let (local_checksum, download_checksum) = stored_checksums(&db).await;
+        assert_eq!(local_checksum.as_deref(), Some(seeded_checksum.as_str()));
+        assert_eq!(download_checksum, None);
+        assert!(
+            !photo_path
+                .with_file_name("conflicting_tone_map_xmp.heic.meta-tmp")
+                .exists()
+        );
+    }
+
     /// If the on-disk file has vanished between tagging and the rewrite
     /// pass, the pass must not error out. The marker stays, so a future
     /// sync that re-downloads the asset re-drives the writer.

@@ -2293,6 +2293,14 @@ fn insertion_described_item_ids(
         }
 
         let references = cdsc_pairs(bytes, iref)?;
+        let xmp_item_ids: HashSet<u32> = iinf.xmp_item_ids.iter().copied().collect();
+        if references.iter().any(|(source, targets)| {
+            xmp_item_ids.contains(source) && targets.contains(tone_map_item_id)
+        }) {
+            return Err(invalid_layout(
+                "HEIC tone-mapped image already has an XMP descriptor",
+            ));
+        }
         if references.iter().any(|(source, targets)| {
             exif_item_ids.contains(source)
                 && targets
@@ -3819,7 +3827,10 @@ fn push_iloc_entry(meta: &mut Meta, loc: ItemLocation) {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{apple_multi_exif_heic, apple_multi_xmp_heic, apple_tmap_insertion_heic};
+pub(crate) use tests::{
+    apple_multi_exif_heic, apple_multi_xmp_heic, apple_tmap_conflicting_xmp_heic,
+    apple_tmap_insertion_heic,
+};
 
 #[cfg(test)]
 mod tests {
@@ -4734,6 +4745,16 @@ mod tests {
         );
         #[cfg(feature = "__fuzz_internals")]
         fuzz_rewrite_xmp_preserves(multi);
+
+        let conflicting = include_bytes!("../../fuzz/seeds/heif_rewrite/conflicting-tmap-xmp");
+        let mut rejected = Vec::new();
+        assert!(rewrite_xmp(conflicting, MARKER, &mut rejected).is_err());
+        assert!(
+            rejected.is_empty(),
+            "conflicting ownership seed must fail before emitting bytes"
+        );
+        #[cfg(feature = "__fuzz_internals")]
+        fuzz_rewrite_xmp_preserves(conflicting);
     }
 
     #[test]
@@ -5753,8 +5774,26 @@ mod tests {
         tone_map_inputs: &[u16],
         exif_targets: &[u16],
     ) -> HeicSpec {
-        let mut spec =
-            apple_multi_xmp_spec(vec![xmp_item(5, aux_xmp)], vec![ref_box(b"cdsc", 5, &[4])]);
+        apple_tmap_insertion_spec_with_xmp_targets(
+            primary_tiff,
+            aux_xmp,
+            &[4],
+            tone_map_inputs,
+            exif_targets,
+        )
+    }
+
+    fn apple_tmap_insertion_spec_with_xmp_targets(
+        primary_tiff: &[u8],
+        aux_xmp: &[u8],
+        xmp_targets: &[u16],
+        tone_map_inputs: &[u16],
+        exif_targets: &[u16],
+    ) -> HeicSpec {
+        let mut spec = apple_multi_xmp_spec(
+            vec![xmp_item(5, aux_xmp)],
+            vec![ref_box(b"cdsc", 5, xmp_targets)],
+        );
         spec.items.push(tone_map_item(7));
         spec.items.push(exif_item(8, primary_tiff));
         spec.iref_children
@@ -5767,6 +5806,16 @@ mod tests {
         build_heic(&apple_tmap_insertion_spec(
             primary_tiff,
             aux_xmp,
+            &[1, 4],
+            &[1, 7],
+        ))
+    }
+
+    pub(crate) fn apple_tmap_conflicting_xmp_heic(primary_tiff: &[u8], aux_xmp: &[u8]) -> Vec<u8> {
+        build_heic(&apple_tmap_insertion_spec_with_xmp_targets(
+            primary_tiff,
+            aux_xmp,
+            &[7],
             &[1, 4],
             &[1, 7],
         ))
@@ -6075,6 +6124,48 @@ mod tests {
                 "{name}"
             );
             assert!(output.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn rewrite_xmp_rejects_existing_xmp_ownership_of_the_tone_map() {
+        let tiff = crate::test_helpers::minimal_tiff_with_source_gps();
+        let mut multiple_descriptors =
+            apple_tmap_insertion_spec_with_xmp_targets(&tiff, AUX_XMP, &[7], &[1, 4], &[1, 7]);
+        multiple_descriptors.items.push(xmp_item(6, AUX_XMP));
+        multiple_descriptors
+            .iref_children
+            .push(ref_box(b"cdsc", 6, &[7]));
+        let cases = [
+            (
+                "tone-map-only XMP",
+                apple_tmap_insertion_spec_with_xmp_targets(&tiff, AUX_XMP, &[7], &[1, 4], &[1, 7]),
+            ),
+            (
+                "multi-target XMP including tone map",
+                apple_tmap_insertion_spec_with_xmp_targets(
+                    &tiff,
+                    AUX_XMP,
+                    &[4, 7],
+                    &[1, 4],
+                    &[1, 7],
+                ),
+            ),
+            ("multiple tone-map XMP descriptors", multiple_descriptors),
+        ];
+
+        for (name, spec) in cases {
+            let input = build_heic(&spec);
+            assert!(
+                extract_xmp_strict(&input).unwrap().is_none(),
+                "{name} must not answer as primary XMP"
+            );
+            let mut output = Vec::new();
+            assert!(
+                rewrite_xmp(&input, MATRIX_XMP, &mut output).is_err(),
+                "{name} must fail closed"
+            );
+            assert!(output.is_empty(), "{name} must emit no bytes");
         }
     }
 

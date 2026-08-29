@@ -289,10 +289,11 @@ XMP and the standalone Exif item associated with the primary image before
 planning datetime or GPS writes. A new XMP item receives a `cdsc` reference
 naming the primary image. When the primary is the first input of one `tmap`
 and its sole Exif descriptor already names exactly the primary and that tone
-map, the XMP receives the same two targets so Apple keeps the HDR rendition.
-Missing, conflicting, additional, or ambiguous relationship evidence fails
-closed. External item data references and top-level boxes whose absolute
-offsets are not adjusted are also rejected.
+map, and no existing XMP item already describes that tone map, the XMP receives
+the same two targets so Apple keeps the HDR rendition. Missing, conflicting,
+additional, or ambiguous relationship or ownership evidence fails closed.
+External item data references and top-level boxes whose absolute offsets are
+not adjusted are also rejected.
 Before publication, validation confirms that every construction-method-0 item
 other than the resolved XMP packet, and every opaque `meta` sub-box, remains
 byte-identical, and that re-reading the rewritten file resolves the packet just
@@ -441,7 +442,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION` | `src/download/retry.rs`, `src/state/db.rs` | Policy-excluded rows become source-deleted only after targeted provider deletion evidence. Present or inconclusive responses retain them outside actionable pending work. |
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
 | `METADATA_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | Every embedded metadata rewrite prepares a uniquely owned sibling and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
-| `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/heif.rs`, `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite accepts tone-map insertion only when `dimg` and primary Exif `cdsc` relationships prove the exact target, prepares a uniquely owned sibling, and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
+| `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/heif.rs`, `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite accepts tone-map insertion only when `dimg` and primary Exif `cdsc` relationships prove the exact target and no existing XMP owns that tone map, prepares a uniquely owned sibling, and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
