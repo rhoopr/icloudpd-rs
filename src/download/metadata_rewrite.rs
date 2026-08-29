@@ -3386,8 +3386,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let photo_path = dir.path().join("rewrite_target.heic");
-        let source = include_bytes!("../../tests/data/sample.heic");
-        std::fs::write(&photo_path, source).unwrap();
+        let source = crate::download::heif::apple_tmap_insertion_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+            b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description xmlns:HDRGainMap='http://ns.apple.com/HDRGainMap/1.0/' HDRGainMap:HDRGainMapHeadroom='2.67'/></rdf:RDF></x:xmpmeta>",
+        );
+        std::fs::write(&photo_path, &source).unwrap();
 
         let db = SqliteStateDb::open_in_memory().unwrap();
         let seeded_checksum = crate::download::file::compute_sha256(&photo_path)
@@ -3420,7 +3423,7 @@ mod tests {
 
         let pass = run_pending(
             &db,
-            MetadataFlags::RATING | MetadataFlags::EMBED_XMP,
+            MetadataFlags::RATING | MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
             Arc::from(".meta-tmp"),
             &CancellationToken::new(),
         )
@@ -3442,6 +3445,10 @@ mod tests {
                 .value,
             5
         );
+        let sidecar = std::fs::read_to_string(photo_path.with_file_name("rewrite_target.heic.xmp"))
+            .expect("read HEIC sidecar");
+        let sidecar: xmp_toolkit::XmpMeta = sidecar.parse().expect("parse HEIC sidecar");
+        crate::test_helpers::assert_source_gps_in_xmp(&sidecar);
 
         let (local_checksum, download_checksum) = stored_checksums(&db).await;
         assert_ne!(local_checksum.as_deref(), Some(seeded_checksum.as_str()));

@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `kei sync --refresh-metadata --repair-capture-timestamps`, an explicit repair for embedded timestamps written before capture-local resolution. It replaces an existing timestamp only for a state-recorded downloaded file with a usable Apple offset, writes the capture-local timestamp and offset together, and keeps ordinary metadata refreshes non-destructive. The command requires `metadata.set_exif_datetime = true` and can overwrite camera-supplied metadata. ([#726])
 - XMP sidecars carry the source photo's GPS fix time, speed, speed reference, and horizontal positioning error from the media's own EXIF alongside the CloudKit
-  location. This includes DNG and other TIFF-based RAW content, and uses the standard `exif:GPSTimeStamp` and `exif:GPSHPositioningError` properties. A photo without
-  readable EXIF still receives its sidecar with the CloudKit metadata. Source EXIF is read without buffering the complete media file. ([#725])
+  location. This includes DNG and other TIFF-based RAW content, and uses the standard `exif:GPSTimeStamp` and `exif:GPSHPositioningError` properties. HEIF files with
+  several Exif items select the one associated with the primary image. A photo without readable EXIF still receives its sidecar with the CloudKit metadata. Source
+  EXIF is read without buffering the complete media file. ([#725])
 
 ### Changed
 
@@ -24,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Headless foreground login and one-shot sync now exit immediately with auth code 3 when 2FA needs operator action. The error prints the `kei login get-code` and `kei login submit-code <CODE>` flow. Watch and service processes keep their durable wait-and-resume behavior. `kei password set` now accepts password-file and password-command sources, and fails before prompting when stdin is not a terminal. ([#698])
-- Embedded XMP writes for HEIC, HEIF, and AVIF files now use a byte-preserving item-map writer. Multi-image files such as HDR and portrait captures carry an XMP packet per image, so kei writes the one describing the primary image and leaves gain map, depth, and matte metadata untouched. Files that require an unproved tone-map association or use external item data fail the metadata write without replacing the media file. Rewritten files retain their existing permissions. ([#558])
+- Embedded XMP writes for HEIC, HEIF, and AVIF files now use a byte-preserving item-map writer. Multi-image files such as HDR and portrait captures carry an XMP packet per image, so kei writes the one describing the primary image and leaves gain map, depth, and matte metadata untouched. A new primary-image packet also describes a tone map when the existing `dimg` and Exif `cdsc` relationships prove that exact scope; ambiguous relationships and external item data fail without replacing the media file. Rewritten files retain their existing permissions. ([#558])
 - A filtered sibling can no longer displace the child that owns a legacy master-keyed state row on the next sync. kei records the owner before planning downloads and reuses it during full sync, incremental sync, and pending retry. ([#721], fixes [#691])
 - A metadata-only iCloud edit (favourite, rating, keywords, caption, GPS) on an unchanged file now refreshes the catalogue during full enumeration and single-pass incremental sync. Changed provider metadata is applied before filtering and path planning, so the refresh reaches every downloaded version of the asset even when its media task is skipped as already on disk or excluded by a filter. The catalogue row and the rewrite marker commit together, so a queued sidecar or EXIF rewrite reads the corrected values instead of replaying stale ones, and no media is re-downloaded. ([#707], refs [#674])
 - A failed catalogue refresh now preserves the previous zone checkpoint instead of advancing past a provider edit that was never stored. ([#707])

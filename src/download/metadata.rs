@@ -2775,6 +2775,10 @@ mod tests {
             ("big-endian.DNG", minimal_big_endian_tiff_with_source_gps()),
             ("source.png", png_with_source_gps()),
             ("source.heic", heic),
+            (
+                "multi-exif.heic",
+                heif::apple_multi_exif_heic(&crate::test_helpers::minimal_tiff_with_source_gps()),
+            ),
         ] {
             let path = dir.path().join(name);
             std::fs::write(&path, bytes).expect("write source media");
