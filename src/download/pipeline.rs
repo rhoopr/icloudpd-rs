@@ -303,6 +303,14 @@ fn pending_filename_matches_derived(pending_filename: &str, derived_filename: &s
         || pending_filename.eq_ignore_ascii_case(derived_filename)
 }
 
+fn capture_repair_requested(config: &DownloadConfig) -> bool {
+    config.refresh_metadata
+        && matches!(
+            config.capture_timestamp_repair,
+            super::CaptureTimestampRepair::ReplaceWithCaptureLocal
+        )
+}
+
 async fn adopt_pending_on_disk_skip(
     state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
@@ -337,6 +345,7 @@ async fn adopt_pending_on_disk_skip(
                 derived.version_size,
                 derived.checksum.as_ref(),
             ),
+            capture_repair_requested(config),
         )
         .await
         {
@@ -453,6 +462,7 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
                 &derived,
                 local_path,
                 Some(recorded_file),
+                capture_repair_requested(config),
             )
             .await
             {
@@ -490,6 +500,7 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
             task_planner,
             &derived,
             None,
+            capture_repair_requested(config),
         )
         .await
         {
@@ -556,6 +567,7 @@ async fn adopt_pending_on_disk_task(
                 derived.version_size,
                 derived.checksum.as_ref(),
             ),
+            capture_repair_requested(config),
         )
         .await
         {
@@ -656,6 +668,7 @@ async fn adopt_pending_task_path(
         asset,
         version_size,
         existing_path,
+        capture_repair_requested(config),
     )
     .await
 }
@@ -667,6 +680,7 @@ async fn adopt_pending_derived_path(
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
     recorded_file: Option<&RecordedLocalFile>,
+    mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
     adopt_pending_derived_path_at(
         db,
@@ -676,6 +690,7 @@ async fn adopt_pending_derived_path(
         derived,
         &derived.path,
         recorded_file,
+        mark_capture_repair,
     )
     .await
 }
@@ -688,6 +703,7 @@ async fn adopt_pending_derived_path_at(
     derived: &DerivedPath,
     path: &Path,
     recorded_file: Option<&RecordedLocalFile>,
+    mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
     let version_size = derived.version_size.as_str();
     let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
@@ -715,8 +731,15 @@ async fn adopt_pending_derived_path_at(
         return Some(PendingOnDiskAdoption::StateWriteFailed(existing_path));
     }
 
-    mark_pending_downloaded_from_existing_path(db, library, asset, version_size, existing_path)
-        .await
+    mark_pending_downloaded_from_existing_path(
+        db,
+        library,
+        asset,
+        version_size,
+        existing_path,
+        mark_capture_repair,
+    )
+    .await
 }
 
 async fn mark_pending_downloaded_from_existing_path(
@@ -725,6 +748,7 @@ async fn mark_pending_downloaded_from_existing_path(
     asset: &PhotoAsset,
     version_size: &str,
     existing_path: PathBuf,
+    mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
     let local_checksum = match super::file::compute_sha256(&existing_path).await {
         Ok(checksum) => checksum,
@@ -740,13 +764,14 @@ async fn mark_pending_downloaded_from_existing_path(
         }
     };
     if let Err(e) = db
-        .mark_downloaded(
+        .mark_downloaded_with_capture_repair(
             library,
             asset.state_id(),
             version_size,
             &existing_path,
             &local_checksum,
             None,
+            mark_capture_repair,
         )
         .await
     {
@@ -989,6 +1014,7 @@ pub(super) struct PassConfig<'a> {
     pub(super) client: &'a Client,
     pub(super) retry_config: &'a RetryConfig,
     pub(super) metadata: MetadataFlags,
+    pub(super) mark_capture_repair_after_download: bool,
     pub(super) concurrency: usize,
     pub(super) reporting: DownloadReporting,
     pub(super) temp_suffix: Arc<str>,
@@ -1008,6 +1034,10 @@ impl std::fmt::Debug for PassConfig<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PassConfig")
             .field("metadata", &self.metadata)
+            .field(
+                "mark_capture_repair_after_download",
+                &self.mark_capture_repair_after_download,
+            )
             .field("concurrency", &self.concurrency)
             .field("reporting", &self.reporting)
             .field("temp_suffix", &self.temp_suffix)
@@ -1690,6 +1720,7 @@ where
                                     asset.state_id(),
                                     asset.metadata(),
                                     mark_for_rewrite,
+                                    capture_repair_requested(config),
                                     crate::state::METADATA_CAPTURE_REVISION,
                                 )
                                 .await
@@ -2147,6 +2178,7 @@ async fn consume_stream_download_tasks(
         bytes_counter,
     } = settings;
     let config = &shared.config;
+    let mark_capture_repair_after_download = capture_repair_requested(config);
     let pb = &shared.pb;
     let pipeline_shutdown = shared.pipeline_shutdown;
     let state_db = shared.state_db;
@@ -2255,6 +2287,7 @@ async fn consume_stream_download_tasks(
                         local_checksum,
                         download_checksum,
                         exif_ok,
+                        mark_capture_repair_after_download,
                     )
                     .await
                     {
@@ -2794,6 +2827,10 @@ pub(super) async fn build_download_outcome(
         client: download_client,
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),
+        mark_capture_repair_after_download: matches!(
+            config.capture_timestamp_repair,
+            super::CaptureTimestampRepair::ReplaceWithCaptureLocal
+        ),
         concurrency: cleanup_concurrency,
         reporting: controls.reporting,
         temp_suffix: Arc::clone(&config.temp_suffix),
@@ -2929,6 +2966,7 @@ pub(super) async fn run_download_pass(
     let client = config.client.clone();
     let retry_config = config.retry_config;
     let metadata_flags = config.metadata;
+    let mark_capture_repair_after_download = config.mark_capture_repair_after_download;
     let state_db = config.state_db.clone();
     let pass_shutdown = config.shutdown_token.child_token();
     let concurrency = config.concurrency;
@@ -3024,6 +3062,7 @@ pub(super) async fn run_download_pass(
                         local_checksum.clone(),
                         download_checksum.clone(),
                         *exif_ok,
+                        mark_capture_repair_after_download,
                     )
                     .await
                     {
@@ -3298,6 +3337,7 @@ async fn download_single_task<C: super::file::DownloadClient>(
                     payload: Arc::clone(&task.metadata),
                     created_local: task.created_local,
                     flags: metadata_flags,
+                    capture_timestamp_repair: crate::download::CaptureTimestampRepair::Preserve,
                     temp_suffix: context.temp_suffix,
                 },
             )
@@ -3332,6 +3372,7 @@ async fn download_single_task<C: super::file::DownloadClient>(
                 payload: Arc::clone(&task.metadata),
                 created_local: task.created_local,
                 flags: metadata_flags,
+                capture_timestamp_repair: crate::download::CaptureTimestampRepair::Preserve,
                 temp_suffix: context.temp_suffix,
             })
             .await;
@@ -4012,6 +4053,7 @@ mod tests {
             client: &client,
             retry_config: &retry_config,
             metadata: MetadataFlags::DATETIME | MetadataFlags::DESCRIPTION,
+            mark_capture_repair_after_download: false,
             concurrency: 3,
             reporting: DownloadReporting::hidden(),
             temp_suffix: Arc::from(".part"),
@@ -4146,6 +4188,7 @@ mod tests {
                             client: &client,
                             retry_config: &retry,
                             metadata: MetadataFlags::default(),
+                            mark_capture_repair_after_download: false,
                             concurrency: 1,
                             reporting: DownloadReporting::hidden(),
                             temp_suffix: std::sync::Arc::from(".kei-tmp"),
@@ -4203,6 +4246,7 @@ mod tests {
                             client: &client,
                             retry_config: &retry,
                             metadata: MetadataFlags::default(),
+                            mark_capture_repair_after_download: false,
                             concurrency: 1,
                             reporting: DownloadReporting::hidden(),
                             temp_suffix: std::sync::Arc::from(".kei-tmp"),
@@ -4763,29 +4807,10 @@ mod tests {
             _: &str,
             _: &crate::state::AssetMetadata,
             _: bool,
+            _: bool,
             _: i64,
         ) -> Result<usize, StateError> {
             Ok(0)
-        }
-
-        async fn clear_metadata_write_failure(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<(), StateError> {
-            Ok(())
-        }
-
-        async fn set_metadata_rewrite_checksums(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-        ) -> Result<(), StateError> {
-            Ok(())
         }
 
         async fn get_downloaded_metadata_hashes(
@@ -4807,6 +4832,47 @@ mod tests {
             _: usize,
         ) -> Result<Vec<AssetRecord>, StateError> {
             Ok(Vec::new())
+        }
+
+        async fn get_pending_metadata_rewrites_page_for_queue(
+            &self,
+            _: crate::state::db::MetadataRewriteQueue,
+            _: Option<&[&str]>,
+            _: usize,
+            _: usize,
+        ) -> Result<Vec<crate::state::db::PendingMetadataRewrite>, StateError> {
+            Ok(Vec::new())
+        }
+
+        async fn record_capture_repair_prepared(
+            &self,
+            _: &crate::state::db::PendingMetadataRewrite,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<crate::state::db::CaptureRepairReceipt>, StateError> {
+            Ok(None)
+        }
+
+        async fn finish_metadata_rewrite(
+            &self,
+            _: &crate::state::db::PendingMetadataRewrite,
+            selected_queue: crate::state::db::MetadataRewriteQueue,
+            _: Option<&str>,
+            _: Option<&str>,
+            completion: crate::state::db::MetadataRewriteCompletion,
+        ) -> Result<bool, StateError> {
+            Ok(matches!(
+                (selected_queue, completion),
+                (
+                    crate::state::db::MetadataRewriteQueue::Ordinary,
+                    crate::state::db::MetadataRewriteCompletion::Ordinary
+                        | crate::state::db::MetadataRewriteCompletion::Both
+                ) | (
+                    crate::state::db::MetadataRewriteQueue::CaptureRepair,
+                    crate::state::db::MetadataRewriteCompletion::CaptureRepair
+                        | crate::state::db::MetadataRewriteCompletion::Both
+                )
+            ))
         }
 
         async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
@@ -4972,6 +5038,7 @@ mod tests {
             download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
+            mark_capture_repair: false,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0);
@@ -4990,6 +5057,7 @@ mod tests {
             download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
+            mark_capture_repair: false,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0);
@@ -5010,6 +5078,7 @@ mod tests {
             download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
+            mark_capture_repair: false,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 1);
@@ -5029,6 +5098,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo1.jpg"),
                 local_checksum: "abc".into(),
                 download_checksum: None,
+                mark_capture_repair: false,
             },
             PendingStateWrite {
                 library: "PrimarySync".into(),
@@ -5037,6 +5107,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo2.jpg"),
                 local_checksum: "def".into(),
                 download_checksum: None,
+                mark_capture_repair: false,
             },
         ];
         let failures = flush_pending_state_writes(&db, &pending).await;
@@ -5060,6 +5131,7 @@ mod tests {
                 download_path: PathBuf::from(format!("/tmp/codex/kei/photo_{i}.jpg")),
                 local_checksum: format!("ck_{i}"),
                 download_checksum: Some(format!("dl_ck_{i}")),
+                mark_capture_repair: false,
             })
             .collect();
 
@@ -5079,6 +5151,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo1.jpg"),
                 local_checksum: "abc".into(),
                 download_checksum: None,
+                mark_capture_repair: false,
             },
             PendingStateWrite {
                 library: "PrimarySync".into(),
@@ -5087,6 +5160,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo2.jpg"),
                 local_checksum: "def".into(),
                 download_checksum: None,
+                mark_capture_repair: false,
             },
         ];
 
@@ -5167,6 +5241,7 @@ mod tests {
                 client: &client,
                 retry_config: &retry,
                 metadata: MetadataFlags::default(),
+                mark_capture_repair_after_download: false,
                 concurrency: 1,
                 reporting: DownloadReporting::hidden(),
                 temp_suffix: std::sync::Arc::from(".kei-tmp"),
@@ -5343,6 +5418,7 @@ mod tests {
                 client: &client,
                 retry_config: &retry,
                 metadata: MetadataFlags::default(),
+                mark_capture_repair_after_download: false,
                 concurrency: 1,
                 reporting: DownloadReporting::hidden(),
                 temp_suffix: std::sync::Arc::from(".kei-tmp"),
@@ -5442,6 +5518,7 @@ mod tests {
             skip_created_after: None,
             metadata: crate::config::MetadataConfig::default(),
             refresh_metadata: false,
+            capture_timestamp_repair: crate::download::CaptureTimestampRepair::Preserve,
             repair_truncated: false,
             concurrent_downloads: 10,
             recent: None,
@@ -5525,6 +5602,7 @@ mod tests {
             skip_created_after: None,
             metadata: crate::config::MetadataConfig::default(),
             refresh_metadata: false,
+            capture_timestamp_repair: crate::download::CaptureTimestampRepair::Preserve,
             repair_truncated: false,
             concurrent_downloads: 1,
             recent: None,
@@ -5974,6 +6052,10 @@ mod tests {
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
+        config.refresh_metadata = true;
+        config.capture_timestamp_repair =
+            crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
+        config.metadata.set_exif_datetime = true;
         let config = Arc::new(config);
 
         // Pre-create the on-disk file at the expected natural path. The path
@@ -6015,6 +6097,17 @@ mod tests {
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 0);
+        let capture_repairs = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                crate::state::db::MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(capture_repairs.len(), 1);
+        assert_eq!(capture_repairs[0].asset.id.as_ref(), "STUCK");
     }
 
     async fn run_producer_metadata_rewritten_pending_file(
@@ -6393,6 +6486,8 @@ mod tests {
         config.directory = std::sync::Arc::from(dir.path());
         config.state_db = Some(db.clone());
         config.refresh_metadata = true;
+        config.capture_timestamp_repair =
+            crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
         config.metadata.set_exif_datetime = true;
         config.filename_exclude =
             Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
@@ -6457,6 +6552,20 @@ mod tests {
             Some("stale-hash")
         );
         assert_eq!(rewrites[0].metadata.title, None);
+        let capture_repairs = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                crate::state::db::MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(capture_repairs.len(), 1);
+        assert_eq!(
+            capture_repairs[0].asset.version_size,
+            crate::state::VersionSizeKey::Medium
+        );
     }
 
     /// #707 review: the pre-plan refresh makes embedded rewrites reachable for

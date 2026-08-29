@@ -134,6 +134,64 @@ pub(crate) struct DownloadedFileRecord {
     pub(crate) download_checksum: Option<String>,
 }
 
+/// Metadata-rewrite debt selected for one bounded drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataRewriteQueue {
+    Ordinary,
+    CaptureRepair,
+}
+
+/// Durable capture-repair state attached to a queued rewrite without adding
+/// repair-only fields to [`AssetRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureRepairReceipt {
+    Pending {
+        metadata_hash: String,
+    },
+    Prepared {
+        metadata_hash: String,
+        output_checksum: String,
+        output_size: u64,
+    },
+}
+
+impl CaptureRepairReceipt {
+    fn metadata_hash(&self) -> &str {
+        match self {
+            Self::Pending { metadata_hash } | Self::Prepared { metadata_hash, .. } => metadata_hash,
+        }
+    }
+}
+
+/// One queued metadata rewrite and its independently persisted capture debt.
+#[derive(Debug, Clone)]
+pub struct PendingMetadataRewrite {
+    pub asset: AssetRecord,
+    pub capture_repair_receipt: Option<CaptureRepairReceipt>,
+}
+
+/// Debt retired by one atomic metadata-rewrite completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataRewriteCompletion {
+    None,
+    Ordinary,
+    CaptureRepair,
+    Both,
+}
+
+impl MetadataRewriteCompletion {
+    const fn clears(self, queue: MetadataRewriteQueue) -> bool {
+        matches!(
+            (self, queue),
+            (Self::Ordinary | Self::Both, MetadataRewriteQueue::Ordinary)
+                | (
+                    Self::CaptureRepair | Self::Both,
+                    MetadataRewriteQueue::CaptureRepair
+                )
+        )
+    }
+}
+
 /// Durable evidence that kei claimed one exact temporary download path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OwnedTempFile {
@@ -257,6 +315,33 @@ pub trait DownloadStateStore: Send + Sync {
         local_checksum: &str,
         download_checksum: Option<&str>,
     ) -> Result<(), StateError>;
+    async fn mark_downloaded_with_capture_repair(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
+        if mark_capture_repair {
+            return Err(StateError::Invariant {
+                operation: "mark_downloaded_with_capture_repair",
+                detail: "capture-repair download finalization is not implemented by this store"
+                    .into(),
+            });
+        }
+        self.mark_downloaded(
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+        )
+        .await
+    }
     async fn mark_failed(
         &self,
         library: &str,
@@ -714,6 +799,7 @@ pub trait MetadataRewriteStore: Send + Sync {
         asset_id: &str,
         metadata: &AssetMetadata,
         mark_for_rewrite: bool,
+        mark_capture_repair: bool,
         capture_revision: i64,
     ) -> Result<usize, StateError>;
     async fn get_downloaded_metadata_hashes(
@@ -728,22 +814,27 @@ pub trait MetadataRewriteStore: Send + Sync {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError>;
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn clear_metadata_write_failure(
+    async fn get_pending_metadata_rewrites_page_for_queue(
         &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError>;
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn set_metadata_rewrite_checksums(
+        queue: MetadataRewriteQueue,
+        library_scope: Option<&[&str]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<PendingMetadataRewrite>, StateError>;
+    async fn record_capture_repair_prepared(
         &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
+        pending: &PendingMetadataRewrite,
+        output_checksum: &str,
+        output_size: u64,
+    ) -> Result<Option<CaptureRepairReceipt>, StateError>;
+    async fn finish_metadata_rewrite(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
         local_checksum: Option<&str>,
         pre_rewrite_checksum: Option<&str>,
-    ) -> Result<(), StateError>;
+        completion: MetadataRewriteCompletion,
+    ) -> Result<bool, StateError>;
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
     async fn begin_metadata_capture_revision(
         &self,
@@ -1046,6 +1137,39 @@ fn upsert_asset_row(
         None
     };
     let metadata_hash: Option<&str> = meta.metadata_hash.as_deref().or(computed_hash.as_deref());
+    let blocked_capture_repair: i64 = conn
+        .query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM assets \
+                WHERE library = ?1 AND id = ?2 \
+                  AND status = 'downloaded' AND is_deleted = 0 \
+                  AND capture_repair_metadata_hash IS NOT NULL \
+                  AND capture_repair_metadata_hash <> '' \
+                  AND capture_repair_output_checksum IS NOT NULL \
+                  AND capture_repair_output_checksum <> '' \
+                  AND capture_repair_output_size IS NOT NULL \
+                  AND capture_repair_output_size >= 0 \
+                  AND capture_repair_metadata_hash IS NOT ?3 \
+                  AND (version_size <> ?4 OR checksum = ?5) \
+            )",
+            rusqlite::params![
+                &record.library,
+                &record.id,
+                metadata_hash,
+                record.version_size.as_str(),
+                &record.checksum
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| StateError::query("upsert_seen::capture_repair_guard", e))?;
+    if blocked_capture_repair != 0 {
+        return Err(StateError::Invariant {
+            operation: "upsert_seen",
+            detail:
+                "provider metadata changed while capture-repair publication awaits finalization"
+                    .into(),
+        });
+    }
 
     let mut stmt = conn
         .prepare_cached(
@@ -1101,46 +1225,124 @@ fn upsert_asset_row(
                     is_deleted = excluded.is_deleted,
                     deleted_at = excluded.deleted_at,
                     provider_data = excluded.provider_data,
-                    metadata_hash = excluded.metadata_hash
+                    metadata_hash = excluded.metadata_hash,
+                    capture_repair_metadata_hash =
+                        CASE
+                            WHEN assets.checksum <> excluded.checksum THEN NULL
+                            WHEN assets.capture_repair_metadata_hash IS NULL
+                                 AND assets.capture_repair_output_checksum IS NULL
+                                 AND assets.capture_repair_output_size IS NULL
+                                THEN NULL
+                            WHEN assets.capture_repair_metadata_hash <> ''
+                                 AND assets.capture_repair_output_checksum IS NULL
+                                 AND assets.capture_repair_output_size IS NULL
+                                THEN excluded.metadata_hash
+                            WHEN assets.capture_repair_metadata_hash <> ''
+                                 AND assets.capture_repair_output_checksum <> ''
+                                 AND assets.capture_repair_output_size >= 0
+                                THEN excluded.metadata_hash
+                            ELSE assets.capture_repair_metadata_hash
+                        END,
+                    capture_repair_output_checksum =
+                        CASE
+                            WHEN assets.checksum <> excluded.checksum THEN NULL
+                            WHEN assets.capture_repair_metadata_hash IS NULL
+                                 AND assets.capture_repair_output_checksum IS NULL
+                                 AND assets.capture_repair_output_size IS NULL
+                                THEN NULL
+                            WHEN assets.capture_repair_metadata_hash <> ''
+                                 AND assets.capture_repair_output_checksum IS NULL
+                                 AND assets.capture_repair_output_size IS NULL
+                                THEN NULL
+                            WHEN assets.capture_repair_metadata_hash <> ''
+                                 AND assets.capture_repair_output_checksum <> ''
+                                 AND assets.capture_repair_output_size >= 0
+                                THEN CASE
+                                    WHEN assets.capture_repair_metadata_hash IS excluded.metadata_hash
+                                        THEN assets.capture_repair_output_checksum
+                                    ELSE NULL
+                                END
+                            ELSE assets.capture_repair_output_checksum
+                        END,
+                    capture_repair_output_size =
+                        CASE
+                            WHEN assets.checksum <> excluded.checksum THEN NULL
+                            WHEN assets.capture_repair_metadata_hash IS NULL
+                                 AND assets.capture_repair_output_checksum IS NULL
+                                 AND assets.capture_repair_output_size IS NULL
+                                THEN NULL
+                            WHEN assets.capture_repair_metadata_hash <> ''
+                                 AND assets.capture_repair_output_checksum IS NULL
+                                 AND assets.capture_repair_output_size IS NULL
+                                THEN NULL
+                            WHEN assets.capture_repair_metadata_hash <> ''
+                                 AND assets.capture_repair_output_checksum <> ''
+                                 AND assets.capture_repair_output_size >= 0
+                                THEN CASE
+                                    WHEN assets.capture_repair_metadata_hash IS excluded.metadata_hash
+                                        THEN assets.capture_repair_output_size
+                                    ELSE NULL
+                                END
+                            ELSE assets.capture_repair_output_size
+                        END
+                WHERE NOT (
+                    assets.checksum = excluded.checksum
+                    AND assets.capture_repair_metadata_hash IS NOT NULL
+                    AND assets.capture_repair_metadata_hash <> ''
+                    AND assets.capture_repair_output_checksum IS NOT NULL
+                    AND assets.capture_repair_output_checksum <> ''
+                    AND assets.capture_repair_output_size IS NOT NULL
+                    AND assets.capture_repair_output_size >= 0
+                    AND assets.capture_repair_metadata_hash IS NOT excluded.metadata_hash
+                )
                 ",
         )
         .map_err(|e| StateError::query("upsert_seen::prepare", e))?;
-    stmt.execute(rusqlite::params![
-        &record.library,
-        &record.id,
-        record.version_size.as_str(),
-        &record.checksum,
-        &record.filename,
-        record.created_at.timestamp(),
-        record.added_at.map(|dt| dt.timestamp()),
-        i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
-        record.media_type.as_str(),
-        last_seen_at,
-        meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
-        i64::from(meta.is_favorite),
-        meta.rating.map(i64::from),
-        meta.latitude,
-        meta.longitude,
-        meta.altitude,
-        meta.orientation.map(i64::from),
-        meta.duration_secs,
-        meta.timezone_offset.map(i64::from),
-        meta.width.map(i64::from),
-        meta.height.map(i64::from),
-        meta.title.as_deref(),
-        meta.keywords.as_deref(),
-        meta.description.as_deref(),
-        meta.media_subtype.as_deref(),
-        meta.burst_id.as_deref(),
-        i64::from(meta.is_hidden),
-        i64::from(meta.is_archived),
-        meta.modified_at.map(|dt| dt.timestamp()),
-        i64::from(meta.is_deleted),
-        meta.deleted_at.map(|dt| dt.timestamp()),
-        meta.provider_data.as_deref(),
-        metadata_hash,
-    ])
-    .map_err(|e| StateError::query("upsert_seen", e))?;
+    let changed = stmt
+        .execute(rusqlite::params![
+            &record.library,
+            &record.id,
+            record.version_size.as_str(),
+            &record.checksum,
+            &record.filename,
+            record.created_at.timestamp(),
+            record.added_at.map(|dt| dt.timestamp()),
+            i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
+            record.media_type.as_str(),
+            last_seen_at,
+            meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
+            i64::from(meta.is_favorite),
+            meta.rating.map(i64::from),
+            meta.latitude,
+            meta.longitude,
+            meta.altitude,
+            meta.orientation.map(i64::from),
+            meta.duration_secs,
+            meta.timezone_offset.map(i64::from),
+            meta.width.map(i64::from),
+            meta.height.map(i64::from),
+            meta.title.as_deref(),
+            meta.keywords.as_deref(),
+            meta.description.as_deref(),
+            meta.media_subtype.as_deref(),
+            meta.burst_id.as_deref(),
+            i64::from(meta.is_hidden),
+            i64::from(meta.is_archived),
+            meta.modified_at.map(|dt| dt.timestamp()),
+            i64::from(meta.is_deleted),
+            meta.deleted_at.map(|dt| dt.timestamp()),
+            meta.provider_data.as_deref(),
+            metadata_hash,
+        ])
+        .map_err(|e| StateError::query("upsert_seen", e))?;
+    if changed == 0 {
+        return Err(StateError::Invariant {
+            operation: "upsert_seen",
+            detail:
+                "provider metadata changed while capture-repair publication awaits finalization"
+                    .into(),
+        });
+    }
 
     Ok(())
 }
@@ -1177,6 +1379,10 @@ fn record_metadata_capture_revision(
 
 /// Execute the `mark_downloaded` UPDATE on `conn`. Returns rows affected;
 /// callers decide what zero rows means in their context.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the state owner receives the exact downloaded-file fields and explicit repair intent for one atomic SQL update"
+)]
 fn update_status_to_downloaded(
     conn: &Connection,
     library: &str,
@@ -1185,13 +1391,23 @@ fn update_status_to_downloaded(
     local_path: &Path,
     local_checksum: &str,
     download_checksum: Option<&str>,
+    mark_capture_repair: bool,
     downloaded_at: i64,
 ) -> Result<usize, StateError> {
     let mut stmt = conn
         .prepare_cached(
             "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-             local_checksum = ?3, download_checksum = COALESCE(?4, download_checksum), last_error = NULL \
-             WHERE library = ?5 AND id = ?6 AND version_size = ?7",
+             local_checksum = ?3, download_checksum = COALESCE(?4, download_checksum), last_error = NULL, \
+             capture_repair_metadata_hash = CASE \
+                 WHEN ?5 = 1 THEN metadata_hash \
+                 WHEN local_checksum IS ?3 THEN capture_repair_metadata_hash ELSE NULL END, \
+             capture_repair_output_checksum = CASE \
+                 WHEN ?5 = 1 THEN NULL \
+                 WHEN local_checksum IS ?3 THEN capture_repair_output_checksum ELSE NULL END, \
+             capture_repair_output_size = CASE \
+                 WHEN ?5 = 1 THEN NULL \
+                 WHEN local_checksum IS ?3 THEN capture_repair_output_size ELSE NULL END \
+             WHERE library = ?6 AND id = ?7 AND version_size = ?8",
         )
         .map_err(|e| StateError::query("mark_downloaded::prepare", e))?;
     stmt.execute(rusqlite::params![
@@ -1199,11 +1415,78 @@ fn update_status_to_downloaded(
         local_path.to_string_lossy(),
         local_checksum,
         download_checksum,
+        i64::from(mark_capture_repair),
         library,
         id,
         version_size
     ])
     .map_err(|e| StateError::query("mark_downloaded", e))
+}
+
+fn ensure_asset_has_no_prepared_capture_repair(
+    conn: &Connection,
+    library: &str,
+    asset_id: &str,
+    operation: &'static str,
+) -> Result<(), StateError> {
+    let prepared: i64 = conn
+        .query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM assets \
+                WHERE library = ?1 AND id = ?2 \
+                  AND capture_repair_metadata_hash IS NOT NULL \
+                  AND capture_repair_metadata_hash <> '' \
+                  AND capture_repair_output_checksum IS NOT NULL \
+                  AND capture_repair_output_checksum <> '' \
+                  AND capture_repair_output_size IS NOT NULL \
+                  AND capture_repair_output_size >= 0 \
+            )",
+            rusqlite::params![library, asset_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| StateError::query(operation, error))?;
+    if prepared != 0 {
+        return Err(StateError::Invariant {
+            operation,
+            detail: "source deletion cannot hide a prepared capture-repair receipt".into(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_master_family_has_no_prepared_capture_repair(
+    conn: &Connection,
+    library: &str,
+    master_record_name: &str,
+    operation: &'static str,
+) -> Result<(), StateError> {
+    let prepared: i64 = conn
+        .query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM assets \
+                WHERE library = ?1 \
+                  AND (id = ?2 OR id IN ( \
+                      SELECT asset_record_name FROM asset_master_mappings \
+                      WHERE library = ?1 AND master_record_name = ?2 \
+                  )) \
+                  AND capture_repair_metadata_hash IS NOT NULL \
+                  AND capture_repair_metadata_hash <> '' \
+                  AND capture_repair_output_checksum IS NOT NULL \
+                  AND capture_repair_output_checksum <> '' \
+                  AND capture_repair_output_size IS NOT NULL \
+                  AND capture_repair_output_size >= 0 \
+            )",
+            rusqlite::params![library, master_record_name],
+            |row| row.get(0),
+        )
+        .map_err(|error| StateError::query(operation, error))?;
+    if prepared != 0 {
+        return Err(StateError::Invariant {
+            operation,
+            detail: "source deletion cannot hide a prepared capture-repair receipt".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Drain a rusqlite row iterator into `Vec<T>`, dropping parse failures but
@@ -1431,6 +1714,28 @@ impl SqliteStateDb {
         local_checksum: &str,
         download_checksum: Option<&str>,
     ) -> Result<(), StateError> {
+        self.mark_downloaded_with_capture_repair(
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn mark_downloaded_with_capture_repair(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
         let downloaded_at = Utc::now().timestamp();
         let library = library.to_owned();
         let id = id.to_owned();
@@ -1448,6 +1753,7 @@ impl SqliteStateDb {
                 &local_path,
                 &local_checksum,
                 download_checksum.as_deref(),
+                mark_capture_repair,
                 downloaded_at,
             )?;
 
@@ -1499,6 +1805,7 @@ impl SqliteStateDb {
                 &local_path,
                 &local_checksum,
                 None,
+                false,
                 now,
             )?;
             debug_assert_eq!(
@@ -3773,6 +4080,12 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         self.with_conn("mark_soft_deleted", move |conn| {
+            ensure_asset_has_no_prepared_capture_repair(
+                conn,
+                &library,
+                &asset_id,
+                "mark_soft_deleted",
+            )?;
             let updated = conn
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
@@ -3797,6 +4110,12 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("resolve_source_deleted::begin", e))?;
+            ensure_asset_has_no_prepared_capture_repair(
+                &tx,
+                &library,
+                &asset_id,
+                "resolve_source_deleted",
+            )?;
             let marked = tx
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
@@ -3825,6 +4144,12 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let master_record_name = master_record_name.to_owned();
         self.with_conn("mark_master_family_soft_deleted", move |conn| {
+            ensure_master_family_has_no_prepared_capture_repair(
+                conn,
+                &library,
+                &master_record_name,
+                "mark_master_family_soft_deleted",
+            )?;
             let updated = conn
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
@@ -3856,6 +4181,12 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("resolve_master_family_source_deleted::begin", e))?;
+            ensure_master_family_has_no_prepared_capture_repair(
+                &tx,
+                &library,
+                &master_record_name,
+                "resolve_master_family_source_deleted",
+            )?;
             let marked = tx
                 .execute(
                     "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
@@ -3933,12 +4264,98 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn record_capture_repair_prepared(
+        &self,
+        pending: &PendingMetadataRewrite,
+        output_checksum: &str,
+        output_size: u64,
+    ) -> Result<Option<CaptureRepairReceipt>, StateError> {
+        if output_checksum.is_empty() {
+            return Err(StateError::Invariant {
+                operation: "record_capture_repair_prepared",
+                detail: "capture-repair output checksum is empty".into(),
+            });
+        }
+        let receipt =
+            pending
+                .capture_repair_receipt
+                .as_ref()
+                .ok_or_else(|| StateError::Invariant {
+                    operation: "record_capture_repair_prepared",
+                    detail: "the selected row has no capture-repair receipt".into(),
+                });
+        let receipt = receipt?;
+        let metadata_hash = receipt.metadata_hash();
+        let (selected_output_checksum, selected_output_size) = match receipt {
+            CaptureRepairReceipt::Pending { .. } => (None, None),
+            CaptureRepairReceipt::Prepared {
+                output_checksum,
+                output_size,
+                ..
+            } => (
+                Some(output_checksum.to_owned()),
+                Some(
+                    i64::try_from(*output_size).map_err(|_error| StateError::Invariant {
+                        operation: "record_capture_repair_prepared",
+                        detail: "selected capture-repair output size exceeds SQLite INTEGER".into(),
+                    })?,
+                ),
+            ),
+        };
+        let Some(input_checksum) = pending.asset.local_checksum.as_deref() else {
+            return Ok(None);
+        };
+        let library = pending.asset.library.to_string();
+        let asset_id = pending.asset.id.to_string();
+        let version_size = pending.asset.version_size.as_str().to_owned();
+        let metadata_hash = metadata_hash.to_owned();
+        let input_checksum = input_checksum.to_owned();
+        let output_checksum = output_checksum.to_owned();
+        let output_size_sql =
+            i64::try_from(output_size).map_err(|_error| StateError::Invariant {
+                operation: "record_capture_repair_prepared",
+                detail: "capture-repair output size exceeds SQLite INTEGER".into(),
+            })?;
+        self.with_conn("record_capture_repair_prepared", move |conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE assets SET capture_repair_output_checksum = ?8, \
+                        capture_repair_output_size = ?9 \
+                     WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                       AND status = 'downloaded' AND is_deleted = 0 \
+                       AND metadata_hash IS ?4 AND local_checksum IS ?5 \
+                       AND capture_repair_metadata_hash IS ?4 \
+                       AND capture_repair_output_checksum IS ?6 \
+                       AND capture_repair_output_size IS ?7",
+                    rusqlite::params![
+                        library,
+                        asset_id,
+                        version_size,
+                        metadata_hash,
+                        input_checksum,
+                        selected_output_checksum,
+                        selected_output_size,
+                        output_checksum,
+                        output_size_sql
+                    ],
+                )
+                .map_err(|e| StateError::query("record_capture_repair_prepared", e))?;
+            Ok((updated > 0).then_some(CaptureRepairReceipt::Prepared {
+                metadata_hash,
+                output_checksum,
+                output_size,
+            }))
+        })
+        .await
+    }
+
     pub(crate) async fn refresh_downloaded_asset_metadata(
         &self,
         library: &str,
         asset_id: &str,
         metadata: &AssetMetadata,
         mark_for_rewrite: bool,
+        mark_capture_repair: bool,
         capture_revision: i64,
     ) -> Result<usize, StateError> {
         let library = library.to_owned();
@@ -3976,10 +4393,70 @@ impl SqliteStateDb {
                         deleted_at = ?21,
                         provider_data = ?22,
                         metadata_hash = ?23,
+                        capture_repair_output_checksum =
+                            CASE
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum <> ''
+                                     AND capture_repair_output_size >= 0
+                                    THEN capture_repair_output_checksum
+                                WHEN capture_repair_metadata_hash IS NULL
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                ELSE capture_repair_output_checksum
+                            END,
+                        capture_repair_output_size =
+                            CASE
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum <> ''
+                                     AND capture_repair_output_size >= 0
+                                    THEN capture_repair_output_size
+                                WHEN capture_repair_metadata_hash IS NULL
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                ELSE capture_repair_output_size
+                            END,
+                        capture_repair_metadata_hash =
+                            CASE
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum <> ''
+                                     AND capture_repair_output_size >= 0
+                                    THEN capture_repair_metadata_hash
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN ?23
+                                WHEN capture_repair_metadata_hash IS NULL
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN CASE WHEN ?25 = 1 THEN ?23 ELSE NULL END
+                                ELSE capture_repair_metadata_hash
+                            END,
                         metadata_write_failed_at =
-                            CASE WHEN ?24 = 1 THEN ?25 ELSE metadata_write_failed_at END
-                    WHERE library = ?26 AND id = ?27
+                            CASE WHEN ?24 = 1 THEN ?26 ELSE metadata_write_failed_at END
+                    WHERE library = ?27 AND id = ?28
                       AND status = 'downloaded' AND is_deleted = 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM assets AS blocked
+                          WHERE blocked.library = ?27 AND blocked.id = ?28
+                            AND blocked.status = 'downloaded' AND blocked.is_deleted = 0
+                            AND blocked.capture_repair_metadata_hash IS NOT NULL
+                            AND blocked.capture_repair_metadata_hash <> ''
+                            AND blocked.capture_repair_output_checksum IS NOT NULL
+                            AND blocked.capture_repair_output_checksum <> ''
+                            AND blocked.capture_repair_output_size IS NOT NULL
+                            AND blocked.capture_repair_output_size >= 0
+                            AND blocked.capture_repair_metadata_hash IS NOT ?23
+                      )
                     ",
                     rusqlite::params![
                         metadata.source.as_deref(),
@@ -4006,6 +4483,7 @@ impl SqliteStateDb {
                         metadata.provider_data.as_deref(),
                         metadata.metadata_hash.as_deref(),
                         i64::from(mark_for_rewrite),
+                        i64::from(mark_capture_repair),
                         rewrite_at,
                         library,
                         asset_id,
@@ -4024,7 +4502,20 @@ impl SqliteStateDb {
                     .query_row(
                         "SELECT COUNT(*) FROM assets \
                          WHERE library = ?1 AND id = ?2 AND is_deleted = 0 \
-                           AND metadata_hash IS NOT NULL AND metadata_hash = ?3",
+                           AND metadata_hash IS NOT NULL AND metadata_hash = ?3 \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM assets AS blocked \
+                               WHERE blocked.library = ?1 AND blocked.id = ?2 \
+                                 AND blocked.status = 'downloaded' \
+                                 AND blocked.is_deleted = 0 \
+                                 AND blocked.capture_repair_metadata_hash IS NOT NULL \
+                                 AND blocked.capture_repair_metadata_hash <> '' \
+                                 AND blocked.capture_repair_output_checksum IS NOT NULL \
+                                 AND blocked.capture_repair_output_checksum <> '' \
+                                 AND blocked.capture_repair_output_size IS NOT NULL \
+                                 AND blocked.capture_repair_output_size >= 0 \
+                                 AND blocked.capture_repair_metadata_hash IS NOT ?3 \
+                           )",
                         rusqlite::params![library, asset_id, metadata.metadata_hash.as_deref()],
                         |row| row.get(0),
                     )
@@ -4045,6 +4536,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn clear_metadata_write_failure(
         &self,
         library: &str,
@@ -4061,48 +4553,6 @@ impl SqliteStateDb {
                 rusqlite::params![library, asset_id, version_size],
             )
             .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Records the media hash a metadata rewrite left on disk, keeping the
-    /// rewrite marker so the caller decides when the write is complete.
-    /// `pre_rewrite_checksum` seeds `download_checksum` only when the column is
-    /// empty, so the provider's pre-metadata hash is established once and later
-    /// rewrites never overwrite it. Pass `None` for `pre_rewrite_checksum` when
-    /// those bytes were never verified against the row, because an unproven
-    /// hash would tell reconcile the file is an intentional rewrite rather than
-    /// damage. A `None` `local_checksum` records that the file changed and its
-    /// hash is unknown, which is the truth after a rewrite whose result could
-    /// not be measured, and which lets a later pass rewrite it again.
-    pub(crate) async fn set_metadata_rewrite_checksums(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        local_checksum: Option<&str>,
-        pre_rewrite_checksum: Option<&str>,
-    ) -> Result<(), StateError> {
-        let library = library.to_owned();
-        let asset_id = asset_id.to_owned();
-        let version_size = version_size.to_owned();
-        let local_checksum = local_checksum.map(str::to_owned);
-        let pre_rewrite_checksum = pre_rewrite_checksum.map(str::to_owned);
-        self.with_conn("set_metadata_rewrite_checksums", move |conn| {
-            conn.execute(
-                "UPDATE assets SET local_checksum = ?4, \
-                 download_checksum = COALESCE(download_checksum, ?5) \
-                 WHERE library = ?1 AND id = ?2 AND version_size = ?3",
-                rusqlite::params![
-                    library,
-                    asset_id,
-                    version_size,
-                    local_checksum,
-                    pre_rewrite_checksum
-                ],
-            )
-            .map_err(|e| StateError::query("set_metadata_rewrite_checksums", e))?;
             Ok(())
         })
         .await
@@ -4156,69 +4606,167 @@ impl SqliteStateDb {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError> {
-        if let Some(libraries) = library_scope {
-            let libraries = unique_sorted_strings(libraries);
-            if libraries.is_empty() {
-                return Ok(Vec::new());
-            }
-            let placeholders = sqlite_placeholders(libraries.len());
-            return self
-                .with_conn("get_pending_metadata_rewrites", move |conn| {
-                    let sql = format!(
-                        "SELECT {ASSET_COLUMNS} FROM assets \
-                         WHERE metadata_write_failed_at IS NOT NULL \
-                           AND status = 'downloaded' \
-                           AND is_deleted = 0 \
-                           AND local_path IS NOT NULL \
-                           AND library IN ({placeholders}) \
-                         ORDER BY metadata_write_failed_at ASC, library, id, version_size \
-                         LIMIT ? OFFSET ?"
-                    );
-                    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-                    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
-                    let mut params: Vec<&dyn rusqlite::ToSql> =
-                        Vec::with_capacity(libraries.len() + 2);
-                    for library in &libraries {
-                        params.push(library);
-                    }
-                    params.push(&limit);
-                    params.push(&offset);
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-                    let rows = stmt
-                        .query_map(rusqlite::params_from_iter(params), row_to_asset_record)
-                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
-                })
-                .await;
+        Ok(self
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                library_scope,
+                offset,
+                limit,
+            )
+            .await?
+            .into_iter()
+            .map(|pending| pending.asset)
+            .collect())
+    }
+
+    pub(crate) async fn get_pending_metadata_rewrites_page_for_queue(
+        &self,
+        queue: MetadataRewriteQueue,
+        library_scope: Option<&[&str]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
+        let libraries = library_scope.map(unique_sorted_strings);
+        if libraries.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        self.with_conn("get_pending_metadata_rewrites_for_queue", move |conn| {
+            query_pending_metadata_rewrites(conn, queue, libraries.as_deref(), offset, limit)
+        })
+        .await
+    }
+
+    pub(crate) async fn finish_metadata_rewrite(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+        completion: MetadataRewriteCompletion,
+    ) -> Result<bool, StateError> {
+        let metadata_hash = pending
+            .asset
+            .metadata
+            .metadata_hash
+            .clone()
+            .ok_or_else(|| StateError::Invariant {
+                operation: "finish_metadata_rewrite",
+                detail: "the selected row has no metadata hash".into(),
+            })?;
+        if pre_rewrite_checksum.is_some()
+            && pre_rewrite_checksum != pending.asset.local_checksum.as_deref()
+        {
+            return Err(StateError::Invariant {
+                operation: "finish_metadata_rewrite",
+                detail: "pre-rewrite checksum does not match the selected input".into(),
+            });
+        }
+        let capture_receipt = pending.capture_repair_receipt.as_ref();
+        if (selected_queue == MetadataRewriteQueue::CaptureRepair
+            || completion.clears(MetadataRewriteQueue::CaptureRepair))
+            && capture_receipt.is_none()
+        {
+            return Err(StateError::Invariant {
+                operation: "finish_metadata_rewrite",
+                detail: "capture-repair completion requires a typed receipt".into(),
+            });
+        }
+        if let Some(CaptureRepairReceipt::Pending { .. }) = capture_receipt
+            && completion.clears(MetadataRewriteQueue::CaptureRepair)
+            && local_checksum != pending.asset.local_checksum.as_deref()
+        {
+            return Err(StateError::Invariant {
+                operation: "finish_metadata_rewrite",
+                detail: "capture-repair bytes changed without a prepared receipt".into(),
+            });
+        }
+        if let Some(CaptureRepairReceipt::Prepared {
+            output_checksum, ..
+        }) = capture_receipt
+            && completion.clears(MetadataRewriteQueue::CaptureRepair)
+            && local_checksum != Some(output_checksum.as_str())
+            && local_checksum != pending.asset.local_checksum.as_deref()
+        {
+            return Err(StateError::Invariant {
+                operation: "finish_metadata_rewrite",
+                detail: "capture-repair output does not match its prepared receipt".into(),
+            });
         }
 
-        self.with_conn("get_pending_metadata_rewrites", move |conn| {
-            let sql = format!(
-                "SELECT {ASSET_COLUMNS} FROM assets \
-                 WHERE metadata_write_failed_at IS NOT NULL \
-                   AND status = 'downloaded' \
-                   AND is_deleted = 0 \
-                   AND local_path IS NOT NULL \
-                 ORDER BY metadata_write_failed_at ASC, library, id, version_size \
-                 LIMIT ?1 OFFSET ?2"
-            );
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-            let rows = stmt
-                .query_map(
-                    [
-                        i64::try_from(limit).unwrap_or(i64::MAX),
-                        i64::try_from(offset).unwrap_or(i64::MAX),
+        let library = pending.asset.library.to_string();
+        let asset_id = pending.asset.id.to_string();
+        let version_size = pending.asset.version_size.as_str().to_owned();
+        let input_checksum = pending.asset.local_checksum.clone();
+        let local_checksum = local_checksum.map(str::to_owned);
+        let pre_rewrite_checksum = pre_rewrite_checksum.map(str::to_owned);
+        let capture_metadata_hash = capture_receipt.map(CaptureRepairReceipt::metadata_hash);
+        let capture_output_checksum = capture_receipt.and_then(|receipt| match receipt {
+            CaptureRepairReceipt::Pending { .. } => None,
+            CaptureRepairReceipt::Prepared {
+                output_checksum, ..
+            } => Some(output_checksum.as_str()),
+        });
+        let capture_output_size = match capture_receipt {
+            None | Some(CaptureRepairReceipt::Pending { .. }) => None,
+            Some(CaptureRepairReceipt::Prepared { output_size, .. }) => Some(
+                i64::try_from(*output_size).map_err(|_error| StateError::Invariant {
+                    operation: "finish_metadata_rewrite",
+                    detail: "capture-repair output size exceeds SQLite INTEGER".into(),
+                })?,
+            ),
+        };
+        let capture_metadata_hash = capture_metadata_hash.map(str::to_owned);
+        let capture_output_checksum = capture_output_checksum.map(str::to_owned);
+        let selected_capture = i64::from(selected_queue == MetadataRewriteQueue::CaptureRepair);
+        let clear_ordinary = i64::from(completion.clears(MetadataRewriteQueue::Ordinary));
+        let clear_capture = i64::from(completion.clears(MetadataRewriteQueue::CaptureRepair));
+        self.with_conn("finish_metadata_rewrite", move |conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE assets SET \
+                        local_checksum = ?6, \
+                        download_checksum = COALESCE(download_checksum, ?7), \
+                        metadata_write_failed_at = CASE WHEN ?8 = 1 \
+                            THEN NULL ELSE metadata_write_failed_at END, \
+                        capture_repair_metadata_hash = CASE \
+                            WHEN ?9 = 1 THEN NULL \
+                            ELSE capture_repair_metadata_hash END, \
+                        capture_repair_output_checksum = CASE \
+                            WHEN ?9 = 1 OR local_checksum IS NOT ?6 \
+                                THEN NULL ELSE capture_repair_output_checksum END, \
+                        capture_repair_output_size = CASE \
+                            WHEN ?9 = 1 OR local_checksum IS NOT ?6 \
+                                THEN NULL ELSE capture_repair_output_size END \
+                     WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                       AND status = 'downloaded' AND is_deleted = 0 \
+                       AND metadata_hash IS ?4 AND local_checksum IS ?5 \
+                       AND ((?10 = 0 AND metadata_write_failed_at IS NOT NULL) \
+                         OR (?10 = 1 \
+                           AND capture_repair_metadata_hash IS ?11 \
+                           AND capture_repair_output_checksum IS ?12 \
+                           AND capture_repair_output_size IS ?13)) \
+                       AND (?9 = 0 OR ( \
+                           capture_repair_metadata_hash IS ?11 \
+                           AND capture_repair_output_checksum IS ?12 \
+                           AND capture_repair_output_size IS ?13))",
+                    rusqlite::params![
+                        library,
+                        asset_id,
+                        version_size,
+                        metadata_hash,
+                        input_checksum,
+                        local_checksum,
+                        pre_rewrite_checksum,
+                        clear_ordinary,
+                        clear_capture,
+                        selected_capture,
+                        capture_metadata_hash,
+                        capture_output_checksum,
+                        capture_output_size
                     ],
-                    row_to_asset_record,
                 )
-                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
+                .map_err(|e| StateError::query("finish_metadata_rewrite", e))?;
+            Ok(updated > 0 && completion.clears(selected_queue))
         })
         .await
     }
@@ -4634,6 +5182,29 @@ impl DownloadStateStore for SqliteStateDb {
             local_path,
             local_checksum,
             download_checksum,
+        )
+        .await
+    }
+
+    async fn mark_downloaded_with_capture_repair(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::mark_downloaded_with_capture_repair(
+            self,
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+            mark_capture_repair,
         )
         .await
     }
@@ -5229,6 +5800,7 @@ impl MetadataRewriteStore for SqliteStateDb {
         asset_id: &str,
         metadata: &AssetMetadata,
         mark_for_rewrite: bool,
+        mark_capture_repair: bool,
         capture_revision: i64,
     ) -> Result<usize, StateError> {
         SqliteStateDb::refresh_downloaded_asset_metadata(
@@ -5237,6 +5809,7 @@ impl MetadataRewriteStore for SqliteStateDb {
             asset_id,
             metadata,
             mark_for_rewrite,
+            mark_capture_repair,
             capture_revision,
         )
         .await
@@ -5263,30 +5836,48 @@ impl MetadataRewriteStore for SqliteStateDb {
         SqliteStateDb::get_pending_metadata_rewrites_page(self, library_scope, offset, limit).await
     }
 
-    async fn clear_metadata_write_failure(
+    async fn get_pending_metadata_rewrites_page_for_queue(
         &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::clear_metadata_write_failure(self, library, asset_id, version_size).await
+        queue: MetadataRewriteQueue,
+        library_scope: Option<&[&str]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
+        SqliteStateDb::get_pending_metadata_rewrites_page_for_queue(
+            self,
+            queue,
+            library_scope,
+            offset,
+            limit,
+        )
+        .await
     }
 
-    async fn set_metadata_rewrite_checksums(
+    async fn record_capture_repair_prepared(
         &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
+        pending: &PendingMetadataRewrite,
+        output_checksum: &str,
+        output_size: u64,
+    ) -> Result<Option<CaptureRepairReceipt>, StateError> {
+        SqliteStateDb::record_capture_repair_prepared(self, pending, output_checksum, output_size)
+            .await
+    }
+
+    async fn finish_metadata_rewrite(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
         local_checksum: Option<&str>,
         pre_rewrite_checksum: Option<&str>,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::set_metadata_rewrite_checksums(
+        completion: MetadataRewriteCompletion,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::finish_metadata_rewrite(
             self,
-            library,
-            asset_id,
-            version_size,
+            pending,
+            selected_queue,
             local_checksum,
             pre_rewrite_checksum,
+            completion,
         )
         .await
     }
@@ -5389,7 +5980,10 @@ impl SqliteStateDb {
     ) {
         let conn = self.acquire_lock("test_clear_local_checksum").unwrap();
         conn.execute(
-            "UPDATE assets SET local_checksum = NULL \
+            "UPDATE assets SET local_checksum = NULL, \
+                capture_repair_metadata_hash = NULL, \
+                capture_repair_output_checksum = NULL, \
+                capture_repair_output_size = NULL \
              WHERE library = ?1 AND id = ?2 AND version_size = ?3",
             rusqlite::params![library, asset_id, version_size],
         )
@@ -5461,8 +6055,98 @@ const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
 
 /// Total number of columns in `ASSET_COLUMNS`. Validated by a unit test that
 /// asserts `row_to_asset_record` reads exactly this many indices (0..N).
-#[cfg(test)]
 const ASSET_COLUMN_COUNT: usize = 40;
+
+fn query_pending_metadata_rewrites(
+    conn: &Connection,
+    queue: MetadataRewriteQueue,
+    libraries: Option<&[String]>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<PendingMetadataRewrite>, StateError> {
+    let (queue_predicate, order) = match queue {
+        MetadataRewriteQueue::Ordinary => (
+            "metadata_write_failed_at IS NOT NULL",
+            "metadata_write_failed_at ASC, library, id, version_size",
+        ),
+        MetadataRewriteQueue::CaptureRepair => (
+            "(capture_repair_metadata_hash IS NOT NULL \
+              OR capture_repair_output_checksum IS NOT NULL \
+              OR capture_repair_output_size IS NOT NULL)",
+            "library, id, version_size",
+        ),
+    };
+    let scope = libraries
+        .map(|libraries| format!(" AND library IN ({})", sqlite_placeholders(libraries.len())))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT {ASSET_COLUMNS}, capture_repair_metadata_hash, \
+            capture_repair_output_checksum, capture_repair_output_size \
+         FROM assets WHERE {queue_predicate} \
+           AND status = 'downloaded' AND is_deleted = 0 AND local_path IS NOT NULL \
+           {scope} ORDER BY {order} LIMIT ? OFFSET ?"
+    );
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let mut params: Vec<&dyn rusqlite::ToSql> =
+        Vec::with_capacity(libraries.map_or(2, |values| values.len() + 2));
+    if let Some(libraries) = libraries {
+        for library in libraries {
+            params.push(library);
+        }
+    }
+    params.push(&limit);
+    params.push(&offset);
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params),
+            row_to_pending_metadata_rewrite,
+        )
+        .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))
+}
+
+fn row_to_pending_metadata_rewrite(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PendingMetadataRewrite> {
+    let metadata_hash: Option<String> = row.get(ASSET_COLUMN_COUNT)?;
+    let output_checksum: Option<String> = row.get(ASSET_COLUMN_COUNT + 1)?;
+    let output_size: Option<i64> = row.get(ASSET_COLUMN_COUNT + 2)?;
+    let capture_repair_receipt = match (metadata_hash, output_checksum, output_size) {
+        (None, None, None) => None,
+        (Some(metadata_hash), None, None) if !metadata_hash.is_empty() => {
+            Some(CaptureRepairReceipt::Pending { metadata_hash })
+        }
+        (Some(metadata_hash), Some(output_checksum), Some(output_size))
+            if !metadata_hash.is_empty() && !output_checksum.is_empty() && output_size >= 0 =>
+        {
+            Some(CaptureRepairReceipt::Prepared {
+                metadata_hash,
+                output_checksum,
+                output_size: u64::try_from(output_size).unwrap_or(0),
+            })
+        }
+        state => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                ASSET_COLUMN_COUNT,
+                rusqlite::types::Type::Null,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed capture-repair receipt: {state:?}"),
+                )
+                .into(),
+            ));
+        }
+    };
+    Ok(PendingMetadataRewrite {
+        asset: row_to_asset_record(row)?,
+        capture_repair_receipt,
+    })
+}
 
 struct ManifestJoinedRow {
     asset: ManifestAssetRow,
@@ -10254,6 +10938,7 @@ mod tests {
                 "MOVED_ON",
                 &edited,
                 true,
+                false,
                 METADATA_CAPTURE_REVISION,
             )
             .await
@@ -10269,6 +10954,7 @@ mod tests {
                 "ABSENT",
                 &edited,
                 true,
+                false,
                 METADATA_CAPTURE_REVISION,
             )
             .await
@@ -10432,6 +11118,7 @@ mod tests {
                 "PHOTO",
                 &metadata,
                 true,
+                false,
                 METADATA_CAPTURE_REVISION,
             )
             .await
@@ -10465,6 +11152,876 @@ mod tests {
             assert_eq!(record.checksum.as_ref(), "checksum123");
             assert_eq!(record.metadata.rating, Some(4));
         }
+    }
+
+    async fn seed_downloaded_capture_asset(
+        db: &SqliteStateDb,
+        id: &str,
+        metadata_hash: &str,
+        provider_checksum: &str,
+        local_checksum: &str,
+    ) {
+        let record = TestAssetRecord::new(id)
+            .checksum(provider_checksum)
+            .metadata(AssetMetadata {
+                metadata_hash: Some(metadata_hash.to_owned()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            id,
+            "original",
+            Path::new("/photos/capture.jpg"),
+            local_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_repair_receipt_is_guarded_and_markers_retire_independently() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_downloaded_capture_asset(&db, "CAPTURE", "metadata-v1", "provider-v1", "local-v1")
+            .await;
+        let metadata = AssetMetadata {
+            metadata_hash: Some("metadata-v1".into()),
+            ..AssetMetadata::default()
+        };
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "CAPTURE",
+            &metadata,
+            true,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+
+        let mut capture = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            capture.capture_repair_receipt,
+            Some(CaptureRepairReceipt::Pending {
+                metadata_hash: "metadata-v1".into()
+            })
+        );
+        let prepared = db
+            .record_capture_repair_prepared(&capture, "local-v2", 2048)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared,
+            CaptureRepairReceipt::Prepared {
+                metadata_hash: "metadata-v1".into(),
+                output_checksum: "local-v2".into(),
+                output_size: 2048,
+            }
+        );
+        capture.capture_repair_receipt = Some(prepared);
+        capture = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let reprepared = db
+            .record_capture_repair_prepared(&capture, "local-v3", 3072)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reprepared,
+            CaptureRepairReceipt::Prepared {
+                metadata_hash: "metadata-v1".into(),
+                output_checksum: "local-v3".into(),
+                output_size: 3072,
+            },
+            "a crash-left prepared receipt may be replaced while input bytes still match"
+        );
+        capture.capture_repair_receipt = Some(reprepared);
+
+        assert!(
+            db.finish_metadata_rewrite(
+                &capture,
+                MetadataRewriteQueue::CaptureRepair,
+                Some("local-v3"),
+                Some("local-v1"),
+                MetadataRewriteCompletion::CaptureRepair,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let ordinary = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary.len(),
+            1,
+            "capture completion must keep generic debt"
+        );
+        assert!(
+            db.finish_metadata_rewrite(
+                &ordinary[0],
+                MetadataRewriteQueue::Ordinary,
+                Some("local-v3"),
+                None,
+                MetadataRewriteCompletion::Ordinary,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded[0].local_checksum.as_deref(), Some("local-v3"));
+        assert_eq!(downloaded[0].download_checksum.as_deref(), Some("local-v1"));
+
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "CAPTURE",
+            &metadata,
+            false,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let pending_no_write = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        db.record_capture_repair_prepared(&pending_no_write, "unused-output", 3072)
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared_no_write = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            db.finish_metadata_rewrite(
+                &prepared_no_write,
+                MetadataRewriteQueue::CaptureRepair,
+                Some("local-v3"),
+                None,
+                MetadataRewriteCompletion::CaptureRepair,
+            )
+            .await
+            .unwrap(),
+            "verified no-write completion may retain the selected input checksum"
+        );
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "CAPTURE",
+            &metadata,
+            true,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let both = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.finish_metadata_rewrite(
+                &both[0],
+                MetadataRewriteQueue::Ordinary,
+                Some("local-v3"),
+                None,
+                MetadataRewriteCompletion::Both,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_repair_refresh_preserves_receipt_until_publication_is_finalised() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_downloaded_capture_asset(&db, "REFRESH", "metadata-v1", "provider-v1", "local-v1")
+            .await;
+
+        let unchanged = AssetMetadata {
+            metadata_hash: Some("metadata-v1".into()),
+            ..AssetMetadata::default()
+        };
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "REFRESH",
+            &unchanged,
+            true,
+            false,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "ordinary refresh must not create capture debt"
+        );
+
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "REFRESH",
+            &unchanged,
+            true,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let mut pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let stale_pending = pending.clone();
+        pending.capture_repair_receipt = db
+            .record_capture_repair_prepared(&pending, "local-v2", 2048)
+            .await
+            .unwrap();
+
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "REFRESH",
+            &unchanged,
+            false,
+            false,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let preserved = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            preserved[0].capture_repair_receipt,
+            pending.capture_repair_receipt
+        );
+
+        let ordinary = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.finish_metadata_rewrite(
+                &ordinary[0],
+                MetadataRewriteQueue::Ordinary,
+                Some("local-ordinary"),
+                Some("local-v1"),
+                MetadataRewriteCompletion::None,
+            )
+            .await
+            .unwrap(),
+            "checksum-only completion must not retire the selected queue"
+        );
+        let ordinary_after_checksum = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_after_checksum.len(), 1);
+        assert_eq!(
+            ordinary_after_checksum[0].asset.local_checksum.as_deref(),
+            Some("local-ordinary")
+        );
+        assert_eq!(
+            ordinary_after_checksum[0]
+                .asset
+                .download_checksum
+                .as_deref(),
+            Some("local-v1")
+        );
+        assert!(
+            db.finish_metadata_rewrite(
+                &ordinary_after_checksum[0],
+                MetadataRewriteQueue::Ordinary,
+                Some("local-ordinary"),
+                None,
+                MetadataRewriteCompletion::Ordinary,
+            )
+            .await
+            .unwrap()
+        );
+        let mut pending_after_ordinary = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            pending_after_ordinary.capture_repair_receipt,
+            Some(CaptureRepairReceipt::Pending {
+                metadata_hash: "metadata-v1".into()
+            }),
+            "ordinary checksum changes must preserve capture intent as pending"
+        );
+        pending_after_ordinary.capture_repair_receipt = db
+            .record_capture_repair_prepared(&pending_after_ordinary, "local-v2", 2048)
+            .await
+            .unwrap();
+
+        let changed = AssetMetadata {
+            metadata_hash: Some("metadata-v2".into()),
+            rating: Some(5),
+            ..AssetMetadata::default()
+        };
+        assert_eq!(
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "REFRESH",
+                &changed,
+                false,
+                false,
+                METADATA_CAPTURE_REVISION,
+            )
+            .await
+            .unwrap(),
+            0,
+            "new provider metadata must wait until published repair bytes are finalised"
+        );
+        let preserved_after_change = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            preserved_after_change[0].capture_repair_receipt,
+            pending_after_ordinary.capture_repair_receipt
+        );
+        assert!(
+            db.record_capture_repair_prepared(&stale_pending, "stale-output", 2048)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale metadata/input guard must not replace the reset receipt"
+        );
+
+        let incremental = TestAssetRecord::new("REFRESH")
+            .checksum("provider-v1")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("metadata-v3".into()),
+                rating: Some(4),
+                ..AssetMetadata::default()
+            })
+            .build();
+        assert!(matches!(
+            db.upsert_seen(&incremental).await,
+            Err(StateError::Invariant {
+                operation: "upsert_seen",
+                ..
+            })
+        ));
+        let incrementally_preserved = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            incrementally_preserved[0].capture_repair_receipt,
+            pending_after_ordinary.capture_repair_receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_capture_receipt_blocks_metadata_refresh_for_every_version() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_downloaded_capture_asset(
+            &db,
+            "MULTI_REFRESH",
+            "metadata-v1",
+            "provider-v1",
+            "local-original",
+        )
+        .await;
+        let medium = TestAssetRecord::new("MULTI_REFRESH")
+            .version_size(VersionSizeKey::Medium)
+            .checksum("provider-medium")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("metadata-v1".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&medium).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "MULTI_REFRESH",
+            "medium",
+            Path::new("/photos/capture-medium.jpg"),
+            "local-medium",
+            None,
+        )
+        .await
+        .unwrap();
+        let current = AssetMetadata {
+            metadata_hash: Some("metadata-v1".into()),
+            ..AssetMetadata::default()
+        };
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "MULTI_REFRESH",
+            &current,
+            true,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|pending| pending.asset.version_size == VersionSizeKey::Original)
+            .unwrap();
+        assert!(
+            db.record_capture_repair_prepared(&pending, "prepared-original", 2048)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let changed = AssetMetadata {
+            metadata_hash: Some("metadata-v2".into()),
+            rating: Some(5),
+            ..AssetMetadata::default()
+        };
+        let changed_medium = TestAssetRecord::new("MULTI_REFRESH")
+            .version_size(VersionSizeKey::Medium)
+            .checksum("provider-medium")
+            .metadata(changed.clone())
+            .build();
+        assert!(matches!(
+            db.upsert_seen(&changed_medium).await,
+            Err(StateError::Invariant {
+                operation: "upsert_seen",
+                ..
+            })
+        ));
+        let new_thumb = TestAssetRecord::new("MULTI_REFRESH")
+            .version_size(VersionSizeKey::Thumb)
+            .checksum("provider-thumb")
+            .metadata(changed.clone())
+            .build();
+        assert!(matches!(
+            db.upsert_seen(&new_thumb).await,
+            Err(StateError::Invariant {
+                operation: "upsert_seen",
+                ..
+            })
+        ));
+        assert_eq!(
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "MULTI_REFRESH",
+                &changed,
+                false,
+                false,
+                METADATA_CAPTURE_REVISION,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        let versions = downloaded
+            .iter()
+            .filter(|record| record.id.as_ref() == "MULTI_REFRESH")
+            .collect::<Vec<_>>();
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions
+                .iter()
+                .all(|record| { record.metadata.metadata_hash.as_deref() == Some("metadata-v1") }),
+            "a blocked version must prevent partial asset-level metadata refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_capture_receipt_blocks_source_deletion_transitions() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        seed_downloaded_capture_asset(
+            &db,
+            "CAPTURE_DELETE",
+            "metadata-v1",
+            "provider-v1",
+            "local-v1",
+        )
+        .await;
+        let metadata = AssetMetadata {
+            metadata_hash: Some("metadata-v1".into()),
+            ..AssetMetadata::default()
+        };
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "CAPTURE_DELETE",
+            &metadata,
+            true,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                1,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        db.record_capture_repair_prepared(&pending, "prepared-output", 2048)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.mark_soft_deleted("PrimarySync", "CAPTURE_DELETE", None)
+                .await,
+            Err(StateError::Invariant {
+                operation: "mark_soft_deleted",
+                ..
+            })
+        ));
+        assert!(matches!(
+            db.resolve_source_deleted("PrimarySync", "CAPTURE_DELETE", None)
+                .await,
+            Err(StateError::Invariant {
+                operation: "resolve_source_deleted",
+                ..
+            })
+        ));
+        db.upsert_asset_master_mapping("PrimarySync", "CAPTURE_DELETE", "MASTER_DELETE")
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.mark_master_family_soft_deleted("PrimarySync", "MASTER_DELETE", None)
+                .await,
+            Err(StateError::Invariant {
+                operation: "mark_master_family_soft_deleted",
+                ..
+            })
+        ));
+        assert!(matches!(
+            db.resolve_master_family_source_deleted("PrimarySync", "MASTER_DELETE", None)
+                .await,
+            Err(StateError::Invariant {
+                operation: "resolve_master_family_source_deleted",
+                ..
+            })
+        ));
+        assert_eq!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                1,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_repair_receipt_fails_closed_and_tracks_installed_bytes() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("ADOPT_CAPTURE")
+            .checksum("provider-v1")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("metadata-v1".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.import_adopt(
+            &record,
+            Path::new("/photos/adopted.jpg"),
+            "local-v1",
+            2048,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "ADOPT_CAPTURE",
+            &record.metadata,
+            false,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let mut pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        pending.capture_repair_receipt = db
+            .record_capture_repair_prepared(&pending, "local-v2", 2048)
+            .await
+            .unwrap();
+
+        db.import_adopt(
+            &record,
+            Path::new("/photos/readopted.jpg"),
+            "local-v1",
+            2048,
+            Some(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()[0]
+                .capture_repair_receipt,
+            pending.capture_repair_receipt,
+            "byte-identical re-adoption must preserve prepared evidence"
+        );
+
+        db.import_adopt(
+            &record,
+            Path::new("/photos/readopted.jpg"),
+            "local-changed",
+            2048,
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "changed installed bytes must invalidate capture evidence"
+        );
+
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "ADOPT_CAPTURE",
+            &record.metadata,
+            false,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        let republished = TestAssetRecord::new("ADOPT_CAPTURE")
+            .checksum("provider-v2")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("metadata-v1".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&republished).await.unwrap();
+        let receipt: (Option<String>, Option<String>, Option<i64>) = {
+            let conn = db.acquire_lock("read invalidated capture receipt").unwrap();
+            conn.query_row(
+                "SELECT capture_repair_metadata_hash, capture_repair_output_checksum, \
+                    capture_repair_output_size FROM assets WHERE id = 'ADOPT_CAPTURE'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(receipt, (None, None, None));
+
+        seed_downloaded_capture_asset(&db, "MALFORMED", "metadata-v1", "provider-v1", "local-v1")
+            .await;
+        {
+            let conn = db.acquire_lock("write malformed capture receipt").unwrap();
+            conn.execute(
+                "UPDATE assets SET capture_repair_output_checksum = 'orphaned' \
+                 WHERE id = 'MALFORMED'",
+                [],
+            )
+            .unwrap();
+        }
+        let changed = AssetMetadata {
+            metadata_hash: Some("metadata-v2".into()),
+            rating: Some(5),
+            ..AssetMetadata::default()
+        };
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "MALFORMED",
+            &changed,
+            false,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .is_err(),
+            "partial capture receipt must fail closed"
+        );
     }
 
     #[tokio::test]
@@ -10548,6 +12105,7 @@ mod tests {
             "ASSET_CHILD",
             &metadata,
             true,
+            false,
             METADATA_CAPTURE_REVISION,
         )
         .await

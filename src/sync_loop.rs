@@ -527,6 +527,20 @@ fn refresh_metadata_forces_one_shot(
     Ok(true)
 }
 
+fn validate_capture_timestamp_repair(
+    repair: download::CaptureTimestampRepair,
+    metadata: &config::MetadataConfig,
+) -> anyhow::Result<download::CaptureTimestampRepair> {
+    if matches!(repair, download::CaptureTimestampRepair::Preserve) {
+        return Ok(repair);
+    }
+    anyhow::ensure!(
+        metadata.set_exif_datetime,
+        "--repair-capture-timestamps requires `metadata.set_exif_datetime = true` so the embedded datetime writer is enabled"
+    );
+    Ok(repair)
+}
+
 /// Keep explicit truncated-file replacement out of long-running service mode.
 /// The operator must authorize each repair run from a foreground command.
 fn repair_truncated_forces_one_shot(
@@ -626,6 +640,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         personality_mode,
         friendly_request,
     )?;
+    let capture_timestamp_repair = if config.runtime.repair_capture_timestamps {
+        download::CaptureTimestampRepair::ReplaceWithCaptureLocal
+    } else {
+        download::CaptureTimestampRepair::Preserve
+    };
 
     // On first run (no config file), persist bootstrap values so subsequent
     // runs don't need the same env again. Only when the user explicitly chose
@@ -655,6 +674,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     )? {
         config.watch.interval = None;
     }
+    let capture_timestamp_repair =
+        validate_capture_timestamp_repair(capture_timestamp_repair, &config.metadata)?;
     if repair_truncated_forces_one_shot(config.runtime.repair_truncated, service_mode)? {
         config.watch.interval = None;
     }
@@ -1060,6 +1081,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             skip_created_after,
             metadata: config.metadata,
             refresh_metadata: config.runtime.refresh_metadata,
+            capture_timestamp_repair,
             repair_truncated: config.runtime.repair_truncated,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
@@ -1352,6 +1374,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     download::drain_pending_metadata_rewrites(
                         db,
                         &config.metadata,
+                        capture_timestamp_repair,
                         &library_scope,
                         Arc::clone(&cfg_temp_suffix),
                         &shutdown_token,
@@ -5092,6 +5115,7 @@ mod tests {
                         id,
                         newer,
                         true,
+                        false,
                         state::METADATA_CAPTURE_REVISION,
                     )
                     .await?;
@@ -5691,6 +5715,7 @@ mod tests {
             asset_id: &str,
             metadata: &state::AssetMetadata,
             mark_for_rewrite: bool,
+            mark_capture_repair: bool,
             capture_revision: i64,
         ) -> Result<usize, state::error::StateError> {
             if self.fail_refresh_downloaded_metadata {
@@ -5704,6 +5729,7 @@ mod tests {
                     asset_id,
                     metadata,
                     mark_for_rewrite,
+                    mark_capture_repair,
                     capture_revision,
                 )
                 .await
@@ -5740,35 +5766,51 @@ mod tests {
                 .await
         }
 
-        async fn clear_metadata_write_failure(
+        async fn get_pending_metadata_rewrites_page_for_queue(
             &self,
-            library: &str,
-            asset_id: &str,
-            version_size: &str,
-        ) -> Result<(), state::error::StateError> {
+            queue: state::db::MetadataRewriteQueue,
+            library_scope: Option<&[&str]>,
+            offset: usize,
+            limit: usize,
+        ) -> Result<Vec<state::db::PendingMetadataRewrite>, state::error::StateError> {
+            if offset == 0 {
+                self.drains
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.inner
-                .clear_metadata_write_failure(library, asset_id, version_size)
+                .get_pending_metadata_rewrites_page_for_queue(queue, library_scope, offset, limit)
                 .await
         }
 
-        async fn set_metadata_rewrite_checksums(
+        async fn record_capture_repair_prepared(
             &self,
-            library: &str,
-            asset_id: &str,
-            version_size: &str,
+            pending: &state::db::PendingMetadataRewrite,
+            output_checksum: &str,
+            output_size: u64,
+        ) -> Result<Option<state::db::CaptureRepairReceipt>, state::error::StateError> {
+            self.inner
+                .record_capture_repair_prepared(pending, output_checksum, output_size)
+                .await
+        }
+
+        async fn finish_metadata_rewrite(
+            &self,
+            pending: &state::db::PendingMetadataRewrite,
+            selected_queue: state::db::MetadataRewriteQueue,
             local_checksum: Option<&str>,
             pre_rewrite_checksum: Option<&str>,
-        ) -> Result<(), state::error::StateError> {
+            completion: state::db::MetadataRewriteCompletion,
+        ) -> Result<bool, state::error::StateError> {
             if self.fail_metadata_checksum_write {
                 return Err(state::error::StateError::LockPoisoned(self.message.into()));
             }
             self.inner
-                .set_metadata_rewrite_checksums(
-                    library,
-                    asset_id,
-                    version_size,
+                .finish_metadata_rewrite(
+                    pending,
+                    selected_queue,
                     local_checksum,
                     pre_rewrite_checksum,
+                    completion,
                 )
                 .await
         }
@@ -9410,6 +9452,23 @@ mod tests {
     fn refresh_metadata_rejected_with_narrowing_filter() {
         let err = refresh_metadata_forces_one_shot(true, false, true).unwrap_err();
         assert!(err.to_string().contains("filters"), "{err}");
+    }
+
+    #[test]
+    fn capture_timestamp_repair_requires_embedded_datetime_output() {
+        let repair = download::CaptureTimestampRepair::ReplaceWithCaptureLocal;
+        let err = validate_capture_timestamp_repair(repair, &config::MetadataConfig::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("set_exif_datetime"), "{err}");
+
+        let metadata = config::MetadataConfig {
+            set_exif_datetime: true,
+            ..config::MetadataConfig::default()
+        };
+        assert_eq!(
+            validate_capture_timestamp_repair(repair, &metadata).unwrap(),
+            repair
+        );
     }
 
     #[test]

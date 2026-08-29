@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 19;
+pub(crate) const SCHEMA_VERSION: i32 = 20;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -519,6 +519,16 @@ CREATE TABLE IF NOT EXISTS owned_temp_files (
 );
 ";
 
+/// V20 durable capture-timestamp repair receipt.
+///
+/// All NULL means no repair is queued. A metadata hash alone is pending, and
+/// all three values mean a prepared replacement is ready to publish.
+const V20_ASSET_COLUMNS: &[(&str, &str)] = &[
+    ("capture_repair_metadata_hash", "TEXT"),
+    ("capture_repair_output_checksum", "TEXT"),
+    ("capture_repair_output_size", "INTEGER"),
+];
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -675,6 +685,15 @@ fn migrate_to_version(
         17 => conn.execute_batch(SCHEMA_V17)?,
         18 => conn.execute_batch(SCHEMA_V18)?,
         19 => conn.execute_batch(SCHEMA_V19)?,
+        20 => {
+            for (column, declaration) in V20_ASSET_COLUMNS {
+                if !column_exists(conn, "assets", column)? {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE assets ADD COLUMN {column} {declaration};"
+                    ))?;
+                }
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -2014,6 +2033,61 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 0);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v20_adds_capture_repair_receipt_without_backfill() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=19 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, \
+                created_at, size_bytes, media_type, status, last_seen_at) \
+             VALUES ('PrimarySync', 'legacy', 'original', 'checksum', 'legacy.jpg', \
+                1, 10, 'photo', 'downloaded', 1)",
+            [],
+        )
+        .unwrap();
+        set_schema_version(&conn, 19).unwrap();
+
+        migrate(&conn).unwrap();
+
+        for (column, _) in V20_ASSET_COLUMNS {
+            assert!(column_exists(&conn, "assets", column).unwrap());
+        }
+        let receipt: (Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT capture_repair_metadata_hash, capture_repair_output_checksum, \
+                    capture_repair_output_size FROM assets WHERE id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt, (None, None, None));
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v20_migration_is_idempotent_after_partial_application() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=19 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute_batch(
+            "ALTER TABLE assets ADD COLUMN capture_repair_metadata_hash TEXT;\
+             ALTER TABLE assets ADD COLUMN capture_repair_output_checksum TEXT;",
+        )
+        .unwrap();
+        set_schema_version(&conn, 19).unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        for (column, _) in V20_ASSET_COLUMNS {
+            assert!(column_exists(&conn, "assets", column).unwrap());
+        }
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 

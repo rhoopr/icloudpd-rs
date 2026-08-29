@@ -19,6 +19,7 @@ pub(crate) mod recap;
 mod retry;
 
 pub(crate) use limiter::BandwidthLimiter;
+pub(crate) use metadata_rewrite::CaptureTimestampRepair;
 
 use pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, PassResult, StreamRuntime, StreamingResult,
@@ -1151,6 +1152,7 @@ pub(crate) struct DownloadConfig {
     pub(crate) skip_created_after: Option<crate::config::CreatedDateFilter>,
     pub(crate) metadata: crate::config::MetadataConfig,
     pub(crate) refresh_metadata: bool,
+    pub(crate) capture_timestamp_repair: CaptureTimestampRepair,
     pub(crate) repair_truncated: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
@@ -1302,6 +1304,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("skip_created_after", &self.skip_created_after);
         s.field("metadata", &self.metadata)
             .field("refresh_metadata", &self.refresh_metadata)
+            .field("capture_timestamp_repair", &self.capture_timestamp_repair)
             .field("repair_truncated", &self.repair_truncated)
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
@@ -1351,6 +1354,7 @@ impl DownloadConfig {
             skip_created_after: None,
             metadata: crate::config::MetadataConfig::default(),
             refresh_metadata: false,
+            capture_timestamp_repair: CaptureTimestampRepair::Preserve,
             repair_truncated: false,
             concurrent_downloads: 1,
             recent: None,
@@ -4129,6 +4133,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
 pub(crate) async fn drain_pending_metadata_rewrites(
     db: &dyn DownloadStore,
     metadata: &crate::config::MetadataConfig,
+    capture_timestamp_repair: CaptureTimestampRepair,
     library_scope: &[&str],
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
@@ -4143,6 +4148,7 @@ pub(crate) async fn drain_pending_metadata_rewrites(
         let pass = metadata_rewrite::run_pending_page(
             db,
             flags,
+            capture_timestamp_repair,
             Arc::clone(&temp_suffix),
             shutdown_token,
             Some(library_scope),
@@ -4153,10 +4159,19 @@ pub(crate) async fn drain_pending_metadata_rewrites(
         if pass.fetched == 0 {
             return failed;
         }
+        tracing::debug!(
+            applied = pass.applied,
+            retired = pass.retired_from_selected_queue,
+            failed = pass.failed,
+            "Metadata rewrite batch completed"
+        );
         if shutdown_token.is_cancelled() {
             return failed.max(1);
         }
-        offset = offset.saturating_add(pass.fetched.saturating_sub(pass.applied));
+        offset = offset.saturating_add(
+            pass.fetched
+                .saturating_sub(pass.retired_from_selected_queue),
+        );
     }
 }
 
@@ -4237,6 +4252,7 @@ async fn refresh_metadata_capture_candidate(
             &candidate.asset_id,
             asset.metadata(),
             mark_for_rewrite,
+            false,
             crate::state::METADATA_CAPTURE_REVISION,
         )
         .await
@@ -5185,6 +5201,10 @@ async fn run_targeted_recovery_pass(
         client: download_client,
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),
+        mark_capture_repair_after_download: matches!(
+            config.capture_timestamp_repair,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal
+        ),
         concurrency: config.concurrent_downloads,
         reporting: controls.reporting,
         temp_suffix: Arc::clone(&config.temp_suffix),
@@ -5240,6 +5260,10 @@ async fn run_targeted_recovery_pass(
                 client: download_client,
                 retry_config: &config.retry,
                 metadata: MetadataFlags::from(config.as_ref()),
+                mark_capture_repair_after_download: matches!(
+                    config.capture_timestamp_repair,
+                    CaptureTimestampRepair::ReplaceWithCaptureLocal
+                ),
                 concurrency: config.concurrent_downloads,
                 reporting: controls.reporting,
                 temp_suffix: Arc::clone(&config.temp_suffix),
@@ -7868,6 +7892,7 @@ async fn apply_changed_provider_metadata(
             asset.state_id(),
             asset.metadata(),
             mark_for_rewrite,
+            false,
             crate::state::METADATA_CAPTURE_REVISION,
         )
         .await;
@@ -8487,6 +8512,10 @@ async fn download_photos_incremental_collecting_inner(
         client: download_client,
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),
+        mark_capture_repair_after_download: matches!(
+            config.capture_timestamp_repair,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal
+        ),
         concurrency: config.concurrent_downloads,
         reporting: controls.reporting,
         temp_suffix: Arc::clone(&config.temp_suffix),
@@ -8543,6 +8572,10 @@ async fn download_photos_incremental_collecting_inner(
                 client: download_client,
                 retry_config: &config.retry,
                 metadata: MetadataFlags::from(config.as_ref()),
+                mark_capture_repair_after_download: matches!(
+                    config.capture_timestamp_repair,
+                    CaptureTimestampRepair::ReplaceWithCaptureLocal
+                ),
                 concurrency: config.concurrent_downloads,
                 reporting: controls.reporting,
                 temp_suffix: Arc::clone(&config.temp_suffix),

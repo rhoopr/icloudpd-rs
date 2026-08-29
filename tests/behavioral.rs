@@ -82,7 +82,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 19;
+const HELPER_SCHEMA_VERSION: i32 = 20;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -141,6 +141,9 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             metadata_write_failed_at INTEGER,
             imported_size INTEGER,
             imported_mtime INTEGER,
+            capture_repair_metadata_hash TEXT,
+            capture_repair_output_checksum TEXT,
+            capture_repair_output_size INTEGER,
             PRIMARY KEY (library, id, version_size)
         );
         CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
@@ -336,7 +339,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 19). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 20). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -354,7 +357,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 19;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 20;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -3829,6 +3832,16 @@ fn behavioral_helper_carries_every_migrated_column() {
         has_owned_temp_files,
         "v19 table owned_temp_files must exist in the behavioral helper's DDL"
     );
+    for column in [
+        "capture_repair_metadata_hash",
+        "capture_repair_output_checksum",
+        "capture_repair_output_size",
+    ] {
+        assert!(
+            has_column(&conn, "assets", column),
+            "v20 column assets.{column} must exist in the behavioral helper's DDL"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
