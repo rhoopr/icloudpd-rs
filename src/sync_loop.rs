@@ -5815,28 +5815,6 @@ mod tests {
                 .await
         }
 
-        async fn set_metadata_rewrite_checksums(
-            &self,
-            library: &str,
-            asset_id: &str,
-            version_size: &str,
-            local_checksum: Option<&str>,
-            pre_rewrite_checksum: Option<&str>,
-        ) -> Result<(), state::error::StateError> {
-            if self.fail_metadata_checksum_write {
-                return Err(state::error::StateError::LockPoisoned(self.message.into()));
-            }
-            self.inner
-                .set_metadata_rewrite_checksums(
-                    library,
-                    asset_id,
-                    version_size,
-                    local_checksum,
-                    pre_rewrite_checksum,
-                )
-                .await
-        }
-
         async fn has_downloaded_without_metadata_hash(
             &self,
         ) -> Result<bool, state::error::StateError> {

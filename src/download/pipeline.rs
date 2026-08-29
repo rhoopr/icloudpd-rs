@@ -4813,17 +4813,6 @@ mod tests {
             Ok(0)
         }
 
-        async fn set_metadata_rewrite_checksums(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-        ) -> Result<(), StateError> {
-            Ok(())
-        }
-
         async fn get_downloaded_metadata_hashes(
             &self,
         ) -> Result<HashMap<(String, String, String), String>, StateError> {

@@ -728,32 +728,6 @@ where
     (groupings_by_library, failed_libraries)
 }
 
-/// Drops a recorded hash that a rewrite may already have invalidated. Keeping a
-/// known-stale hash would make the next pass read kei's own rewrite as damage
-/// and refuse it forever, so recording "unknown" is both truthful and the only
-/// state a later pass can recover from.
-async fn forget_stale_checksum<D>(
-    db: &D,
-    record: &crate::state::types::AssetRecord,
-    version_size: &str,
-) where
-    D: MetadataRewriteStore + ?Sized,
-{
-    if record.local_checksum.is_none() {
-        return;
-    }
-    if let Err(e) = db
-        .set_metadata_rewrite_checksums(&record.library, &record.id, version_size, None, None)
-        .await
-    {
-        tracing::warn!(
-            asset_id = %record.id,
-            error = %e,
-            "Could not clear the stale media checksum; `kei reconcile` can still repair the file"
-        );
-    }
-}
-
 pub(super) async fn run_pending_page<D>(
     db: &D,
     metadata_flags: MetadataFlags,
@@ -869,7 +843,6 @@ where
                 ),
         );
         let created_local = record.metadata.capture_local(record.created_at);
-        let version_size = record.version_size;
 
         let embed_writable =
             metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&path);
@@ -1154,8 +1127,21 @@ where
                     );
                     if selected_queue == MetadataRewriteQueue::Ordinary
                         && pending_rewrite.capture_repair_receipt.is_none()
+                        && let Err(fallback_error) = db
+                            .finish_metadata_rewrite(
+                                &pending_rewrite,
+                                MetadataRewriteQueue::Ordinary,
+                                None,
+                                None,
+                                MetadataRewriteCompletion::None,
+                            )
+                            .await
                     {
-                        forget_stale_checksum(db, record, version_size.as_str()).await;
+                        tracing::warn!(
+                            asset_id = %record.id,
+                            error = %fallback_error,
+                            "Could not clear the stale media checksum; `kei reconcile` can still repair the file"
+                        );
                     }
                     errored += 1;
                     continue;

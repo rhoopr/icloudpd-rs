@@ -835,15 +835,6 @@ pub trait MetadataRewriteStore: Send + Sync {
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
     ) -> Result<bool, StateError>;
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn set_metadata_rewrite_checksums(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        local_checksum: Option<&str>,
-        pre_rewrite_checksum: Option<&str>,
-    ) -> Result<(), StateError>;
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
     async fn begin_metadata_capture_revision(
         &self,
@@ -4567,54 +4558,6 @@ impl SqliteStateDb {
         .await
     }
 
-    /// Records the media hash a metadata rewrite left on disk, keeping the
-    /// rewrite marker so the caller decides when the write is complete.
-    /// `pre_rewrite_checksum` seeds `download_checksum` only when the column is
-    /// empty, so the provider's pre-metadata hash is established once and later
-    /// rewrites never overwrite it. Pass `None` for `pre_rewrite_checksum` when
-    /// those bytes were never verified against the row, because an unproven
-    /// hash would tell reconcile the file is an intentional rewrite rather than
-    /// damage. A `None` `local_checksum` records that the file changed and its
-    /// hash is unknown, which is the truth after a rewrite whose result could
-    /// not be measured, and which lets a later pass rewrite it again.
-    pub(crate) async fn set_metadata_rewrite_checksums(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        local_checksum: Option<&str>,
-        pre_rewrite_checksum: Option<&str>,
-    ) -> Result<(), StateError> {
-        let library = library.to_owned();
-        let asset_id = asset_id.to_owned();
-        let version_size = version_size.to_owned();
-        let local_checksum = local_checksum.map(str::to_owned);
-        let pre_rewrite_checksum = pre_rewrite_checksum.map(str::to_owned);
-        self.with_conn("set_metadata_rewrite_checksums", move |conn| {
-            conn.execute(
-                "UPDATE assets SET local_checksum = ?4, \
-                 download_checksum = COALESCE(download_checksum, ?5), \
-                 capture_repair_metadata_hash = CASE WHEN local_checksum IS ?4 \
-                    THEN capture_repair_metadata_hash ELSE NULL END, \
-                 capture_repair_output_checksum = CASE WHEN local_checksum IS ?4 \
-                    THEN capture_repair_output_checksum ELSE NULL END, \
-                 capture_repair_output_size = CASE WHEN local_checksum IS ?4 \
-                    THEN capture_repair_output_size ELSE NULL END \
-                 WHERE library = ?1 AND id = ?2 AND version_size = ?3",
-                rusqlite::params![
-                    library,
-                    asset_id,
-                    version_size,
-                    local_checksum,
-                    pre_rewrite_checksum
-                ],
-            )
-            .map_err(|e| StateError::query("set_metadata_rewrite_checksums", e))?;
-            Ok(())
-        })
-        .await
-    }
-
     pub(crate) async fn get_downloaded_metadata_hashes(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError> {
@@ -4663,71 +4606,17 @@ impl SqliteStateDb {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError> {
-        if let Some(libraries) = library_scope {
-            let libraries = unique_sorted_strings(libraries);
-            if libraries.is_empty() {
-                return Ok(Vec::new());
-            }
-            let placeholders = sqlite_placeholders(libraries.len());
-            return self
-                .with_conn("get_pending_metadata_rewrites", move |conn| {
-                    let sql = format!(
-                        "SELECT {ASSET_COLUMNS} FROM assets \
-                         WHERE metadata_write_failed_at IS NOT NULL \
-                           AND status = 'downloaded' \
-                           AND is_deleted = 0 \
-                           AND local_path IS NOT NULL \
-                           AND library IN ({placeholders}) \
-                         ORDER BY metadata_write_failed_at ASC, library, id, version_size \
-                         LIMIT ? OFFSET ?"
-                    );
-                    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-                    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
-                    let mut params: Vec<&dyn rusqlite::ToSql> =
-                        Vec::with_capacity(libraries.len() + 2);
-                    for library in &libraries {
-                        params.push(library);
-                    }
-                    params.push(&limit);
-                    params.push(&offset);
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-                    let rows = stmt
-                        .query_map(rusqlite::params_from_iter(params), row_to_asset_record)
-                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
-                })
-                .await;
-        }
-
-        self.with_conn("get_pending_metadata_rewrites", move |conn| {
-            let sql = format!(
-                "SELECT {ASSET_COLUMNS} FROM assets \
-                 WHERE metadata_write_failed_at IS NOT NULL \
-                   AND status = 'downloaded' \
-                   AND is_deleted = 0 \
-                   AND local_path IS NOT NULL \
-                 ORDER BY metadata_write_failed_at ASC, library, id, version_size \
-                 LIMIT ?1 OFFSET ?2"
-            );
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-            let rows = stmt
-                .query_map(
-                    [
-                        i64::try_from(limit).unwrap_or(i64::MAX),
-                        i64::try_from(offset).unwrap_or(i64::MAX),
-                    ],
-                    row_to_asset_record,
-                )
-                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| StateError::query("get_pending_metadata_rewrites", e))
-        })
-        .await
+        Ok(self
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                library_scope,
+                offset,
+                limit,
+            )
+            .await?
+            .into_iter()
+            .map(|pending| pending.asset)
+            .collect())
     }
 
     pub(crate) async fn get_pending_metadata_rewrites_page_for_queue(
@@ -5989,25 +5878,6 @@ impl MetadataRewriteStore for SqliteStateDb {
             local_checksum,
             pre_rewrite_checksum,
             completion,
-        )
-        .await
-    }
-
-    async fn set_metadata_rewrite_checksums(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        local_checksum: Option<&str>,
-        pre_rewrite_checksum: Option<&str>,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::set_metadata_rewrite_checksums(
-            self,
-            library,
-            asset_id,
-            version_size,
-            local_checksum,
-            pre_rewrite_checksum,
         )
         .await
     }

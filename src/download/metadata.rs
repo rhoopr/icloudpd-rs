@@ -46,8 +46,6 @@ const EXIF_EX_XMP_PREFIX: &str = "exifEX";
 #[cfg(feature = "xmp")]
 const KEI_MANAGED_FIELDS: &str = "managedFields";
 
-#[cfg(feature = "xmp")]
-static HEIF_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EMBED_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "xmp")]
 static SIDECAR_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1226,23 +1224,6 @@ fn publish_prepared_embed(
     )
 }
 
-#[cfg(all(feature = "xmp", test))]
-fn apply_metadata_heif_with_installer(
-    path: &Path,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
-    install: impl FnOnce(
-        &Path,
-        &Path,
-        super::file::ExistingFileFingerprint,
-        super::file::ExistingFileFingerprint,
-    ) -> anyhow::Result<()>,
-) -> Result<super::file::ExistingFileFingerprint> {
-    prepare_metadata_heif(path, write, temp_suffix, expected_fingerprint)?
-        .publish_with(path, install)
-}
-
 #[cfg(feature = "xmp")]
 fn prepare_metadata_heif(
     path: &Path,
@@ -1320,7 +1301,7 @@ fn prepare_metadata_heif(
     }
     let rewrite_input = native_input.as_deref().unwrap_or(&input);
 
-    let (file, tmp_path) = create_unique_heif_temp(path, temp_suffix)?;
+    let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
     let cleanup_permissions = file
         .metadata()
         .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
@@ -1531,50 +1512,6 @@ fn create_unique_embed_temp_with_sequence(
                 return Err(error).with_context(|| {
                     format!(
                         "Could not create temporary embedded metadata file {}",
-                        candidate.display()
-                    )
-                });
-            }
-        }
-    }
-}
-
-#[cfg(feature = "xmp")]
-fn heif_temp_path(path: &Path, temp_suffix: &str, sequence: u64) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!(
-        ".kei-heif-{}-{sequence}{temp_suffix}",
-        std::process::id()
-    ))
-}
-
-#[cfg(feature = "xmp")]
-fn create_unique_heif_temp(path: &Path, temp_suffix: &str) -> Result<(std::fs::File, PathBuf)> {
-    create_unique_heif_temp_with_sequence(path, temp_suffix, || {
-        HEIF_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    })
-}
-
-#[cfg(feature = "xmp")]
-fn create_unique_heif_temp_with_sequence(
-    path: &Path,
-    temp_suffix: &str,
-    mut next_sequence: impl FnMut() -> u64,
-) -> Result<(std::fs::File, PathBuf)> {
-    loop {
-        let candidate = heif_temp_path(path, temp_suffix, next_sequence());
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((file, candidate)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "Could not create temporary HEIC metadata file {}",
                         candidate.display()
                     )
                 });
@@ -1928,23 +1865,6 @@ impl PreparedMetadataFile {
     }
 }
 
-#[cfg(all(feature = "xmp", test))]
-fn apply_metadata_xmp_toolkit_with_installer(
-    path: &Path,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
-    install: impl FnOnce(
-        &Path,
-        &Path,
-        super::file::ExistingFileFingerprint,
-        super::file::ExistingFileFingerprint,
-    ) -> anyhow::Result<()>,
-) -> Result<super::file::ExistingFileFingerprint> {
-    prepare_metadata_xmp_toolkit(path, write, temp_suffix, expected_fingerprint)?
-        .publish_with(path, install)
-}
-
 #[cfg(feature = "xmp")]
 fn prepare_metadata_xmp_toolkit(
     path: &Path,
@@ -2044,23 +1964,6 @@ fn prepare_metadata_xmp_toolkit(
         expected_input: expected,
         expected_output: output,
     })
-}
-
-#[cfg(all(not(feature = "xmp"), test))]
-fn apply_metadata_native_with_installer(
-    path: &Path,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-    expected_fingerprint: Option<super::file::ExistingFileFingerprint>,
-    install: impl FnOnce(
-        &Path,
-        &Path,
-        super::file::ExistingFileFingerprint,
-        super::file::ExistingFileFingerprint,
-    ) -> anyhow::Result<()>,
-) -> Result<super::file::ExistingFileFingerprint> {
-    prepare_metadata_native(path, write, temp_suffix, expected_fingerprint)?
-        .publish_with(path, install)
 }
 
 #[cfg(not(feature = "xmp"))]
@@ -3433,7 +3336,7 @@ mod tests {
         let install_called_in_closure = std::sync::Arc::clone(&install_called);
         let expected_path = path.clone();
 
-        let result = apply_metadata_xmp_toolkit_with_installer(
+        let prepared = prepare_metadata_xmp_toolkit(
             &path,
             &MetadataWrite {
                 rating: Some(3),
@@ -3441,16 +3344,17 @@ mod tests {
             },
             ".meta-tmp",
             None,
-            move |tmp, dst, _expected, _replacement| {
-                install_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
-                assert!(
-                    tmp.exists(),
-                    "metadata temp file must exist before durable install"
-                );
-                assert_eq!(dst, expected_path.as_path());
-                Err(std::io::Error::other("simulated durable install failure").into())
-            },
-        );
+        )
+        .unwrap();
+        let result = prepared.publish_with(&path, move |tmp, dst, _expected, _replacement| {
+            install_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                tmp.exists(),
+                "metadata temp file must exist before durable install"
+            );
+            assert_eq!(dst, expected_path.as_path());
+            Err(std::io::Error::other("simulated durable install failure").into())
+        });
 
         assert!(
             result.is_err(),
@@ -3478,7 +3382,7 @@ mod tests {
         let path = fresh_jpeg(&dir, "concurrent_edit.jpg");
         let external = b"external edit".to_vec();
 
-        let result = apply_metadata_xmp_toolkit_with_installer(
+        let prepared = prepare_metadata_xmp_toolkit(
             &path,
             &MetadataWrite {
                 rating: Some(3),
@@ -3486,11 +3390,12 @@ mod tests {
             },
             ".meta-tmp",
             None,
-            |src, dst, expected, expected_replacement| {
-                fs::write(dst, &external)?;
-                publish_prepared_embed(src, dst, expected, expected_replacement)
-            },
-        );
+        )
+        .unwrap();
+        let result = prepared.publish_with(&path, |src, dst, expected, expected_replacement| {
+            fs::write(dst, &external)?;
+            publish_prepared_embed(src, dst, expected, expected_replacement)
+        });
 
         let error = result.expect_err("a concurrent edit must block metadata publication");
         assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
@@ -3578,19 +3483,6 @@ mod tests {
         path
     }
 
-    fn heif_temp_entries(dir: &Path, temp_suffix: &str) -> Vec<PathBuf> {
-        let prefix = format!(".kei-heif-{}-", std::process::id());
-        fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                (name.starts_with(&prefix) && name.ends_with(temp_suffix)).then(|| entry.path())
-            })
-            .collect()
-    }
-
     fn embed_temp_entries(dir: &Path, temp_suffix: &str) -> Vec<PathBuf> {
         let prefix = format!(".kei-metadata-{}-", std::process::id());
         fs::read_dir(dir)
@@ -3624,42 +3516,24 @@ mod tests {
         fs::remove_file(created).unwrap();
     }
 
-    #[test]
-    fn create_unique_heif_temp_preserves_regular_file_collision() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("photo.heic");
-        let collision = heif_temp_path(&path, ".meta-tmp", 41);
-        let unique = heif_temp_path(&path, ".meta-tmp", 42);
-        fs::write(&collision, b"unrelated bytes").unwrap();
-        let mut sequences = [41, 42].into_iter();
-
-        let (file, created) =
-            create_unique_heif_temp_with_sequence(&path, ".meta-tmp", || sequences.next().unwrap())
-                .unwrap();
-        drop(file);
-
-        assert_eq!(created, unique);
-        assert_eq!(fs::read(&collision).unwrap(), b"unrelated bytes");
-        fs::remove_file(created).unwrap();
-    }
-
     #[cfg(unix)]
     #[test]
-    fn create_unique_heif_temp_preserves_symlink_collision() {
+    fn create_unique_embed_temp_preserves_symlink_collision() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.heic");
         let target = dir.path().join("unrelated");
-        let collision = heif_temp_path(&path, ".meta-tmp", 51);
-        let unique = heif_temp_path(&path, ".meta-tmp", 52);
+        let collision = embed_temp_path(&path, ".meta-tmp", 51);
+        let unique = embed_temp_path(&path, ".meta-tmp", 52);
         fs::write(&target, b"unrelated bytes").unwrap();
         symlink(&target, &collision).unwrap();
         let mut sequences = [51, 52].into_iter();
 
-        let (file, created) =
-            create_unique_heif_temp_with_sequence(&path, ".meta-tmp", || sequences.next().unwrap())
-                .unwrap();
+        let (file, created) = create_unique_embed_temp_with_sequence(&path, ".meta-tmp", || {
+            sequences.next().unwrap()
+        })
+        .unwrap();
         drop(file);
 
         assert_eq!(created, unique);
@@ -3998,7 +3872,7 @@ mod tests {
             "rejected HEIC rewrites must leave original media bytes untouched"
         );
         assert!(
-            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            embed_temp_entries(dir.path(), ".meta-tmp").is_empty(),
             "rejected HEIC rewrites must clean the metadata temp file"
         );
     }
@@ -4013,7 +3887,7 @@ mod tests {
         // written, fsynced and validated, but the atomic install has not yet
         // renamed over the original.
         let install_calls = std::cell::Cell::new(0u32);
-        let result = apply_metadata_heif_with_installer(
+        let prepared = prepare_metadata_heif(
             &path,
             &MetadataWrite {
                 rating: Some(5),
@@ -4021,12 +3895,13 @@ mod tests {
             },
             ".meta-tmp",
             None,
-            |src, _dst, _expected, _expected_replacement| {
-                install_calls.set(install_calls.get() + 1);
-                assert!(src.exists(), "temp file must exist at the install boundary");
-                Err(std::io::Error::other("simulated crash before publication").into())
-            },
-        );
+        )
+        .unwrap();
+        let result = prepared.publish_with(&path, |src, _dst, _expected, _expected_replacement| {
+            install_calls.set(install_calls.get() + 1);
+            assert!(src.exists(), "temp file must exist at the install boundary");
+            Err(std::io::Error::other("simulated crash before publication").into())
+        });
 
         assert!(
             result.is_err(),
@@ -4043,7 +3918,7 @@ mod tests {
             "a crash before publication must leave the original byte-identical"
         );
         assert!(
-            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            embed_temp_entries(dir.path(), ".meta-tmp").is_empty(),
             "a failure before exchange must clean its uniquely owned temp file"
         );
     }
@@ -4054,7 +3929,7 @@ mod tests {
         let path = fresh_heic(dir.path(), "concurrent_edit.heic");
         let external = b"external edit at the install boundary";
 
-        let result = apply_metadata_heif_with_installer(
+        let prepared = prepare_metadata_heif(
             &path,
             &MetadataWrite {
                 rating: Some(5),
@@ -4062,16 +3937,17 @@ mod tests {
             },
             ".meta-tmp",
             None,
-            |src, dst, expected, expected_replacement| {
-                fs::write(dst, external)?;
-                crate::download::file::publish_file_if_unchanged_blocking(
-                    src,
-                    dst,
-                    expected,
-                    expected_replacement,
-                )
-            },
-        );
+        )
+        .unwrap();
+        let result = prepared.publish_with(&path, |src, dst, expected, expected_replacement| {
+            fs::write(dst, external)?;
+            crate::download::file::publish_file_if_unchanged_blocking(
+                src,
+                dst,
+                expected,
+                expected_replacement,
+            )
+        });
 
         let error = result.expect_err("a concurrent edit must block HEIC publication");
         assert!(
@@ -4086,7 +3962,7 @@ mod tests {
             "a concurrent edit must not be overwritten by the stale HEIC rewrite"
         );
         assert!(
-            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            embed_temp_entries(dir.path(), ".meta-tmp").is_empty(),
             "a refused pre-exchange publication must clean its uniquely owned temp file"
         );
     }
@@ -4097,7 +3973,7 @@ mod tests {
         let path = fresh_heic(dir.path(), "changed_temp.heic");
         let original = fs::read(&path).unwrap();
 
-        let error = apply_metadata_heif_with_installer(
+        let prepared = prepare_metadata_heif(
             &path,
             &MetadataWrite {
                 rating: Some(5),
@@ -4105,7 +3981,10 @@ mod tests {
             },
             ".meta-tmp",
             None,
-            |src, dst, expected, expected_replacement| {
+        )
+        .unwrap();
+        let error = prepared
+            .publish_with(&path, |src, dst, expected, expected_replacement| {
                 fs::write(src, b"unapproved temporary bytes")?;
                 crate::download::file::publish_file_if_unchanged_blocking(
                     src,
@@ -4113,12 +3992,11 @@ mod tests {
                     expected,
                     expected_replacement,
                 )
-            },
-        )
-        .expect_err("temporary bytes changed after validation must not be published");
+            })
+            .expect_err("temporary bytes changed after validation must not be published");
 
         assert_eq!(fs::read(&path).unwrap(), original);
-        let retained = heif_temp_entries(dir.path(), ".meta-tmp");
+        let retained = embed_temp_entries(dir.path(), ".meta-tmp");
         assert_eq!(retained.len(), 1);
         let disposition = crate::download::file::classify_conditional_publish_error(&error);
         assert!(disposition.retained_paths.contains(&retained[0]));
@@ -4153,7 +4031,7 @@ mod tests {
 
         assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
         assert_eq!(fs::read(&path).unwrap(), changed);
-        assert!(heif_temp_entries(dir.path(), ".meta-tmp").is_empty());
+        assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
     }
 
     #[test]
@@ -4178,7 +4056,7 @@ mod tests {
         assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
         assert_eq!(fs::read(&path).unwrap(), changed);
         assert!(!temp_path_for(&path, ".meta-tmp").exists());
-        assert!(heif_temp_entries(dir.path(), ".meta-tmp").is_empty());
+        assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
     }
 
     #[test]
@@ -4214,7 +4092,7 @@ mod tests {
         readonly_permissions.set_readonly(true);
         fs::set_permissions(&path, readonly_permissions).unwrap();
 
-        let result = apply_metadata_heif_with_installer(
+        let prepared = prepare_metadata_heif(
             &path,
             &MetadataWrite {
                 rating: Some(5),
@@ -4222,18 +4100,19 @@ mod tests {
             },
             ".meta-tmp",
             None,
-            |src, _dst, _expected, _expected_replacement| {
-                assert!(
-                    fs::metadata(src).unwrap().permissions().readonly(),
-                    "the validated temp file must carry the source read-only permission"
-                );
-                Err(std::io::Error::other("stop after permission check").into())
-            },
-        );
+        )
+        .unwrap();
+        let result = prepared.publish_with(&path, |src, _dst, _expected, _expected_replacement| {
+            assert!(
+                fs::metadata(src).unwrap().permissions().readonly(),
+                "the validated temp file must carry the source read-only permission"
+            );
+            Err(std::io::Error::other("stop after permission check").into())
+        });
 
         assert!(result.is_err(), "the injected install failure must surface");
         fs::set_permissions(&path, original_permissions).unwrap();
-        assert!(heif_temp_entries(dir.path(), ".meta-tmp").is_empty());
+        assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
     }
 
     #[cfg(unix)]
@@ -4262,7 +4141,7 @@ mod tests {
         );
         fs::set_permissions(&path, original_permissions).unwrap();
         assert!(
-            heif_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+            embed_temp_entries(dir.path(), ".meta-tmp").is_empty(),
             "the mode check must not leave a temp file"
         );
     }
@@ -5562,7 +5441,7 @@ mod native_tests {
         let path = fresh_jpeg(dir.path(), "native-concurrent.jpg");
         let external = b"external native edit";
 
-        let result = apply_metadata_native_with_installer(
+        let prepared = prepare_metadata_native(
             &path,
             &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
@@ -5570,11 +5449,12 @@ mod native_tests {
             },
             ".kei-tmp",
             None,
-            |src, dst, expected, expected_replacement| {
-                fs::write(dst, external)?;
-                publish_prepared_embed(src, dst, expected, expected_replacement)
-            },
-        );
+        )
+        .unwrap();
+        let result = prepared.publish_with(&path, |src, dst, expected, expected_replacement| {
+            fs::write(dst, external)?;
+            publish_prepared_embed(src, dst, expected, expected_replacement)
+        });
 
         let error = result.expect_err("a concurrent edit must block native EXIF publication");
         assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
