@@ -257,6 +257,12 @@ exchanges the verified `.part` file with that exact fingerprint. A changed
 target is restored or retained and the state row stays failed. All other
 downloads keep no-overwrite publication.
 
+When no-overwrite publication finds an existing destination, the file owner
+compares it with the verified `.part` file. Identical bytes are deduplicated.
+Different or unverifiable bytes return a typed collision and retain the
+`.part` file. The pipeline records the task as failed before it can write a
+sidecar or finalize downloaded state.
+
 A file may be safe on disk while its state write is still a cycle failure. Do
 not weaken deferred state-write handling or infer that a visible final file
 means the database transition succeeded.
@@ -433,7 +439,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
-| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. |
+| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/mod.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |

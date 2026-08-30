@@ -5,6 +5,9 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 source "$script_dir/lib.sh"
 
 run_scenario_test lib identity_collision
+run_scenario_test lib contract_file_publish_no_overwrite_destination_already_exists
+run_scenario_test lib contract_file_publish_different_destination_returns_typed_collision
+run_scenario_test lib different_byte_destination_race_keeps_loser_failed_without_metadata_write
 run_scenario_test lib live_photo_motion_with_size_suffixed_primary_stem_is_on_disk_skipped
 run_scenario_test lib live_photo_motion_with_identity_suffixed_primary_stem_is_on_disk_skipped
 run_scenario_test lib live_photo_motion_with_sanitized_identity_suffix_is_on_disk_skipped

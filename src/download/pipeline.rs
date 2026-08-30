@@ -5276,6 +5276,164 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn different_byte_destination_race_keeps_loser_failed_without_metadata_write() {
+        use crate::state::{MediaType, SqliteStateDb};
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let winner_body = MINIMAL_JPEG.to_vec();
+        let mut loser_body = MINIMAL_JPEG.to_vec();
+        *loser_body
+            .get_mut(17)
+            .expect("minimal JPEG must contain a Y-density value") = 2;
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/WINNER.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(winner_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/LOSER.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(loser_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let download_path = dir.path().join("shared.jpg");
+        let winner_db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let loser_db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let metadata = MetadataFlags::from(&crate::config::MetadataConfig {
+            xmp_sidecar: true,
+            ..crate::config::MetadataConfig::default()
+        });
+        let make_task = |asset_id: &str, checksum_byte: u8, rating: u8| DownloadTask {
+            url: format!("{}/{asset_id}.jpg", server.uri()).into(),
+            download_path: download_path.clone(),
+            publication: crate::download::file::FinalPublication::NoReplace,
+            checksum: base64::engine::general_purpose::STANDARD
+                .encode([checksum_byte; 32])
+                .into(),
+            asset_id: asset_id.into(),
+            asset_record_name: asset_id.into(),
+            library: "PrimarySync".into(),
+            metadata: Arc::new(MetadataPayload {
+                rating: Some(rating),
+                ..MetadataPayload::default()
+            }),
+            size: winner_body.len() as u64,
+            created_local: chrono::Local::now().fixed_offset(),
+            version_size: VersionSizeKey::Original,
+            media_type: MediaType::Photo,
+        };
+        let winner_task = make_task("WINNER", 0x41, 1);
+        let loser_task = make_task("LOSER", 0x42, 5);
+        let loser_part_path = super::super::file::temp_download_path(
+            &download_path,
+            &loser_task.checksum,
+            ".kei-tmp",
+        )
+        .expect("valid temporary path");
+
+        for (db, task) in [(&winner_db, &winner_task), (&loser_db, &loser_task)] {
+            db.upsert_seen(&AssetRecord::new_pending(
+                Arc::from("PrimarySync"),
+                task.asset_id.to_string(),
+                task.version_size,
+                task.checksum.to_string(),
+                "shared.jpg".to_string(),
+                chrono::Utc::now(),
+                None,
+                task.size,
+                MediaType::Photo,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let client = Client::new();
+        let winner_store: Arc<dyn DownloadStore> = winner_db.clone();
+        let winner_result = run_download_pass(
+            PassConfig {
+                client: &client,
+                retry_config: &retry,
+                metadata,
+                mark_capture_repair_after_download: false,
+                concurrency: 1,
+                reporting: DownloadReporting::hidden(),
+                temp_suffix: Arc::from(".kei-tmp"),
+                shutdown_token: CancellationToken::new(),
+                state_db: Some(winner_store),
+                rate_limit_counter: Arc::new(AtomicUsize::new(0)),
+                bandwidth_limiter: None,
+                library: Arc::from("PrimarySync"),
+            },
+            vec![winner_task],
+        )
+        .await;
+        assert_eq!(winner_result.downloaded, 1);
+        assert!(winner_result.failed.is_empty());
+
+        let sidecar_path = sidecar_path_for(&download_path);
+        let winner_sidecar = fs::read(&sidecar_path).expect("winner sidecar must be written");
+        let loser_store: Arc<dyn DownloadStore> = loser_db.clone();
+        let loser_result = run_download_pass(
+            PassConfig {
+                client: &client,
+                retry_config: &retry,
+                metadata,
+                mark_capture_repair_after_download: false,
+                concurrency: 1,
+                reporting: DownloadReporting::hidden(),
+                temp_suffix: Arc::from(".kei-tmp"),
+                shutdown_token: CancellationToken::new(),
+                state_db: Some(loser_store),
+                rate_limit_counter: Arc::new(AtomicUsize::new(0)),
+                bandwidth_limiter: None,
+                library: Arc::from("PrimarySync"),
+            },
+            vec![loser_task],
+        )
+        .await;
+
+        assert_eq!(loser_result.downloaded, 0);
+        assert_eq!(loser_result.failed.len(), 1);
+        assert_eq!(fs::read(&download_path).unwrap(), winner_body);
+        assert_eq!(fs::read(&sidecar_path).unwrap(), winner_sidecar);
+        assert_eq!(fs::read(&loser_part_path).unwrap(), loser_body);
+        assert!(
+            loser_db
+                .get_downloaded_page(0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let failed = loser_db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("verified bytes differ")),
+            "collision must remain durable failed work"
+        );
+    }
+
     #[tokio::test]
     async fn temporary_ownership_retires_after_publish_and_interruption() {
         use base64::Engine as _;
