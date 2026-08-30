@@ -143,6 +143,15 @@ pub(super) enum ConditionalPublishTargetChanged {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error(
+    "Refusing to deduplicate {part_path} with {final_path} because their verified bytes differ"
+)]
+pub(super) struct FinalPathCollision {
+    part_path: PathBuf,
+    final_path: PathBuf,
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("Conditional publication must retain paths: {paths:?}")]
 struct ConditionalPublishMustRetainPaths {
     paths: Vec<PathBuf>,
@@ -586,8 +595,7 @@ async fn attempt_download_with_publication<C: DownloadClient>(
 }
 
 /// Rename a `.part` file to its final destination, handling the case where
-/// a concurrent download already placed the final file. If the destination
-/// exists, the redundant `.part` file is removed instead of overwriting.
+/// a concurrent download already placed identical bytes at the final path.
 #[cfg(test)]
 pub(super) async fn rename_part_to_final(
     part_path: &Path,
@@ -619,18 +627,30 @@ pub(super) async fn publish_part_to_final(
         }
         Ok(PublishResult::DestinationExists) => {
             // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
-            // Another task won the race — clean up our .part file.
+            let part_fingerprint = fingerprint_regular_file(part_path)
+                .await
+                .with_context(|| format!("Could not verify {}", part_path.display()))?;
+            let final_fingerprint = fingerprint_regular_file(final_path)
+                .await
+                .with_context(|| format!("Could not verify {}", final_path.display()))?;
+            if part_fingerprint != final_fingerprint {
+                return Err(FinalPathCollision {
+                    part_path: part_path.to_path_buf(),
+                    final_path: final_path.to_path_buf(),
+                }
+                .into());
+            }
+
             tracing::debug!(
                 path = %final_path.display(),
-                "Destination already exists, removing redundant .part file"
+                "Destination has identical bytes, removing redundant .part file"
             );
-            if let Err(rm_err) = fs::remove_file(part_path).await {
-                tracing::warn!(
-                    path = %part_path.display(),
-                    error = %rm_err,
-                    "Failed to remove redundant .part file"
-                );
-            }
+            fs::remove_file(part_path).await.with_context(|| {
+                format!(
+                    "Could not remove redundant completed download {}",
+                    part_path.display()
+                )
+            })?;
             Ok(())
         }
         Err(e) => Err(e).with_context(|| {
@@ -4312,7 +4332,7 @@ mod tests {
         let part = dir.path().join("photo.part");
         let final_path = dir.path().join("photo.jpg");
         tokio::fs::write(&final_path, b"existing").await.unwrap();
-        tokio::fs::write(&part, b"duplicate").await.unwrap();
+        tokio::fs::write(&part, b"existing").await.unwrap();
 
         // Should succeed without replacing the existing final file. On Linux,
         // plain rename(old, new) would overwrite `photo.jpg`; the publish path
@@ -4326,6 +4346,23 @@ mod tests {
             b"existing",
             "existing final file must not be replaced by duplicate .part bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn contract_file_publish_different_destination_returns_typed_collision() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&final_path, b"winner").await.unwrap();
+        tokio::fs::write(&part, b"loser").await.unwrap();
+
+        let error = rename_part_to_final(&part, &final_path)
+            .await
+            .expect_err("different bytes must collide");
+
+        assert!(error.downcast_ref::<FinalPathCollision>().is_some());
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"winner");
+        assert_eq!(tokio::fs::read(&part).await.unwrap(), b"loser");
     }
 
     #[tokio::test]
