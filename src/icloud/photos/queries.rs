@@ -239,7 +239,7 @@ pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
             (k.as_str(), val)
         })
         .collect();
-    pairs.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    pairs.sort_unstable_by_key(|(key, _)| *key);
 
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs)
