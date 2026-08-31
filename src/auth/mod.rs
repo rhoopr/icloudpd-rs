@@ -77,6 +77,12 @@ impl std::fmt::Debug for AuthResult {
 enum AuthFlowErrorClass {
     TransientAppleFailure,
     MisdirectedRequest,
+    TwoFactorAtGeneration(session::SessionGeneration),
+    PushForbidden,
+    RetryWithCleanAuth {
+        removed_files: usize,
+        generation: session::SessionGeneration,
+    },
     Other,
 }
 
@@ -99,16 +105,14 @@ impl std::fmt::Display for TwoFactorGeneration {
 }
 
 pub(crate) fn two_factor_generation(error: &anyhow::Error) -> Option<session::SessionGeneration> {
-    error
-        .downcast_ref::<TwoFactorGeneration>()
-        .map(|error| error.generation)
+    match classify_auth_flow_error(error) {
+        AuthFlowErrorClass::TwoFactorAtGeneration(generation) => Some(generation),
+        _ => None,
+    }
 }
 
 fn is_forbidden(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<AuthError>(),
-        Some(AuthError::ApiError { code: 403, .. })
-    )
+    classify_auth_flow_error(error) == AuthFlowErrorClass::PushForbidden
 }
 
 async fn map_push_error(session: &Session, error: anyhow::Error) -> Result<anyhow::Error> {
@@ -136,16 +140,19 @@ where
     Fut: Future<Output = Result<T>>,
 {
     match attempt(initial_generation).await {
-        Err(error) => {
-            let Some(retry) = error.downcast_ref::<RetryWithCleanAuth>() else {
-                return Err(error);
-            };
-            tracing::warn!(
-                removed_files = retry.removed_files,
-                "Apple rejected persisted authentication state; retrying once from clean state"
-            );
-            attempt(Some(retry.generation)).await
-        }
+        Err(error) => match classify_auth_flow_error(&error) {
+            AuthFlowErrorClass::RetryWithCleanAuth {
+                removed_files,
+                generation,
+            } => {
+                tracing::warn!(
+                    removed_files,
+                    "Apple rejected persisted authentication state; retrying once from clean state"
+                );
+                attempt(Some(generation)).await
+            }
+            _ => Err(error),
+        },
         result => result,
     }
 }
@@ -156,6 +163,15 @@ where
 /// preserved. This helper only owns local branch decisions for transient auth
 /// guidance and bounded 421 HTTP-pool recovery.
 fn classify_auth_flow_error(err: &anyhow::Error) -> AuthFlowErrorClass {
+    if let Some(error) = err.downcast_ref::<TwoFactorGeneration>() {
+        return AuthFlowErrorClass::TwoFactorAtGeneration(error.generation);
+    }
+    if let Some(error) = err.downcast_ref::<RetryWithCleanAuth>() {
+        return AuthFlowErrorClass::RetryWithCleanAuth {
+            removed_files: error.removed_files,
+            generation: error.generation,
+        };
+    }
     let Some(auth_err) = err.downcast_ref::<AuthError>() else {
         return AuthFlowErrorClass::Other;
     };
@@ -163,6 +179,8 @@ fn classify_auth_flow_error(err: &anyhow::Error) -> AuthFlowErrorClass {
         AuthFlowErrorClass::TransientAppleFailure
     } else if auth_err.is_misdirected_request() {
         AuthFlowErrorClass::MisdirectedRequest
+    } else if matches!(auth_err, AuthError::ApiError { code: 403, .. }) {
+        AuthFlowErrorClass::PushForbidden
     } else {
         AuthFlowErrorClass::Other
     }
@@ -407,7 +425,7 @@ async fn authenticate_inner(
                     session.reset_http_clients()?;
                     pool_reset = true;
                 }
-                AuthFlowErrorClass::Other => {
+                _ => {
                     tracing::debug!(
                         error = %e,
                         "Invalid authentication token, will log in from scratch"
@@ -453,7 +471,7 @@ async fn authenticate_inner(
                         session.reset_http_clients()?;
                     }
                 }
-                AuthFlowErrorClass::Other => {
+                _ => {
                     tracing::debug!(
                         error = %e,
                         "accountLogin failed, falling back to SRP"
@@ -540,7 +558,11 @@ async fn authenticate_inner(
                 twofa::trigger_push_notification(&mut session, endpoints, &client_id, domain).await
             {
                 let error = map_push_error(&session, error).await?;
-                if error.downcast_ref::<RetryWithCleanAuth>().is_some() || is_forbidden(&error) {
+                if matches!(
+                    classify_auth_flow_error(&error),
+                    AuthFlowErrorClass::RetryWithCleanAuth { .. }
+                        | AuthFlowErrorClass::PushForbidden
+                ) {
                     return Err(error);
                 }
                 tracing::warn!(error = %error, "Failed to trigger push notification");
@@ -694,7 +716,7 @@ async fn send_2fa_push_inner(
                     session.reset_http_clients()?;
                     pool_reset = true;
                 }
-                AuthFlowErrorClass::Other => {}
+                _ => {}
             },
         }
     }
@@ -969,8 +991,7 @@ mod tests {
         );
         assert_eq!(
             classify_auth_flow_error(&error),
-            AuthFlowErrorClass::Other,
-            "the generation wrapper is only classified by sync owners"
+            AuthFlowErrorClass::TwoFactorAtGeneration(generation)
         );
         assert!(error.to_string().contains("Two-factor authentication"));
     }
