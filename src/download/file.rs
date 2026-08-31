@@ -994,59 +994,253 @@ pub(crate) enum VerifiedLocalCopy {
     DestinationConflict,
 }
 
+async fn create_reconciliation_temp(
+    destination: &Path,
+) -> anyhow::Result<(PathBuf, tokio::fs::File, FileIdentity)> {
+    for _ in 0..128 {
+        let path =
+            destination.with_file_name(format!(".kei-reconcile-{}.tmp", uuid::Uuid::new_v4()));
+        match tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => {
+                let file = file.into_std().await;
+                let identity = file_identity(&file)?;
+                return Ok((path, tokio::fs::File::from_std(file), identity));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!(
+        "Could not allocate a unique reconciliation file beside {}",
+        destination.display()
+    )
+}
+
+async fn fingerprint_regular_file_with_identity(
+    path: &Path,
+) -> anyhow::Result<(ExistingFileFingerprint, FileIdentity)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (snapshot, identity) = fingerprint_regular_file_with_identity_blocking(&path)?;
+        Ok::<_, anyhow::Error>((snapshot.fingerprint, identity))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+fn retain_reconciliation_temp(path: &Path, reason: &str) {
+    tracing::warn!(
+        path = %path.display(),
+        reason,
+        "Retaining reconciliation temporary file for manual inspection"
+    );
+}
+
 pub(crate) async fn copy_local_file_no_replace(
     source: &Path,
     destination: &Path,
-    temp_suffix: &str,
     expected_source_hash: &str,
 ) -> anyhow::Result<VerifiedLocalCopy> {
-    if fs::try_exists(destination).await? {
-        let source_hash = compute_sha256(source).await?;
-        if source_hash != expected_source_hash {
-            return Ok(VerifiedLocalCopy::SourceChanged);
+    let source_fingerprint = fingerprint_regular_file(source).await?;
+    let source_hash = data_encoding::HEXLOWER.encode(&source_fingerprint.sha256);
+    if source_hash != expected_source_hash {
+        return Ok(VerifiedLocalCopy::SourceChanged);
+    }
+    match fs::symlink_metadata(destination).await {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Ok(VerifiedLocalCopy::DestinationConflict);
         }
-        let destination_hash = compute_sha256(destination).await?;
-        return Ok(if source_hash == destination_hash {
-            VerifiedLocalCopy::Verified(destination_hash)
-        } else {
-            VerifiedLocalCopy::DestinationConflict
-        });
+        Ok(_) => {
+            let destination_fingerprint = fingerprint_regular_file(destination).await?;
+            return Ok(if source_fingerprint == destination_fingerprint {
+                VerifiedLocalCopy::Verified(source_hash)
+            } else {
+                VerifiedLocalCopy::DestinationConflict
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).await?;
     }
-    let filename = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("reconciled");
-    let part_path = destination.with_file_name(format!("{filename}{temp_suffix}-reconcile"));
-    crate::fs_util::log_remove_async(&part_path).await;
-    fs::copy(source, &part_path).await?;
-    let source_hash = compute_sha256(source).await?;
-    let copied_hash = compute_sha256(&part_path).await?;
-    if source_hash != expected_source_hash {
-        crate::fs_util::log_remove_async(&part_path).await;
+    let (part_path, mut part_file, part_identity) = create_reconciliation_temp(destination).await?;
+    let source_path = source.to_path_buf();
+    let mut source_file =
+        match tokio::task::spawn_blocking(move || open_regular_file_blocking(&source_path)).await {
+            Ok(Ok(file)) => tokio::fs::File::from_std(file),
+            Ok(Err(error)) => {
+                retain_reconciliation_temp(&part_path, "source open failed");
+                return Err(error);
+            }
+            Err(error) => {
+                retain_reconciliation_temp(&part_path, "source open task failed");
+                return Err(std::io::Error::other(error).into());
+            }
+        };
+    if let Err(error) = tokio::io::copy(&mut source_file, &mut part_file).await {
+        retain_reconciliation_temp(&part_path, "copy failed");
+        return Err(error.into());
+    }
+    if let Err(error) = part_file.sync_all().await {
+        retain_reconciliation_temp(&part_path, "temporary file sync failed");
+        return Err(error.into());
+    }
+    let source_after = match fingerprint_regular_file(source).await {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            retain_reconciliation_temp(&part_path, "source revalidation failed");
+            return Err(error);
+        }
+    };
+    if source_after != source_fingerprint {
+        retain_reconciliation_temp(&part_path, "source changed during copy");
         return Ok(VerifiedLocalCopy::SourceChanged);
     }
-    if copied_hash != expected_source_hash {
-        crate::fs_util::log_remove_async(&part_path).await;
+    let (copied_fingerprint, part_path_identity) =
+        match fingerprint_regular_file_with_identity(&part_path).await {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                retain_reconciliation_temp(&part_path, "temporary file validation failed");
+                return Err(error);
+            }
+        };
+    let part_path_is_owned = part_path_identity == part_identity;
+    if copied_fingerprint != source_fingerprint || !part_path_is_owned {
+        retain_reconciliation_temp(&part_path, "temporary file changed after validation");
         anyhow::bail!("local path reconciliation checksum mismatch");
     }
-    match publish_part_no_replace(&part_path, destination).await? {
+    let part_file = part_file.into_std().await;
+    let publication = match publish_reconciliation_part_no_replace(&part_path, destination).await {
+        Ok(publication) => publication,
+        Err(error) => {
+            retain_reconciliation_temp(&part_path, "publication failed");
+            return Err(error.into());
+        }
+    };
+    match publication {
         PublishResult::Published => {
             crate::fs_util::fsync_parent_dir_async_best_effort(destination).await;
-            Ok(VerifiedLocalCopy::Verified(copied_hash))
+            let (installed, installed_identity) =
+                fingerprint_regular_file_with_identity(destination).await?;
+            let published_identity = file_identity(&part_file)?;
+            if installed == source_fingerprint && installed_identity == published_identity {
+                if fs::symlink_metadata(&part_path).await.is_ok() {
+                    retain_reconciliation_temp(
+                        &part_path,
+                        "platform retained the verified hard-link source",
+                    );
+                }
+                Ok(VerifiedLocalCopy::Verified(source_hash))
+            } else {
+                anyhow::bail!(
+                    "Published reconciliation file changed at {}",
+                    destination.display()
+                )
+            }
         }
         PublishResult::DestinationExists => {
-            crate::fs_util::log_remove_async(&part_path).await;
-            let destination_hash = compute_sha256(destination).await?;
-            Ok(if destination_hash == expected_source_hash {
-                VerifiedLocalCopy::Verified(destination_hash)
-            } else {
-                VerifiedLocalCopy::DestinationConflict
-            })
+            retain_reconciliation_temp(&part_path, "destination appeared during publication");
+            match fs::symlink_metadata(destination).await {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    let destination_fingerprint = fingerprint_regular_file(destination).await?;
+                    Ok(if destination_fingerprint == source_fingerprint {
+                        VerifiedLocalCopy::Verified(source_hash)
+                    } else {
+                        VerifiedLocalCopy::DestinationConflict
+                    })
+                }
+                Ok(_) => Ok(VerifiedLocalCopy::DestinationConflict),
+                Err(error) => Err(error.into()),
+            }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn publish_reconciliation_part_no_replace(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    let rename_result =
+        tokio::task::spawn_blocking(move || renameat2_no_replace_blocking(&part, &final_path_buf))
+            .await
+            .map_err(std::io::Error::other)?;
+
+    match rename_result {
+        Ok(()) => Ok(PublishResult::Published),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishResult::DestinationExists)
+        }
+        Err(error) if is_renameat2_unsupported(&error) => {
+            publish_part_by_hard_link_retained(part_path, final_path)
+                .await
+                .or_else(|link_error| destination_exists_or(link_error, final_path))
+        }
+        Err(error) => destination_exists_or(error, final_path),
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn publish_reconciliation_part_no_replace(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let part = CString::new(part.as_os_str().as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let final_path = CString::new(final_path_buf.as_os_str().as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        // SAFETY: both paths are valid NUL-terminated C strings and
+        // RENAME_EXCL atomically refuses an existing destination on macOS.
+        let result =
+            unsafe { libc::renamex_np(part.as_ptr(), final_path.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    match result {
+        Ok(()) => Ok(PublishResult::Published),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishResult::DestinationExists)
+        }
+        Err(error) => destination_exists_or(error, final_path),
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+async fn publish_reconciliation_part_no_replace(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    publish_part_by_hard_link_retained(part_path, final_path)
+        .await
+        .or_else(|link_error| destination_exists_or(link_error, final_path))
+}
+
+#[cfg(windows)]
+async fn publish_reconciliation_part_no_replace(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    publish_part_no_replace(part_path, final_path).await
 }
 
 #[cfg(target_os = "linux")]
@@ -1231,12 +1425,27 @@ async fn publish_part_by_hard_link(
                     "Failed to remove published .part file after no-overwrite hard link"
                 );
             }
+
             Ok(PublishResult::Published)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(PublishResult::DestinationExists)
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+async fn publish_part_by_hard_link_retained(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    match fs::hard_link(part_path, final_path).await {
+        Ok(()) => Ok(PublishResult::Published),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishResult::DestinationExists)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1454,6 +1663,107 @@ fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Res
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileIdentity {
+    Extended { volume: u64, index: [u8; 16] },
+    Legacy { volume: u32, index: u64 },
+}
+
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        };
+
+        let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+        // SAFETY: the file handle is live and `info` points to writable storage
+        // of the exact FileIdInfo structure requested from Windows.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as isize,
+                FileIdInfo,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if result != 0 {
+            // SAFETY: the successful call initialized the complete structure.
+            let info = unsafe { info.assume_init() };
+            if info.FileId.Identifier != [0; 16] {
+                return Ok(FileIdentity::Extended {
+                    volume: info.VolumeSerialNumber,
+                    index: info.FileId.Identifier,
+                });
+            }
+        }
+
+        let mut legacy = std::mem::MaybeUninit::uninit();
+        // SAFETY: the file handle is live and `legacy` points to writable
+        // storage of the exact structure initialized by Windows.
+        let result = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle() as isize, legacy.as_mut_ptr())
+        };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the successful call initialized the complete structure.
+        let legacy = unsafe { legacy.assume_init() };
+        let index = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
+        if index == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem did not provide a stable file identity",
+            ));
+        }
+        Ok(FileIdentity::Legacy {
+            volume: legacy.dwVolumeSerialNumber,
+            index,
+        })
+    }
+}
+
+fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options
+        .open(path)
+        .with_context(|| format!("Could not open regular file {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.file_type().is_file(),
+        "Path is not a regular file: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
 /// Compute the SHA-256 hash of a file, returning a hex-encoded string.
 ///
 /// Used for `local_checksum` / `download_checksum` in the state DB and
@@ -1474,10 +1784,17 @@ fn fingerprint_file_blocking(path: &Path) -> anyhow::Result<ExistingFileFingerpr
 }
 
 fn fingerprint_file_snapshot_blocking(path: &Path) -> anyhow::Result<ExistingFileSnapshot> {
-    use sha2::{Digest, Sha256};
-
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("Could not open {} for SHA-256", path.display()))?;
+    fingerprint_open_file_snapshot_blocking(&mut file, path)
+}
+
+fn fingerprint_open_file_snapshot_blocking(
+    file: &mut std::fs::File,
+    path: &Path,
+) -> anyhow::Result<ExistingFileSnapshot> {
+    use sha2::{Digest, Sha256};
+
     let mut size = 0_u64;
     let mut sha256 = Sha256::new();
     let mut prefix = [0_u8; 12];
@@ -1525,45 +1842,29 @@ fn fingerprint_file_snapshot_blocking(path: &Path) -> anyhow::Result<ExistingFil
 pub(super) async fn fingerprint_regular_file(
     path: &Path,
 ) -> anyhow::Result<ExistingFileFingerprint> {
-    let before = fs::symlink_metadata(path)
-        .await
-        .with_context(|| format!("Could not inspect replacement file {}", path.display()))?;
-    anyhow::ensure!(
-        before.file_type().is_file(),
-        "Replacement path is not a regular file: {}",
-        path.display()
-    );
-    let fingerprint = fingerprint_file(path).await?;
-    let after = fs::symlink_metadata(path)
-        .await
-        .with_context(|| format!("Could not recheck replacement file {}", path.display()))?;
-    anyhow::ensure!(
-        after.file_type().is_file(),
-        "Replacement path changed away from a regular file: {}",
-        path.display()
-    );
-    Ok(fingerprint)
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || fingerprint_regular_file_blocking(&path)).await?
 }
 
 pub(super) fn fingerprint_regular_file_snapshot_blocking(
     path: &Path,
 ) -> anyhow::Result<ExistingFileSnapshot> {
-    let before = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Could not inspect replacement file {}", path.display()))?;
+    Ok(fingerprint_regular_file_with_identity_blocking(path)?.0)
+}
+
+fn fingerprint_regular_file_with_identity_blocking(
+    path: &Path,
+) -> anyhow::Result<(ExistingFileSnapshot, FileIdentity)> {
+    let mut file = open_regular_file_blocking(path)?;
+    let opened_identity = file_identity(&file)?;
+    let snapshot = fingerprint_open_file_snapshot_blocking(&mut file, path)?;
+    let after = open_regular_file_blocking(path)?;
     anyhow::ensure!(
-        before.file_type().is_file(),
-        "Replacement path is not a regular file: {}",
+        file_identity(&after)? == opened_identity,
+        "Replacement path changed while it was fingerprinted: {}",
         path.display()
     );
-    let snapshot = fingerprint_file_snapshot_blocking(path)?;
-    let after = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Could not recheck replacement file {}", path.display()))?;
-    anyhow::ensure!(
-        after.file_type().is_file(),
-        "Replacement path changed away from a regular file: {}",
-        path.display()
-    );
-    Ok(snapshot)
+    Ok((snapshot, opened_identity))
 }
 
 fn fingerprint_regular_file_blocking(path: &Path) -> anyhow::Result<ExistingFileFingerprint> {
@@ -1935,10 +2236,9 @@ mod tests {
         std::fs::write(&source, b"catalog bytes").unwrap();
         let expected_source_hash = compute_sha256(&source).await.unwrap();
 
-        let copied =
-            copy_local_file_no_replace(&source, &destination, ".part", &expected_source_hash)
-                .await
-                .unwrap();
+        let copied = copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+            .await
+            .unwrap();
         assert_eq!(
             copied,
             VerifiedLocalCopy::Verified(expected_source_hash.clone())
@@ -1947,25 +2247,92 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"catalog bytes");
 
         std::fs::write(&destination, b"user bytes").unwrap();
-        let conflict =
-            copy_local_file_no_replace(&source, &destination, ".part", &expected_source_hash)
-                .await
-                .unwrap();
+        let conflict = copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+            .await
+            .unwrap();
         assert_eq!(conflict, VerifiedLocalCopy::DestinationConflict);
         assert_eq!(std::fs::read(&destination).unwrap(), b"user bytes");
 
         let changed_destination = dir.path().join("nested/changed.jpg");
         std::fs::write(&source, b"tampered byte").unwrap();
-        let changed = copy_local_file_no_replace(
-            &source,
-            &changed_destination,
-            ".part",
-            &expected_source_hash,
-        )
-        .await
-        .unwrap();
+        let changed =
+            copy_local_file_no_replace(&source, &changed_destination, &expected_source_hash)
+                .await
+                .unwrap();
         assert_eq!(changed, VerifiedLocalCopy::SourceChanged);
         assert!(!changed_destination.exists());
+
+        std::fs::write(&source, b"catalog bytes").unwrap();
+        let long_destination = dir.path().join("a".repeat(240));
+        let long_name =
+            copy_local_file_no_replace(&source, &long_destination, &expected_source_hash)
+                .await
+                .unwrap();
+        assert_eq!(long_name, VerifiedLocalCopy::Verified(expected_source_hash));
+        assert_eq!(std::fs::read(&long_destination).unwrap(), b"catalog bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_reconciliation_copy_rejects_non_regular_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        let target = dir.path().join("target.jpg");
+        let destination = dir.path().join("destination.jpg");
+        std::fs::write(&source, b"catalog bytes").unwrap();
+        std::fs::write(&target, b"catalog bytes").unwrap();
+        let expected_source_hash = compute_sha256(&source).await.unwrap();
+
+        symlink(&target, &destination).unwrap();
+        let symlink_result =
+            copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+                .await
+                .unwrap();
+        assert_eq!(symlink_result, VerifiedLocalCopy::DestinationConflict);
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"catalog bytes");
+
+        std::fs::remove_file(&destination).unwrap();
+        symlink(dir.path().join("missing.jpg"), &destination).unwrap();
+        let dangling_result =
+            copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+                .await
+                .unwrap();
+        assert_eq!(dangling_result, VerifiedLocalCopy::DestinationConflict);
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let directory_result =
+            copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+                .await
+                .unwrap();
+        assert_eq!(directory_result, VerifiedLocalCopy::DestinationConflict);
+        assert!(destination.is_dir());
+
+        let source_link = dir.path().join("source-link.jpg");
+        let source_link_destination = dir.path().join("source-link-destination.jpg");
+        symlink(&source, &source_link).unwrap();
+        let source_result = copy_local_file_no_replace(
+            &source_link,
+            &source_link_destination,
+            &expected_source_hash,
+        )
+        .await;
+        assert!(source_result.is_err());
+        assert!(!source_link_destination.exists());
     }
 
     #[test]

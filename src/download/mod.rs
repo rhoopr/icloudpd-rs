@@ -3758,7 +3758,6 @@ pub(crate) async fn reconcile_catalog_paths(
         match file::copy_local_file_no_replace(
             source_path,
             &task.download_path,
-            &config.temp_suffix,
             expected_local_checksum,
         )
         .await

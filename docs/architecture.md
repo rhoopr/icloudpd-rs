@@ -190,11 +190,13 @@ failure, or a stale pass plan retains the pending hash for the next cycle.
 For a genuine path change, reconciliation copies verified bytes through
 no-overwrite publication only when the copied bytes match the recorded local
 SHA-256, then updates the recorded local path. Missing or changed checksum
-evidence stays retryable. The earlier copy stays where it is: kei never deletes
-local media, and no command removes a file that no longer matches a derived
-path. `import-existing` adopts through the same derivation. Assets without a
-usable offset retain host-local paths and remain compatible with icloudpd's
-date-folder layout.
+evidence stays retryable. Existing source, temporary, and destination entries
+must remain regular files across fingerprinting; links and special files are
+never followed or accepted as reconciled media. The earlier copy stays where
+it is: kei never deletes local media, and no command removes a file that no
+longer matches a derived path. `import-existing` adopts through the same
+derivation. Assets without a usable offset retain host-local paths and remain
+compatible with icloudpd's date-folder layout.
 
 Existing embedded and sidecar timestamps are repaired only through the
 explicit `sync --refresh-metadata` flow, which is bounded by the same
