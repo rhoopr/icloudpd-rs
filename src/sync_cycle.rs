@@ -571,15 +571,34 @@ where
 {
     match db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY).await {
         Ok(Some(stored)) if stored == current_hash => {
-            if let Err(e) = db
-                .delete_metadata_by_prefix(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
-                .await
-            {
-                tracing::debug!(error = %e, "Failed to clear reverted pending download config hash");
+            match db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY).await {
+                Ok(Some(_)) => {
+                    tracing::info!(
+                        "Download path config returned to the active hash while reconciliation was pending; staging reconciliation back to the active paths"
+                    );
+                    stage_download_config_hash_reconciliation(db, current_hash).await
+                }
+                Ok(None) => DownloadConfigHashOutcome::Unchanged,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to inspect pending download config hash");
+                    DownloadConfigHashOutcome::ReadFailed
+                }
             }
-            DownloadConfigHashOutcome::Unchanged
         }
         Ok(Some(stored)) if stored == legacy_hash => {
+            match db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY).await {
+                Ok(Some(_)) => {
+                    tracing::info!(
+                        "Download path config returned to a legacy active hash while reconciliation was pending; staging reconciliation back to the active paths"
+                    );
+                    return stage_download_config_hash_reconciliation(db, current_hash).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to inspect pending download config hash");
+                    return DownloadConfigHashOutcome::ReadFailed;
+                }
+            }
             match db.has_downloaded_live_photo_videos().await {
                 Ok(false) => {}
                 Ok(true) => {
@@ -737,7 +756,13 @@ pub(crate) async fn run_cycle(
     // the pending marker drives separate catalog/targeted rehydration work.
     if !config.runtime.dry_run
         && download_controls.run_mode.downloads_files()
-        && let (Some(db), Some(first_library)) = (state_db, library_states.first())
+        && let (Some(db), Some(first_library)) = (
+            state_db,
+            library_states
+                .iter()
+                .copied()
+                .find(|state| has_active_passes(state)),
+        )
     {
         let probe_config = build_download_config(
             download::SyncMode::Full,
@@ -745,7 +770,7 @@ pub(crate) async fn run_cycle(
             Arc::new(download::AssetGroupings::default()),
             Arc::from(first_library.zone_name.as_str()),
         );
-        let download_config_hash = download::hash_download_config(&probe_config);
+        let download_config_hash = download::hash_scoped_download_config(&probe_config, config);
         let legacy_download_config_hash = download::hash_legacy_download_config(&probe_config);
         let outcome = check_download_config_hash_for_cycle(
             db,

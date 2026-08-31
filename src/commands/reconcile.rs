@@ -131,7 +131,6 @@ pub(crate) async fn classify_local_drift(
     let actual_size = metadata.len();
     if !local_file_size_matches_state(
         &local_path,
-        actual_size,
         LocalFileSizeExpectation::AtLeastProvider(size_bytes),
         local_checksum.as_deref(),
         download_checksum.as_deref(),

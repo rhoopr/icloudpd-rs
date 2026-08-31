@@ -12,10 +12,12 @@ use crate::icloud::photos::PhotoAsset;
 use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 
 use super::DownloadConfig;
+#[cfg(test)]
+use super::filter::derive_expected_paths;
 use super::filter::{
-    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, derive_expected_paths,
-    determine_media_type, filter_asset_to_tasks_with_proven_primary_path, is_asset_filtered,
-    pre_ensure_asset_dir,
+    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath,
+    derive_expected_paths_with_proven_primary_path, determine_media_type,
+    filter_asset_to_tasks_with_proven_primary_path, is_asset_filtered, pre_ensure_asset_dir,
 };
 use super::paths;
 
@@ -68,7 +70,8 @@ impl TaskPlanner {
             &mut self.claimed_paths,
             &mut self.dir_cache,
         );
-        let expected_paths = derive_expected_paths(asset, config);
+        let expected_paths =
+            derive_expected_paths_with_proven_primary_path(asset, config, proven_primary_path);
         for task in &mut tasks {
             let Some(expected) = expected_paths
                 .iter()
@@ -158,6 +161,47 @@ impl TaskPlanner {
         }
         self.claimed_paths
             .insert(NormalizedPath::new(replacement_path), expected_size);
+    }
+
+    pub(super) async fn reserve_reconciliation_path(
+        &mut self,
+        path: &Path,
+        expected_size: u64,
+        asset_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let normalized = NormalizedPath::normalize(path);
+        if !self.claimed_paths.contains_key(normalized.as_ref()) {
+            self.claimed_paths
+                .insert(NormalizedPath::new(path), expected_size);
+            return Some(path.to_path_buf());
+        }
+
+        let parent = path.parent()?;
+        let filename = path.file_name()?.to_str()?;
+        self.dir_cache.ensure_dir_async(parent).await;
+        let mut tried = Vec::<Box<str>>::with_capacity(4);
+        if let Some(path) = self.available_recorded_retry_sibling(
+            parent,
+            paths::insert_asset_identity_suffix(filename, asset_id),
+            &mut tried,
+        ) {
+            self.claimed_paths
+                .insert(NormalizedPath::new(&path), expected_size);
+            return Some(path);
+        }
+
+        let mut ordinal = 2u64;
+        loop {
+            let candidate =
+                paths::insert_asset_identity_ordinal_suffix(filename, asset_id, ordinal);
+            if let Some(path) = self.available_recorded_retry_sibling(parent, candidate, &mut tried)
+            {
+                self.claimed_paths
+                    .insert(NormalizedPath::new(&path), expected_size);
+                return Some(path);
+            }
+            ordinal = ordinal.checked_add(1)?;
+        }
     }
 
     pub(super) async fn claim_recorded_repair_path(
@@ -512,6 +556,32 @@ mod tests {
                 .is_some_and(|name| name.contains("ON_DISK")),
             "same-size on-disk collision should use an identity path: {:?}",
             plan.tasks[0].download_path
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_reservations_separate_same_size_assets() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("same.jpg");
+        let mut planner = TaskPlanner::new();
+
+        assert_eq!(
+            planner
+                .reserve_reconciliation_path(&bare, 1000, "asset-a")
+                .await,
+            Some(bare.clone())
+        );
+        let second = planner
+            .reserve_reconciliation_path(&bare, 1000, "asset-b")
+            .await
+            .unwrap();
+
+        assert_ne!(second, bare);
+        assert!(
+            second
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("asset-b"))
         );
     }
 

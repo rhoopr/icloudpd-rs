@@ -1802,12 +1802,41 @@ fn open_regular_file_with_access_blocking(
     Ok(file)
 }
 
+fn open_regular_file_for_metadata_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_WRITE_ATTRIBUTES,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options
+        .access_mode(FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options
+        .open(path)
+        .with_context(|| format!("Could not open regular file {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.file_type().is_file(),
+        "Path is not a regular file: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
 pub(super) fn set_reconciled_file_mtime_blocking(
     path: &Path,
     expected_local_sha256: &str,
     timestamp: i64,
 ) -> anyhow::Result<()> {
-    let mut file = open_regular_file_with_access_blocking(path, true)?;
+    let mut file = open_regular_file_for_metadata_blocking(path)?;
     let opened_identity = file_identity(&file)?;
     let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, path)?.fingerprint;
     anyhow::ensure!(
@@ -1849,6 +1878,8 @@ fn set_open_file_capture_time(
             .set_modified(time)
             .set_accessed(time),
     )?;
+    // Windows attribute-only handles cannot call FlushFileBuffers; the media bytes were flushed before publication.
+    #[cfg(not(windows))]
     file.sync_all()?;
     Ok(())
 }
@@ -1857,8 +1888,9 @@ pub(super) fn validate_reconciled_file_blocking(
     path: &Path,
     expected_local_sha256: &str,
     timestamp: i64,
+    source_permissions: std::fs::Permissions,
 ) -> anyhow::Result<()> {
-    let mut file = open_regular_file_with_access_blocking(path, true)?;
+    let mut file = open_regular_file_for_metadata_blocking(path)?;
     let opened_identity = file_identity(&file)?;
     let snapshot = fingerprint_open_file_snapshot_blocking(&mut file, path)?;
     anyhow::ensure!(
@@ -1867,6 +1899,10 @@ pub(super) fn validate_reconciled_file_blocking(
         path.display()
     );
     set_open_file_capture_time(&file, path, timestamp)?;
+    file.set_permissions(source_permissions)?;
+    // Keep the final restrictive attributes; Windows cannot flush this attribute-only handle.
+    #[cfg(not(windows))]
+    file.sync_all()?;
     let current = open_regular_file_blocking(path)?;
     anyhow::ensure!(
         file_identity(&current)? == opened_identity,
@@ -2017,11 +2053,15 @@ impl LocalFileSizeExpectation {
 #[must_use = "file-size validation determines whether existing bytes can be trusted"]
 pub(crate) async fn local_file_size_matches_state(
     path: &Path,
-    actual_size: u64,
     expectation: LocalFileSizeExpectation,
     local_checksum: Option<&str>,
     download_checksum: Option<&str>,
 ) -> anyhow::Result<bool> {
+    let metadata = fs::symlink_metadata(path).await?;
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let actual_size = metadata.len();
     if expectation.accepts(actual_size) {
         return Ok(true);
     }
@@ -2034,7 +2074,8 @@ pub(crate) async fn local_file_size_matches_state(
         return Ok(false);
     }
 
-    let actual_checksum = compute_sha256(path).await?;
+    let fingerprint = fingerprint_regular_file(path).await?;
+    let actual_checksum = data_encoding::HEXLOWER.encode(&fingerprint.sha256);
     Ok(local_checksum == Some(actual_checksum.as_str()))
 }
 
@@ -2445,6 +2486,18 @@ mod tests {
         .await;
         assert!(source_result.is_err());
         assert!(!source_link_destination.exists());
+
+        let recorded_hash = compute_sha256(&source).await.unwrap();
+        assert!(
+            !local_file_size_matches_state(
+                &source_link,
+                LocalFileSizeExpectation::AtLeastProvider(1),
+                Some(&recorded_hash),
+                Some(&recorded_hash),
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[test]

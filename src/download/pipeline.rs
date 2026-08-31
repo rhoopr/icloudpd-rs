@@ -23,8 +23,9 @@ use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
 use super::error::DownloadError;
 use super::file::{LocalFileSizeExpectation, local_file_size_matches_state};
 use super::filter::{
-    DerivedPath, DownloadTask, FilterReason, derive_expected_paths, determine_media_type,
-    extract_skip_candidates, is_asset_filtered,
+    DerivedPath, DownloadTask, FilterReason, derive_expected_paths,
+    derive_expected_paths_with_proven_primary_path, derive_primary_for_path_proof,
+    determine_media_type, extract_skip_candidates, is_asset_filtered,
 };
 use super::finalize::{
     DownloadedFinalization, PendingStateWrite, StateWriteFlush, check_state_write_circuit_breaker,
@@ -611,7 +612,6 @@ async fn pending_file_size_allows_adoption(
     asset: &PhotoAsset,
     version_size: &str,
     path: &Path,
-    actual_size: u64,
     provider_size: u64,
     recorded_file: Option<&RecordedLocalFile>,
 ) -> bool {
@@ -619,7 +619,6 @@ async fn pending_file_size_allows_adoption(
         recorded_file.filter(|recorded| path_matches_recorded_file(path, &recorded.path));
     let result = local_file_size_matches_state(
         path,
-        actual_size,
         LocalFileSizeExpectation::ExactProvider(provider_size),
         recorded_file.and_then(|recorded| recorded.local_checksum.as_deref()),
         recorded_file.and_then(|recorded| recorded.download_checksum.as_deref()),
@@ -649,14 +648,13 @@ async fn adopt_pending_task_path(
     recorded_file: Option<&RecordedLocalFile>,
 ) -> Option<PendingOnDiskAdoption> {
     let version_size = task.version_size.as_str();
-    let (existing_path, existing_size) = task_planner
+    let (existing_path, _) = task_planner
         .existing_regular_path_with_size(&task.download_path)
         .await?;
     if !pending_file_size_allows_adoption(
         asset,
         version_size,
         &existing_path,
-        existing_size,
         task.size,
         recorded_file,
     )
@@ -719,12 +717,11 @@ async fn adopt_pending_derived_path_at(
     mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
     let version_size = derived.version_size.as_str();
-    let (existing_path, existing_size) = task_planner.existing_regular_path_with_size(path).await?;
+    let (existing_path, _) = task_planner.existing_regular_path_with_size(path).await?;
     if !pending_file_size_allows_adoption(
         asset,
         version_size,
         &existing_path,
-        existing_size,
         derived.size,
         recorded_file,
     )
@@ -816,7 +813,6 @@ pub(super) async fn state_path_size_allows_skip(
 ) -> bool {
     let result = local_file_size_matches_state(
         path,
-        on_disk_size,
         LocalFileSizeExpectation::AtLeastProvider(expected_size),
         recorded_file.local_checksum.as_deref(),
         recorded_file.download_checksum.as_deref(),
@@ -854,10 +850,7 @@ pub(super) async fn state_proven_primary_path(
     asset: &PhotoAsset,
     task_planner: &mut TaskPlanner,
 ) -> Option<PathBuf> {
-    let derived_paths = derive_expected_paths(asset, config);
-    let primary = derived_paths
-        .iter()
-        .find(|derived| derived.version_size.is_primary_media())?;
+    let primary = derive_primary_for_path_proof(asset, config)?;
     let library = effective_asset_library(asset, config);
     let recorded_file = ctx.downloaded_file_matching_checksum(
         library,
@@ -867,7 +860,7 @@ pub(super) async fn state_proven_primary_path(
     )?;
     if !stored_path_matches_current_collision_family(
         asset.state_id(),
-        primary,
+        &primary,
         config,
         None,
         &recorded_file.path,
@@ -1025,7 +1018,8 @@ pub(super) async fn state_confirmed_current_path_exists(
 ) -> Option<PathBuf> {
     let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
     let stored_path = &recorded_file.path;
-    let derived_paths = derive_expected_paths(asset, config);
+    let derived_paths =
+        derive_expected_paths_with_proven_primary_path(asset, config, proven_primary_path);
 
     for derived in &derived_paths {
         if derived.version_size != task.version_size {
@@ -8356,7 +8350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_streaming_new_live_photo_motion_uses_state_proven_bare_primary() {
+    async fn full_streaming_video_only_uses_state_proven_collision_primary() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
         use wiremock::matchers::{method, path};
@@ -8405,24 +8399,34 @@ mod tests {
         config.state_db = Some(db.clone());
         config.live_photo_mode = crate::types::LivePhotoMode::ImageOnly;
         let image_only_paths = derive_expected_paths(&asset, &config);
-        let still_path = image_only_paths
+        let bare_still_path = image_only_paths
             .iter()
             .find(|path| path.version_size == VersionSizeKey::Original)
             .unwrap()
             .path
             .clone();
         assert_eq!(image_only_paths.len(), 1);
-        config.live_photo_mode = crate::types::LivePhotoMode::Both;
-        let motion_path = derive_expected_paths(&asset, &config)
-            .iter()
+        let still_path = identity_suffixed_path_for(&bare_still_path, asset.state_id());
+        config.live_photo_mode = crate::types::LivePhotoMode::VideoOnly;
+        let ctx = super::super::filter::DerivationContext::build(&asset, &config);
+        let motion_path = super::super::filter::derive_mov_companion(
+            &asset,
+            &config,
+            &ctx,
+            still_path.file_name().and_then(|name| name.to_str()),
+        )
+        .expect("video-only Live Photo should derive a motion companion")
+        .path;
+        let wrong_motion_path = derive_expected_paths(&asset, &config)
+            .into_iter()
             .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
             .unwrap()
-            .path
-            .clone();
-        let wrong_motion_path =
-            path_for_filename(&config, &asset, "IMG_0001-LIVE_ENABLE_FULL_HEVC.MOV");
+            .path;
         let config = Arc::new(config);
         tokio::fs::create_dir_all(still_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&bare_still_path, vec![6u8; still_body.len()])
             .await
             .unwrap();
         tokio::fs::write(&still_path, &still_body).await.unwrap();
@@ -8542,9 +8546,11 @@ mod tests {
             motion_body,
             "correcting the motion path must retain the old file"
         );
-        assert!(
-            !identity_suffixed_path_for(&still_path, asset.state_id()).exists(),
-            "enabling the MOV must not copy or re-download the proven still"
+        assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_body);
+        assert_eq!(
+            tokio::fs::read(&bare_still_path).await.unwrap(),
+            vec![6u8; still_body.len()],
+            "video-only planning must not touch either primary collision entry"
         );
 
         let printed = stream_and_download_from_stream(

@@ -169,48 +169,63 @@ calendar-date filter, so enumeration safety does not depend on the backup host
 timezone.
 
 The download config hash contains only fields that can change a rendered local
-path for an already-downloaded version. Eligibility and version-selection
-fields, including date bounds, recent limits, media selection, resolution, and
-Live Photo mode, live only in the enumeration hash. A matching legacy mixed
-v2 hash is promoted to the current path-only shape without reconciliation only
+path for an already-downloaded version, plus the selected library/pass scope
+whose rows were reconciled. Eligibility and version-selection fields,
+including date bounds, recent limits, media selection, resolution, and Live
+Photo mode, live only in the enumeration hash. Changing the selected scope
+stages reconciliation for that scope, so a later selection cannot inherit a
+hash promoted by unrelated libraries or passes. A matching legacy mixed v2
+hash is promoted to the current path-only shape without reconciliation only
 when no downloaded Live Photo video rows exist. A v2 catalogue with downloaded
-Live Photo videos, an older path-only hash, or a genuine path change stages
-reconciliation without discarding provider cursors.
+Live Photo videos, an older path-only hash, a changed scope, or a genuine path
+change stages reconciliation without discarding provider cursors. If a path
+change is partially applied and configuration returns to the active hash, the
+pending marker is restaged to the active value and reconciliation moves the
+partial rows back before clearing it.
 Path-hash staging, reconciliation, and promotion run only in download mode.
 Print-only and dry-run planning use catalogue and filesystem evidence without
 mutating path-hash metadata, catalogue rows, or local files.
 
-Path reconciliation resolves only versions with downloaded catalog rows. It
-recognises exact, AM/PM-equivalent, size-suffixed, and identity-suffixed paths
-owned by that row before ordinary collision handling, so an asset cannot
-collide with its own file. Newly eligible versions remain the following full
-enumeration's responsibility. A changed provider checksum or size is requeued
-for download rather than copying stale local bytes. Reconciliation-detected
-retry work does not consume a download attempt before a transfer is made.
+Path reconciliation resolves every exact downloaded version in the selected
+catalogue scope, independently of current date, media, filename, resolution,
+RAW, edited, alternative, or Live Photo eligibility. It recognises exact,
+AM/PM-equivalent, size-suffixed, and identity-suffixed paths owned by that row
+before ordinary collision handling, so an asset cannot collide with its own
+file. An exact target is retired only after its current path is validated,
+verified publication and state finalisation succeed, or provider deletion is
+durably applied. Newly eligible versions without downloaded rows remain the
+following full enumeration's responsibility. A changed provider checksum or
+size is requeued for download rather than copying stale local bytes.
+Reconciliation-detected retry work does not consume a download attempt before
+a transfer is made.
 Normal full and incremental planning applies the same proof before primary
 collision handling: the selected primary version, effective library, provider
 checksum, recorded collision family, regular-file type, and recorded integrity
-must all match. The planner then skips that exact primary path and derives a
-Live Photo companion from its actual filename. Content equality alone never
+must all match. Video-only planning derives this proof without emitting or
+downloading the still. The planner then skips that exact primary path and
+derives a Live Photo companion from its actual filename in download, dry-run,
+print-only, retry, and reconciliation flows. Content equality alone never
 establishes ownership. Motion collision-family checks accept the bare motion
 family and the companion paired with the proven primary filename rather than
 hypothetical primary collision stems. A direct motion identity or ordinal
-collision remains current only while its unsuffixed base is an existing regular
-file; the base need not be state-owned, and links or other nonregular entries
-are never accepted. Shared task planning rebinds a collision-selected alternate
-to an existing nonregular expected leaf, so every run mode reports or fails the
-exact blocked target instead of creating another collision ordinal.
+collision remains current only while its unsuffixed base is an existing
+regular file; the base need not be state-owned, and links or other nonregular
+entries are never accepted. Shared task planning rebinds a collision-selected
+alternate to an existing nonregular expected leaf, so every run mode reports
+or fails the exact blocked target instead of creating another collision
+ordinal.
 Selected smart folders are never resolved from historical membership rows.
 They require an explicit successful fresh-query marker from the normal sync
 flow before the pending path hash can be promoted. Interruption, refresh
 failure, or a stale pass plan retains the pending hash for the next cycle.
 
-For a genuine path change, reconciliation copies verified bytes through
-no-overwrite publication only when the copied bytes match the recorded local
-SHA-256. Before updating the recorded local path, it strictly sets the copied
-media's access and modification times through the same no-follow, checksum-
-verified file handle, reproduces and merges configured XMP sidecars without
-embedded writes, and makes the destination directory durable. A source sidecar
+For a genuine path change, reconciliation copies verified bytes and source
+permissions through no-overwrite publication only when the copied bytes match
+the recorded local SHA-256. Before updating the recorded local path, it
+strictly sets the copied media's access and modification times through the same
+no-follow, checksum-verified file handle, reproduces and merges configured XMP
+sidecars without embedded writes, and makes the destination directory durable.
+A source sidecar
 is rendered from an explicit regular-file snapshot or an explicit empty seed.
 That seed is revalidated immediately before conditional destination
 publication, which is the sidecar snapshot linearization point. A later source
@@ -263,8 +278,9 @@ inventory. The retry owner:
 1. Removes only work already proven source-deleted.
 2. Resolves current provider records in targeted batches.
 3. Uses durable asset/master mappings and checksum/size evidence for legacy
-   identities. A persisted legacy owner resolves matching siblings without
-   changing the selected child.
+   identities. A persisted legacy owner constrains provider lookup before
+   sibling results are merged, so matching or deleted siblings cannot change
+   or mask the selected child.
 4. Adopts an existing matching local file when safe.
 5. Marks current filter exclusions as policy-excluded.
 6. Persists unknown or transient verification state.

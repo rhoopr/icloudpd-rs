@@ -964,6 +964,13 @@ fn select_primary<'a>(
     {
         return None;
     }
+    select_primary_for_path_proof(config, ctx)
+}
+
+fn select_primary_for_path_proof<'a>(
+    config: &(impl PathDerivationSource + ?Sized),
+    ctx: &DerivationContext<'a>,
+) -> Option<(&'a AssetVersion, AssetVersionSize)> {
     let requested = config.resolution().to_asset_version_size()?;
     let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
     version_with_fallback(
@@ -1118,7 +1125,22 @@ pub(super) fn derive_primary(
     ctx: &DerivationContext<'_>,
 ) -> Option<DerivedPath> {
     let (version, effective_size) = select_primary(asset, config, ctx)?;
+    Some(derive_selected_primary(
+        asset,
+        config,
+        ctx,
+        version,
+        effective_size,
+    ))
+}
 
+fn derive_selected_primary(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+    ctx: &DerivationContext<'_>,
+    version: &AssetVersion,
+    effective_size: AssetVersionSize,
+) -> DerivedPath {
     let mapped = mapped_version_filename(asset.state_id(), &ctx.base_filename, &version.asset_type);
     let sized = match effective_size {
         AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
@@ -1137,7 +1159,7 @@ pub(super) fn derive_primary(
         config.album_name(),
     );
 
-    Some(DerivedPath {
+    DerivedPath {
         path,
         filename,
         url: version.url.clone(),
@@ -1145,7 +1167,25 @@ pub(super) fn derive_primary(
         size: version.size,
         version_size: VersionSizeKey::from(effective_size),
         check_ampm_on_disk: true,
-    })
+    }
+}
+
+pub(super) fn derive_primary_for_path_proof(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+) -> Option<DerivedPath> {
+    if !asset.has_valid_id() {
+        return None;
+    }
+    let ctx = DerivationContext::build(asset, config);
+    let (version, effective_size) = select_primary_for_path_proof(config, &ctx)?;
+    Some(derive_selected_primary(
+        asset,
+        config,
+        &ctx,
+        version,
+        effective_size,
+    ))
 }
 
 fn boxed_url_seen(version: &AssetVersion, seen_urls: &[Box<str>]) -> bool {
@@ -1314,6 +1354,14 @@ pub(super) fn derive_expected_paths(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &(impl PathDerivationSource + ?Sized),
 ) -> Vec<DerivedPath> {
+    derive_expected_paths_with_proven_primary_path(asset, config, None)
+}
+
+pub(super) fn derive_expected_paths_with_proven_primary_path(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &(impl PathDerivationSource + ?Sized),
+    proven_primary_path: Option<&Path>,
+) -> Vec<DerivedPath> {
     if !asset.has_valid_id() {
         return Vec::new();
     }
@@ -1339,9 +1387,14 @@ pub(super) fn derive_expected_paths(
         seen_urls.push(p.url.clone());
         out.push(p);
     }
-    let primary_filename = primary_index
-        .and_then(|index| out.get(index))
-        .map(|p| p.filename.as_str());
+    let primary_filename = proven_primary_path
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .or_else(|| {
+            primary_index
+                .and_then(|index| out.get(index))
+                .map(|p| p.filename.as_str())
+        });
     if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename) {
         if seen_urls
             .iter()
@@ -1719,7 +1772,10 @@ pub(super) fn filter_asset_to_tasks_with_proven_primary_path(
     let ctx = DerivationContext::build(asset, config);
     let payload = build_payload(asset, config);
     let mut tasks = Vec::with_capacity(5);
-    let mut effective_primary_filename: Option<String> = None;
+    let mut effective_primary_filename = proven_primary_path
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
     let mut seen_urls = Vec::<Box<str>>::with_capacity(4);
     let task_library: Arc<str> = asset
         .source_zone()
@@ -1916,6 +1972,31 @@ pub(super) fn filter_asset_to_tasks_with_proven_primary_path(
     }
 
     tasks
+}
+
+pub(super) fn reconciliation_task_from_derived(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    derived: DerivedPath,
+    download_path: PathBuf,
+) -> DownloadTask {
+    DownloadTask {
+        url: derived.url,
+        download_path,
+        publication: FinalPublication::NoReplace,
+        checksum: derived.checksum,
+        asset_id: asset.state_id_arc(),
+        asset_record_name: asset.asset_record_name_arc(),
+        library: asset
+            .source_zone()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::clone(&config.library)),
+        metadata: build_payload(asset, config),
+        size: derived.size,
+        created_local: asset.created_local(),
+        version_size: derived.version_size,
+        media_type: determine_media_type(derived.version_size, asset),
+    }
 }
 
 #[cfg(test)]

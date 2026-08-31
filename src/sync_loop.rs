@@ -1331,6 +1331,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &library_states,
             )
             .await;
+            match db
+                .get_metadata(crate::sync_cycle::PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+            {
+                Ok(Some(_)) => watch_precheck = WatchPrecheck::proceed_all(),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Failed to inspect pending path reconciliation before watch pre-check; running the cycle"
+                    );
+                    watch_precheck = WatchPrecheck::proceed_all();
+                }
+            }
         }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
@@ -8835,7 +8849,7 @@ mod tests {
             Arc::new(download::AssetGroupings::default()),
             Arc::from("PrimarySync"),
         );
-        let old_hash = download::hash_download_config(&old_download_config);
+        let old_hash = download::hash_scoped_download_config(&old_download_config, &config);
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, &old_hash)
             .await
             .expect("seed old download hash");
@@ -8870,12 +8884,15 @@ mod tests {
             Arc::clone(&db),
             Arc::clone(&observed_modes),
         );
-        let new_hash = download::hash_download_config(&build_download_config(
-            download::SyncMode::Full,
-            Arc::new(rustc_hash::FxHashSet::default()),
-            Arc::new(download::AssetGroupings::default()),
-            Arc::from("PrimarySync"),
-        ));
+        let new_hash = download::hash_scoped_download_config(
+            &build_download_config(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from("PrimarySync"),
+            ),
+            &config,
+        );
 
         lib_state.plan_is_stale = true;
         let stale_result = run_cycle(
@@ -9035,7 +9052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cycle_multi_pass_persists_base_download_config_hash() {
+    async fn run_cycle_multi_pass_persists_scoped_download_config_hash() {
         let config = make_run_cycle_config();
         let db = make_state_db();
         let download_dir = tempfile::tempdir().expect("download tempdir");
@@ -9077,7 +9094,7 @@ mod tests {
             Arc::new(download::AssetGroupings::default()),
             Arc::from("PrimarySync"),
         );
-        let base_hash = download::hash_download_config(&base_config);
+        let scoped_hash = download::hash_scoped_download_config(&base_config, &config);
         let pass_hashes: Vec<String> = passes
             .iter()
             .map(|pass| download::hash_download_config(&base_config.with_pass(pass)))
@@ -9103,12 +9120,25 @@ mod tests {
             .expect("read stored download hash")
             .expect("download hash should be persisted");
         assert_eq!(
-            stored_hash, base_hash,
-            "global download config hash must be the base run-level hash"
+            stored_hash, scoped_hash,
+            "download config hash must include the selected reconciliation scope"
         );
         assert!(
             pass_hashes.iter().take(2).all(|hash| hash != &stored_hash),
             "album-expanded folder templates must not overwrite the global hash: {pass_hashes:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_download_config_hash_changes_with_selection() {
+        let selected = make_run_cycle_config();
+        let mut changed = make_run_cycle_config();
+        changed.filters.selection.unfiled = !changed.filters.selection.unfiled;
+        let download_config = download::DownloadConfig::test_default();
+
+        assert_ne!(
+            download::hash_scoped_download_config(&download_config, &selected),
+            download::hash_scoped_download_config(&download_config, &changed)
         );
     }
 
@@ -10149,7 +10179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_config_revert_clears_pending_reconciliation() {
+    async fn download_config_revert_restages_active_reconciliation() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "active-hash")
             .await
@@ -10161,12 +10191,43 @@ mod tests {
         let outcome =
             check_download_config_hash_for_cycle(&db, "active-hash", "legacy-active-hash").await;
 
-        assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
+        assert_eq!(outcome, DownloadConfigHashOutcome::Changed);
         assert_eq!(
             db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
                 .await
-                .unwrap(),
-            None
+                .unwrap()
+                .as_deref(),
+            Some("active-hash")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_download_config_revert_restages_active_reconciliation() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-active-hash")
+            .await
+            .unwrap();
+        db.set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, "abandoned-hash")
+            .await
+            .unwrap();
+
+        let outcome =
+            check_download_config_hash_for_cycle(&db, "current-hash", "legacy-active-hash").await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Changed);
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("legacy-active-hash")
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current-hash")
         );
     }
 
@@ -10207,9 +10268,6 @@ mod tests {
     async fn download_config_v2_hash_without_live_photo_video_migrates_directly() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-current-hash")
-            .await
-            .unwrap();
-        db.set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, "abandoned-hash")
             .await
             .unwrap();
         db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")

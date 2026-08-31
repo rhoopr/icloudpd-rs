@@ -1102,10 +1102,7 @@ impl PhotoAlbum {
                                 ),
                             }
                         }
-                        (Ok(master), None)
-                            if request.asset_record_name.is_none()
-                                && master.record_type == "CPLMaster" =>
-                        {
+                        (Ok(master), None) if master.record_type == "CPLMaster" => {
                             RecordResolution::MasterPresent
                         }
                         (Ok(asset), None)
@@ -3259,7 +3256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_record_lookup_omitted_sibling_keeps_shared_master_state_unknown() {
+    async fn targeted_record_lookup_omitted_sibling_keeps_shared_master_live() {
         let response = json!({
             "records": [
                 test_master_record("master-shared"),
@@ -3281,7 +3278,10 @@ mod tests {
 
         assert!(!batch.complete);
         assert_eq!(batch.results.len(), 1);
-        assert!(matches!(batch.results[0].1, RecordResolution::Unknown));
+        assert!(matches!(
+            batch.results[0].1,
+            RecordResolution::MasterPresent
+        ));
     }
 
     #[tokio::test]

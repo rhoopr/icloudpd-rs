@@ -488,16 +488,24 @@ pub(super) struct PendingRetryPlan {
     pub(super) requested: usize,
 }
 
-struct ProviderLookupPlan {
-    requests: Vec<RecordLookupRequest>,
-    master_by_state_id: FxHashMap<String, String>,
+pub(super) struct ProviderLookupPlan {
+    pub(super) requests: Vec<RecordLookupRequest>,
+    pub(super) master_by_state_id: FxHashMap<String, String>,
+    pub(super) legacy_master_state_owners: FxHashMap<String, String>,
 }
 
-async fn build_provider_lookup_plan(
+pub(super) async fn build_provider_lookup_plan(
     db: &dyn DownloadStore,
     library: &str,
     state_ids: &[&str],
 ) -> Result<ProviderLookupPlan> {
+    let legacy_master_state_owners: FxHashMap<String, String> = db
+        .get_legacy_master_state_owners()
+        .await?
+        .into_iter()
+        .filter(|(owner_library, _, _)| owner_library == library)
+        .map(|(_, master_record_name, asset_record_name)| (master_record_name, asset_record_name))
+        .collect();
     let mut requests = Vec::new();
     let mut seen_requests = FxHashSet::default();
     let mut master_by_state_id = FxHashMap::default();
@@ -508,9 +516,17 @@ async fn build_provider_lookup_plan(
         let master = mapped_master.as_deref().unwrap_or(state_id).to_string();
         let asset_record_names = if mapped_master.is_some() {
             vec![state_id.to_string()]
+        } else if let Some(owner) = legacy_master_state_owners.get(state_id) {
+            vec![owner.clone()]
         } else {
-            db.get_asset_record_names_for_master(library, &master)
-                .await?
+            let mapped = db
+                .get_asset_record_names_for_master(library, &master)
+                .await?;
+            if mapped.len() == 1 {
+                mapped
+            } else {
+                Vec::new()
+            }
         };
         master_by_state_id.insert(state_id.to_string(), master.clone());
         if asset_record_names.is_empty() {
@@ -542,6 +558,7 @@ async fn build_provider_lookup_plan(
     Ok(ProviderLookupPlan {
         requests,
         master_by_state_id,
+        legacy_master_state_owners,
     })
 }
 
@@ -602,6 +619,7 @@ async fn revalidate_policy_excluded_assets(
     let ProviderLookupPlan {
         requests,
         master_by_state_id,
+        ..
     } = build_provider_lookup_plan(db.as_ref(), &config.library, &state_id_refs).await?;
 
     let requested = state_ids.len();
@@ -664,14 +682,6 @@ pub(super) async fn build_pending_retry_download_tasks(
             )
         })
         .collect();
-    let legacy_master_state_owners: FxHashMap<String, String> = db
-        .get_legacy_master_state_owners()
-        .await?
-        .into_iter()
-        .filter(|(library, _, _)| library == config.library.as_ref())
-        .map(|(_, master_record_name, asset_record_name)| (master_record_name, asset_record_name))
-        .collect();
-
     let backfilled = db
         .backfill_asset_master_mappings_from_album_memberships()
         .await?;
@@ -697,6 +707,7 @@ pub(super) async fn build_pending_retry_download_tasks(
     let ProviderLookupPlan {
         requests: lookup_requests,
         master_by_state_id,
+        legacy_master_state_owners,
     } = build_provider_lookup_plan(db.as_ref(), &config.library, &pending_state_ids).await?;
 
     let requested_state_ids: FxHashSet<&str> = lookup_requests
@@ -750,7 +761,22 @@ pub(super) async fn build_pending_retry_download_tasks(
                 .await?;
             }
             RecordResolution::MasterPresent => {
-                legacy_present_state_ids.insert(state_id.as_str().to_string());
+                let state_id = state_id.as_str();
+                if master_by_state_id
+                    .get(state_id)
+                    .is_some_and(|master| master == state_id)
+                {
+                    legacy_present_state_ids.insert(state_id.to_string());
+                } else {
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        state_id,
+                        AssetVerificationState::Unknown,
+                        "provider returned the master but omitted the mapped asset record",
+                    )
+                    .await?;
+                }
             }
             RecordResolution::Deleted {
                 deleted_at,
@@ -1409,6 +1435,40 @@ mod tests {
             panic!("persisted owner should resolve matching siblings");
         };
         assert_eq!(selected.asset_record_name(), "asset-b");
+    }
+
+    #[tokio::test]
+    async fn provider_lookup_plan_uses_persisted_legacy_owner() {
+        let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-a", "legacy-master")
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-b", "legacy-master")
+            .await
+            .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "legacy-master", "asset-b")
+                .await
+                .unwrap()
+        );
+
+        let plan = build_provider_lookup_plan(&db, "PrimarySync", &["legacy-master"])
+            .await
+            .unwrap();
+
+        assert_eq!(plan.requests.len(), 1);
+        assert_eq!(plan.requests[0].state_id.as_str(), "legacy-master");
+        assert_eq!(
+            plan.requests[0]
+                .asset_record_name
+                .as_ref()
+                .map(ProviderRecordId::as_str),
+            Some("asset-b")
+        );
+        assert_eq!(
+            plan.legacy_master_state_owners.get("legacy-master"),
+            Some(&"asset-b".to_string())
+        );
     }
 
     #[tokio::test]

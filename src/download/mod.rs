@@ -64,7 +64,7 @@ use crate::state::{
 };
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-    RawPolicy,
+    PhotoResolution, RawPolicy,
 };
 
 /// Outcome of a download pass.
@@ -1052,6 +1052,31 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     hasher.update([config.file_match_policy as u8]);
     hasher.update([config.live_photo_mov_filename_policy as u8]);
     hasher.update([u8::from(config.keep_unicode_in_filenames)]);
+    finalize_hash(hasher)
+}
+
+pub(crate) fn hash_scoped_download_config(
+    download_config: &DownloadConfig,
+    config: &crate::config::Config,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"path-scope-v1");
+    hash_bytes(
+        &mut hasher,
+        hash_download_config(download_config).as_bytes(),
+    );
+    let scope = serde_json::json!({
+        "albums": album_selector_fingerprint_json(&config.filters.selection.albums),
+        "albums_explicit": config.filters.selection.albums_explicit,
+        "smart_folders": smart_folder_selector_fingerprint_json(&config.filters.selection.smart_folders),
+        "smart_folders_explicit": config.filters.selection.smart_folders_explicit,
+        "libraries": library_selector_fingerprint_json(&config.filters.selection.libraries),
+        "unfiled": config.filters.selection.unfiled,
+    })
+    .to_string();
+    hash_bytes(&mut hasher, scope.as_bytes());
     finalize_hash(hasher)
 }
 
@@ -3474,6 +3499,63 @@ pub(crate) async fn reconcile_catalog_paths(
     .await
 }
 
+fn reconciliation_config_for_version(
+    config: &DownloadConfig,
+    version_size: VersionSizeKey,
+) -> DownloadConfig {
+    let mut target = config.clone();
+    target.media = crate::config::MediaSelection::all();
+    target.skip_created_before = None;
+    target.skip_created_after = None;
+    target.recent = None;
+    target.filename_exclude = Arc::from(Vec::<glob::Pattern>::new());
+    target.exclude_asset_ids = Arc::new(FxHashSet::default());
+    target.edited = false;
+    target.alternative = false;
+    target.force_resolution = true;
+    match version_size {
+        VersionSizeKey::Original => {
+            target.resolution = PhotoResolution::Original;
+            target.live_photo_mode = LivePhotoMode::ImageOnly;
+        }
+        VersionSizeKey::Medium => {
+            target.resolution = PhotoResolution::Medium;
+            target.live_photo_mode = LivePhotoMode::ImageOnly;
+        }
+        VersionSizeKey::Thumb => {
+            target.resolution = PhotoResolution::Thumb;
+            target.live_photo_mode = LivePhotoMode::ImageOnly;
+        }
+        VersionSizeKey::Adjusted => {
+            target.resolution = PhotoResolution::None;
+            target.live_photo_mode = LivePhotoMode::ImageOnly;
+            target.edited = true;
+        }
+        VersionSizeKey::Alternative => {
+            target.resolution = PhotoResolution::None;
+            target.live_photo_mode = LivePhotoMode::ImageOnly;
+            target.alternative = true;
+        }
+        VersionSizeKey::LiveOriginal => {
+            target.live_photo_mode = LivePhotoMode::VideoOnly;
+            target.live_resolution = AssetVersionSize::LiveOriginal;
+        }
+        VersionSizeKey::LiveMedium => {
+            target.live_photo_mode = LivePhotoMode::VideoOnly;
+            target.live_resolution = AssetVersionSize::LiveMedium;
+        }
+        VersionSizeKey::LiveThumb => {
+            target.live_photo_mode = LivePhotoMode::VideoOnly;
+            target.live_resolution = AssetVersionSize::LiveThumb;
+        }
+        VersionSizeKey::LiveAdjusted => {
+            target.live_photo_mode = LivePhotoMode::Both;
+            target.edited = true;
+        }
+    }
+    target
+}
+
 #[cfg(all(test, feature = "xmp"))]
 async fn reconcile_catalog_paths_with_before_final_media_validation(
     passes: &[crate::commands::AlbumPass],
@@ -3520,6 +3602,23 @@ async fn reconcile_catalog_paths_inner(
         }
         offset = offset.saturating_add(u64::from(PAGE_SIZE));
     }
+    let mut albums_by_asset: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
+    for (asset_id, album_name) in db.get_all_asset_albums(&config.library).await? {
+        albums_by_asset
+            .entry(asset_id)
+            .or_default()
+            .insert(album_name);
+    }
+    records.retain(|record| {
+        let known_albums = albums_by_asset.get(record.id.as_ref());
+        passes.iter().any(|pass| match pass.kind {
+            crate::commands::PassKind::Album => {
+                known_albums.is_some_and(|albums| albums.contains(pass.album.name.as_ref()))
+            }
+            crate::commands::PassKind::Unfiled => known_albums.is_none_or(FxHashSet::is_empty),
+            crate::commands::PassKind::SmartFolder => false,
+        })
+    });
     if records.is_empty() {
         return Ok(PathReconciliationResult {
             complete: true,
@@ -3532,51 +3631,17 @@ async fn reconcile_catalog_paths_inner(
         .iter()
         .map(PendingRetryTarget::from_record)
         .collect();
-    let mut requests = Vec::new();
-    let mut seen_requests = FxHashSet::default();
-    let mut master_by_state_id = FxHashMap::default();
-    for record in &records {
-        let mapped_master = db
-            .get_master_record_name_for_asset(&config.library, &record.id)
-            .await?;
-        let master = mapped_master
-            .as_deref()
-            .unwrap_or(record.id.as_ref())
-            .to_owned();
-        let asset_record_names = if mapped_master.is_some() {
-            vec![record.id.to_string()]
-        } else {
-            db.get_asset_record_names_for_master(&config.library, &master)
-                .await?
-        };
-        master_by_state_id.insert(record.id.to_string(), master.clone());
-        for asset_record_name in asset_record_names {
-            let key = (
-                record.id.to_string(),
-                master.clone(),
-                asset_record_name.clone(),
-            );
-            if seen_requests.insert(key.clone()) {
-                requests.push(RecordLookupRequest::paired(
-                    ProviderRecordId::new(key.0),
-                    ProviderRecordId::new(key.1),
-                    ProviderRecordId::new(key.2),
-                ));
-            }
-        }
-    }
+    let state_ids: Vec<&str> = records.iter().map(|record| record.id.as_ref()).collect();
+    let retry::ProviderLookupPlan {
+        requests,
+        master_by_state_id,
+        legacy_master_state_owners,
+    } = retry::build_provider_lookup_plan(db.as_ref(), &config.library, &state_ids).await?;
 
     let pass_configs: Vec<Arc<DownloadConfig>> = passes
         .iter()
         .map(|pass| Arc::new(config.with_pass(pass)))
         .collect();
-    let mut albums_by_asset: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
-    for (asset_id, album_name) in db.get_all_asset_albums(&config.library).await? {
-        albums_by_asset
-            .entry(asset_id)
-            .or_default()
-            .insert(album_name);
-    }
     let album_container_ids: Vec<String> = passes
         .iter()
         .filter(|pass| pass.kind == crate::commands::PassKind::Album)
@@ -3598,7 +3663,7 @@ async fn reconcile_catalog_paths_inner(
     let selection_complete = album_membership_complete;
     let batch = provider_pass.album.resolve_records(&requests).await;
     let download_ctx = preload_download_context(&config).await;
-    let mut task_planner = planner::TaskPlanner::new();
+    let mut reconciliation_reservations = planner::TaskPlanner::new();
     let mut stats = SyncStats::default();
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
@@ -3607,13 +3672,76 @@ async fn reconcile_catalog_paths_inner(
         .iter()
         .map(|record| (PendingRetryTarget::from_record(record), record))
         .collect();
-    for (state_id, resolution) in batch.results {
+    let mut resolutions = batch.results;
+    let legacy_present_state_ids: FxHashSet<String> = resolutions
+        .iter()
+        .filter(|(_, resolution)| matches!(resolution, RecordResolution::MasterPresent))
+        .map(|(state_id, _)| state_id.as_str().to_string())
+        .collect();
+    if !legacy_present_state_ids.is_empty() && !shutdown_token.is_cancelled() {
+        match provider_pass
+            .album
+            .hydrate_matching_master_assets_from_changes(&legacy_present_state_ids, &shutdown_token)
+            .await
+        {
+            Ok(hydrated) => {
+                let mut candidates_by_master: FxHashMap<String, Vec<PhotoAsset>> =
+                    FxHashMap::default();
+                for asset in hydrated {
+                    candidates_by_master
+                        .entry(asset.id().to_string())
+                        .or_default()
+                        .push(asset);
+                }
+                for (state_id, resolution) in &mut resolutions {
+                    if !matches!(resolution, RecordResolution::MasterPresent) {
+                        continue;
+                    }
+                    let state_id = state_id.as_str();
+                    let owner = legacy_master_state_owners.get(state_id);
+                    let mut candidates = candidates_by_master.remove(state_id).unwrap_or_default();
+                    if let Some(owner) = owner {
+                        candidates.retain(|asset| asset.asset_record_name() == owner);
+                    }
+                    candidates.retain(|asset| {
+                        asset.versions().iter().any(|(_, version)| {
+                            records
+                                .iter()
+                                .filter(|record| record.id.as_ref() == state_id)
+                                .any(|record| {
+                                    record.checksum.as_ref() == version.checksum.as_ref()
+                                        && record.size_bytes == version.size
+                                })
+                        })
+                    });
+                    if candidates.len() == 1
+                        && let Some(asset) = candidates.pop()
+                    {
+                        *resolution = RecordResolution::Present(asset);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    library = %config.library,
+                    %error,
+                    "Path reconciliation could not hydrate live legacy master owners"
+                );
+            }
+        }
+    }
+    let provider_lookup_complete = resolutions.iter().all(|(_, resolution)| {
+        matches!(
+            resolution,
+            RecordResolution::Present(_) | RecordResolution::Deleted { .. }
+        )
+    });
+    for (state_id, resolution) in resolutions {
         if shutdown_token.is_cancelled() {
             break;
         }
         match resolution {
             RecordResolution::Present(asset) => {
-                targets.retain(|target| target.asset_id.as_ref() != state_id.as_str());
                 let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
                 let known_albums = albums_by_asset.get(state_id.as_str());
                 for (pass, pass_config) in passes.iter().zip(&pass_configs) {
@@ -3628,43 +3756,80 @@ async fn reconcile_catalog_paths_inner(
                     if !selected {
                         continue;
                     }
-                    let derived_paths = filter::derive_expected_paths(&asset, pass_config.as_ref());
-                    let proven_primary_path = pipeline::state_proven_primary_path(
-                        &download_ctx,
-                        pass_config,
-                        &asset,
-                        &mut task_planner,
-                    )
-                    .await;
-                    let plan = task_planner
-                        .plan_asset_with_proven_primary_path(
-                            &asset,
-                            pass_config,
-                            proven_primary_path.as_deref(),
-                        )
-                        .await;
-                    if plan.filter_reason.is_some() {
-                        continue;
-                    }
-                    for task in plan.tasks {
-                        let target = PendingRetryTarget::from_task(&task);
-                        let Some(record) = records_by_target.get(&target) else {
+                    let state_targets: Vec<PendingRetryTarget> = targets
+                        .iter()
+                        .filter(|target| target.asset_id.as_ref() == state_id.as_str())
+                        .cloned()
+                        .collect();
+                    for target in state_targets {
+                        let Some(record) = records_by_target.get(&target).copied() else {
                             continue;
                         };
+                        let target_config =
+                            reconciliation_config_for_version(pass_config, target.version_size);
+                        let mut target_planner = planner::TaskPlanner::new();
+                        let proven_primary_path = pipeline::state_proven_primary_path(
+                            &download_ctx,
+                            &target_config,
+                            &asset,
+                            &mut target_planner,
+                        )
+                        .await;
+                        let Some(derived) = filter::derive_expected_paths_with_proven_primary_path(
+                            &asset,
+                            &target_config,
+                            proven_primary_path.as_deref(),
+                        )
+                        .into_iter()
+                        .find(|derived| derived.version_size == target.version_size) else {
+                            continue;
+                        };
+                        let plan = target_planner
+                            .plan_asset_with_proven_primary_path(
+                                &asset,
+                                &target_config,
+                                proven_primary_path.as_deref(),
+                            )
+                            .await;
+                        let planned_task = plan
+                            .tasks
+                            .into_iter()
+                            .find(|task| task.version_size == target.version_size);
+                        let mut task = if let Some(task) = planned_task {
+                            task
+                        } else {
+                            let path =
+                                if let Some(path) = target_planner.existing_path(&derived.path) {
+                                    path
+                                } else {
+                                    derived.path.clone()
+                                };
+                            filter::reconciliation_task_from_derived(
+                                &asset,
+                                &target_config,
+                                derived.clone(),
+                                path,
+                            )
+                        };
+                        task.download_path = reconciliation_reservations
+                            .reserve_reconciliation_path(
+                                &task.download_path,
+                                task.size,
+                                asset.state_id(),
+                            )
+                            .await
+                            .unwrap_or(task.download_path);
                         let provider_version_is_current = record.checksum.as_ref()
                             == task.checksum.as_ref()
                             && record.size_bytes == task.size;
-                        let recorded_path_is_current = if let (Some(derived), Some(recorded_path)) = (
-                            derived_paths
-                                .iter()
-                                .find(|derived| derived.version_size == task.version_size),
-                            record.local_path.as_deref(),
-                        ) {
+                        let recorded_path_is_current = if let Some(recorded_path) =
+                            record.local_path.as_deref()
+                        {
                             let matches_current_family =
                                 pipeline::stored_path_matches_current_collision_family(
                                     asset.state_id(),
-                                    derived,
-                                    pass_config,
+                                    &derived,
+                                    &target_config,
                                     proven_primary_path.as_deref(),
                                     recorded_path,
                                 )
@@ -3703,6 +3868,7 @@ async fn reconcile_catalog_paths_inner(
                             false
                         };
                         if recorded_path_is_current {
+                            targets.remove(&target);
                             continue;
                         }
                         let key = RetryTaskKey::from(&task);
@@ -3758,7 +3924,7 @@ async fn reconcile_catalog_paths_inner(
             tracing::debug!(asset_id = %task.asset_id, "Path reconciliation deferred catalog row without a local file to targeted retry");
             continue;
         };
-        let source_metadata = match tokio::fs::metadata(source_path).await {
+        let source_metadata = match tokio::fs::symlink_metadata(source_path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 deferred_to_pending_retry = true;
@@ -3827,6 +3993,7 @@ async fn reconcile_catalog_paths_inner(
             continue;
         }
         if source_path == task.download_path.as_path() {
+            targets.remove(&target);
             continue;
         }
         let Some(expected_local_checksum) = record
@@ -3917,8 +4084,14 @@ async fn reconcile_catalog_paths_inner(
                 let final_path = task.download_path.clone();
                 let final_checksum = local_checksum.clone();
                 let timestamp = task.created_local.timestamp();
+                let source_permissions = source_metadata.permissions();
                 let final_validation = tokio::task::spawn_blocking(move || {
-                    file::validate_reconciled_file_blocking(&final_path, &final_checksum, timestamp)
+                    file::validate_reconciled_file_blocking(
+                        &final_path,
+                        &final_checksum,
+                        timestamp,
+                        source_permissions,
+                    )
                 })
                 .await
                 .context("Final reconciled media validation task panicked")
@@ -3948,6 +4121,7 @@ async fn reconcile_catalog_paths_inner(
                     stats.state_write_failures += 1;
                     tracing::warn!(asset_id = %task.asset_id, %error, "Failed to persist reconciled local path");
                 } else {
+                    targets.remove(&target);
                     stats.downloaded += 1;
                     if matches!(
                         task.media_type,
@@ -3982,7 +4156,7 @@ async fn reconcile_catalog_paths_inner(
         }
     }
     stats.interrupted = shutdown_token.is_cancelled();
-    let complete = batch.complete
+    let complete = provider_lookup_complete
         && selection_complete
         && targets.is_empty()
         && !deferred_to_pending_retry
@@ -14655,6 +14829,17 @@ mod tests {
         assert_eq!(summary.failed, 0);
     }
 
+    #[test]
+    fn reconciliation_version_config_preserves_raw_policy() {
+        let mut config = test_config();
+        config.raw_policy = RawPolicy::PreferRaw;
+
+        let target = reconciliation_config_for_version(&config, VersionSizeKey::Original);
+
+        assert_eq!(target.raw_policy, RawPolicy::PreferRaw);
+        assert_eq!(target.resolution, PhotoResolution::Original);
+    }
+
     #[tokio::test]
     async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
@@ -14699,6 +14884,13 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::write(&old_path, vec![7u8; 1024]).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&old_path, std::fs::Permissions::from_mode(0o400))
+                .await
+                .unwrap();
+        }
         let local_checksum = file::compute_sha256(&old_path).await.unwrap();
         let record = crate::test_helpers::TestAssetRecord::new("RECONCILE")
             .filename("reconcile.jpg")
@@ -14745,15 +14937,47 @@ mod tests {
             downloaded[0].local_path.as_deref(),
             Some(old_path.as_path())
         );
+        tokio::fs::write(&mov_path, vec![8u8; 2048]).await.unwrap();
+        let mov_local_checksum = file::compute_sha256(&mov_path).await.unwrap();
+        let mov_record = crate::test_helpers::TestAssetRecord::new("RECONCILE")
+            .version_size(VersionSizeKey::LiveOriginal)
+            .filename("reconcile.MOV")
+            .checksum("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
+            .size(2048)
+            .media_type(crate::state::MediaType::LivePhotoVideo)
+            .build();
+        db.upsert_seen(&mov_record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "RECONCILE",
+            VersionSizeKey::LiveOriginal.as_str(),
+            &mov_path,
+            &mov_local_checksum,
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="),
+        )
+        .await
+        .unwrap();
 
         let mut new_config = test_config();
         new_config.directory = Arc::from(new_dir.path());
         new_config.state_db = Some(db.clone());
+        new_config.skip_created_before = Some(crate::config::CreatedDateFilter::CaptureDate(
+            chrono::NaiveDate::from_ymd_opt(2099, 1, 1).unwrap(),
+        ));
+        new_config.live_photo_mode = LivePhotoMode::ImageOnly;
         let expected_path = filter::expected_paths_for(&asset, &new_config)
             .into_iter()
             .next()
             .unwrap()
             .path;
+        let expected_mov_path = filter::expected_paths_for(
+            &asset,
+            &reconciliation_config_for_version(&new_config, VersionSizeKey::LiveOriginal),
+        )
+        .into_iter()
+        .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+        .unwrap()
+        .path;
 
         let result =
             reconcile_catalog_paths(&passes, Arc::new(new_config), CancellationToken::new())
@@ -14761,17 +14985,46 @@ mod tests {
                 .expect("path reconciliation");
 
         assert!(result.complete);
-        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(result.stats.downloaded, 2);
         assert_eq!(tokio::fs::read(&old_path).await.unwrap(), vec![7u8; 1024]);
+        assert_eq!(tokio::fs::read(&mov_path).await.unwrap(), vec![8u8; 2048]);
         assert_file_capture_times(&expected_path, capture_timestamp);
+        assert_file_capture_times(&expected_mov_path, capture_timestamp);
         assert_eq!(
             tokio::fs::read(&expected_path).await.unwrap(),
             vec![7u8; 1024]
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(&expected_path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+        }
+        assert_eq!(
+            tokio::fs::read(&expected_mov_path).await.unwrap(),
+            vec![8u8; 2048]
+        );
         let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(
-            downloaded[0].local_path.as_deref(),
+            downloaded
+                .iter()
+                .find(|record| record.version_size == VersionSizeKey::Original)
+                .and_then(|record| record.local_path.as_deref()),
             Some(expected_path.as_path())
+        );
+        assert_eq!(
+            downloaded
+                .iter()
+                .find(|record| record.version_size == VersionSizeKey::LiveOriginal)
+                .and_then(|record| record.local_path.as_deref()),
+            Some(expected_mov_path.as_path())
         );
 
         tokio::fs::remove_file(&expected_path).await.unwrap();
@@ -15214,6 +15467,16 @@ mod tests {
         tokio::fs::write(&source_sidecar, &source_bytes)
             .await
             .expect("write source sidecar");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(
+                &fixture.source_path,
+                std::fs::Permissions::from_mode(0o400),
+            )
+            .await
+            .expect("make reconciliation source read-only");
+        }
         {
             let connection = fixture
                 .db
@@ -15249,6 +15512,19 @@ mod tests {
             tokio::fs::read(&source_sidecar).await.unwrap(),
             source_bytes
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(&fixture.destination_path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+        }
         assert_recorded_path(&fixture, &fixture.source_path).await;
         {
             let connection = fixture
@@ -16582,7 +16858,7 @@ mod tests {
             .await
             .expect("build pending retry plan");
 
-        assert_eq!(plan.unmatched_targets.len(), 0);
+        assert_eq!(plan.unmatched_targets.len(), 1);
         let summary = db.get_summary().await.expect("summary");
         assert_eq!(summary.source_deleted, 0);
         assert_eq!(summary.pending, 1);
