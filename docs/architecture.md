@@ -189,14 +189,30 @@ failure, or a stale pass plan retains the pending hash for the next cycle.
 
 For a genuine path change, reconciliation copies verified bytes through
 no-overwrite publication only when the copied bytes match the recorded local
-SHA-256, then updates the recorded local path. Missing or changed checksum
-evidence stays retryable. Existing source, temporary, and destination entries
-must remain regular files across fingerprinting; links and special files are
-never followed or accepted as reconciled media. The earlier copy stays where
-it is: kei never deletes local media, and no command removes a file that no
-longer matches a derived path. `import-existing` adopts through the same
-derivation. Assets without a usable offset retain host-local paths and remain
-compatible with icloudpd's date-folder layout.
+SHA-256. Before updating the recorded local path, it strictly sets the copied
+media's access and modification times through the same no-follow, checksum-
+verified file handle, reproduces and merges configured XMP sidecars without
+embedded writes, and makes the destination directory durable. A source sidecar
+is rendered from an explicit regular-file snapshot or an explicit empty seed.
+That seed is revalidated immediately before conditional destination
+publication, which is the sidecar snapshot linearization point. A later source
+edit is an external concurrent change, as it is after normal sync, and does not
+block state finalization. The destination sidecar may be absent, byte-identical
+to the source seed, or already byte-identical to the expected provider-merged
+output; any other destination is a conflict. Immediately before state
+finalization, reconciliation reopens the destination media without following
+links, verifies that the path still identifies the regular-file handle that
+was hashed, and requires its SHA-256 to equal the copied checksum. Metadata,
+timestamp, durability, final media validation, or state failure leaves the old
+path authoritative and the pending path hash retryable.
+Missing or changed checksum evidence stays retryable. Existing source,
+temporary, and destination entries must remain regular files across
+fingerprinting; links and special files are never followed or accepted as
+reconciled media. The earlier copy stays where it is: kei never deletes local
+media, and no command removes a file that no longer matches a derived path.
+`import-existing` adopts through the same derivation. Assets without a usable
+offset retain host-local paths and remain compatible with icloudpd's
+date-folder layout.
 
 Existing embedded and sidecar timestamps are repaired only through the
 explicit `sync --refresh-metadata` flow, which is bounded by the same
@@ -482,7 +498,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_rewrite.rs` | Media and sidecar metadata writes run only for explicitly enabled metadata flags. |
 | `METADATA_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | Every embedded metadata rewrite prepares a uniquely owned sibling and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
 | `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/heif.rs`, `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite accepts tone-map insertion only when `dimg` and primary Exif `cdsc` relationships prove the exact target and no existing XMP owns that tone map, prepares a uniquely owned sibling, and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
-| `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
+| `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Path reconciliation derives exact output from the source sidecar or an explicit empty seed and rejects any other destination. Failure preserves the sidecar and durable rewrite marker. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/mod.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
 ## Change-impact checklist

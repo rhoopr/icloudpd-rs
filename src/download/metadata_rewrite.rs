@@ -411,6 +411,71 @@ async fn write_sidecar_metadata(
     }
 }
 
+#[cfg(feature = "xmp")]
+pub(super) async fn write_reconciled_sidecar(
+    source_media_path: &Path,
+    destination_media_path: &Path,
+    source_sidecar_path: &Path,
+    payload: Arc<MetadataPayload>,
+    created_local: DateTime<FixedOffset>,
+    temp_suffix: &str,
+) -> bool {
+    let source_media_path = source_media_path.to_path_buf();
+    let planned = tokio::task::spawn_blocking(move || {
+        plan_sidecar_write(&source_media_path, &payload, &created_local)
+    })
+    .await;
+    let (write, source_error) = match planned {
+        Ok(planned) => planned,
+        Err(error) => {
+            tracing::warn!(error = %error, "XMP sidecar planning task panicked");
+            return false;
+        }
+    };
+    let written = match tokio::fs::symlink_metadata(source_sidecar_path).await {
+        Ok(_) => {
+            super::metadata::write_sidecar_from_seed(
+                destination_media_path,
+                source_sidecar_path,
+                &write,
+                temp_suffix,
+            )
+            .await
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            super::metadata::write_sidecar_from_empty_seed(
+                destination_media_path,
+                source_sidecar_path,
+                &write,
+                temp_suffix,
+            )
+            .await
+        }
+        Err(error) => Err(error.into()),
+    };
+    match written {
+        Ok(()) if source_error.is_none() => true,
+        Ok(()) => {
+            if let Some(error) = source_error {
+                tracing::warn!(
+                    path = %destination_media_path.display(),
+                    %error,
+                    "Source GPS read failed after sidecar publication; leaving marker for retry"
+                );
+            }
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %destination_media_path.display(),
+                %error,
+                "Failed to write reconciled XMP sidecar"
+            );
+            false
+        }
+    }
+}
+
 fn gps_from_payload(payload: &MetadataPayload) -> Option<super::metadata::GpsCoords> {
     match (payload.latitude, payload.longitude) {
         (Some(lat), Some(lng)) => Some(super::metadata::GpsCoords {

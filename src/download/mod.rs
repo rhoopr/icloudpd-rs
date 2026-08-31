@@ -3398,6 +3398,29 @@ const PATH_RECONCILIATION_PROVIDER_CHANGED_REASON: &str =
 const PATH_RECONCILIATION_SOURCE_CHANGED_REASON: &str =
     "local checksum changed during path reconciliation";
 
+#[cfg(feature = "xmp")]
+async fn reconcile_xmp_sidecar(
+    source_media_path: &Path,
+    task: &DownloadTask,
+    temp_suffix: &str,
+) -> Result<()> {
+    let source_sidecar_path = metadata::sidecar_path(source_media_path)?;
+    anyhow::ensure!(
+        metadata_rewrite::write_reconciled_sidecar(
+            source_media_path,
+            &task.download_path,
+            &source_sidecar_path,
+            Arc::clone(&task.metadata),
+            task.created_local,
+            temp_suffix,
+        )
+        .await,
+        "Could not finalise reconciled XMP sidecar for {}",
+        task.download_path.display()
+    );
+    Ok(())
+}
+
 async fn requeue_catalog_file(
     db: &dyn DownloadStore,
     task: &DownloadTask,
@@ -3422,6 +3445,38 @@ pub(crate) async fn reconcile_catalog_paths(
     passes: &[crate::commands::AlbumPass],
     config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
+) -> Result<PathReconciliationResult> {
+    reconcile_catalog_paths_inner(
+        passes,
+        config,
+        shutdown_token,
+        #[cfg(all(test, feature = "xmp"))]
+        None,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "xmp"))]
+async fn reconcile_catalog_paths_with_before_final_media_validation(
+    passes: &[crate::commands::AlbumPass],
+    config: Arc<DownloadConfig>,
+    shutdown_token: CancellationToken,
+    before_final_media_validation: &dyn Fn(),
+) -> Result<PathReconciliationResult> {
+    reconcile_catalog_paths_inner(
+        passes,
+        config,
+        shutdown_token,
+        Some(before_final_media_validation),
+    )
+    .await
+}
+
+async fn reconcile_catalog_paths_inner(
+    passes: &[crate::commands::AlbumPass],
+    config: Arc<DownloadConfig>,
+    shutdown_token: CancellationToken,
+    #[cfg(all(test, feature = "xmp"))] before_final_media_validation: Option<&dyn Fn()>,
 ) -> Result<PathReconciliationResult> {
     let Some(db) = &config.state_db else {
         return Ok(PathReconciliationResult::default());
@@ -3763,6 +3818,88 @@ pub(crate) async fn reconcile_catalog_paths(
         .await
         {
             Ok(file::VerifiedLocalCopy::Verified(local_checksum)) => {
+                let mtime_path = task.download_path.clone();
+                let mtime_checksum = local_checksum.clone();
+                let timestamp = task.created_local.timestamp();
+                let mtime_result = tokio::task::spawn_blocking(move || {
+                    file::set_reconciled_file_mtime_blocking(
+                        &mtime_path,
+                        &mtime_checksum,
+                        timestamp,
+                    )
+                })
+                .await
+                .context("Reconciled mtime task panicked")
+                .and_then(std::convert::identity);
+                if let Err(error) = mtime_result {
+                    stats.failed += 1;
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        path = %task.download_path.display(),
+                        %error,
+                        "Failed to set reconciled media capture time"
+                    );
+                    continue;
+                }
+
+                #[cfg(feature = "xmp")]
+                if config.metadata.xmp_sidecar
+                    && let Err(error) =
+                        reconcile_xmp_sidecar(source_path, &task, &config.temp_suffix).await
+                {
+                    stats.exif_failures += 1;
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        path = %task.download_path.display(),
+                        %error,
+                        "Failed to reconcile XMP sidecar"
+                    );
+                    continue;
+                }
+
+                let durable_path = task.download_path.clone();
+                let durability_result = tokio::task::spawn_blocking(move || {
+                    crate::fs_util::fsync_parent_dir(&durable_path)
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(std::convert::identity);
+                if let Err(error) = durability_result {
+                    stats.failed += 1;
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        path = %task.download_path.display(),
+                        %error,
+                        "Failed to make reconciled path durable"
+                    );
+                    continue;
+                }
+
+                #[cfg(all(test, feature = "xmp"))]
+                if let Some(hook) = before_final_media_validation {
+                    hook();
+                }
+
+                let final_path = task.download_path.clone();
+                let final_checksum = local_checksum.clone();
+                let timestamp = task.created_local.timestamp();
+                let final_validation = tokio::task::spawn_blocking(move || {
+                    file::validate_reconciled_file_blocking(&final_path, &final_checksum, timestamp)
+                })
+                .await
+                .context("Final reconciled media validation task panicked")
+                .and_then(std::convert::identity);
+                if let Err(error) = final_validation {
+                    stats.failed += 1;
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        path = %task.download_path.display(),
+                        %error,
+                        "Reconciled media changed before state finalization"
+                    );
+                    continue;
+                }
+
                 if let Err(error) = db
                     .mark_downloaded(
                         &task.library,
@@ -3816,6 +3953,7 @@ pub(crate) async fn reconcile_catalog_paths(
         && targets.is_empty()
         && !deferred_to_pending_retry
         && stats.failed == 0
+        && stats.exif_failures == 0
         && stats.state_write_failures == 0
         && !stats.interrupted;
     Ok(PathReconciliationResult {
@@ -14288,6 +14426,7 @@ mod tests {
         records[0]["fields"]["resOriginalVidComplFileType"] =
             json!({"value": "com.apple.quicktime-movie"});
         let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let capture_timestamp = asset.created_local().timestamp();
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
             album: album_with_session(
@@ -14380,6 +14519,7 @@ mod tests {
         assert!(result.complete);
         assert_eq!(result.stats.downloaded, 1);
         assert_eq!(tokio::fs::read(&old_path).await.unwrap(), vec![7u8; 1024]);
+        assert_file_capture_times(&expected_path, capture_timestamp);
         assert_eq!(
             tokio::fs::read(&expected_path).await.unwrap(),
             vec![7u8; 1024]
@@ -14408,6 +14548,446 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 1);
+    }
+
+    struct PathReconciliationFixture {
+        db: Arc<crate::state::SqliteStateDb>,
+        _old_dir: TempDir,
+        _new_dir: TempDir,
+        passes: Vec<AlbumPass>,
+        config: DownloadConfig,
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        capture_timestamp: i64,
+        media_bytes: Vec<u8>,
+    }
+
+    async fn path_reconciliation_fixture(
+        record_name: &str,
+        xmp_sidecar: bool,
+    ) -> PathReconciliationFixture {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let old_dir = TempDir::new().expect("old dir");
+        let new_dir = TempDir::new().expect("new dir");
+        let mut records =
+            mock_photo_records_for_zone_with_filename(record_name, "PrimarySync", "photo.jpg");
+        records[1]["fields"]["isFavorite"] = json!({"value": 1, "type": "INT64"});
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let capture_timestamp = asset.created_local().timestamp();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut old_config = test_config();
+        old_config.directory = Arc::from(old_dir.path());
+        old_config.state_db = Some(db.clone());
+        let source_path = filter::expected_paths_for(&asset, &old_config)
+            .into_iter()
+            .next()
+            .expect("source path")
+            .path;
+        tokio::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .await
+            .expect("create source parent");
+        let media_bytes = vec![7u8; 1024];
+        tokio::fs::write(&source_path, &media_bytes)
+            .await
+            .expect("write source media");
+        let local_checksum = file::compute_sha256(&source_path)
+            .await
+            .expect("hash source media");
+        let record = crate::test_helpers::TestAssetRecord::new(record_name)
+            .filename("photo.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(media_bytes.len() as u64)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            "PrimarySync",
+            record_name,
+            VersionSizeKey::Original.as_str(),
+            &source_path,
+            &local_checksum,
+            Some("provider-checksum"),
+        )
+        .await
+        .expect("record source path");
+        db.upsert_asset_master_mapping("PrimarySync", &format!("asset-{record_name}"), record_name)
+            .await
+            .expect("seed asset mapping");
+
+        let mut config = test_config();
+        config.directory = Arc::from(new_dir.path());
+        config.state_db = Some(db.clone());
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = xmp_sidecar;
+        }
+        #[cfg(not(feature = "xmp"))]
+        let _ = xmp_sidecar;
+        let destination_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .expect("destination path")
+            .path;
+
+        PathReconciliationFixture {
+            db,
+            _old_dir: old_dir,
+            _new_dir: new_dir,
+            passes,
+            config,
+            source_path,
+            destination_path,
+            capture_timestamp,
+            media_bytes,
+        }
+    }
+
+    fn assert_file_capture_times(path: &Path, expected_timestamp: i64) {
+        let metadata = std::fs::metadata(path).expect("destination metadata");
+        for (name, time) in [
+            ("modified", metadata.modified().expect("modified time")),
+            ("accessed", metadata.accessed().expect("access time")),
+        ] {
+            let actual = time
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("post-epoch capture time")
+                .as_secs();
+            assert_eq!(
+                actual,
+                expected_timestamp.unsigned_abs(),
+                "{name} time must equal the capture timestamp"
+            );
+        }
+    }
+
+    async fn assert_recorded_path(fixture: &PathReconciliationFixture, expected: &Path) {
+        let downloaded = fixture
+            .db
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("downloaded row");
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].local_path.as_deref(), Some(expected));
+    }
+
+    #[cfg(feature = "xmp")]
+    fn xmp_with_creator(creator: &str) -> Vec<u8> {
+        let mut xmp = xmp_toolkit::XmpMeta::new().expect("XMP packet");
+        xmp.set_property(
+            xmp_toolkit::xmp_ns::DC,
+            "creator",
+            &xmp_toolkit::XmpValue::new(creator.to_owned()),
+        )
+        .expect("creator property");
+        xmp.to_string().into_bytes()
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn path_reconciliation_preserves_source_sidecar_custom_xmp_and_layers_provider_fields() {
+        let fixture = path_reconciliation_fixture("RECONCILE_SIDECAR_CUSTOM", true).await;
+        let source_sidecar = metadata::sidecar_path(&fixture.source_path).expect("source sidecar");
+        let source_sidecar_bytes = xmp_with_creator("User-Photographer");
+        tokio::fs::write(&source_sidecar, &source_sidecar_bytes)
+            .await
+            .expect("write source sidecar");
+
+        let result = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconcile sidecar");
+
+        assert!(result.complete);
+        assert_eq!(result.stats.exif_failures, 0);
+        assert_eq!(
+            tokio::fs::read(&source_sidecar).await.unwrap(),
+            source_sidecar_bytes,
+            "source sidecar must not be mutated"
+        );
+        let destination_sidecar =
+            metadata::sidecar_path(&fixture.destination_path).expect("destination sidecar");
+        let destination_xmp = tokio::fs::read_to_string(&destination_sidecar)
+            .await
+            .expect("read destination sidecar");
+        assert!(
+            destination_xmp.contains("User-Photographer"),
+            "custom source XMP must survive: {destination_xmp}"
+        );
+        let destination_xmp: xmp_toolkit::XmpMeta =
+            destination_xmp.parse().expect("parse destination sidecar");
+        assert_eq!(
+            destination_xmp
+                .property(xmp_toolkit::xmp_ns::XMP, "Rating")
+                .map(|property| property.value),
+            Some("5".to_owned())
+        );
+        assert_file_capture_times(&fixture.destination_path, fixture.capture_timestamp);
+        assert_recorded_path(&fixture, &fixture.destination_path).await;
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn path_reconciliation_creates_missing_configured_sidecar() {
+        let fixture = path_reconciliation_fixture("RECONCILE_SIDECAR_CREATE", true).await;
+        let source_sidecar = metadata::sidecar_path(&fixture.source_path).expect("source sidecar");
+        assert!(!source_sidecar.exists());
+
+        let result = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconcile sidecar");
+
+        assert!(result.complete);
+        let destination_sidecar =
+            metadata::sidecar_path(&fixture.destination_path).expect("destination sidecar");
+        let destination_xmp: xmp_toolkit::XmpMeta = tokio::fs::read_to_string(destination_sidecar)
+            .await
+            .expect("read created sidecar")
+            .parse()
+            .expect("parse created sidecar");
+        assert_eq!(
+            destination_xmp
+                .property(xmp_toolkit::xmp_ns::XMP, "Rating")
+                .map(|property| property.value),
+            Some("5".to_owned())
+        );
+        assert!(
+            !source_sidecar.exists(),
+            "source sidecar must remain absent"
+        );
+        assert_recorded_path(&fixture, &fixture.destination_path).await;
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn path_reconciliation_retries_after_sidecar_write_and_state_failure() {
+        const RECORD_NAME: &str = "RECONCILE_SIDECAR_STATE_RETRY";
+        let fixture = path_reconciliation_fixture(RECORD_NAME, true).await;
+        let source_sidecar = metadata::sidecar_path(&fixture.source_path).expect("source sidecar");
+        let source_bytes = xmp_with_creator("State-Retry-Creator");
+        tokio::fs::write(&source_sidecar, &source_bytes)
+            .await
+            .expect("write source sidecar");
+        {
+            let connection = fixture
+                .db
+                .acquire_lock("install reconciliation state failure")
+                .expect("state database lock");
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_reconciliation_mark_downloaded \
+                     BEFORE UPDATE OF status, downloaded_at, local_path, local_checksum ON assets \
+                     WHEN OLD.id = '{RECORD_NAME}' AND NEW.local_path <> OLD.local_path \
+                     BEGIN SELECT RAISE(ABORT, 'simulated mark_downloaded failure'); END;"
+                ))
+                .expect("install state failure trigger");
+        }
+
+        let failed = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconciliation with state failure");
+
+        assert!(!failed.complete);
+        assert_eq!(failed.stats.state_write_failures, 1);
+        let first_destination_sidecar =
+            metadata::sidecar_path(&fixture.destination_path).expect("destination sidecar");
+        let merged = tokio::fs::read(&first_destination_sidecar)
+            .await
+            .expect("merged destination sidecar");
+        assert_ne!(merged, source_bytes);
+        assert_eq!(
+            tokio::fs::read(&source_sidecar).await.unwrap(),
+            source_bytes
+        );
+        assert_recorded_path(&fixture, &fixture.source_path).await;
+        {
+            let connection = fixture
+                .db
+                .acquire_lock("remove reconciliation state failure")
+                .expect("state database lock");
+            connection
+                .execute_batch("DROP TRIGGER fail_reconciliation_mark_downloaded")
+                .expect("remove state failure trigger");
+        }
+
+        let retried = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconciliation retry");
+
+        assert!(retried.complete);
+        assert_eq!(retried.stats.downloaded, 1);
+        assert_eq!(
+            tokio::fs::read(&fixture.destination_path).await.unwrap(),
+            fixture.media_bytes,
+            "the first published destination must survive the state-write retry"
+        );
+        assert_eq!(
+            tokio::fs::read(&first_destination_sidecar).await.unwrap(),
+            merged
+        );
+        assert_eq!(
+            tokio::fs::read(&source_sidecar).await.unwrap(),
+            source_bytes
+        );
+        let downloaded = fixture.db.get_downloaded_page(0, 10).await.unwrap();
+        let recorded_path = downloaded[0].local_path.as_deref().expect("recorded path");
+        assert_ne!(recorded_path, fixture.source_path);
+        assert!(recorded_path.exists());
+        assert!(
+            metadata::sidecar_path(recorded_path)
+                .expect("recorded destination sidecar")
+                .exists()
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn path_reconciliation_conflicting_destination_sidecar_keeps_old_state() {
+        let fixture = path_reconciliation_fixture("RECONCILE_SIDECAR_CONFLICT", true).await;
+        let source_sidecar = metadata::sidecar_path(&fixture.source_path).expect("source sidecar");
+        let destination_sidecar =
+            metadata::sidecar_path(&fixture.destination_path).expect("destination sidecar");
+        tokio::fs::create_dir_all(destination_sidecar.parent().expect("destination parent"))
+            .await
+            .expect("create destination parent");
+        let source_bytes = xmp_with_creator("Source-Creator");
+        let destination_bytes = xmp_with_creator("Destination-Creator");
+        tokio::fs::write(&source_sidecar, &source_bytes)
+            .await
+            .expect("write source sidecar");
+        tokio::fs::write(&destination_sidecar, &destination_bytes)
+            .await
+            .expect("write destination sidecar");
+
+        let result = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("conflicting sidecar result");
+
+        assert!(!result.complete);
+        assert_eq!(result.stats.exif_failures, 1);
+        assert_eq!(
+            tokio::fs::read(&source_sidecar).await.unwrap(),
+            source_bytes
+        );
+        assert_eq!(
+            tokio::fs::read(&destination_sidecar).await.unwrap(),
+            destination_bytes
+        );
+        assert_eq!(
+            tokio::fs::read(&fixture.source_path).await.unwrap(),
+            fixture.media_bytes
+        );
+        assert_eq!(
+            tokio::fs::read(&fixture.destination_path).await.unwrap(),
+            fixture.media_bytes
+        );
+        assert_recorded_path(&fixture, &fixture.source_path).await;
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn path_reconciliation_destination_media_replacement_keeps_old_state() {
+        let fixture = path_reconciliation_fixture("RECONCILE_MEDIA_REPLACED", true).await;
+        let destination_sidecar =
+            metadata::sidecar_path(&fixture.destination_path).expect("destination sidecar");
+        let replacement = b"external replacement".to_vec();
+
+        let result = reconcile_catalog_paths_with_before_final_media_validation(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+            &|| {
+                assert!(
+                    destination_sidecar.exists(),
+                    "sidecar must already be published"
+                );
+                assert_file_capture_times(&fixture.destination_path, fixture.capture_timestamp);
+                std::fs::remove_file(&fixture.destination_path).expect("remove reconciled media");
+                std::fs::write(&fixture.destination_path, &replacement)
+                    .expect("replace reconciled media");
+            },
+        )
+        .await
+        .expect("media replacement result");
+
+        assert!(!result.complete);
+        assert_eq!(result.stats.failed, 1);
+        assert_eq!(
+            std::fs::read(&fixture.destination_path).unwrap(),
+            replacement,
+            "external replacement must remain untouched"
+        );
+        assert_recorded_path(&fixture, &fixture.source_path).await;
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_no_metadata_moves_only_media_and_mtime() {
+        let fixture = path_reconciliation_fixture("RECONCILE_NO_METADATA", false).await;
+
+        let result = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("media-only reconciliation");
+
+        assert!(result.complete);
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(
+            tokio::fs::read(&fixture.source_path).await.unwrap(),
+            fixture.media_bytes,
+            "source media must remain unchanged"
+        );
+        assert_file_capture_times(&fixture.destination_path, fixture.capture_timestamp);
+        assert_eq!(
+            tokio::fs::read(&fixture.destination_path).await.unwrap(),
+            fixture.media_bytes
+        );
+        assert!(
+            !metadata::sidecar_path(&fixture.destination_path)
+                .expect("destination sidecar")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_dir(
+                fixture
+                    .destination_path
+                    .parent()
+                    .expect("destination parent")
+            )
+            .expect("destination entries")
+            .count(),
+            1
+        );
+        assert_recorded_path(&fixture, &fixture.destination_path).await;
     }
 
     #[tokio::test]

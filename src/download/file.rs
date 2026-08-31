@@ -1741,7 +1741,13 @@ fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
     }
 }
 
-fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
+pub(super) fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
+    open_regular_file_with_access_blocking(path, false)
+}
+
+pub(super) fn open_optional_regular_file_blocking(
+    path: &Path,
+) -> anyhow::Result<Option<std::fs::File>> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(windows)]
@@ -1749,6 +1755,37 @@ fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Could not open regular file {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        file.metadata()?.file_type().is_file(),
+        "Path is not a regular file: {}",
+        path.display()
+    );
+    Ok(Some(file))
+}
+
+fn open_regular_file_with_access_blocking(
+    path: &Path,
+    write: bool,
+) -> anyhow::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(write);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     #[cfg(windows)]
@@ -1762,6 +1799,80 @@ fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
         path.display()
     );
     Ok(file)
+}
+
+pub(super) fn set_reconciled_file_mtime_blocking(
+    path: &Path,
+    expected_local_sha256: &str,
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    let mut file = open_regular_file_with_access_blocking(path, true)?;
+    let opened_identity = file_identity(&file)?;
+    let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, path)?.fingerprint;
+    anyhow::ensure!(
+        data_encoding::HEXLOWER.encode(&fingerprint.sha256) == expected_local_sha256,
+        "Reconciled file bytes changed before setting capture time: {}",
+        path.display()
+    );
+
+    set_open_file_capture_time(&file, path, timestamp)?;
+
+    let current = open_regular_file_blocking(path)?;
+    anyhow::ensure!(
+        file_identity(&current)? == opened_identity,
+        "Reconciled file path changed while setting capture time: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn set_open_file_capture_time(
+    file: &std::fs::File,
+    path: &Path,
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    let time = if timestamp >= 0 {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp.unsigned_abs())
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            timestamp,
+            "Negative timestamp (pre-1970 date), clamping mtime to epoch"
+        );
+        std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(timestamp.unsigned_abs()))
+            .unwrap_or(std::time::UNIX_EPOCH)
+    };
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(time)
+            .set_accessed(time),
+    )?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(super) fn validate_reconciled_file_blocking(
+    path: &Path,
+    expected_local_sha256: &str,
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    let mut file = open_regular_file_with_access_blocking(path, true)?;
+    let opened_identity = file_identity(&file)?;
+    let snapshot = fingerprint_open_file_snapshot_blocking(&mut file, path)?;
+    anyhow::ensure!(
+        data_encoding::HEXLOWER.encode(&snapshot.fingerprint.sha256) == expected_local_sha256,
+        "Reconciled file bytes changed before state finalization: {}",
+        path.display()
+    );
+    set_open_file_capture_time(&file, path, timestamp)?;
+    let current = open_regular_file_blocking(path)?;
+    anyhow::ensure!(
+        file_identity(&current)? == opened_identity,
+        "Reconciled file path changed before state finalization: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Compute the SHA-256 hash of a file, returning a hex-encoded string.
