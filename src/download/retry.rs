@@ -307,6 +307,15 @@ impl PendingRetryPlanning<'_> {
                 !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
             }) {
                 let target = PendingRetryTarget::from_task(&task);
+                if self
+                    .task_planner
+                    .existing_path_match(&task.download_path)
+                    .await
+                    == planner::ExistingPathMatch::NonRegular
+                {
+                    retry_tasks.push(task);
+                    continue;
+                }
                 if let Some(evidence) = self.pending_evidence.get(&target)
                     && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
                 {
@@ -1137,6 +1146,75 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].version_size, VersionSizeKey::LiveOriginal);
         assert_eq!(tasks[0].download_path, motion_path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let motion_filename = motion_path.file_name().unwrap().to_str().unwrap();
+            let recorded_motion_path =
+                motion_path.with_file_name(super::super::paths::insert_asset_identity_suffix(
+                    motion_filename,
+                    asset.state_id(),
+                ));
+            tokio::fs::write(&recorded_motion_path, vec![8u8; 24])
+                .await
+                .unwrap();
+            symlink(&recorded_motion_path, &motion_path).unwrap();
+            let local_checksum = file::compute_sha256(&recorded_motion_path).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                asset.state_id(),
+                VersionSizeKey::LiveOriginal.as_str(),
+                &recorded_motion_path,
+                &local_checksum,
+                Some(motion_checksum),
+            )
+            .await
+            .unwrap();
+            db.mark_failed(
+                "PrimarySync",
+                asset.state_id(),
+                VersionSizeKey::LiveOriginal.as_str(),
+                "nonregular expected target",
+            )
+            .await
+            .unwrap();
+            let failed_record = db
+                .get_failed()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|record| record.version_size == VersionSizeKey::LiveOriginal)
+                .unwrap();
+            let target = PendingRetryTarget::from_record(&failed_record);
+            let mut pending_targets = FxHashSet::from_iter([target.clone()]);
+            let pending_evidence =
+                FxHashMap::from_iter([(target, PendingRetryEvidence::from_record(&failed_record))]);
+            let download_ctx = super::super::preload_download_context(&pass_configs[0]).await;
+            let mut task_planner = planner::TaskPlanner::new();
+            let mut tasks = Vec::new();
+            let mut retry_sources = FxHashMap::default();
+
+            PendingRetryPlanning {
+                db: db.as_ref(),
+                download_ctx: download_ctx.as_ref(),
+                pass_configs: &pass_configs,
+                pending_evidence: &pending_evidence,
+                pending_targets: &mut pending_targets,
+                task_planner: &mut task_planner,
+                tasks: &mut tasks,
+                retry_sources: &mut retry_sources,
+            }
+            .plan_resolved_asset(&asset, asset.state_id())
+            .await
+            .unwrap();
+
+            assert!(pending_targets.is_empty());
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].download_path, motion_path);
+            assert!(motion_path.is_symlink());
+        }
     }
 
     #[tokio::test]

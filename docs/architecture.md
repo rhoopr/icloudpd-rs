@@ -193,8 +193,13 @@ checksum, recorded collision family, regular-file type, and recorded integrity
 must all match. The planner then skips that exact primary path and derives a
 Live Photo companion from its actual filename. Content equality alone never
 establishes ownership. Motion collision-family checks accept the bare motion
-family, direct motion identity collisions, and the companion paired with that
-proven primary filename rather than hypothetical primary collision stems.
+family and the companion paired with the proven primary filename rather than
+hypothetical primary collision stems. A direct motion identity or ordinal
+collision remains current only while its unsuffixed base is an existing regular
+file; the base need not be state-owned, and links or other nonregular entries
+are never accepted. Shared task planning rebinds a collision-selected alternate
+to an existing nonregular expected leaf, so every run mode reports or fails the
+exact blocked target instead of creating another collision ordinal.
 Selected smart folders are never resolved from historical membership rows.
 They require an explicit successful fresh-query marker from the normal sync
 flow before the pending path hash can be promoted. Interruption, refresh
