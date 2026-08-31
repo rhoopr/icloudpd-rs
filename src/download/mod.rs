@@ -3599,6 +3599,7 @@ async fn reconcile_catalog_paths_inner(
     let batch = provider_pass.album.resolve_records(&requests).await;
     let download_ctx = preload_download_context(&config).await;
     let mut task_planner = planner::TaskPlanner::new();
+    let mut stats = SyncStats::default();
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
     let mut invalid_owned_targets = FxHashSet::default();
@@ -3613,6 +3614,7 @@ async fn reconcile_catalog_paths_inner(
         match resolution {
             RecordResolution::Present(asset) => {
                 targets.retain(|target| target.asset_id.as_ref() != state_id.as_str());
+                let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
                 let known_albums = albums_by_asset.get(state_id.as_str());
                 for (pass, pass_config) in passes.iter().zip(&pass_configs) {
                     let selected = match pass.kind {
@@ -3751,7 +3753,6 @@ async fn reconcile_catalog_paths_inner(
         }
     }
 
-    let mut stats = SyncStats::default();
     let mut deferred_to_pending_retry = false;
     for task in tasks {
         let target = PendingRetryTarget::from_task(&task);
@@ -14856,8 +14857,10 @@ mod tests {
             .unwrap()
             .path
             .clone();
+        let state_id = "asset-RECONCILE_LIVE_NAME";
+        let wrong_primary = paths::insert_asset_identity_suffix("reconcile-live.heic", state_id);
         let wrong_motion_path =
-            corrected_motion_path.with_file_name("reconcile-live-RECONCILE_LIVE_NAME_HEVC.MOV");
+            corrected_motion_path.with_file_name(paths::live_photo_mov_path_suffix(&wrong_primary));
         tokio::fs::create_dir_all(primary_path.parent().unwrap())
             .await
             .unwrap();
@@ -14871,7 +14874,7 @@ mod tests {
             .unwrap();
         let primary_local_checksum = file::compute_sha256(&primary_path).await.unwrap();
         let motion_local_checksum = file::compute_sha256(&wrong_motion_path).await.unwrap();
-        let primary_record = TestAssetRecord::new("RECONCILE_LIVE_NAME")
+        let primary_record = TestAssetRecord::new(state_id)
             .filename("reconcile-live.heic")
             .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .size(primary_bytes.len() as u64)
@@ -14880,7 +14883,7 @@ mod tests {
         db.upsert_seen(&primary_record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
-            "RECONCILE_LIVE_NAME",
+            state_id,
             VersionSizeKey::Original.as_str(),
             &primary_path,
             &primary_local_checksum,
@@ -14888,9 +14891,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let motion_record = TestAssetRecord::new("RECONCILE_LIVE_NAME")
+        let motion_record = TestAssetRecord::new(state_id)
             .version_size(VersionSizeKey::LiveOriginal)
-            .filename("reconcile-live-RECONCILE_LIVE_NAME_HEVC.MOV")
+            .filename(&wrong_motion_path.file_name().unwrap().to_string_lossy())
             .checksum("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
             .size(motion_bytes.len() as u64)
             .media_type(crate::state::MediaType::LivePhotoVideo)
@@ -14898,7 +14901,7 @@ mod tests {
         db.upsert_seen(&motion_record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
-            "RECONCILE_LIVE_NAME",
+            state_id,
             VersionSizeKey::LiveOriginal.as_str(),
             &wrong_motion_path,
             &motion_local_checksum,
