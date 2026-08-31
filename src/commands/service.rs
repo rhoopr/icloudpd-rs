@@ -163,6 +163,7 @@ pub(crate) async fn attempt_reauth(
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     let mut session = shared_session.write().await;
+    session.reacquire_lock()?;
 
     // Try validation first — timeout prevents a hung HTTP request from
     // holding the write lock indefinitely and starving download tasks.
@@ -178,10 +179,11 @@ pub(crate) async fn attempt_reauth(
     }
 
     tracing::info!("Session invalid, performing full re-authentication...");
+    let generation = session.generation();
     session.release_lock()?;
     drop(session);
 
-    let new_auth = auth::authenticate_in_input_mode(
+    let new_auth = auth::authenticate_with_modes(
         cookie_directory,
         username,
         password_provider,
@@ -189,7 +191,9 @@ pub(crate) async fn attempt_reauth(
         None,
         None,
         None, // no code — interactive prompt or TwoFactorRequired
+        crate::personality::Mode::Off,
         input_mode,
+        Some(generation),
     )
     .await?;
 

@@ -61,6 +61,7 @@ enum WatchPrecheck {
 enum SyncAuthErrorClass {
     TwoFactorRequired,
     LockContention,
+    SessionReset,
     Other,
 }
 
@@ -77,6 +78,8 @@ fn classify_sync_auth_error(err: &anyhow::Error) -> SyncAuthErrorClass {
         SyncAuthErrorClass::TwoFactorRequired
     } else if auth_err.is_lock_contention() {
         SyncAuthErrorClass::LockContention
+    } else if auth_err.is_session_reset() {
+        SyncAuthErrorClass::SessionReset
     } else {
         SyncAuthErrorClass::Other
     }
@@ -798,11 +801,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         None,
         config.ui.personality_mode,
         input_mode,
+        None,
     )
     .await
     {
         Ok(result) => result,
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
+            let expected_generation = auth::two_factor_generation(&e);
             if !should_wait_for_2fa(is_watch_mode, &e) {
                 return Err(e);
             }
@@ -827,6 +832,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     None,
                     config.ui.personality_mode,
                     input_mode,
+                    expected_generation,
                 )
             })
             .await?
@@ -883,6 +889,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let mut retried_after_session_error = false;
     let (shared_session, mut photos_service, libraries) = loop {
         let this_auth = take_pending_auth(&mut pending_auth)?;
+        let released_generation = this_auth.session.generation();
         let init_result =
             init_photos_service(this_auth, api_retry_config, config.ui.personality_mode).await;
         let (ss, mut ps) = match init_result {
@@ -899,6 +906,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         &password_provider,
                         &notifier,
                         None,
+                        Some(released_generation),
                         is_watch_mode,
                         input_mode,
                     )
@@ -922,6 +930,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         &password_provider,
                         &notifier,
                         Some((ss, ps)),
+                        None,
                         is_watch_mode,
                         input_mode,
                     )
@@ -1721,29 +1730,58 @@ async fn reauth_after_session_error(
     password_provider: &crate::password::PasswordProvider,
     notifier: &Notifier,
     live: Option<(auth::SharedSession, crate::icloud::photos::PhotosService)>,
+    released_generation: Option<auth::session::SessionGeneration>,
     is_watch_mode: bool,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<auth::AuthResult> {
-    if let Some((ss, ps)) = live {
-        ss.read().await.release_lock()?;
+    let expected_generation = if let Some((ss, ps)) = live {
+        let session = ss.read().await;
+        let generation = session.generation();
+        session.release_lock()?;
+        drop(session);
         drop(ps);
         drop(ss);
-    }
+        Some(generation)
+    } else {
+        released_generation
+    };
 
     clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
-    match authenticate_sync_session(config, password_provider, input_mode).await {
+    match authenticate_sync_session(config, password_provider, input_mode, expected_generation)
+        .await
+    {
         Ok(result) => return Ok(result),
+        Err(e)
+            if matches!(
+                classify_sync_auth_error(&e),
+                SyncAuthErrorClass::SessionReset | SyncAuthErrorClass::LockContention
+            ) =>
+        {
+            return Err(e);
+        }
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
-            if let Some(result) =
-                retry_persisted_session_after_two_factor(config, password_provider, input_mode)
-                    .await
+            let expected_generation = auth::two_factor_generation(&e).or(expected_generation);
+            if let Some(result) = retry_persisted_session_after_two_factor(
+                config,
+                password_provider,
+                input_mode,
+                expected_generation,
+            )
+            .await?
             {
                 return Ok(result);
             }
             if !should_wait_for_2fa(is_watch_mode, &e) {
                 return Err(e);
             }
-            return notify_and_wait_for_2fa(config, password_provider, notifier, input_mode).await;
+            return notify_and_wait_for_2fa(
+                config,
+                password_provider,
+                notifier,
+                input_mode,
+                expected_generation,
+            )
+            .await;
         }
         Err(e) => {
             tracing::warn!(
@@ -1753,23 +1791,41 @@ async fn reauth_after_session_error(
         }
     }
 
-    let session_file =
-        auth::session_file_path(&config.auth.cookie_directory, &config.auth.username);
-    auth::strip_session_routing_state(&session_file).await;
+    auth::strip_session_routing_state(
+        &config.auth.cookie_directory,
+        &config.auth.username,
+        expected_generation,
+    )
+    .await?;
 
-    match authenticate_sync_session(config, password_provider, input_mode).await {
+    match authenticate_sync_session(config, password_provider, input_mode, expected_generation)
+        .await
+    {
         Ok(result) => Ok(result),
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::SessionReset => Err(e),
         Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
-            if let Some(result) =
-                retry_persisted_session_after_two_factor(config, password_provider, input_mode)
-                    .await
+            let expected_generation = auth::two_factor_generation(&e).or(expected_generation);
+            if let Some(result) = retry_persisted_session_after_two_factor(
+                config,
+                password_provider,
+                input_mode,
+                expected_generation,
+            )
+            .await?
             {
                 return Ok(result);
             }
             if !should_wait_for_2fa(is_watch_mode, &e) {
                 return Err(e);
             }
-            notify_and_wait_for_2fa(config, password_provider, notifier, input_mode).await
+            notify_and_wait_for_2fa(
+                config,
+                password_provider,
+                notifier,
+                input_mode,
+                expected_generation,
+            )
+            .await
         }
         Err(e) => Err(e),
     }
@@ -1794,6 +1850,7 @@ async fn authenticate_sync_session(
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
     input_mode: crate::InputMode,
+    expected_generation: Option<auth::session::SessionGeneration>,
 ) -> anyhow::Result<auth::AuthResult> {
     auth::authenticate_with_modes(
         &config.auth.cookie_directory,
@@ -1805,6 +1862,7 @@ async fn authenticate_sync_session(
         None,
         config.ui.personality_mode,
         input_mode,
+        expected_generation,
     )
     .await
 }
@@ -1813,19 +1871,23 @@ async fn retry_persisted_session_after_two_factor(
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
     input_mode: crate::InputMode,
-) -> Option<auth::AuthResult> {
+    expected_generation: Option<auth::session::SessionGeneration>,
+) -> anyhow::Result<Option<auth::AuthResult>> {
     tracing::debug!(
         "2FA-required auth wrote session state; retrying persisted-session auth once before waiting"
     );
     clear_validation_cache_for_reauth(&config.auth.cookie_directory, &config.auth.username).await;
-    match authenticate_sync_session(config, password_provider, input_mode).await {
-        Ok(result) => Some(result),
+    match authenticate_sync_session(config, password_provider, input_mode, expected_generation)
+        .await
+    {
+        Ok(result) => Ok(Some(result)),
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::SessionReset => Err(e),
         Err(e) => {
             tracing::debug!(
                 error = %e,
                 "Persisted-session retry after 2FA-required auth did not recover"
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -1835,6 +1897,7 @@ async fn notify_and_wait_for_2fa(
     password_provider: &crate::password::PasswordProvider,
     notifier: &Notifier,
     input_mode: crate::InputMode,
+    expected_generation: Option<auth::session::SessionGeneration>,
 ) -> anyhow::Result<auth::AuthResult> {
     let msg = two_factor_recovery_message(&config.auth.username);
     tracing::warn!(message = %msg, "2FA required");
@@ -1846,7 +1909,7 @@ async fn notify_and_wait_for_2fa(
         None,
     );
     wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
-        authenticate_sync_session(config, password_provider, input_mode)
+        authenticate_sync_session(config, password_provider, input_mode, expected_generation)
     })
     .await
 }
@@ -3247,6 +3310,14 @@ mod tests {
                 "session.lock".into()
             )),
             SyncAuthErrorClass::LockContention
+        );
+    }
+
+    #[test]
+    fn classify_sync_auth_error_detects_session_reset() {
+        assert_eq!(
+            classify_sync_auth_error_for(auth::error::AuthError::SessionReset),
+            SyncAuthErrorClass::SessionReset
         );
     }
 
@@ -4888,7 +4959,7 @@ mod tests {
             .find("clear_validation_cache_for_reauth")
             .expect("session-error reauth must clear cache before retrying auth");
         let lenient_auth = body
-            .find("authenticate_sync_session(config, password_provider, input_mode)")
+            .find("match authenticate_sync_session(")
             .expect("session-error reauth must try persisted-session auth");
         let strip = body
             .find("auth::strip_session_routing_state")

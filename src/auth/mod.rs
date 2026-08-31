@@ -11,6 +11,7 @@ pub mod srp;
 pub mod twofa;
 
 use crate::retry::RetryConfig;
+use std::future::Future;
 
 /// Retry budget for Apple's auth endpoints (SRP init/complete, 2FA push,
 /// 2FA submit). The flow is user-blocking, so we keep this short: three
@@ -79,6 +80,76 @@ enum AuthFlowErrorClass {
     Other,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Apple rejected persisted authentication state")]
+struct RetryWithCleanAuth {
+    removed_files: usize,
+    generation: session::SessionGeneration,
+}
+
+#[derive(Debug)]
+struct TwoFactorGeneration {
+    generation: session::SessionGeneration,
+}
+
+impl std::fmt::Display for TwoFactorGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        AuthError::TwoFactorRequired.fmt(f)
+    }
+}
+
+pub(crate) fn two_factor_generation(error: &anyhow::Error) -> Option<session::SessionGeneration> {
+    error
+        .downcast_ref::<TwoFactorGeneration>()
+        .map(|error| error.generation)
+}
+
+fn is_forbidden(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<AuthError>(),
+        Some(AuthError::ApiError { code: 403, .. })
+    )
+}
+
+async fn map_push_error(session: &Session, error: anyhow::Error) -> Result<anyhow::Error> {
+    if session.loaded_persisted_auth() && is_forbidden(&error) {
+        let removed_files = session
+            .discard_persisted_auth()
+            .await
+            .map_err(|error| error.context("Could not discard stale iCloud authentication state"))?
+            .len();
+        return Ok(RetryWithCleanAuth {
+            removed_files,
+            generation: session.generation(),
+        }
+        .into());
+    }
+    Ok(error)
+}
+
+async fn retry_once_after_stale_auth<T, F, Fut>(
+    initial_generation: Option<session::SessionGeneration>,
+    mut attempt: F,
+) -> Result<T>
+where
+    F: FnMut(Option<session::SessionGeneration>) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    match attempt(initial_generation).await {
+        Err(error) => {
+            let Some(retry) = error.downcast_ref::<RetryWithCleanAuth>() else {
+                return Err(error);
+            };
+            tracing::warn!(
+                removed_files = retry.removed_files,
+                "Apple rejected persisted authentication state; retrying once from clean state"
+            );
+            attempt(Some(retry.generation)).await
+        }
+        result => result,
+    }
+}
+
 /// Classify errors that change auth orchestration behavior.
 ///
 /// `anyhow::Error` remains the return type so the original error chain is
@@ -131,6 +202,7 @@ pub async fn authenticate(
         code,
         crate::personality::Mode::Off,
         crate::InputMode::detect(),
+        None,
     )
     .await
 }
@@ -156,6 +228,7 @@ pub(crate) async fn authenticate_in_input_mode(
         code,
         crate::personality::Mode::Off,
         input_mode,
+        None,
     )
     .await
 }
@@ -191,6 +264,7 @@ pub async fn authenticate_with_mode(
         code,
         mode,
         crate::InputMode::detect(),
+        None,
     )
     .await
 }
@@ -210,6 +284,7 @@ pub(crate) async fn authenticate_with_modes(
     code: Option<&str>,
     mode: crate::personality::Mode,
     input_mode: crate::InputMode,
+    expected_generation: Option<session::SessionGeneration>,
 ) -> Result<AuthResult> {
     #[cfg(debug_assertions)]
     if std::env::var("KEI_UNSTABLE_FAKE_TWO_FACTOR_REQUIRED_FOR_TESTS").as_deref() == Ok("1") {
@@ -218,18 +293,37 @@ pub(crate) async fn authenticate_with_modes(
     }
 
     let endpoints = Endpoints::for_domain(domain)?;
-    let session = Session::new(cookie_dir, apple_id, endpoints.home, timeout_secs).await?;
-    authenticate_inner(
-        session,
-        &endpoints,
-        apple_id,
-        password_provider,
-        domain,
-        client_id,
-        code,
-        mode,
-        input_mode,
-    )
+    retry_once_after_stale_auth(expected_generation, |generation| {
+        let client_id = client_id.clone();
+        let endpoints = &endpoints;
+        async move {
+            let session = match generation {
+                Some(generation) => {
+                    Session::new_after_release(
+                        cookie_dir,
+                        apple_id,
+                        endpoints.home,
+                        timeout_secs,
+                        generation,
+                    )
+                    .await?
+                }
+                None => Session::new(cookie_dir, apple_id, endpoints.home, timeout_secs).await?,
+            };
+            authenticate_inner(
+                session,
+                endpoints,
+                apple_id,
+                password_provider,
+                domain,
+                client_id,
+                code,
+                mode,
+                input_mode,
+            )
+            .await
+        }
+    })
     .await
 }
 
@@ -425,7 +519,11 @@ async fn authenticate_inner(
         // Headless with no code: bail without any Apple API calls.
         // The user triggers the push manually via `get-code`.
         if code.is_none() && !input_mode.can_prompt() {
-            return Err(AuthError::TwoFactorRequired.into());
+            return Err(anyhow::Error::new(AuthError::TwoFactorRequired).context(
+                TwoFactorGeneration {
+                    generation: session.generation(),
+                },
+            ));
         }
 
         let verified = if let Some(c) = code {
@@ -438,10 +536,14 @@ async fn authenticate_inner(
             // a code for some accounts but not all — the explicit push
             // ensures every account gets one. Apple deduplicates, so
             // accounts that already got a code from SRP won't see a second.
-            if let Err(e) =
+            if let Err(error) =
                 twofa::trigger_push_notification(&mut session, endpoints, &client_id, domain).await
             {
-                tracing::warn!(error = %e, "Failed to trigger push notification");
+                let error = map_push_error(&session, error).await?;
+                if error.downcast_ref::<RetryWithCleanAuth>().is_some() || is_forbidden(&error) {
+                    return Err(error);
+                }
+                tracing::warn!(error = %error, "Failed to trigger push notification");
             }
 
             const MAX_WRONG_CODES: u32 = 3;
@@ -521,7 +623,17 @@ pub async fn send_2fa_push(
     domain: &str,
 ) -> Result<()> {
     let endpoints = Endpoints::for_domain(domain)?;
-    send_2fa_push_inner(cookie_dir, apple_id, password_provider, domain, &endpoints).await
+    retry_once_after_stale_auth(None, |generation| {
+        send_2fa_push_inner(
+            cookie_dir,
+            apple_id,
+            password_provider,
+            domain,
+            &endpoints,
+            generation,
+        )
+    })
+    .await
 }
 
 async fn send_2fa_push_inner(
@@ -530,8 +642,15 @@ async fn send_2fa_push_inner(
     password_provider: &crate::password::PasswordProvider,
     domain: &str,
     endpoints: &Endpoints,
+    expected_generation: Option<session::SessionGeneration>,
 ) -> Result<()> {
-    let mut session = Session::new(cookie_dir, apple_id, endpoints.home, None).await?;
+    let mut session = match expected_generation {
+        Some(generation) => {
+            Session::new_after_release(cookie_dir, apple_id, endpoints.home, None, generation)
+                .await?
+        }
+        None => Session::new(cookie_dir, apple_id, endpoints.home, None).await?,
+    };
 
     let client_id = session
         .client_id()
@@ -646,7 +765,10 @@ async fn send_2fa_push_inner(
         return already_authenticated();
     }
 
-    twofa::trigger_push_notification(&mut session, endpoints, &client_id, domain).await
+    match twofa::trigger_push_notification(&mut session, endpoints, &client_id, domain).await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(map_push_error(&session, error).await?),
+    }
 }
 
 fn already_authenticated() -> Result<()> {
@@ -734,7 +856,7 @@ mod tests {
     use secrecy::SecretString;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
@@ -822,6 +944,201 @@ mod tests {
             classify_auth_flow_error(&transient),
             AuthFlowErrorClass::TransientAppleFailure
         );
+    }
+
+    #[tokio::test]
+    async fn two_factor_required_carries_session_generation() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let session = Session::new(
+            cookies.path(),
+            "generation@example.com",
+            "https://example.com",
+            None,
+        )
+        .await
+        .expect("session");
+        let generation = session.generation();
+        let error = anyhow::Error::new(AuthError::TwoFactorRequired)
+            .context(TwoFactorGeneration { generation });
+
+        assert_eq!(two_factor_generation(&error), Some(generation));
+        assert!(
+            error
+                .downcast_ref::<AuthError>()
+                .is_some_and(AuthError::is_two_factor_required)
+        );
+        assert_eq!(
+            classify_auth_flow_error(&error),
+            AuthFlowErrorClass::Other,
+            "the generation wrapper is only classified by sync owners"
+        );
+        assert!(error.to_string().contains("Two-factor authentication"));
+    }
+
+    #[tokio::test]
+    async fn map_push_error_only_cleans_persisted_403() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let apple_id = "persisted@example.com";
+        let files = session::persisted_auth_files(cookies.path(), apple_id);
+        tokio::fs::write(&files[1], b"stale")
+            .await
+            .expect("session file");
+        let persisted = Session::new(cookies.path(), apple_id, "https://example.com", None)
+            .await
+            .expect("persisted session");
+
+        let retry = map_push_error(
+            &persisted,
+            AuthError::ApiError {
+                code: 403,
+                message: "forbidden".into(),
+            }
+            .into(),
+        )
+        .await
+        .expect("map persisted 403");
+
+        assert!(retry.downcast_ref::<RetryWithCleanAuth>().is_some());
+        assert!(files.iter().all(|path| !path.exists()));
+        drop(persisted);
+
+        let clean = Session::new(cookies.path(), apple_id, "https://example.com", None)
+            .await
+            .expect("clean session");
+        let forbidden = map_push_error(
+            &clean,
+            AuthError::ApiError {
+                code: 403,
+                message: "forbidden".into(),
+            }
+            .into(),
+        )
+        .await
+        .expect("map clean 403");
+        assert!(is_forbidden(&forbidden));
+
+        let unavailable = map_push_error(
+            &clean,
+            AuthError::ApiError {
+                code: 503,
+                message: "unavailable".into(),
+            }
+            .into(),
+        )
+        .await
+        .expect("map non-403");
+        assert!(unavailable.downcast_ref::<RetryWithCleanAuth>().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_auth_retry_runs_once_more() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let session = Session::new(
+            cookies.path(),
+            "generation@example.com",
+            "https://example.com",
+            None,
+        )
+        .await
+        .expect("session");
+        let generation = session.generation();
+        drop(session);
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = retry_once_after_stale_auth(None, |expected_generation| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                match attempts.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        assert_eq!(expected_generation, None);
+                        Err(RetryWithCleanAuth {
+                            removed_files: 3,
+                            generation,
+                        }
+                        .into())
+                    }
+                    1 => {
+                        assert_eq!(expected_generation, Some(generation));
+                        Ok(42)
+                    }
+                    attempt => panic!("unexpected attempt {attempt}"),
+                }
+            }
+        })
+        .await
+        .expect("clean retry");
+
+        assert_eq!(result, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ordinary_auth_failure_does_not_retry() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let err = retry_once_after_stale_auth(None, |expected_generation| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(expected_generation, None);
+                Err::<(), _>(
+                    AuthError::ApiError {
+                        code: 403,
+                        message: "forbidden".into(),
+                    }
+                    .into(),
+                )
+            }
+        })
+        .await
+        .expect_err("clean failure");
+
+        assert!(is_forbidden(&err));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_auth_retry_surfaces_second_failure() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let session = Session::new(
+            cookies.path(),
+            "generation@example.com",
+            "https://example.com",
+            None,
+        )
+        .await
+        .expect("session");
+        let generation = session.generation();
+        drop(session);
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let err = retry_once_after_stale_auth(None, |expected_generation| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(expected_generation, None);
+                    Err::<(), anyhow::Error>(
+                        RetryWithCleanAuth {
+                            removed_files: 1,
+                            generation,
+                        }
+                        .into(),
+                    )
+                } else {
+                    assert_eq!(expected_generation, Some(generation));
+                    Err(AuthError::ApiError {
+                        code: 403,
+                        message: "still forbidden".into(),
+                    }
+                    .into())
+                }
+            }
+        })
+        .await
+        .expect_err("second failure");
+
+        assert!(is_forbidden(&err));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -990,7 +1307,7 @@ mod tests {
             Some(SecretString::from("should-not-be-read"))
         });
 
-        let err = send_2fa_push_inner(cookies.path(), apple_id, &provider, "com", &endpoints)
+        let err = send_2fa_push_inner(cookies.path(), apple_id, &provider, "com", &endpoints, None)
             .await
             .expect_err("validated session should not need a 2FA push");
 
@@ -1033,7 +1350,7 @@ mod tests {
             Some(SecretString::from("should-not-be-read"))
         });
 
-        let err = send_2fa_push_inner(cookies.path(), apple_id, &provider, "com", &endpoints)
+        let err = send_2fa_push_inner(cookies.path(), apple_id, &provider, "com", &endpoints, None)
             .await
             .expect_err("validated session should not need a 2FA push");
 
@@ -1057,6 +1374,88 @@ mod tests {
             check_requires_2fa(&cached),
             "regression guard must cover HSA flags that would otherwise demand 2FA"
         );
+    }
+
+    async fn mount_persisted_two_factor_push_forbidden(server: &wiremock::MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/setup/ws/1/validate"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/setup/ws/1/accountLogin"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(make_response(2, true, false, true)),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_code_maps_persisted_push_403_to_clean_retry() {
+        let server = crate::start_wiremock_or_skip!();
+        mount_persisted_two_factor_push_forbidden(&server).await;
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let apple_id = "get-code-retry@example.com";
+        tokio::fs::write(
+            session_file_path(cookies.path(), apple_id),
+            r#"{"session_token":"stale-token"}"#,
+        )
+        .await
+        .expect("session file");
+        let provider: crate::password::PasswordProvider =
+            Arc::new(|| Some(SecretString::from("unused")));
+
+        let err = send_2fa_push_inner(cookies.path(), apple_id, &provider, "com", &endpoints, None)
+            .await
+            .expect_err("persisted push 403");
+
+        assert!(err.downcast_ref::<RetryWithCleanAuth>().is_some());
+    }
+
+    #[tokio::test]
+    async fn interactive_login_maps_persisted_push_403_to_clean_retry() {
+        let server = crate::start_wiremock_or_skip!();
+        mount_persisted_two_factor_push_forbidden(&server).await;
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let apple_id = "interactive-retry@example.com";
+        tokio::fs::write(
+            session_file_path(cookies.path(), apple_id),
+            r#"{"session_token":"stale-token"}"#,
+        )
+        .await
+        .expect("session file");
+        let session = Session::new(cookies.path(), apple_id, &server.uri(), Some(5))
+            .await
+            .expect("session");
+        let provider: crate::password::PasswordProvider =
+            Arc::new(|| Some(SecretString::from("unused")));
+
+        let err = authenticate_inner(
+            session,
+            &endpoints,
+            apple_id,
+            &provider,
+            "com",
+            None,
+            None,
+            crate::personality::Mode::Off,
+            crate::InputMode::Interactive,
+        )
+        .await
+        .expect_err("persisted push 403");
+
+        assert!(err.downcast_ref::<RetryWithCleanAuth>().is_some());
     }
 
     #[tokio::test]

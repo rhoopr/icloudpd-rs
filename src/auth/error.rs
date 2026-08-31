@@ -66,6 +66,11 @@ pub enum AuthError {
     #[error("Another kei process is using the iCloud session: {0}")]
     LockContention(String),
 
+    #[error(
+        "The local iCloud session was reset while this process was idle. Restart kei to load fresh authentication state."
+    )]
+    SessionReset,
+
     #[error(transparent)]
     Http(Box<reqwest::Error>),
 
@@ -105,6 +110,10 @@ impl AuthError {
     /// Check if this error indicates lock contention with another kei instance.
     pub const fn is_lock_contention(&self) -> bool {
         matches!(self, Self::LockContention(_))
+    }
+
+    pub(crate) const fn is_session_reset(&self) -> bool {
+        matches!(self, Self::SessionReset)
     }
 
     /// True when Apple returned a terminal authentication state that should

@@ -3,11 +3,6 @@
     reason = "CLI subcommand whose primary purpose is to print reset status to stdout"
 )]
 
-use std::path::{Path, PathBuf};
-
-use anyhow::Context;
-use fs4::fs_std::FileExt;
-
 use crate::auth;
 use crate::cli;
 use crate::config;
@@ -112,59 +107,6 @@ pub(crate) async fn run_reset_sync_token(
     Ok(())
 }
 
-/// Session artifacts for `username` inside `cookie_directory`, in removal
-/// order: the cookie jar, the persisted session, and the response cache.
-///
-/// The password store (`<user>.credential`) and the state database are
-/// deliberately excluded: `reset session` discards Apple session state
-/// (including trust tokens) only, so `kei login` can mint a clean session
-/// afterwards.
-fn session_files(cookie_directory: &Path, username: &str) -> Vec<PathBuf> {
-    let slug = auth::session::sanitize_username(username);
-    vec![
-        cookie_directory.join(&slug),
-        cookie_directory.join(format!("{slug}.session")),
-        cookie_directory.join(format!("{slug}.cache")),
-    ]
-}
-
-/// Acquire the per-account advisory session lock, failing on contention.
-///
-/// Mirrors the lock acquisition in `auth::session::Session::new`: a held lock
-/// means another kei instance (sync, service, or login) is active for this
-/// account, and `reset session` must not remove session files from under it.
-fn acquire_session_lock(cookie_directory: &Path, slug: &str) -> anyhow::Result<std::fs::File> {
-    let lock_path = cookie_directory.join(format!("{slug}.lock"));
-    let file = std::fs::File::create(&lock_path)
-        .with_context(|| format!("Could not create session lock file {}", lock_path.display()))?;
-    let acquired = file
-        .try_lock_exclusive()
-        .with_context(|| format!("Could not acquire session lock {}", lock_path.display()))?;
-    anyhow::ensure!(
-        acquired,
-        "Another kei instance is running for this account (lock: {}). \
-         Stop it before resetting the session. If running in Docker, check \
-         for containers with `docker ps` and stop them with `docker stop <name>`.",
-        lock_path.display()
-    );
-    Ok(file)
-}
-
-/// Remove every file in `files` that exists, returning the paths removed.
-async fn discard(files: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
-    let mut removed = Vec::new();
-    for path in files {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => removed.push(path.clone()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("Could not remove {}", path.display()));
-            }
-        }
-    }
-    Ok(removed)
-}
-
 /// Run the reset-session command: discard the local session so the next
 /// `kei login` starts from a clean slate.
 ///
@@ -187,8 +129,10 @@ pub(crate) async fn run_reset_session(
         anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
     }
 
-    let files = session_files(&cookie_directory, &username);
-    let existing: Vec<&PathBuf> = files.iter().filter(|p| p.exists()).collect();
+    let state_guard =
+        auth::session::SessionStateGuard::acquire(&cookie_directory, &username).await?;
+    let files = state_guard.files();
+    let existing: Vec<_> = files.iter().filter(|p| p.exists()).collect();
 
     // Nothing to remove: report and exit before the lock and the `--yes`
     // guard, mirroring the no-DB early return of the other reset subcommands.
@@ -199,16 +143,6 @@ pub(crate) async fn run_reset_session(
         );
         return Ok(());
     }
-
-    // Hold the same advisory lock the sync service takes — acquired before
-    // the prompt, so no instance can start mid-confirmation and we never
-    // yank session files out from under a running one.
-    let slug = auth::session::sanitize_username(&username);
-    let _lock_file = tokio::task::spawn_blocking({
-        let cookie_directory = cookie_directory.clone();
-        move || acquire_session_lock(&cookie_directory, &slug)
-    })
-    .await??;
 
     if !yes {
         use std::io::IsTerminal;
@@ -235,82 +169,11 @@ pub(crate) async fn run_reset_session(
         }
     }
 
-    let removed = discard(&files).await?;
+    let removed = state_guard.discard().await?;
     for path in &removed {
         println!("Removed {}", path.display());
     }
     println!("Session reset. Run `kei login` to authenticate again.");
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_files_cover_jar_session_and_cache_only() {
-        let dir = Path::new("/data");
-        let files = session_files(dir, "user@test.com");
-        let names: Vec<String> = files
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        let slug = auth::session::sanitize_username("user@test.com");
-        assert_eq!(
-            names,
-            vec![
-                slug.clone(),
-                format!("{slug}.session"),
-                format!("{slug}.cache")
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn reset_session_removes_nothing_while_the_session_lock_is_held() {
-        let dir = tempfile::tempdir().unwrap();
-        let slug = auth::session::sanitize_username("user@test.com");
-        std::fs::write(dir.path().join(&slug), b"jar").unwrap();
-        std::fs::write(dir.path().join(format!("{slug}.session")), b"session").unwrap();
-
-        // Simulate a running instance holding the advisory lock.
-        let held = acquire_session_lock(dir.path(), &slug).unwrap();
-
-        // The reset's lock step must fail on contention, so discard never runs.
-        let err = acquire_session_lock(dir.path(), &slug).unwrap_err();
-        assert!(
-            err.to_string().contains("Another kei instance is running"),
-            "unexpected error: {err}"
-        );
-        assert!(dir.path().join(&slug).exists());
-        assert!(dir.path().join(format!("{slug}.session")).exists());
-
-        // Once the running instance goes away, the lock is acquirable again.
-        drop(held);
-        let _reacquired = acquire_session_lock(dir.path(), &slug).unwrap();
-    }
-
-    #[tokio::test]
-    async fn discard_removes_only_listed_files_and_tolerates_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let slug = auth::session::sanitize_username("user@test.com");
-        let files = session_files(dir.path(), "user@test.com");
-
-        // Present: jar + cache. Missing: .session. Bystanders: credential + db.
-        std::fs::write(dir.path().join(&slug), b"jar").unwrap();
-        std::fs::write(dir.path().join(format!("{slug}.cache")), b"cache").unwrap();
-        let credential = dir.path().join(format!("{slug}.credential"));
-        let db = dir.path().join(format!("{slug}.db"));
-        std::fs::write(&credential, b"cred").unwrap();
-        std::fs::write(&db, b"db").unwrap();
-
-        let removed = discard(&files).await.unwrap();
-
-        assert_eq!(removed.len(), 2);
-        assert!(!dir.path().join(&slug).exists());
-        assert!(!dir.path().join(format!("{slug}.cache")).exists());
-        assert!(credential.exists(), "password store must survive the reset");
-        assert!(db.exists(), "state database must survive the reset");
-    }
 }
