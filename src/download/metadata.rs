@@ -2372,16 +2372,10 @@ fn encode_gps(decimal: f64, pos: char, neg: char) -> String {
     format!("{deg_u32},{min:.4}{hemisphere}")
 }
 
-/// XMP `exif:GPSAltitude` is a rational; we use `meters/1` (scale of 1).
+/// Preserve the provider's altitude precision using Rust's shortest round-trip decimal.
 #[cfg(feature = "xmp")]
 fn encode_altitude(meters: f64) -> String {
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "abs() is non-negative; altitudes in millimeters never approach u64::MAX"
-    )]
-    let scaled = (meters.abs() * 1000.0).round() as u64;
-    format!("{scaled}/1000")
+    meters.abs().to_string()
 }
 
 #[cfg(all(test, feature = "xmp"))]
