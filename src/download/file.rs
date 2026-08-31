@@ -1745,6 +1745,7 @@ pub(super) fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs:
     open_regular_file_with_access_blocking(path, false)
 }
 
+#[cfg(feature = "xmp")]
 pub(super) fn open_optional_regular_file_blocking(
     path: &Path,
 ) -> anyhow::Result<Option<std::fs::File>> {
