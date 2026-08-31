@@ -57,12 +57,44 @@ full set with `just test scenarios`.
 |-------|----------|--------------------|
 | `auth-session` | Persisted-session reuse, validation caching, 2FA push state, and reauthentication routing | Authentication recovery, session validation, or watch-mode reauthentication |
 | `config-docs` | Supported configuration stays aligned with examples, migration guidance, and contributor commands | Config keys, defaults, examples, migration docs, or gate commands |
+| `config-reconciliation` | Config-hash staging, local catalog path reconciliation, and repeat-cycle stability | Download config hashes, path reconciliation, config drift, or local reconciliation copies |
 | `fulltest-harness` | Full-test phase reachability and rejection of stale or empty scenario filters | `just` dispatch, full-test orchestration, or scenario-runner helpers |
 | `identity-deltas` | Incremental identity mapping, hard and soft deletion, selected relations, and master-family transitions | CloudKit change parsing, identity mapping, membership, or tombstone policy |
 | `path-family` | Collision suffixes and primary, Live Photo, import, and pending-file family matching | Path rendering, collision handling, import matching, or on-disk adoption |
 | `pending-recovery` | Durable pending hydration, policy-excluded deletion proof, ambiguous identity retention, and sibling recovery | Retry resolution, pending or policy-excluded state, provider identity, or targeted hydration |
 | `service-health` | Health and metrics facts exposed by unattended operation | Health checks, metrics, cycle reporting, or service monitoring |
 | `url-refresh` | Refresh of expired or aged download URLs without replaying stale deltas | Incremental downloads, URL freshness, album hydration, or retry downloads |
+
+## State-transition proof
+
+Use a state-transition test when behavior crosses durable configuration,
+filesystem paths, media publication, metadata, SQLite state, retry work, or
+provider checkpoints. The test must cover these stages:
+
+1. **Initial durable state:** Use real SQLite and a `TempDir` where practical.
+   Create the exact state and files that exist before the transition.
+2. **Controlled mutation:** Change one config field, provider fact, local
+   entry, or injected failure.
+3. **Production cycle:** Enter through the normal production owner and its
+   direct callers. Do not duplicate planning or finalization policy in the
+   test.
+4. **Durable outcome:** Assert concrete filesystem, SQLite, metadata, retry,
+   and checkpoint results. An empty destination proves only the empty case.
+5. **Steady-state cycle:** Run the same configuration again. Assert no repeat
+   reconciliation, duplicate file, orphaned state path, or repeated provider
+   work.
+
+Cover each applicable dimension: album, smart-folder, and unfiled passes;
+single and companion media; absent, regular, conflicting, leaf-symlink, and
+parent-symlink entries; metadata disabled and enabled; interruption; and
+state-write failure. Keep the matrix proportional to the changed behavior.
+
+`just gate`, line coverage, fuzzing, and fresh-workspace live tests are
+supporting evidence. They do not prove a multi-cycle transition unless they
+exercise the initial state, mutation, durable outcome, and steady-state cycle.
+Reports must state whether the destination was empty, whether durable state
+was pre-seeded, what changed between cycles, and whether an unchanged cycle
+was checked.
 
 ## Running
 
