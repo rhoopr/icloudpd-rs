@@ -168,14 +168,25 @@ use a conservative UTC enumeration bound and then apply the exact resolved
 calendar-date filter, so enumeration safety does not depend on the backup host
 timezone.
 
-Capture-local path rendering does not change the download config hash, so a
-sync that sees no other drift stays incremental and never re-enumerates an
-already-downloaded asset. A date-only created bound is hashed under its own
-tag in both the download config hash and the eligibility-config hash, so it
-drifts like any other eligibility field. For an asset carrying a usable
-offset, a path derived under host-local rendering is not a current derived
-path, so a full sweep forwards that asset and downloads it into its
-capture-local folder. The earlier copy stays where it is: kei never deletes
+The download config hash contains only fields that can change a rendered local
+path for an already-downloaded version. Eligibility and version-selection
+fields, including date bounds, recent limits, media selection, resolution, and
+Live Photo mode, live only in the enumeration hash. A matching legacy mixed
+hash is promoted to the path-only shape without reconciliation; a genuine path
+change still stages reconciliation without discarding provider cursors.
+
+Path reconciliation resolves only versions with downloaded catalog rows. It
+recognises exact, AM/PM-equivalent, size-suffixed, and identity-suffixed paths
+owned by that row before ordinary collision handling, so an asset cannot
+collide with its own file. Newly eligible versions remain the following full
+enumeration's responsibility. A changed provider checksum or size is requeued
+for download rather than copying stale local bytes. Reconciliation-detected
+retry work does not consume a download attempt before a transfer is made.
+
+For a genuine path change, reconciliation copies verified bytes through
+no-overwrite publication only when the copied bytes match the recorded local
+SHA-256, then updates the recorded local path. Missing or changed checksum
+evidence stays retryable. The earlier copy stays where it is: kei never deletes
 local media, and no command removes a file that no longer matches a derived
 path. `import-existing` adopts through the same derivation. Assets without a
 usable offset retain host-local paths and remain compatible with icloudpd's

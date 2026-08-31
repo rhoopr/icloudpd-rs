@@ -793,8 +793,8 @@ async fn mark_pending_downloaded_from_existing_path(
     Some(PendingOnDiskAdoption::Adopted(existing_path))
 }
 
-async fn state_path_size_allows_skip(
-    asset: &PhotoAsset,
+pub(super) async fn state_path_size_allows_skip(
+    asset_id: &str,
     version_size: VersionSizeKey,
     path: &Path,
     on_disk_size: u64,
@@ -813,7 +813,7 @@ async fn state_path_size_allows_skip(
         Ok(true) => true,
         Ok(false) => {
             tracing::warn!(
-                asset_id = %asset.id(),
+                asset_id,
                 version_size = %version_size.as_str(),
                 path = %path.display(),
                 on_disk_size,
@@ -824,7 +824,7 @@ async fn state_path_size_allows_skip(
         }
         Err(error) => {
             tracing::warn!(
-                asset_id = %asset.id(),
+                asset_id,
                 version_size = %version_size.as_str(),
                 path = %path.display(),
                 error = %error,
@@ -835,7 +835,7 @@ async fn state_path_size_allows_skip(
     }
 }
 
-fn stored_path_matches_current_collision_family(
+pub(super) fn stored_path_matches_current_collision_family(
     asset_id: &str,
     derived: &DerivedPath,
     derived_paths: &[DerivedPath],
@@ -945,7 +945,7 @@ pub(super) async fn state_confirmed_current_path_exists(
         };
         if existing_path.as_path() == stored_path.as_path() {
             if state_path_size_allows_skip(
-                asset,
+                asset.id(),
                 derived.version_size,
                 &existing_path,
                 existing_size,
@@ -975,7 +975,7 @@ pub(super) async fn state_confirmed_current_path_exists(
         }
         let (existing_path, existing_size) = task_planner.existing_path_with_size(stored_path)?;
         if state_path_size_allows_skip(
-            asset,
+            asset.id(),
             task.version_size,
             &existing_path,
             existing_size,

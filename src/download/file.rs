@@ -986,15 +986,31 @@ enum PublishResult {
 /// Copy an existing catalog file to a new derived path without replacing any
 /// file already present at the destination. The copy is verified before the
 /// same no-overwrite `.part` publication used by provider downloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum VerifiedLocalCopy {
+    Verified(String),
+    SourceChanged,
+    DestinationConflict,
+}
+
 pub(crate) async fn copy_local_file_no_replace(
     source: &Path,
     destination: &Path,
     temp_suffix: &str,
-) -> anyhow::Result<Option<String>> {
+    expected_source_hash: &str,
+) -> anyhow::Result<VerifiedLocalCopy> {
     if fs::try_exists(destination).await? {
         let source_hash = compute_sha256(source).await?;
+        if source_hash != expected_source_hash {
+            return Ok(VerifiedLocalCopy::SourceChanged);
+        }
         let destination_hash = compute_sha256(destination).await?;
-        return Ok((source_hash == destination_hash).then_some(destination_hash));
+        return Ok(if source_hash == destination_hash {
+            VerifiedLocalCopy::Verified(destination_hash)
+        } else {
+            VerifiedLocalCopy::DestinationConflict
+        });
     }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).await?;
@@ -1008,19 +1024,27 @@ pub(crate) async fn copy_local_file_no_replace(
     fs::copy(source, &part_path).await?;
     let source_hash = compute_sha256(source).await?;
     let copied_hash = compute_sha256(&part_path).await?;
-    if source_hash != copied_hash {
+    if source_hash != expected_source_hash {
+        crate::fs_util::log_remove_async(&part_path).await;
+        return Ok(VerifiedLocalCopy::SourceChanged);
+    }
+    if copied_hash != expected_source_hash {
         crate::fs_util::log_remove_async(&part_path).await;
         anyhow::bail!("local path reconciliation checksum mismatch");
     }
     match publish_part_no_replace(&part_path, destination).await? {
         PublishResult::Published => {
             crate::fs_util::fsync_parent_dir_async_best_effort(destination).await;
-            Ok(Some(copied_hash))
+            Ok(VerifiedLocalCopy::Verified(copied_hash))
         }
         PublishResult::DestinationExists => {
             crate::fs_util::log_remove_async(&part_path).await;
             let destination_hash = compute_sha256(destination).await?;
-            Ok((source_hash == destination_hash).then_some(destination_hash))
+            Ok(if destination_hash == expected_source_hash {
+                VerifiedLocalCopy::Verified(destination_hash)
+            } else {
+                VerifiedLocalCopy::DestinationConflict
+            })
         }
     }
 }
@@ -1909,20 +1933,39 @@ mod tests {
         let source = dir.path().join("source.jpg");
         let destination = dir.path().join("nested/destination.jpg");
         std::fs::write(&source, b"catalog bytes").unwrap();
+        let expected_source_hash = compute_sha256(&source).await.unwrap();
 
-        let copied = copy_local_file_no_replace(&source, &destination, ".part")
-            .await
-            .unwrap();
-        assert!(copied.is_some());
+        let copied =
+            copy_local_file_no_replace(&source, &destination, ".part", &expected_source_hash)
+                .await
+                .unwrap();
+        assert_eq!(
+            copied,
+            VerifiedLocalCopy::Verified(expected_source_hash.clone())
+        );
         assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
         assert_eq!(std::fs::read(&destination).unwrap(), b"catalog bytes");
 
         std::fs::write(&destination, b"user bytes").unwrap();
-        let conflict = copy_local_file_no_replace(&source, &destination, ".part")
-            .await
-            .unwrap();
-        assert_eq!(conflict, None);
+        let conflict =
+            copy_local_file_no_replace(&source, &destination, ".part", &expected_source_hash)
+                .await
+                .unwrap();
+        assert_eq!(conflict, VerifiedLocalCopy::DestinationConflict);
         assert_eq!(std::fs::read(&destination).unwrap(), b"user bytes");
+
+        let changed_destination = dir.path().join("nested/changed.jpg");
+        std::fs::write(&source, b"tampered byte").unwrap();
+        let changed = copy_local_file_no_replace(
+            &source,
+            &changed_destination,
+            ".part",
+            &expected_source_hash,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed, VerifiedLocalCopy::SourceChanged);
+        assert!(!changed_destination.exists());
     }
 
     #[test]

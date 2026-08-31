@@ -9961,7 +9961,12 @@ mod tests {
             .await
             .expect("seed token");
 
-        let outcome = check_download_config_hash_for_cycle(&db, "current-download-hash").await;
+        let outcome = check_download_config_hash_for_cycle(
+            &db,
+            "current-download-hash",
+            "legacy-current-download-hash",
+        )
+        .await;
 
         assert_eq!(outcome, DownloadConfigHashOutcome::Changed);
         assert_eq!(
@@ -9994,7 +9999,12 @@ mod tests {
             .await
             .expect("seed token");
 
-        let outcome = check_download_config_hash_for_cycle(&db, "current-download-hash").await;
+        let outcome = check_download_config_hash_for_cycle(
+            &db,
+            "current-download-hash",
+            "legacy-current-download-hash",
+        )
+        .await;
 
         assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
         assert_eq!(
@@ -10025,7 +10035,8 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = check_download_config_hash_for_cycle(&db, "active-hash").await;
+        let outcome =
+            check_download_config_hash_for_cycle(&db, "active-hash", "legacy-active-hash").await;
 
         assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
         assert_eq!(
@@ -10033,6 +10044,46 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_legacy_hash_migrates_without_reconciliation() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-current-hash")
+            .await
+            .unwrap();
+        db.set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, "abandoned-hash")
+            .await
+            .unwrap();
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")
+            .await
+            .unwrap();
+
+        let outcome =
+            check_download_config_hash_for_cycle(&db, "current-path-hash", "legacy-current-hash")
+                .await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current-path-hash")
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-keep")
         );
     }
 

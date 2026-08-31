@@ -349,6 +349,18 @@ pub trait DownloadStateStore: Send + Sync {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError>;
+    async fn mark_retry_required(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version_size: &str,
+        _error: &str,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "mark_retry_required",
+            detail: "retry-required transitions are not implemented by this state store".into(),
+        })
+    }
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
     /// Return live policy-excluded identities for targeted deletion revalidation.
     ///
@@ -1928,6 +1940,40 @@ impl SqliteStateDb {
                 });
             }
 
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_retry_required(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        error: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let id = id.to_owned();
+        let version_size = version_size.to_owned();
+        let error = error.to_owned();
+
+        self.with_conn("mark_retry_required", move |conn| {
+            let rows = conn
+                .execute(
+                    "UPDATE assets SET status = 'failed', last_error = ?1 \
+                     WHERE library = ?2 AND id = ?3 AND version_size = ?4",
+                    rusqlite::params![&error, &library, &id, &version_size],
+                )
+                .map_err(|e| StateError::query("mark_retry_required", e))?;
+
+            if rows == 0 {
+                return Err(StateError::Invariant {
+                    operation: "mark_retry_required",
+                    detail: format!(
+                        "library={library} id={id} version_size={version_size} not present"
+                    ),
+                });
+            }
             Ok(())
         })
         .await
@@ -5217,6 +5263,16 @@ impl DownloadStateStore for SqliteStateDb {
         error: &str,
     ) -> Result<(), StateError> {
         SqliteStateDb::mark_failed(self, library, id, version_size, error).await
+    }
+
+    async fn mark_retry_required(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        error: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::mark_retry_required(self, library, id, version_size, error).await
     }
 
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {

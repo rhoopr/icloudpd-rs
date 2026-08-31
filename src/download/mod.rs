@@ -800,12 +800,12 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 /// Bump this when path derivation changes without a corresponding config
 /// field changing. That forces existing state to revalidate on disk instead
 /// of trusting paths derived under older code.
-const PATH_DERIVATION_HASH_VERSION: u8 = 2;
+const LEGACY_PATH_DERIVATION_HASH_VERSION: u8 = 2;
+const PATH_DERIVATION_HASH_VERSION: u8 = 3;
 const ENUMERATION_SAFETY_HASH_VERSION: u8 = 2;
 pub(crate) const DOWNLOAD_CONFIG_HASH_KEY: &str = "config_hash";
 
-/// Fields shared between [`hash_download_config`] and [`compute_config_hash`]
-/// that affect path resolution and asset eligibility.
+/// Fields used by the legacy mixed path-and-eligibility fingerprint.
 #[derive(Debug)]
 struct SharedHashFields<'a> {
     directory: &'a std::path::Path,
@@ -828,13 +828,12 @@ struct SharedHashFields<'a> {
     filename_exclude: &'a [glob::Pattern],
 }
 
-/// Hash the shared config fields into the hasher. All enum values use
-/// `repr(u8)` byte representations and dates use "YYYY-MM-DD" Display
-/// format for stability across compiler/library upgrades.
+/// Reproduce the v2 fingerprint so matching stored hashes can migrate without
+/// forcing an unnecessary whole-library path reconciliation.
 fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     use sha2::Digest;
 
-    hasher.update([PATH_DERIVATION_HASH_VERSION]);
+    hasher.update([LEGACY_PATH_DERIVATION_HASH_VERSION]);
     hash_bytes(hasher, f.directory.as_os_str().as_encoded_bytes());
     hash_bytes(hasher, f.folder_structure.as_bytes());
     hash_bytes(hasher, f.folder_structure_albums.as_bytes());
@@ -1038,6 +1037,24 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
+    hasher.update([PATH_DERIVATION_HASH_VERSION]);
+    hash_bytes(&mut hasher, config.directory.as_os_str().as_encoded_bytes());
+    hash_bytes(&mut hasher, config.folder_structure.as_bytes());
+    hash_bytes(&mut hasher, config.folder_structure_albums.as_bytes());
+    hash_bytes(
+        &mut hasher,
+        config.folder_structure_smart_folders.as_bytes(),
+    );
+    hasher.update([config.file_match_policy as u8]);
+    hasher.update([config.live_photo_mov_filename_policy as u8]);
+    hasher.update([u8::from(config.keep_unicode_in_filenames)]);
+    finalize_hash(hasher)
+}
+
+pub(crate) fn hash_legacy_download_config(config: &DownloadConfig) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
     hash_shared_fields(
         &mut hasher,
         &SharedHashFields {
@@ -1113,11 +1130,15 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     for pattern in &sorted_excludes {
         hash_bytes(&mut hasher, pattern.as_bytes());
     }
-    // Note: `recent` is intentionally excluded from this enum hash.
-    // Changing --recent should not invalidate sync tokens because the
-    // incremental path already applies the recent cap post-fetch.
-    // `recent` IS included in hash_download_config (trust-state) so
-    // changing it still triggers filesystem re-verification.
+    if let Some(recent) = config.filters.recent {
+        hasher.update(b"recent:");
+        hasher.update(recent.to_le_bytes());
+        hasher.update(match config.filters.recent_scope {
+            crate::cli::RecentScope::Global => b"global".as_slice(),
+            crate::cli::RecentScope::PerFilter => b"per-filter".as_slice(),
+        });
+        hasher.update(b"\0");
+    }
 
     // The unfiled selector is still unsafe to classify from the current state
     // alone: switching it on can make old, never-enumerated unfiled assets
@@ -3367,17 +3388,23 @@ pub(crate) struct PathReconciliationResult {
     pub(crate) stats: SyncStats,
 }
 
-async fn requeue_missing_catalog_file(
+const PATH_RECONCILIATION_PROVIDER_CHANGED_REASON: &str =
+    "provider version changed during path reconciliation";
+const PATH_RECONCILIATION_SOURCE_CHANGED_REASON: &str =
+    "local checksum changed during path reconciliation";
+
+async fn requeue_catalog_file(
     db: &dyn DownloadStore,
     task: &DownloadTask,
+    reason: &str,
     stats: &mut SyncStats,
 ) {
     if let Err(error) = db
-        .mark_failed(
+        .mark_retry_required(
             &task.library,
             &task.asset_id,
             task.version_size.as_str(),
-            crate::commands::reconcile::FILE_MISSING_REASON,
+            reason,
         )
         .await
     {
@@ -3494,6 +3521,11 @@ pub(crate) async fn reconcile_catalog_paths(
     let mut task_planner = planner::TaskPlanner::new();
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
+    let mut invalid_owned_targets = FxHashSet::default();
+    let records_by_target: FxHashMap<PendingRetryTarget, &crate::state::AssetRecord> = records
+        .iter()
+        .map(|record| (PendingRetryTarget::from_record(record), record))
+        .collect();
     for (state_id, resolution) in batch.results {
         if shutdown_token.is_cancelled() {
             break;
@@ -3514,11 +3546,69 @@ pub(crate) async fn reconcile_catalog_paths(
                     if !selected {
                         continue;
                     }
+                    let derived_paths = filter::derive_expected_paths(&asset, pass_config.as_ref());
                     let plan = task_planner.plan_asset(&asset, pass_config).await;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
                     for task in plan.tasks {
+                        let target = PendingRetryTarget::from_task(&task);
+                        let Some(record) = records_by_target.get(&target) else {
+                            continue;
+                        };
+                        let provider_version_is_current = record.checksum.as_ref()
+                            == task.checksum.as_ref()
+                            && record.size_bytes == task.size;
+                        let recorded_path_is_current = if let (Some(derived), Some(recorded_path)) = (
+                            derived_paths
+                                .iter()
+                                .find(|derived| derived.version_size == task.version_size),
+                            record.local_path.as_deref(),
+                        ) {
+                            let matches_current_family =
+                                pipeline::stored_path_matches_current_collision_family(
+                                    asset.state_id(),
+                                    derived,
+                                    &derived_paths,
+                                    pass_config,
+                                    recorded_path,
+                                );
+                            if !provider_version_is_current || !matches_current_family {
+                                false
+                            } else if let Ok(metadata) = tokio::fs::metadata(recorded_path).await {
+                                let recorded_file = RecordedLocalFile {
+                                    path: recorded_path.to_path_buf(),
+                                    local_checksum: record
+                                        .local_checksum
+                                        .clone()
+                                        .map(String::into_boxed_str),
+                                    download_checksum: record
+                                        .download_checksum
+                                        .clone()
+                                        .map(String::into_boxed_str),
+                                };
+                                let intact = pipeline::state_path_size_allows_skip(
+                                    task.asset_id.as_ref(),
+                                    task.version_size,
+                                    recorded_path,
+                                    metadata.len(),
+                                    derived.size,
+                                    &recorded_file,
+                                )
+                                .await;
+                                if !intact {
+                                    invalid_owned_targets.insert(target.clone());
+                                }
+                                intact
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if recorded_path_is_current {
+                            continue;
+                        }
                         let key = RetryTaskKey::from(&task);
                         if task_keys.insert(key) {
                             tasks.push(task);
@@ -3552,10 +3642,6 @@ pub(crate) async fn reconcile_catalog_paths(
         }
     }
 
-    let records_by_target: FxHashMap<PendingRetryTarget, &crate::state::AssetRecord> = records
-        .iter()
-        .map(|record| (PendingRetryTarget::from_record(record), record))
-        .collect();
     let mut stats = SyncStats::default();
     let mut deferred_to_pending_retry = false;
     for task in tasks {
@@ -3567,15 +3653,27 @@ pub(crate) async fn reconcile_catalog_paths(
         };
         let Some(source_path) = record.local_path.as_deref() else {
             deferred_to_pending_retry = true;
-            requeue_missing_catalog_file(db.as_ref(), &task, &mut stats).await;
+            requeue_catalog_file(
+                db.as_ref(),
+                &task,
+                crate::commands::reconcile::FILE_MISSING_REASON,
+                &mut stats,
+            )
+            .await;
             tracing::debug!(asset_id = %task.asset_id, "Path reconciliation deferred catalog row without a local file to targeted retry");
             continue;
         };
-        match tokio::fs::try_exists(source_path).await {
-            Ok(true) => {}
-            Ok(false) => {
+        let source_metadata = match tokio::fs::metadata(source_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 deferred_to_pending_retry = true;
-                requeue_missing_catalog_file(db.as_ref(), &task, &mut stats).await;
+                requeue_catalog_file(
+                    db.as_ref(),
+                    &task,
+                    crate::commands::reconcile::FILE_MISSING_REASON,
+                    &mut stats,
+                )
+                .await;
                 tracing::debug!(asset_id = %task.asset_id, path = %source_path.display(), "Path reconciliation deferred missing local file to targeted retry");
                 continue;
             }
@@ -3584,15 +3682,82 @@ pub(crate) async fn reconcile_catalog_paths(
                 tracing::warn!(asset_id = %task.asset_id, path = %source_path.display(), %error, "Path reconciliation could not inspect the catalog file");
                 continue;
             }
+        };
+        if record.checksum.as_ref() != task.checksum.as_ref() || record.size_bytes != task.size {
+            deferred_to_pending_retry = true;
+            requeue_catalog_file(
+                db.as_ref(),
+                &task,
+                PATH_RECONCILIATION_PROVIDER_CHANGED_REASON,
+                &mut stats,
+            )
+            .await;
+            tracing::debug!(asset_id = %task.asset_id, "Path reconciliation deferred changed provider version to targeted retry");
+            continue;
         }
+        if invalid_owned_targets.contains(&target) {
+            deferred_to_pending_retry = true;
+            requeue_catalog_file(
+                db.as_ref(),
+                &task,
+                crate::commands::reconcile::FILE_TRUNCATED_REASON,
+                &mut stats,
+            )
+            .await;
+            continue;
+        }
+        let recorded_file = RecordedLocalFile {
+            path: source_path.to_path_buf(),
+            local_checksum: record.local_checksum.clone().map(String::into_boxed_str),
+            download_checksum: record.download_checksum.clone().map(String::into_boxed_str),
+        };
+        if !pipeline::state_path_size_allows_skip(
+            task.asset_id.as_ref(),
+            task.version_size,
+            source_path,
+            source_metadata.len(),
+            task.size,
+            &recorded_file,
+        )
+        .await
+        {
+            deferred_to_pending_retry = true;
+            requeue_catalog_file(
+                db.as_ref(),
+                &task,
+                crate::commands::reconcile::FILE_TRUNCATED_REASON,
+                &mut stats,
+            )
+            .await;
+            continue;
+        }
+        if source_path == task.download_path.as_path() {
+            continue;
+        }
+        let Some(expected_local_checksum) = record
+            .local_checksum
+            .as_deref()
+            .filter(|checksum| !checksum.is_empty())
+        else {
+            deferred_to_pending_retry = true;
+            requeue_catalog_file(
+                db.as_ref(),
+                &task,
+                PATH_RECONCILIATION_SOURCE_CHANGED_REASON,
+                &mut stats,
+            )
+            .await;
+            continue;
+        };
         match file::copy_local_file_no_replace(
             source_path,
             &task.download_path,
             &config.temp_suffix,
+            expected_local_checksum,
         )
         .await
         {
-            Ok(Some(local_checksum)) => {
+            Ok(file::VerifiedLocalCopy::Verified(local_checksum)) => {
                 if let Err(error) = db
                     .mark_downloaded(
                         &task.library,
@@ -3620,7 +3785,17 @@ pub(crate) async fn reconcile_catalog_paths(
                         stats.disk_bytes_written.saturating_add(record.size_bytes);
                 }
             }
-            Ok(None) => {
+            Ok(file::VerifiedLocalCopy::SourceChanged) => {
+                deferred_to_pending_retry = true;
+                requeue_catalog_file(
+                    db.as_ref(),
+                    &task,
+                    PATH_RECONCILIATION_SOURCE_CHANGED_REASON,
+                    &mut stats,
+                )
+                .await;
+            }
+            Ok(file::VerifiedLocalCopy::DestinationConflict) => {
                 stats.failed += 1;
                 tracing::warn!(asset_id = %task.asset_id, path = %task.download_path.display(), "Path reconciliation found conflicting destination bytes");
             }
@@ -12653,24 +12828,24 @@ mod tests {
     // ── hash_download_config additional sensitivity ─────────────────────
 
     #[test]
-    fn test_hash_download_config_changes_on_resolution() {
+    fn test_hash_download_config_ignores_resolution() {
         let mut config1 = test_config();
         config1.resolution = crate::types::PhotoResolution::Original;
         let mut config2 = test_config();
         config2.resolution = crate::types::PhotoResolution::Medium;
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_live_resolution() {
+    fn test_hash_download_config_ignores_live_resolution() {
         let mut config1 = test_config();
         config1.live_resolution = AssetVersionSize::LiveOriginal;
         let mut config2 = test_config();
         config2.live_resolution = AssetVersionSize::LiveMedium;
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
@@ -12689,19 +12864,19 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_raw_policy() {
+    fn test_hash_download_config_ignores_raw_policy() {
         let mut config1 = test_config();
         config1.raw_policy = RawPolicy::AsIs;
         let mut config2 = test_config();
         config2.raw_policy = RawPolicy::PreferRaw;
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_skip_created_before() {
+    fn test_hash_download_config_ignores_skip_created_before() {
         let mut config1 = test_config();
         config1.skip_created_before = None;
         let mut config2 = test_config();
@@ -12710,14 +12885,14 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         ));
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_skip_created_after() {
+    fn test_hash_download_config_ignores_skip_created_after() {
         let mut config1 = test_config();
         config1.skip_created_after = None;
         let mut config2 = test_config();
@@ -12726,14 +12901,14 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         ));
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_distinguishes_capture_date_from_instant() {
+    fn test_hash_download_config_ignores_created_date_filter_shape() {
         let date = chrono::NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
         let mut instant = test_config();
         instant.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
@@ -12743,71 +12918,113 @@ mod tests {
         capture_date.skip_created_before =
             Some(crate::config::CreatedDateFilter::CaptureDate(date));
 
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&instant),
             hash_download_config(&capture_date)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_recent() {
+    fn test_hash_download_config_ignores_recent() {
         let mut config1 = test_config();
         config1.recent = None;
         let mut config2 = test_config();
         config2.recent = Some(100);
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_recent_scope_when_recent_is_set() {
+    fn test_hash_download_config_ignores_recent_scope() {
         let mut config1 = test_config();
         config1.recent = Some(100);
         config1.recent_scope = crate::cli::RecentScope::Global;
         let mut config2 = test_config();
         config2.recent = Some(100);
         config2.recent_scope = crate::cli::RecentScope::PerFilter;
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_force_resolution() {
+    fn test_hash_download_config_ignores_force_resolution() {
         let mut config1 = test_config();
         config1.force_resolution = false;
         let mut config2 = test_config();
         config2.force_resolution = true;
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_media_videos() {
+    fn test_hash_download_config_ignores_media_videos() {
         let mut config1 = test_config();
         config1.media.videos = true;
         let mut config2 = test_config();
         config2.media.videos = false;
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_media_photos() {
+    fn test_hash_download_config_ignores_media_photos() {
         let mut config1 = test_config();
         config1.media.photos = true;
         let mut config2 = test_config();
         config2.media.photos = false;
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_ignores_live_photo_mode() {
+        let mut config1 = test_config();
+        config1.live_photo_mode = LivePhotoMode::ImageOnly;
+        let mut config2 = test_config();
+        config2.live_photo_mode = LivePhotoMode::Both;
+        assert_eq!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_ignores_optional_versions_and_filename_exclusion() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.edited = true;
+        config2.alternative = true;
+        config2.filename_exclude =
+            Arc::from(vec![glob::Pattern::new("*.tmp").expect("valid glob")]);
+        assert_eq!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_legacy_download_config_hash_changes_on_skip_created_before() {
+        let mut config1 = test_config();
+        config1.skip_created_before = None;
+        let mut config2 = test_config();
+        config2.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        assert_ne!(
+            hash_legacy_download_config(&config1),
+            hash_legacy_download_config(&config2)
         );
     }
 
@@ -14032,35 +14249,47 @@ mod tests {
 
     #[tokio::test]
     async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
-        #[derive(Clone, Debug)]
-        struct LookupOnlySession {
-            records: Arc<Vec<Value>>,
-        }
-
-        #[async_trait::async_trait]
-        impl PhotosSession for LookupOnlySession {
-            async fn post(
-                &self,
-                url: &str,
-                _body: String,
-                _headers: &[(&str, &str)],
-            ) -> anyhow::Result<Value> {
-                if url.contains("/records/lookup?") {
-                    return Ok(json!({"records": self.records.as_ref().clone()}));
-                }
-                anyhow::bail!("path reconciliation made an unexpected provider request: {url}")
-            }
-
-            fn clone_box(&self) -> Box<dyn PhotosSession> {
-                Box::new(self.clone())
-            }
-        }
-
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let old_dir = TempDir::new().expect("old dir");
         let new_dir = TempDir::new().expect("new dir");
-        let old_path = old_dir.path().join("reconcile.jpg");
-        tokio::fs::write(&old_path, b"catalog bytes").await.unwrap();
+        let mut records =
+            mock_photo_records_for_zone_with_filename("RECONCILE", "PrimarySync", "reconcile.jpg");
+        records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/RECONCILE.mov",
+            "size": 2048,
+            "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        records[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value": "com.apple.quicktime-movie"});
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut old_config = test_config();
+        old_config.directory = Arc::from(old_dir.path());
+        old_config.state_db = Some(db.clone());
+        let old_path = filter::expected_paths_for(&asset, &old_config)
+            .into_iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path;
+        let mov_path = filter::expected_paths_for(&asset, &old_config)
+            .into_iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap()
+            .path;
+        tokio::fs::create_dir_all(old_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&old_path, vec![7u8; 1024]).await.unwrap();
         let local_checksum = file::compute_sha256(&old_path).await.unwrap();
         let record = crate::test_helpers::TestAssetRecord::new("RECONCILE")
             .filename("reconcile.jpg")
@@ -14082,39 +14311,52 @@ mod tests {
             .await
             .unwrap();
 
-        let records =
-            mock_photo_records_for_zone_with_filename("RECONCILE", "PrimarySync", "reconcile.jpg");
-        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: album_with_session(
-                "PrimarySync",
-                "",
-                Box::new(LookupOnlySession {
-                    records: Arc::new(records),
-                }),
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-        let mut config = test_config();
-        config.directory = Arc::from(new_dir.path());
-        config.state_db = Some(db.clone());
-        let expected_path = filter::expected_paths_for(&asset, &config)
+        let unchanged =
+            reconcile_catalog_paths(&passes, Arc::new(old_config), CancellationToken::new())
+                .await
+                .expect("unchanged path reconciliation");
+
+        assert!(unchanged.complete);
+        assert_eq!(unchanged.stats.downloaded, 0);
+        assert!(
+            !mov_path.exists(),
+            "a newly eligible version without a downloaded row belongs to full enumeration"
+        );
+        let old_filename = old_path.file_name().and_then(|name| name.to_str()).unwrap();
+        let identity_path = old_path.with_file_name(paths::insert_asset_identity_suffix(
+            old_filename,
+            asset.state_id(),
+        ));
+        assert!(
+            !identity_path.exists(),
+            "owned path must not create a sibling"
+        );
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(old_path.as_path())
+        );
+
+        let mut new_config = test_config();
+        new_config.directory = Arc::from(new_dir.path());
+        new_config.state_db = Some(db.clone());
+        let expected_path = filter::expected_paths_for(&asset, &new_config)
             .into_iter()
             .next()
             .unwrap()
             .path;
 
-        let result = reconcile_catalog_paths(&passes, Arc::new(config), CancellationToken::new())
-            .await
-            .expect("path reconciliation");
+        let result =
+            reconcile_catalog_paths(&passes, Arc::new(new_config), CancellationToken::new())
+                .await
+                .expect("path reconciliation");
 
         assert!(result.complete);
         assert_eq!(result.stats.downloaded, 1);
-        assert_eq!(tokio::fs::read(&old_path).await.unwrap(), b"catalog bytes");
+        assert_eq!(tokio::fs::read(&old_path).await.unwrap(), vec![7u8; 1024]);
         assert_eq!(
             tokio::fs::read(&expected_path).await.unwrap(),
-            b"catalog bytes"
+            vec![7u8; 1024]
         );
         let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(
@@ -14140,6 +14382,199 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_keeps_owned_identity_collision_path() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("download dir");
+        let records =
+            mock_photo_records_for_zone_with_filename("OWNED_IDENTITY", "PrimarySync", "owned.jpg");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let bare_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .unwrap()
+            .path;
+        let filename = bare_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let identity_path = bare_path.with_file_name(paths::insert_asset_identity_suffix(
+            filename,
+            asset.state_id(),
+        ));
+        let ordinal_path = bare_path.with_file_name(paths::insert_asset_identity_ordinal_suffix(
+            filename,
+            asset.state_id(),
+            2,
+        ));
+        tokio::fs::create_dir_all(bare_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&bare_path, vec![1u8; 1024]).await.unwrap();
+        tokio::fs::write(&identity_path, vec![7u8; 1024])
+            .await
+            .unwrap();
+        let local_checksum = file::compute_sha256(&identity_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("OWNED_IDENTITY")
+            .filename("owned.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "OWNED_IDENTITY",
+            "original",
+            &identity_path,
+            &local_checksum,
+            Some("provider-checksum"),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-OWNED_IDENTITY", "OWNED_IDENTITY")
+            .await
+            .unwrap();
+
+        let result =
+            reconcile_catalog_paths(&passes, Arc::new(config.clone()), CancellationToken::new())
+                .await
+                .expect("owned identity path reconciliation");
+
+        assert!(result.complete);
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(!ordinal_path.exists());
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(
+            downloaded[0].local_path.as_deref(),
+            Some(identity_path.as_path())
+        );
+
+        tokio::fs::write(&identity_path, []).await.unwrap();
+        let truncated =
+            reconcile_catalog_paths(&passes, Arc::new(config), CancellationToken::new())
+                .await
+                .expect("truncated owned path reconciliation");
+        assert!(!truncated.complete);
+        assert_eq!(truncated.stats.downloaded, 0);
+        assert!(!ordinal_path.exists());
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn path_reconciliation_changed_provider_version_requeues_without_copy() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("download dir");
+        let mut records = mock_photo_records_for_zone_with_filename(
+            "CHANGED_PROVIDER",
+            "PrimarySync",
+            "changed.jpg",
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(2048);
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let bare_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .unwrap()
+            .path;
+        tokio::fs::create_dir_all(bare_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&bare_path, vec![7u8; 1024]).await.unwrap();
+        let local_checksum = file::compute_sha256(&bare_path).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("CHANGED_PROVIDER")
+            .filename("changed.jpg")
+            .checksum("old-provider-checksum")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "CHANGED_PROVIDER",
+            "original",
+            &bare_path,
+            &local_checksum,
+            Some("old-provider-checksum"),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-CHANGED_PROVIDER", "CHANGED_PROVIDER")
+            .await
+            .unwrap();
+        db.mark_failed(
+            "PrimarySync",
+            "CHANGED_PROVIDER",
+            "original",
+            "prior transfer failure",
+        )
+        .await
+        .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "CHANGED_PROVIDER",
+            "original",
+            &bare_path,
+            &local_checksum,
+            Some("old-provider-checksum"),
+        )
+        .await
+        .unwrap();
+
+        let result = reconcile_catalog_paths(&passes, Arc::new(config), CancellationToken::new())
+            .await
+            .expect("changed provider reconciliation");
+
+        assert!(!result.complete);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(tokio::fs::read(&bare_path).await.unwrap(), vec![7u8; 1024]);
+        let entries = std::fs::read_dir(bare_path.parent().unwrap())
+            .unwrap()
+            .count();
+        assert_eq!(entries, 1, "changed provider bytes must not be copied");
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].download_attempts, 1,
+            "reconciliation detection must not consume another transfer attempt"
+        );
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some(PATH_RECONCILIATION_PROVIDER_CHANGED_REASON)
+        );
     }
 
     #[tokio::test]
@@ -18467,6 +18902,16 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_config_hash_different_created_date_bound() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.skip_created_before = Some("2026-01-01".to_string());
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
     fn test_compute_config_hash_different_albums() {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
@@ -18570,17 +19015,31 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_config_hash_different_recent_same_hash() {
+    fn test_compute_config_hash_different_recent() {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
             s.recent = Some(crate::cli::RecentLimit::Count(100));
         });
-        assert_eq!(
+        assert_ne!(
             compute_config_hash(&a),
             compute_config_hash(&b),
-            "recent is intentionally excluded from the config hash"
+            "loosening a recent limit must trigger full inventory reconciliation"
         );
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_recent_scope() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |s| {
+            s.recent = Some(crate::cli::RecentLimit::Count(100));
+            s.recent_scope = Some(crate::cli::RecentScope::Global);
+        });
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.recent = Some(crate::cli::RecentLimit::Count(100));
+            s.recent_scope = Some(crate::cli::RecentScope::PerFilter);
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
 
     #[test]
@@ -18602,28 +19061,6 @@ mod tests {
     // ── LivePhotoMode + filename_exclude filter tests ─────────────
 
     // ── exclude_asset_ids filter tests ─────────────────────────────
-
-    #[test]
-    fn test_hash_changes_on_live_photo_mode() {
-        let config1 = test_config();
-        let mut config2 = test_config();
-        config2.live_photo_mode = LivePhotoMode::Skip;
-        assert_ne!(
-            hash_download_config(&config1),
-            hash_download_config(&config2)
-        );
-    }
-
-    #[test]
-    fn test_hash_changes_on_filename_exclude() {
-        let config1 = test_config();
-        let mut config2 = test_config();
-        config2.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        assert_ne!(
-            hash_download_config(&config1),
-            hash_download_config(&config2)
-        );
-    }
 
     // ── requires_per_pass_paths predicate ──────────────────────────
 
@@ -18923,8 +19360,13 @@ mod tests {
         let config = test_config();
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "c3f2be1a9e394951",
+            hash, "c5c974018e8060d9",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
+        );
+        assert_eq!(
+            hash_legacy_download_config(&config),
+            "c3f2be1a9e394951",
+            "legacy hash changed -- matching stored hashes would no longer migrate safely"
         );
     }
 
@@ -18959,8 +19401,13 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "d327fda31e8bec04",
+            hash, "f4799f8b1ec4966d",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
+        );
+        assert_eq!(
+            hash_legacy_download_config(&config),
+            "d327fda31e8bec04",
+            "legacy hash changed -- matching stored hashes would no longer migrate safely"
         );
     }
 
