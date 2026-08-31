@@ -14,7 +14,7 @@ use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 use super::DownloadConfig;
 use super::filter::{
     DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, determine_media_type,
-    filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
+    filter_asset_to_tasks_with_proven_primary_path, is_asset_filtered, pre_ensure_asset_dir,
 };
 use super::paths;
 
@@ -35,10 +35,21 @@ impl TaskPlanner {
 
     /// Convert one asset into download tasks after applying the shared
     /// asset-level filters and path-aware on-disk checks.
+    #[cfg(test)]
     pub(super) async fn plan_asset(
         &mut self,
         asset: &PhotoAsset,
         config: &DownloadConfig,
+    ) -> AssetTaskPlan {
+        self.plan_asset_with_proven_primary_path(asset, config, None)
+            .await
+    }
+
+    pub(super) async fn plan_asset_with_proven_primary_path(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        proven_primary_path: Option<&Path>,
     ) -> AssetTaskPlan {
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return AssetTaskPlan {
@@ -49,8 +60,13 @@ impl TaskPlanner {
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
-        let tasks =
-            filter_asset_to_tasks(asset, config, &mut self.claimed_paths, &mut self.dir_cache);
+        let tasks = filter_asset_to_tasks_with_proven_primary_path(
+            asset,
+            config,
+            proven_primary_path,
+            &mut self.claimed_paths,
+            &mut self.dir_cache,
+        );
         let malformed_resource = if tasks.is_empty() {
             super::filter::malformed_no_task_resource(asset, config)
         } else {

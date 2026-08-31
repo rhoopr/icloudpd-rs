@@ -216,6 +216,7 @@ pub(super) fn take_matching_pending_retry_tasks<I>(
 
 struct PendingRetryPlanning<'a> {
     db: &'a dyn DownloadStore,
+    download_ctx: &'a super::DownloadContext,
     pass_configs: &'a [Arc<DownloadConfig>],
     pending_evidence: &'a FxHashMap<PendingRetryTarget, PendingRetryEvidence>,
     pending_targets: &'a mut FxHashSet<PendingRetryTarget>,
@@ -230,7 +231,21 @@ impl PendingRetryPlanning<'_> {
         let mut state_write_failed_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
         for (pass_index, pass_config) in self.pass_configs.iter().enumerate() {
-            let plan = self.task_planner.plan_asset(asset, pass_config).await;
+            let proven_primary_path = pipeline::state_proven_primary_path(
+                self.download_ctx,
+                pass_config,
+                asset,
+                self.task_planner,
+            )
+            .await;
+            let plan = self
+                .task_planner
+                .plan_asset_with_proven_primary_path(
+                    asset,
+                    pass_config,
+                    proven_primary_path.as_deref(),
+                )
+                .await;
             let targets: Vec<PendingRetryTarget> = self
                 .pending_targets
                 .iter()
@@ -661,6 +676,7 @@ pub(super) async fn build_pending_retry_download_tasks(
 
     let requested = pending_targets.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
+    let download_ctx = super::preload_download_context(config).await;
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
     let mut task_planner = planner::TaskPlanner::new();
@@ -713,6 +729,7 @@ pub(super) async fn build_pending_retry_download_tasks(
             RecordResolution::Present(asset) => {
                 PendingRetryPlanning {
                     db: db.as_ref(),
+                    download_ctx: download_ctx.as_ref(),
                     pass_configs: &pass_configs,
                     pending_evidence: &pending_evidence,
                     pending_targets: &mut pending_targets,
@@ -897,6 +914,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                     let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
                     PendingRetryPlanning {
                         db: db.as_ref(),
+                        download_ctx: download_ctx.as_ref(),
                         pass_configs: &pass_configs,
                         pending_evidence: &pending_evidence,
                         pending_targets: &mut pending_targets,
@@ -994,7 +1012,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::test_helpers::TestAssetRecord;
+    use crate::test_helpers::{TestAssetRecord, TestPhotoAsset};
 
     fn candidate(master: &str, asset: &str, checksum: &str, size: u64) -> PhotoAsset {
         PhotoAsset::new(
@@ -1021,6 +1039,104 @@ mod tests {
                 },
             }),
         )
+    }
+
+    #[tokio::test]
+    async fn pending_retry_new_live_photo_motion_uses_state_proven_bare_primary() {
+        let still_checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let motion_checksum = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+        let asset = TestPhotoAsset::new("PENDING_LIVE_ENABLE")
+            .filename("IMG_0100.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(32)
+            .orig_checksum(still_checksum)
+            .live_photo(
+                "https://p01.icloud-content.com/IMG_0100.MOV",
+                motion_checksum,
+                24,
+            )
+            .build();
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let derived_paths = filter::derive_expected_paths(&asset, &config);
+        let still_path = derived_paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path
+            .clone();
+        let motion_path = derived_paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap()
+            .path
+            .clone();
+        tokio::fs::create_dir_all(still_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&still_path, vec![7u8; 32]).await.unwrap();
+        let local_checksum = file::compute_sha256(&still_path).await.unwrap();
+        let still_record = TestAssetRecord::new(asset.state_id())
+            .filename("IMG_0100.HEIC")
+            .checksum(still_checksum)
+            .size(32)
+            .build();
+        db.upsert_seen(&still_record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            asset.state_id(),
+            VersionSizeKey::Original.as_str(),
+            &still_path,
+            &local_checksum,
+            Some(still_checksum),
+        )
+        .await
+        .unwrap();
+        let motion_record = TestAssetRecord::new(asset.state_id())
+            .version_size(VersionSizeKey::LiveOriginal)
+            .filename(
+                motion_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap(),
+            )
+            .checksum(motion_checksum)
+            .size(24)
+            .build();
+        db.upsert_seen(&motion_record).await.unwrap();
+
+        let target = PendingRetryTarget::from_record(&motion_record);
+        let mut pending_targets = FxHashSet::from_iter([target.clone()]);
+        let pending_evidence =
+            FxHashMap::from_iter([(target, PendingRetryEvidence::from_record(&motion_record))]);
+        let pass_configs = vec![Arc::new(config)];
+        let download_ctx = super::super::preload_download_context(&pass_configs[0]).await;
+        let mut task_planner = planner::TaskPlanner::new();
+        let mut tasks = Vec::new();
+        let mut retry_sources = FxHashMap::default();
+
+        PendingRetryPlanning {
+            db: db.as_ref(),
+            download_ctx: download_ctx.as_ref(),
+            pass_configs: &pass_configs,
+            pending_evidence: &pending_evidence,
+            pending_targets: &mut pending_targets,
+            task_planner: &mut task_planner,
+            tasks: &mut tasks,
+            retry_sources: &mut retry_sources,
+        }
+        .plan_resolved_asset(&asset, asset.state_id())
+        .await
+        .unwrap();
+
+        assert!(pending_targets.is_empty());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].version_size, VersionSizeKey::LiveOriginal);
+        assert_eq!(tasks[0].download_path, motion_path);
     }
 
     #[tokio::test]

@@ -580,6 +580,22 @@ where
             DownloadConfigHashOutcome::Unchanged
         }
         Ok(Some(stored)) if stored == legacy_hash => {
+            match db.has_downloaded_live_photo_videos().await {
+                Ok(false) => {}
+                Ok(true) => {
+                    tracing::info!(
+                        "Legacy download path hash includes Live Photo videos; staging local reconciliation"
+                    );
+                    return stage_download_config_hash_reconciliation(db, current_hash).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to inspect downloaded Live Photo videos for path hash migration"
+                    );
+                    return DownloadConfigHashOutcome::ReadFailed;
+                }
+            }
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
                     metadata_updates: vec![(
@@ -610,26 +626,36 @@ where
             tracing::info!(
                 "Download path config changed since last sync; preserving provider checkpoints and staging local reconciliation"
             );
-            if let Err(e) = db
-                .set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, current_hash)
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to stage pending download config_hash");
-                DownloadConfigHashOutcome::TokenPurgeFailed
-            } else {
-                if let Err(e) = db
-                    .set_metadata(LAST_RECOVERY_ACTION_KEY, "reconcile_local_paths")
-                    .await
-                {
-                    tracing::debug!(error = %e, "Failed to persist local path reconciliation state");
-                }
-                DownloadConfigHashOutcome::Changed
-            }
+            stage_download_config_hash_reconciliation(db, current_hash).await
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to read download config_hash");
             DownloadConfigHashOutcome::ReadFailed
         }
+    }
+}
+
+async fn stage_download_config_hash_reconciliation<D>(
+    db: &D,
+    current_hash: &str,
+) -> DownloadConfigHashOutcome
+where
+    D: state::SyncTokenStore + ?Sized,
+{
+    if let Err(e) = db
+        .set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, current_hash)
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to stage pending download config_hash");
+        DownloadConfigHashOutcome::TokenPurgeFailed
+    } else {
+        if let Err(e) = db
+            .set_metadata(LAST_RECOVERY_ACTION_KEY, "reconcile_local_paths")
+            .await
+        {
+            tracing::debug!(error = %e, "Failed to persist local path reconciliation state");
+        }
+        DownloadConfigHashOutcome::Changed
     }
 }
 
@@ -710,6 +736,7 @@ pub(crate) async fn run_cycle(
     // incremental mode. Path-only drift keeps source tracking incremental;
     // the pending marker drives separate catalog/targeted rehydration work.
     if !config.runtime.dry_run
+        && download_controls.run_mode.downloads_files()
         && let (Some(db), Some(first_library)) = (state_db, library_states.first())
     {
         let probe_config = build_download_config(

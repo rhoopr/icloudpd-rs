@@ -1670,9 +1670,20 @@ fn resolve_download_path(
 /// in the same download session, preventing race conditions where two assets
 /// with the same filename both see "file doesn't exist" during concurrent downloads.
 /// Caller must check [`is_asset_filtered`] first.
+#[cfg(test)]
 pub(super) fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
+    claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
+    dir_cache: &mut paths::DirCache,
+) -> Vec<DownloadTask> {
+    filter_asset_to_tasks_with_proven_primary_path(asset, config, None, claimed_paths, dir_cache)
+}
+
+pub(super) fn filter_asset_to_tasks_with_proven_primary_path(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    proven_primary_path: Option<&Path>,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> Vec<DownloadTask> {
@@ -1732,7 +1743,9 @@ pub(super) fn filter_asset_to_tasks(
             version_size,
             check_ampm_on_disk,
         } = d;
-        let primary_resolution = {
+        let primary_resolution = if let Some(proven_path) = proven_primary_path {
+            PathResolution::Skip(proven_path.to_path_buf())
+        } else {
             let mut rctx = ResolveContext {
                 config,
                 created_local: &ctx.created_local,

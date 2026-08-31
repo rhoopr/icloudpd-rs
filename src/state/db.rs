@@ -616,6 +616,14 @@ pub trait SyncTokenStore: Send + Sync {
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
+    async fn has_downloaded_live_photo_videos(&self) -> Result<bool, StateError> {
+        Err(StateError::Invariant {
+            operation: "has_downloaded_live_photo_videos",
+            detail:
+                "downloaded Live Photo video migration query is not implemented by this state store"
+                    .into(),
+        })
+    }
     async fn commit_checkpoint_transition(
         &self,
         _transition: CheckpointTransition,
@@ -2920,6 +2928,19 @@ impl SqliteStateDb {
             .map_err(|e| StateError::query("get_downloaded_file_records", e))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StateError::query("get_downloaded_file_records", e))
+        })
+        .await
+    }
+
+    pub(crate) async fn has_downloaded_live_photo_videos(&self) -> Result<bool, StateError> {
+        self.with_conn("has_downloaded_live_photo_videos", move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets \
+                 WHERE status = 'downloaded' AND media_type = 'live_photo_video' LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query("has_downloaded_live_photo_videos", e))
         })
         .await
     }
@@ -5625,6 +5646,10 @@ impl SyncTokenStore for SqliteStateDb {
         SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
     }
 
+    async fn has_downloaded_live_photo_videos(&self) -> Result<bool, StateError> {
+        SqliteStateDb::has_downloaded_live_photo_videos(self).await
+    }
+
     async fn commit_checkpoint_transition(
         &self,
         transition: CheckpointTransition,
@@ -8141,6 +8166,31 @@ mod tests {
             downloaded.download_checksum.as_deref(),
             Some("download-checksum")
         );
+    }
+
+    #[tokio::test]
+    async fn downloaded_live_photo_video_query_only_counts_downloaded_motion_rows() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        assert!(!db.has_downloaded_live_photo_videos().await.unwrap());
+
+        let pending = TestAssetRecord::new("PENDING_LIVE_VIDEO")
+            .version_size(VersionSizeKey::LiveOriginal)
+            .media_type(MediaType::LivePhotoVideo)
+            .build();
+        db.upsert_seen(&pending).await.unwrap();
+        assert!(!db.has_downloaded_live_photo_videos().await.unwrap());
+
+        db.mark_downloaded(
+            "PrimarySync",
+            "PENDING_LIVE_VIDEO",
+            VersionSizeKey::LiveOriginal.as_str(),
+            Path::new("IMG_0001_HEVC.MOV"),
+            "local-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db.has_downloaded_live_photo_videos().await.unwrap());
     }
 
     #[tokio::test]

@@ -172,8 +172,13 @@ The download config hash contains only fields that can change a rendered local
 path for an already-downloaded version. Eligibility and version-selection
 fields, including date bounds, recent limits, media selection, resolution, and
 Live Photo mode, live only in the enumeration hash. A matching legacy mixed
-hash is promoted to the path-only shape without reconciliation; a genuine path
-change still stages reconciliation without discarding provider cursors.
+v2 hash is promoted to the current path-only shape without reconciliation only
+when no downloaded Live Photo video rows exist. A v2 catalogue with downloaded
+Live Photo videos, an older path-only hash, or a genuine path change stages
+reconciliation without discarding provider cursors.
+Path-hash staging, reconciliation, and promotion run only in download mode.
+Print-only and dry-run planning use catalogue and filesystem evidence without
+mutating path-hash metadata, catalogue rows, or local files.
 
 Path reconciliation resolves only versions with downloaded catalog rows. It
 recognises exact, AM/PM-equivalent, size-suffixed, and identity-suffixed paths
@@ -182,6 +187,14 @@ collide with its own file. Newly eligible versions remain the following full
 enumeration's responsibility. A changed provider checksum or size is requeued
 for download rather than copying stale local bytes. Reconciliation-detected
 retry work does not consume a download attempt before a transfer is made.
+Normal full and incremental planning applies the same proof before primary
+collision handling: the selected primary version, effective library, provider
+checksum, recorded collision family, regular-file type, and recorded integrity
+must all match. The planner then skips that exact primary path and derives a
+Live Photo companion from its actual filename. Content equality alone never
+establishes ownership. Motion collision-family checks accept the bare motion
+family, direct motion identity collisions, and the companion paired with that
+proven primary filename rather than hypothetical primary collision stems.
 Selected smart folders are never resolved from historical membership rows.
 They require an explicit successful fresh-query marker from the normal sync
 flow before the pending path hash can be promoted. Interruption, refresh

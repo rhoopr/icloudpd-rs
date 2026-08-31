@@ -4468,7 +4468,7 @@ mod tests {
         let build_download_config =
             make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
 
-        run_cycle(
+        Box::pin(run_cycle(
             &states,
             &config,
             Some(db.as_ref()),
@@ -4477,7 +4477,7 @@ mod tests {
             controls,
             &shared_session,
             &CancellationToken::new(),
-        )
+        ))
         .await
         .expect("run cycle")
     }
@@ -7422,7 +7422,7 @@ mod tests {
         );
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
-        run_cycle(
+        Box::pin(run_cycle(
             &states,
             &config,
             Some(db.as_ref()),
@@ -7431,7 +7431,7 @@ mod tests {
             controls,
             &shared_session,
             &CancellationToken::new(),
-        )
+        ))
         .await
         .expect("run cycle")
     }
@@ -8958,6 +8958,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_v3_hash_print_only_preserves_path_state() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let local_path = download_dir.path().join("tracked.jpg");
+        std::fs::write(&local_path, b"tracked bytes").expect("seed tracked file");
+        let record = crate::test_helpers::TestAssetRecord::new("PRINT_V3")
+            .filename("tracked.jpg")
+            .checksum("provider-checksum")
+            .size(13)
+            .build();
+        db.upsert_seen(&record).await.expect("seed tracked row");
+        db.mark_downloaded(
+            "PrimarySync",
+            "PRINT_V3",
+            state::VersionSizeKey::Original.as_str(),
+            &local_path,
+            "local-checksum",
+            Some("provider-checksum"),
+        )
+        .await
+        .expect("mark tracked row downloaded");
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "c5c974018e8060d9")
+            .await
+            .expect("seed v3 path hash");
+        db.set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, "existing-pending-hash")
+            .await
+            .expect("seed pending path hash");
+        let state_before = format!("{:?}", db.get_downloaded_page(0, 10).await.unwrap());
+        let file_before = std::fs::read(&local_path).expect("read tracked file");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_empty_full_album("zone-tok-print"),
+        );
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::new(
+                download::DownloadRunMode::PrintFilenames,
+                download::DownloadReporting::hidden(),
+            ),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run print-only v3 cycle");
+
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("c5c974018e8060d9")
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("existing-pending-hash")
+        );
+        assert_eq!(
+            format!("{:?}", db.get_downloaded_page(0, 10).await.unwrap()),
+            state_before
+        );
+        assert_eq!(std::fs::read(&local_path).unwrap(), file_before);
+    }
+
+    #[tokio::test]
     async fn run_cycle_multi_pass_persists_base_download_config_hash() {
         let config = make_run_cycle_config();
         let db = make_state_db();
@@ -10094,7 +10171,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_config_legacy_hash_migrates_without_reconciliation() {
+    async fn download_config_v3_hash_stages_reconciliation() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        let config = download::DownloadConfig::test_default();
+        let current_hash = download::hash_download_config(&config);
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "c5c974018e8060d9")
+            .await
+            .unwrap();
+
+        let outcome = check_download_config_hash_for_cycle(
+            &db,
+            &current_hash,
+            &download::hash_legacy_download_config(&config),
+        )
+        .await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Changed);
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("c5c974018e8060d9")
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(current_hash.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_v2_hash_without_live_photo_video_migrates_directly() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-current-hash")
             .await
@@ -10123,6 +10233,60 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-keep")
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_v2_hash_with_live_photo_video_stages_reconciliation() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-current-hash")
+            .await
+            .unwrap();
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")
+            .await
+            .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("LIVE_HASH_MIGRATION")
+            .version_size(state::VersionSizeKey::LiveOriginal)
+            .media_type(state::MediaType::LivePhotoVideo)
+            .filename("IMG_0001_HEVC.MOV")
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "LIVE_HASH_MIGRATION",
+            state::VersionSizeKey::LiveOriginal.as_str(),
+            std::path::Path::new("IMG_0001_HEVC.MOV"),
+            "local-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let outcome =
+            check_download_config_hash_for_cycle(&db, "current-path-hash", "legacy-current-hash")
+                .await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Changed);
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("legacy-current-hash")
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current-path-hash")
         );
         assert_eq!(
             db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))

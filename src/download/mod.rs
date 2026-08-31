@@ -805,7 +805,7 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 /// field changing. That forces existing state to revalidate on disk instead
 /// of trusting paths derived under older code.
 const LEGACY_PATH_DERIVATION_HASH_VERSION: u8 = 2;
-const PATH_DERIVATION_HASH_VERSION: u8 = 3;
+const PATH_DERIVATION_HASH_VERSION: u8 = 4;
 const ENUMERATION_SAFETY_HASH_VERSION: u8 = 2;
 pub(crate) const DOWNLOAD_CONFIG_HASH_KEY: &str = "config_hash";
 
@@ -2254,6 +2254,24 @@ impl DownloadContext {
             .and_then(|versions| versions.get(version_size.as_str()))
     }
 
+    fn downloaded_file_matching_checksum(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+        provider_checksum: &str,
+    ) -> Option<&RecordedLocalFile> {
+        let stored_checksum = self
+            .downloaded_checksums
+            .get(library)
+            .and_then(|assets| assets.get(asset_id))
+            .and_then(|versions| versions.get(version_size.as_str()))?;
+        if provider_checksum.is_empty() || stored_checksum.as_ref() != provider_checksum {
+            return None;
+        }
+        self.downloaded_file(library, asset_id, version_size)
+    }
+
     fn pending_file(
         &self,
         library: &str,
@@ -3579,6 +3597,7 @@ async fn reconcile_catalog_paths_inner(
                 .await?);
     let selection_complete = album_membership_complete;
     let batch = provider_pass.album.resolve_records(&requests).await;
+    let download_ctx = preload_download_context(&config).await;
     let mut task_planner = planner::TaskPlanner::new();
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
@@ -3608,7 +3627,20 @@ async fn reconcile_catalog_paths_inner(
                         continue;
                     }
                     let derived_paths = filter::derive_expected_paths(&asset, pass_config.as_ref());
-                    let plan = task_planner.plan_asset(&asset, pass_config).await;
+                    let proven_primary_path = pipeline::state_proven_primary_path(
+                        &download_ctx,
+                        pass_config,
+                        &asset,
+                        &mut task_planner,
+                    )
+                    .await;
+                    let plan = task_planner
+                        .plan_asset_with_proven_primary_path(
+                            &asset,
+                            pass_config,
+                            proven_primary_path.as_deref(),
+                        )
+                        .await;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -3632,6 +3664,7 @@ async fn reconcile_catalog_paths_inner(
                                     derived,
                                     &derived_paths,
                                     pass_config,
+                                    proven_primary_path.as_deref(),
                                     recorded_path,
                                 );
                             if !provider_version_is_current || !matches_current_family {
@@ -3985,6 +4018,7 @@ async fn build_retry_download_tasks(
     let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
     let requested_count = pending_keys.len();
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
+    let download_ctx = preload_download_context(config).await;
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested_count);
     let mut task_planner = planner::TaskPlanner::new();
 
@@ -4009,7 +4043,20 @@ async fn build_retry_download_tasks(
                 continue;
             };
             let asset = asset.clone().with_state_record_name(Arc::clone(state_id));
-            let plan = task_planner.plan_asset(&asset, pass_config).await;
+            let proven_primary_path = pipeline::state_proven_primary_path(
+                &download_ctx,
+                pass_config,
+                &asset,
+                &mut task_planner,
+            )
+            .await;
+            let plan = task_planner
+                .plan_asset_with_proven_primary_path(
+                    &asset,
+                    pass_config,
+                    proven_primary_path.as_deref(),
+                )
+                .await;
             if plan.filter_reason.is_some() {
                 continue;
             }
@@ -4052,6 +4099,11 @@ async fn build_incremental_expired_url_retry_tasks(
     let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
     let requested_count = pending_keys.len();
     let mut pass_indices_by_asset: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
+    let download_ctx = if let Some(config) = pass_configs.first() {
+        preload_download_context(config).await
+    } else {
+        Arc::new(DownloadContext::default())
+    };
 
     for task in failed_tasks {
         let key = RetryTaskKey::from(task);
@@ -4131,7 +4183,20 @@ async fn build_incremental_expired_url_retry_tasks(
                     let Some(pass_config) = pass_configs.get(pass_index) else {
                         continue;
                     };
-                    let plan = task_planner.plan_asset(&asset, pass_config).await;
+                    let proven_primary_path = pipeline::state_proven_primary_path(
+                        &download_ctx,
+                        pass_config,
+                        &asset,
+                        &mut task_planner,
+                    )
+                    .await;
+                    let plan = task_planner
+                        .plan_asset_with_proven_primary_path(
+                            &asset,
+                            pass_config,
+                            proven_primary_path.as_deref(),
+                        )
+                        .await;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -8627,7 +8692,20 @@ async fn download_photos_incremental_collecting_inner(
         )]
         let effective_config = &pass_configs[*pass_index];
 
-        let mut plan = task_planner.plan_asset(asset, effective_config).await;
+        let proven_primary_path = pipeline::state_proven_primary_path(
+            &download_ctx,
+            effective_config,
+            asset,
+            &mut task_planner,
+        )
+        .await;
+        let mut plan = task_planner
+            .plan_asset_with_proven_primary_path(
+                asset,
+                effective_config,
+                proven_primary_path.as_deref(),
+            )
+            .await;
         if let Some(reason) = plan.filter_reason {
             skip_breakdown.record_filter_reason(reason);
             continue;
@@ -8665,6 +8743,7 @@ async fn download_photos_incremental_collecting_inner(
                         asset,
                         &task,
                         &mut task_planner,
+                        proven_primary_path.as_deref(),
                     )
                     .await
                     .is_some();
@@ -8809,6 +8888,35 @@ async fn download_photos_incremental_collecting_inner(
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
         // Don't advance the sync token — this is a read-only operation.
+        return Ok(SyncResult {
+            outcome: if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
+                DownloadOutcome::PartialFailure {
+                    failed_count: enumeration_errors + delta_summary.state_transition_failures,
+                }
+            } else {
+                DownloadOutcome::Success
+            },
+            sync_token: None,
+            stats,
+            full_enumeration_ran: false,
+        });
+    }
+
+    if controls.run_mode.is_dry_run() {
+        for task in &tasks {
+            tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
+        }
+        let mut stats = SyncStats {
+            downloaded: tasks.len(),
+            skipped: skip_breakdown,
+            enumeration_errors,
+            state_write_failures: delta_summary.state_transition_failures,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            ..SyncStats::default()
+        };
+        if let Some(reason) = delta_summary.token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
         return Ok(SyncResult {
             outcome: if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
                 DownloadOutcome::PartialFailure {
@@ -9194,6 +9302,141 @@ mod tests {
             out[0].url.as_ref(),
             "https://p01.icloud-content.com/fresh-a"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_retry_replanning_matches_state_proven_live_photo_motion_path() {
+        let still_checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let motion_checksum = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+        let fresh_url = "https://p01.icloud-content.com/fresh-live-motion.mov";
+        let mut records = incremental_photo_records_with_url(
+            "RETRY_LIVE_ENABLE",
+            "IMG_0200.HEIC",
+            "https://p01.icloud-content.com/still.heic",
+            32,
+        );
+        records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
+        records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(still_checksum);
+        records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+            "downloadURL": fresh_url,
+            "size": 24,
+            "fileChecksum": motion_checksum,
+        }});
+        records[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value": "com.apple.quicktime-movie"});
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let state_id = asset.asset_record_name().to_string();
+        let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.live_photo_mode = LivePhotoMode::Both;
+        let config = Arc::new(config);
+        let derived_paths = filter::derive_expected_paths(&asset, config.as_ref());
+        let still_path = derived_paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path
+            .clone();
+        let motion_path = derived_paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap()
+            .path
+            .clone();
+        tokio::fs::create_dir_all(still_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&still_path, vec![7u8; 32]).await.unwrap();
+        let local_checksum = file::compute_sha256(&still_path).await.unwrap();
+        let still_record = TestAssetRecord::new(&state_id)
+            .filename("IMG_0200.HEIC")
+            .checksum(still_checksum)
+            .size(32)
+            .build();
+        db.upsert_seen(&still_record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            &state_id,
+            VersionSizeKey::Original.as_str(),
+            &still_path,
+            &local_checksum,
+            Some(still_checksum),
+        )
+        .await
+        .unwrap();
+
+        let download_ctx = preload_download_context(&config).await;
+        let mut task_planner = planner::TaskPlanner::new();
+        let proven_primary_path =
+            pipeline::state_proven_primary_path(&download_ctx, &config, &asset, &mut task_planner)
+                .await;
+        let mut failed = task_planner
+            .plan_asset_with_proven_primary_path(&asset, &config, proven_primary_path.as_deref())
+            .await
+            .tasks
+            .into_iter()
+            .find(|task| task.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap();
+        failed.url = "https://p01.icloud-content.com/stale-live-motion.mov".into();
+        assert_eq!(failed.download_path, motion_path);
+
+        let full_passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album(
+                "Library",
+                MockPhotosFlow::new()
+                    .album_count(1)
+                    .query_page(records.clone(), Some("full-token"))
+                    .build(),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let full_retry = build_retry_download_tasks(
+            &full_passes,
+            &config,
+            std::slice::from_ref(&failed),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(full_retry.len(), 1);
+        assert_eq!(full_retry[0].download_path, motion_path);
+        assert_eq!(full_retry[0].url.as_ref(), fresh_url);
+
+        let incremental_passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album(
+                "Library",
+                MockPhotosFlow::new()
+                    .changes_zone_page(records, "incremental-token", false)
+                    .build(),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let retry_sources = FxHashMap::from_iter([(
+            RetryTaskKey::from(&failed),
+            UrlRetrySource {
+                asset_record_name: asset.asset_record_name_arc(),
+                pass_index: 0,
+            },
+        )]);
+        let incremental_retry = build_incremental_expired_url_retry_tasks(
+            &incremental_passes,
+            &[Arc::clone(&config)],
+            &retry_sources,
+            &[failed],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(incremental_retry.len(), 1);
+        assert_eq!(incremental_retry[0].download_path, motion_path);
+        assert_eq!(incremental_retry[0].url.as_ref(), fresh_url);
     }
 
     #[test]
@@ -14550,6 +14793,137 @@ mod tests {
         assert_eq!(summary.failed, 1);
     }
 
+    #[tokio::test]
+    async fn path_reconciliation_corrects_motion_name_from_state_proven_primary() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("download dir");
+        let mut records = mock_photo_records_for_zone_with_filename(
+            "RECONCILE_LIVE_NAME",
+            "PrimarySync",
+            "reconcile-live.heic",
+        );
+        records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/RECONCILE_LIVE_NAME.mov",
+            "size": 2048,
+            "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        records[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value": "com.apple.quicktime-movie"});
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let capture_timestamp = asset.created_local().timestamp();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session(
+                "PrimarySync",
+                "",
+                Box::new(PendingLookupSession {
+                    records: Arc::new(records),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let expected = filter::expected_paths_for(&asset, &config);
+        let primary_path = expected
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path
+            .clone();
+        let corrected_motion_path = expected
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap()
+            .path
+            .clone();
+        let wrong_motion_path =
+            corrected_motion_path.with_file_name("reconcile-live-RECONCILE_LIVE_NAME_HEVC.MOV");
+        tokio::fs::create_dir_all(primary_path.parent().unwrap())
+            .await
+            .unwrap();
+        let primary_bytes = vec![7u8; 1024];
+        let motion_bytes = vec![8u8; 2048];
+        tokio::fs::write(&primary_path, &primary_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(&wrong_motion_path, &motion_bytes)
+            .await
+            .unwrap();
+        let primary_local_checksum = file::compute_sha256(&primary_path).await.unwrap();
+        let motion_local_checksum = file::compute_sha256(&wrong_motion_path).await.unwrap();
+        let primary_record = TestAssetRecord::new("RECONCILE_LIVE_NAME")
+            .filename("reconcile-live.heic")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(primary_bytes.len() as u64)
+            .media_type(crate::state::MediaType::LivePhotoImage)
+            .build();
+        db.upsert_seen(&primary_record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "RECONCILE_LIVE_NAME",
+            VersionSizeKey::Original.as_str(),
+            &primary_path,
+            &primary_local_checksum,
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        )
+        .await
+        .unwrap();
+        let motion_record = TestAssetRecord::new("RECONCILE_LIVE_NAME")
+            .version_size(VersionSizeKey::LiveOriginal)
+            .filename("reconcile-live-RECONCILE_LIVE_NAME_HEVC.MOV")
+            .checksum("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
+            .size(motion_bytes.len() as u64)
+            .media_type(crate::state::MediaType::LivePhotoVideo)
+            .build();
+        db.upsert_seen(&motion_record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "RECONCILE_LIVE_NAME",
+            VersionSizeKey::LiveOriginal.as_str(),
+            &wrong_motion_path,
+            &motion_local_checksum,
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-RECONCILE_LIVE_NAME",
+            "RECONCILE_LIVE_NAME",
+        )
+        .await
+        .unwrap();
+
+        let result = reconcile_catalog_paths(&passes, Arc::new(config), CancellationToken::new())
+            .await
+            .expect("motion naming reconciliation");
+
+        assert!(result.complete);
+        assert_eq!(result.stats.downloaded, 1);
+        assert_file_capture_times(&corrected_motion_path, capture_timestamp);
+        assert_eq!(
+            tokio::fs::read(&corrected_motion_path).await.unwrap(),
+            motion_bytes
+        );
+        assert_eq!(
+            tokio::fs::read(&wrong_motion_path).await.unwrap(),
+            motion_bytes,
+            "reconciliation must retain the old motion path"
+        );
+        assert_eq!(tokio::fs::read(&primary_path).await.unwrap(), primary_bytes);
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        let motion = downloaded
+            .iter()
+            .find(|record| record.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap();
+        assert_eq!(
+            motion.local_path.as_deref(),
+            Some(corrected_motion_path.as_path())
+        );
+    }
+
     struct PathReconciliationFixture {
         db: Arc<crate::state::SqliteStateDb>,
         _old_dir: TempDir,
@@ -18117,6 +18491,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_collecting_new_live_photo_motion_uses_state_proven_bare_primary() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let still_body = vec![7u8; 32];
+        let motion_body = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".to_vec();
+        let still_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&still_body));
+        let motion_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&motion_body));
+        Mock::given(method("GET"))
+            .and(path("/incremental-still.heic"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(still_body.clone()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/incremental-motion.mov"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(motion_body.clone())
+                    .insert_header("content-type", "video/quicktime"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let still_url = format!("{}/incremental-still.heic", server.uri());
+        let motion_url = format!("{}/incremental-motion.mov", server.uri());
+        let mut records = incremental_photo_records_with_url(
+            "LIVE_ENABLE_INCREMENTAL",
+            "IMG_0002.HEIC",
+            &still_url,
+            still_body.len() as u64,
+        );
+        records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
+        records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(still_checksum.clone());
+        records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+            "downloadURL": motion_url,
+            "size": motion_body.len(),
+            "fileChecksum": motion_checksum,
+        }});
+        records[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value": "com.apple.quicktime-movie"});
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.id())
+            .await
+            .unwrap();
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.state_db = Some(db.clone());
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        let image_only_paths = filter::expected_paths_for(&asset, &config);
+        let still_path = image_only_paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path
+            .clone();
+        assert_eq!(image_only_paths.len(), 1);
+        config.live_photo_mode = LivePhotoMode::Both;
+        let motion_path = filter::expected_paths_for(&asset, &config)
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap()
+            .path
+            .clone();
+        tokio::fs::create_dir_all(still_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&still_path, &still_body).await.unwrap();
+        let local_checksum = file::compute_sha256(&still_path).await.unwrap();
+        let state_id = asset.asset_record_name();
+        let state_record = TestAssetRecord::new(state_id)
+            .filename("IMG_0002.HEIC")
+            .checksum(&still_checksum)
+            .size(still_body.len() as u64)
+            .build();
+        db.upsert_seen(&state_record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            state_id,
+            VersionSizeKey::Original.as_str(),
+            &still_path,
+            &local_checksum,
+            Some(&still_checksum),
+        )
+        .await
+        .unwrap();
+
+        let make_passes = || {
+            vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: mock_album(
+                    "Library",
+                    MockPhotosFlow::new()
+                        .changes_zone_page(records.clone(), "zone-token-next", false)
+                        .build(),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }]
+        };
+        let config = Arc::new(config);
+        let printed = download_photos_incremental_collecting_inner(
+            &Client::new(),
+            &make_passes(),
+            &config,
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(printed.outcome, DownloadOutcome::Success));
+        assert_eq!(printed.sync_token, None);
+        assert!(!motion_path.exists());
+
+        let (capture, guard) = crate::test_helpers::TracingCapture::install();
+        let dry_run = download_photos_incremental_collecting_inner(
+            &Client::new(),
+            &make_passes(),
+            &config,
+            "zone-token-prev",
+            DownloadControls::dry_run_hidden(),
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        assert!(matches!(dry_run.outcome, DownloadOutcome::Success));
+        assert_eq!(dry_run.stats.downloaded, 1);
+        assert_eq!(dry_run.sync_token, None);
+        let dry_run_paths: Vec<String> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.message() == Some("[DRY RUN] Would download"))
+            .filter_map(|event| event.field("path").map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(dry_run_paths, vec![motion_path.display().to_string()]);
+        assert!(!motion_path.exists());
+        assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+
+        let first = download_photos_incremental_collecting_inner(
+            &Client::new(),
+            &make_passes(),
+            &config,
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(first.outcome, DownloadOutcome::Success));
+        assert_eq!(first.stats.downloaded, 1);
+        assert_eq!(tokio::fs::read(&motion_path).await.unwrap(), motion_body);
+        assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_body);
+        let still_filename = still_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        assert!(
+            !still_path
+                .with_file_name(paths::insert_asset_identity_suffix(
+                    still_filename,
+                    asset.state_id(),
+                ))
+                .exists()
+        );
+
+        let second = download_photos_incremental_collecting_inner(
+            &Client::new(),
+            &make_passes(),
+            &config,
+            "zone-token-next",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(second.outcome, DownloadOutcome::Success));
+        assert_eq!(second.stats.downloaded, 0);
+        assert_eq!(second.stats.failed, 0);
+        assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
@@ -19966,7 +20541,7 @@ mod tests {
         let config = test_config();
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "c5c974018e8060d9",
+            hash, "9ca2d918d6f42eb0",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
         assert_eq!(
@@ -20007,7 +20582,7 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "f4799f8b1ec4966d",
+            hash, "181b9ff6e81f4521",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
         assert_eq!(

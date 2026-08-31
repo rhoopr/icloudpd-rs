@@ -835,11 +835,61 @@ pub(super) async fn state_path_size_allows_skip(
     }
 }
 
+pub(super) async fn state_proven_primary_path(
+    ctx: &DownloadContext,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task_planner: &mut TaskPlanner,
+) -> Option<PathBuf> {
+    let derived_paths = derive_expected_paths(asset, config);
+    let primary = derived_paths
+        .iter()
+        .find(|derived| derived.version_size.is_primary_media())?;
+    let library = effective_asset_library(asset, config);
+    let recorded_file = ctx.downloaded_file_matching_checksum(
+        library,
+        asset.state_id(),
+        primary.version_size,
+        &primary.checksum,
+    )?;
+    if !stored_path_matches_current_collision_family(
+        asset.state_id(),
+        primary,
+        &derived_paths,
+        config,
+        None,
+        &recorded_file.path,
+    ) {
+        return None;
+    }
+
+    task_planner.prepare_path_parent(&recorded_file.path).await;
+    let (existing_path, existing_size) =
+        task_planner.existing_path_with_size(&recorded_file.path)?;
+    let metadata = tokio::fs::symlink_metadata(&existing_path).await.ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != existing_size
+        || !state_path_size_allows_skip(
+            asset.id(),
+            primary.version_size,
+            &existing_path,
+            existing_size,
+            primary.size,
+            recorded_file,
+        )
+        .await
+    {
+        return None;
+    }
+    Some(existing_path)
+}
+
 pub(super) fn stored_path_matches_current_collision_family(
     asset_id: &str,
     derived: &DerivedPath,
     derived_paths: &[DerivedPath],
     config: &DownloadConfig,
+    proven_primary_path: Option<&Path>,
     stored_path: &Path,
 ) -> bool {
     if stored_path.parent() != derived.path.parent() {
@@ -850,9 +900,15 @@ pub(super) fn stored_path_matches_current_collision_family(
         return false;
     };
 
-    collision_family_base_filenames(asset_id, derived, derived_paths, config)
-        .iter()
-        .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id))
+    collision_family_base_filenames(
+        asset_id,
+        derived,
+        derived_paths,
+        config,
+        proven_primary_path,
+    )
+    .iter()
+    .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id))
 }
 
 fn collision_family_base_filenames(
@@ -860,26 +916,39 @@ fn collision_family_base_filenames(
     derived: &DerivedPath,
     derived_paths: &[DerivedPath],
     config: &DownloadConfig,
+    proven_primary_path: Option<&Path>,
 ) -> Vec<String> {
-    let mut bases = vec![
-        derived.filename.clone(),
-        super::paths::add_dedup_suffix(&derived.filename, derived.size),
-        super::paths::insert_asset_identity_suffix(&derived.filename, asset_id),
-    ];
+    let mut bases = vec![derived.filename.clone()];
 
-    if derived.version_size.is_live_photo_motion()
-        && let Some(primary) = primary_derived_path(derived_paths)
-    {
-        let primary_collision_filenames = [
-            super::paths::add_dedup_suffix(&primary.filename, primary.size),
-            super::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
-        ];
-        for primary_filename in primary_collision_filenames {
+    if derived.version_size.is_live_photo_motion() {
+        if let Some(primary_filename) = proven_primary_path
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+        {
             bases.push(live_photo_motion_filename_for_primary(
-                &primary_filename,
+                primary_filename,
                 config,
             ));
+        } else if let Some(primary) = primary_derived_path(derived_paths) {
+            for primary_filename in [
+                super::paths::add_dedup_suffix(&primary.filename, primary.size),
+                super::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
+            ] {
+                bases.push(live_photo_motion_filename_for_primary(
+                    &primary_filename,
+                    config,
+                ));
+            }
         }
+    } else {
+        bases.push(super::paths::add_dedup_suffix(
+            &derived.filename,
+            derived.size,
+        ));
+        bases.push(super::paths::insert_asset_identity_suffix(
+            &derived.filename,
+            asset_id,
+        ));
     }
 
     bases.sort();
@@ -929,6 +998,7 @@ pub(super) async fn state_confirmed_current_path_exists(
     asset: &PhotoAsset,
     task: &DownloadTask,
     task_planner: &mut TaskPlanner,
+    proven_primary_path: Option<&Path>,
 ) -> Option<PathBuf> {
     let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
     let stored_path = &recorded_file.path;
@@ -969,6 +1039,7 @@ pub(super) async fn state_confirmed_current_path_exists(
             derived,
             &derived_paths,
             config,
+            proven_primary_path,
             stored_path,
         ) {
             continue;
@@ -990,6 +1061,35 @@ pub(super) async fn state_confirmed_current_path_exists(
     }
 
     None
+}
+
+async fn read_only_task_needs_download(
+    ctx: &DownloadContext,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task: &DownloadTask,
+    task_planner: &mut TaskPlanner,
+    proven_primary_path: Option<&Path>,
+) -> bool {
+    match ctx.should_download_fast(
+        &task.library,
+        &task.asset_id,
+        task.version_size,
+        &task.checksum,
+        false,
+    ) {
+        Some(needs_download) => needs_download,
+        None => state_confirmed_current_path_exists(
+            ctx,
+            config,
+            asset,
+            task,
+            task_planner,
+            proven_primary_path,
+        )
+        .await
+        .is_none(),
+    }
 }
 
 async fn record_seen_for_forwarded_task(
@@ -1288,13 +1388,12 @@ where
                     if is_asset_filtered(&asset, config.as_ref()).is_some() {
                         continue;
                     }
-                    // Fast-skip is path-blind; in `{album}` mode the same
-                    // asset legitimately lives at multiple paths, so we'd
-                    // under-report the listing if we trusted the DB here.
-                    // `album_name.is_some()` is the right signal because by
-                    // the time this runs, `with_album_name` has expanded
-                    // `{album}` out of `folder_structure` entirely.
-                    if config.album_name.is_none() {
+                    // Fast-skip is path-blind. Album passes can place one
+                    // asset at multiple paths, and Live Photos must validate
+                    // the stored companion against the proven primary family.
+                    // `album_name.is_some()` is the right album signal because
+                    // `with_album_name` has already expanded `{album}`.
+                    if config.album_name.is_none() && !asset.is_live_photo() {
                         let candidates = extract_skip_candidates(&asset, config.as_ref());
                         let library = effective_asset_library(&asset, config);
                         if !candidates.is_empty()
@@ -1315,7 +1414,16 @@ where
                         }
                     }
 
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let proven_primary_path =
+                        state_proven_primary_path(&download_ctx, config, &asset, &mut task_planner)
+                            .await;
+                    let plan = task_planner
+                        .plan_asset_with_proven_primary_path(
+                            &asset,
+                            config,
+                            proven_primary_path.as_deref(),
+                        )
+                        .await;
                     if let Some(resource) = &plan.malformed_resource {
                         enum_errors += 1;
                         tracing::error!(
@@ -1331,6 +1439,18 @@ where
                         reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
                     )]
                     for task in &plan.tasks {
+                        if !read_only_task_needs_download(
+                            &download_ctx,
+                            config,
+                            &asset,
+                            task,
+                            &mut task_planner,
+                            proven_primary_path.as_deref(),
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         #[cfg(test)]
                         printed_filenames.push(task.download_path.clone());
                         println!("{}", task.download_path.display());
@@ -1367,7 +1487,16 @@ where
             }
             match result {
                 Ok(asset) => {
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let proven_primary_path =
+                        state_proven_primary_path(&download_ctx, config, &asset, &mut task_planner)
+                            .await;
+                    let plan = task_planner
+                        .plan_asset_with_proven_primary_path(
+                            &asset,
+                            config,
+                            proven_primary_path.as_deref(),
+                        )
+                        .await;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -1381,10 +1510,24 @@ where
                         );
                         continue;
                     }
+                    let mut planned = 0;
                     for task in &plan.tasks {
+                        if !read_only_task_needs_download(
+                            &download_ctx,
+                            config,
+                            &asset,
+                            task,
+                            &mut task_planner,
+                            proven_primary_path.as_deref(),
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
+                        planned += 1;
                     }
-                    count += plan.tasks.len();
+                    count += planned;
                 }
                 Err(e) => {
                     enum_errors += 1;
@@ -1754,7 +1897,16 @@ where
                         }
                     }
 
-                    let plan = task_planner.plan_asset(&asset, config).await;
+                    let proven_primary_path =
+                        state_proven_primary_path(&download_ctx, config, &asset, &mut task_planner)
+                            .await;
+                    let plan = task_planner
+                        .plan_asset_with_proven_primary_path(
+                            &asset,
+                            config,
+                            proven_primary_path.as_deref(),
+                        )
+                        .await;
                     if let Some(reason) = plan.filter_reason {
                         skips.record_filter_reason(reason);
                         producer_pb.inc(1);
@@ -1955,6 +2107,7 @@ where
                                                 &asset,
                                                 &task,
                                                 &mut task_planner,
+                                                proven_primary_path.as_deref(),
                                             )
                                             .await
                                         {
@@ -5906,25 +6059,10 @@ mod tests {
             printed.printed_filenames
         );
 
-        let asset = make_asset();
-        let base_path = derive_expected_paths(&asset, config.as_ref())
-            .into_iter()
-            .next()
-            .expect("asset has an expected path")
-            .path;
-        let base_filename = base_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("expected path has a filename");
-        let expected_dry_run_path =
-            base_path.with_file_name(super::super::paths::insert_asset_identity_suffix(
-                base_filename,
-                asset.asset_record_name(),
-            ));
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let dry_run = stream_and_download_from_stream(
             &reqwest::Client::new(),
-            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(make_asset())]),
             &config,
             DownloadControls::dry_run_hidden(),
             1,
@@ -5932,15 +6070,15 @@ mod tests {
             StreamRuntime::new(None, None),
         )
         .await
-        .expect("dry-run sync should plan the child identity");
-        assert_eq!(dry_run.downloaded, 1);
-        let dry_run_path = capture
-            .events()
-            .into_iter()
-            .find(|event| event.message() == Some("[DRY RUN] Would download"))
-            .and_then(|event| event.field("path").map(ToOwned::to_owned))
-            .expect("dry-run path event");
-        assert_eq!(dry_run_path, expected_dry_run_path.display().to_string());
+        .expect("dry-run sync should recognize the downloaded child");
+        assert_eq!(dry_run.downloaded, 0);
+        assert!(
+            capture
+                .events()
+                .into_iter()
+                .all(|event| event.message() != Some("[DRY RUN] Would download")),
+            "dry-run must not report a collision path for downloaded child state"
+        );
     }
 
     #[tokio::test]
@@ -8070,6 +8208,288 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn live_photo_motion_collision_family_uses_proven_primary_stem() {
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        let asset = live_photo_collision_asset("LIVE_FAMILY");
+        let derived_paths = derive_expected_paths(&asset, &config);
+        let motion = derived_paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap();
+        let bare_primary = path_for_filename(&config, &asset, "IMG_0001.HEIC");
+        let bare_motion = path_for_filename(&config, &asset, "IMG_0001_HEVC.MOV");
+        let wrong_primary_collision =
+            path_for_filename(&config, &asset, "IMG_0001-LIVE_FAMILY_HEVC.MOV");
+        let direct_motion_collision =
+            path_for_filename(&config, &asset, "IMG_0001_HEVC-LIVE_FAMILY.MOV");
+        let identity_primary = path_for_filename(&config, &asset, "IMG_0001-LIVE_FAMILY.HEIC");
+        let paired_motion = path_for_filename(&config, &asset, "IMG_0001-LIVE_FAMILY_HEVC.MOV");
+
+        assert!(stored_path_matches_current_collision_family(
+            asset.state_id(),
+            motion,
+            &derived_paths,
+            &config,
+            Some(&bare_primary),
+            &bare_motion,
+        ));
+        assert!(!stored_path_matches_current_collision_family(
+            asset.state_id(),
+            motion,
+            &derived_paths,
+            &config,
+            Some(&bare_primary),
+            &wrong_primary_collision,
+        ));
+        assert!(stored_path_matches_current_collision_family(
+            asset.state_id(),
+            motion,
+            &derived_paths,
+            &config,
+            Some(&bare_primary),
+            &direct_motion_collision,
+        ));
+        assert!(stored_path_matches_current_collision_family(
+            asset.state_id(),
+            motion,
+            &derived_paths,
+            &config,
+            Some(&identity_primary),
+            &paired_motion,
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_streaming_new_live_photo_motion_uses_state_proven_bare_primary() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let still_body = vec![7u8; 32];
+        let motion_body = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".to_vec();
+        let still_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&still_body));
+        let motion_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&motion_body));
+        Mock::given(method("GET"))
+            .and(path("/still.heic"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(still_body.clone()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/motion.mov"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(motion_body.clone())
+                    .insert_header("content-type", "video/quicktime"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let still_url = format!("{}/still.heic", server.uri());
+        let motion_url = format!("{}/motion.mov", server.uri());
+        let asset = TestPhotoAsset::new("LIVE_ENABLE_FULL")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(still_body.len() as u64)
+            .orig_url(&still_url)
+            .orig_checksum(&still_checksum)
+            .live_photo(&motion_url, &motion_checksum, motion_body.len() as u64)
+            .build();
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.state_db = Some(db.clone());
+        config.live_photo_mode = crate::types::LivePhotoMode::ImageOnly;
+        let image_only_paths = derive_expected_paths(&asset, &config);
+        let still_path = image_only_paths
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path
+            .clone();
+        assert_eq!(image_only_paths.len(), 1);
+        config.live_photo_mode = crate::types::LivePhotoMode::Both;
+        let motion_path = derive_expected_paths(&asset, &config)
+            .iter()
+            .find(|path| path.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap()
+            .path
+            .clone();
+        let wrong_motion_path =
+            path_for_filename(&config, &asset, "IMG_0001-LIVE_ENABLE_FULL_HEVC.MOV");
+        let config = Arc::new(config);
+        tokio::fs::create_dir_all(still_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&still_path, &still_body).await.unwrap();
+        tokio::fs::write(&wrong_motion_path, &motion_body)
+            .await
+            .unwrap();
+        let local_checksum = super::super::file::compute_sha256(&still_path)
+            .await
+            .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new(asset.id())
+            .filename("IMG_0001.HEIC")
+            .checksum(&still_checksum)
+            .size(still_body.len() as u64)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            asset.id(),
+            VersionSizeKey::Original.as_str(),
+            &still_path,
+            &local_checksum,
+            Some(&still_checksum),
+        )
+        .await
+        .unwrap();
+        let motion_local_checksum = super::super::file::compute_sha256(&wrong_motion_path)
+            .await
+            .unwrap();
+        let motion_record = crate::test_helpers::TestAssetRecord::new(asset.id())
+            .filename("IMG_0001.MOV")
+            .checksum(&motion_checksum)
+            .size(motion_body.len() as u64)
+            .version_size(VersionSizeKey::LiveOriginal)
+            .media_type(crate::state::MediaType::LivePhotoVideo)
+            .build();
+        db.upsert_seen(&motion_record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            asset.id(),
+            VersionSizeKey::LiveOriginal.as_str(),
+            &wrong_motion_path,
+            &motion_local_checksum,
+            Some(&motion_checksum),
+        )
+        .await
+        .unwrap();
+        let state_before_print = format!("{:?}", db.get_downloaded_page(0, 10).await.unwrap());
+
+        let printed = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &config,
+            DownloadControls::new(
+                super::super::DownloadRunMode::PrintFilenames,
+                DownloadReporting::hidden(),
+            ),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(printed.printed_filenames, vec![motion_path.clone()]);
+        assert_eq!(
+            format!("{:?}", db.get_downloaded_page(0, 10).await.unwrap()),
+            state_before_print
+        );
+        assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_body);
+        assert_eq!(
+            tokio::fs::read(&wrong_motion_path).await.unwrap(),
+            motion_body
+        );
+        assert!(!motion_path.exists());
+        assert!(db.get_pending().await.unwrap().is_empty());
+
+        let (capture, guard) = crate::test_helpers::TracingCapture::install();
+        let dry_run = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &config,
+            DownloadControls::dry_run_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        assert_eq!(dry_run.downloaded, 1);
+        let dry_run_paths: Vec<String> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.message() == Some("[DRY RUN] Would download"))
+            .filter_map(|event| event.field("path").map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(dry_run_paths, vec![motion_path.display().to_string()]);
+        assert!(!motion_path.exists());
+        assert!(db.get_pending().await.unwrap().is_empty());
+
+        let first = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.downloaded, 1);
+        assert_eq!(tokio::fs::read(&motion_path).await.unwrap(), motion_body);
+        assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_body);
+        assert_eq!(
+            tokio::fs::read(&wrong_motion_path).await.unwrap(),
+            motion_body,
+            "correcting the motion path must retain the old file"
+        );
+        assert!(
+            !identity_suffixed_path_for(&still_path, asset.state_id()).exists(),
+            "enabling the MOV must not copy or re-download the proven still"
+        );
+
+        let printed = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &config,
+            DownloadControls::new(
+                super::super::DownloadRunMode::PrintFilenames,
+                DownloadReporting::hidden(),
+            ),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            printed.printed_filenames.is_empty(),
+            "a correctly tracked motion companion must print nothing"
+        );
+
+        let second = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.downloaded, 0);
+        assert!(second.failed.is_empty());
+        assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 2);
     }
 
     /// Regression for #594: a downloaded asset stored at an identity-suffixed
