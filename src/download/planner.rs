@@ -110,6 +110,20 @@ impl TaskPlanner {
         }
     }
 
+    pub(super) fn rebind_claimed_path(
+        &mut self,
+        planned_path: &Path,
+        replacement_path: &Path,
+        expected_size: u64,
+    ) {
+        let planned = NormalizedPath::normalize(planned_path);
+        if self.claimed_paths.get(planned.as_ref()) == Some(&expected_size) {
+            self.claimed_paths.remove(planned.as_ref());
+        }
+        self.claimed_paths
+            .insert(NormalizedPath::new(replacement_path), expected_size);
+    }
+
     pub(super) async fn claim_recorded_repair_path(
         &mut self,
         recorded_path: &Path,
@@ -461,6 +475,30 @@ mod tests {
                 .is_some_and(|name| name.contains("ON_DISK")),
             "same-size on-disk collision should use an identity path: {:?}",
             plan.tasks[0].download_path
+        );
+    }
+
+    #[test]
+    fn rebind_claimed_path_releases_the_abandoned_collision_path() {
+        let mut planner = TaskPlanner::new();
+        let abandoned = Path::new("/tmp/photo-ASSET.jpg");
+        let replacement = Path::new("/tmp/photo.jpg");
+        planner
+            .claimed_paths
+            .insert(NormalizedPath::new(abandoned), 1000);
+
+        planner.rebind_claimed_path(abandoned, replacement, 1000);
+
+        assert!(
+            !planner
+                .claimed_paths
+                .contains_key(NormalizedPath::normalize(abandoned).as_ref())
+        );
+        assert_eq!(
+            planner
+                .claimed_paths
+                .get(NormalizedPath::normalize(replacement).as_ref()),
+            Some(&1000)
         );
     }
 

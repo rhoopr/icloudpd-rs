@@ -3644,7 +3644,22 @@ async fn reconcile_catalog_paths_inner(
                     if plan.filter_reason.is_some() {
                         continue;
                     }
-                    for task in plan.tasks {
+                    for mut task in plan.tasks {
+                        if let Some(derived) = derived_paths
+                            .iter()
+                            .find(|derived| derived.version_size == task.version_size)
+                            && task.download_path != derived.path
+                            && tokio::fs::symlink_metadata(&derived.path)
+                                .await
+                                .is_ok_and(|metadata| !metadata.file_type().is_file())
+                        {
+                            task_planner.rebind_claimed_path(
+                                &task.download_path,
+                                &derived.path,
+                                task.size,
+                            );
+                            task.download_path = derived.path.clone();
+                        }
                         let target = PendingRetryTarget::from_task(&task);
                         let Some(record) = records_by_target.get(&target) else {
                             continue;
@@ -14793,8 +14808,11 @@ mod tests {
         assert_eq!(summary.failed, 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn path_reconciliation_corrects_motion_name_from_state_proven_primary() {
+        use std::os::unix::fs::symlink;
+
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let dir = TempDir::new().expect("download dir");
         let mut records = mock_photo_records_for_zone_with_filename(
@@ -14895,6 +14913,27 @@ mod tests {
         )
         .await
         .unwrap();
+
+        symlink(&wrong_motion_path, &corrected_motion_path).unwrap();
+        let blocked =
+            reconcile_catalog_paths(&passes, Arc::new(config.clone()), CancellationToken::new())
+                .await
+                .expect("motion naming reconciliation should report the linked target");
+        assert!(!blocked.complete);
+        assert_eq!(blocked.stats.failed, 1);
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        let motion = downloaded
+            .iter()
+            .find(|record| record.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap();
+        assert_eq!(
+            motion.local_path.as_deref(),
+            Some(wrong_motion_path.as_path())
+        );
+        assert!(corrected_motion_path.is_symlink());
+        tokio::fs::remove_file(&corrected_motion_path)
+            .await
+            .unwrap();
 
         let result = reconcile_catalog_paths(&passes, Arc::new(config), CancellationToken::new())
             .await
