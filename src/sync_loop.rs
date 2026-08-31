@@ -8844,12 +8844,26 @@ mod tests {
             .expect("seed zone token");
 
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-        let lib_state = make_run_cycle_library_state_with_album(
+        let mut lib_state = make_run_cycle_library_state_with_passes(
             "PrimarySync",
             &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
-            make_incremental_album("zone-tok-new"),
+            vec![
+                crate::commands::AlbumPass {
+                    kind: crate::commands::PassKind::Unfiled,
+                    album: make_incremental_album("zone-tok-new"),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                },
+                crate::commands::AlbumPass {
+                    kind: crate::commands::PassKind::SmartFolder,
+                    album: make_named_empty_full_album(
+                        "PrimarySync",
+                        "Favorites",
+                        "smart-query-token",
+                    ),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                },
+            ],
         );
-        let states = vec![&lib_state];
         let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
         let build_download_config = make_recording_run_cycle_download_config_builder(
             new_download_dir.path(),
@@ -8863,8 +8877,39 @@ mod tests {
             Arc::from("PrimarySync"),
         ));
 
+        lib_state.plan_is_stale = true;
+        let stale_result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+        assert!(!stale_result.db_sync_token_advance_safe);
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read active download hash")
+                .as_deref(),
+            Some(old_hash.as_str()),
+            "a stale plan must not promote the pending path hash"
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read pending download hash")
+                .as_deref(),
+            Some(new_hash.as_str())
+        );
+
+        lib_state.plan_is_stale = false;
         let result = run_cycle(
-            &states,
+            &[&lib_state],
             &config,
             Some(db.as_ref()),
             false,
@@ -8877,6 +8922,7 @@ mod tests {
         .expect("run cycle");
 
         assert_eq!(result.failed_count, 0);
+        assert!(result.stats.smart_folder_refresh_complete);
         assert_eq!(result.stats.full_enumeration_reason, None);
         let observed_modes = observed_modes.lock().expect("recorded modes lock").clone();
         assert!(

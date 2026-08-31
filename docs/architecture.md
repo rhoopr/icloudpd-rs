@@ -182,6 +182,10 @@ collide with its own file. Newly eligible versions remain the following full
 enumeration's responsibility. A changed provider checksum or size is requeued
 for download rather than copying stale local bytes. Reconciliation-detected
 retry work does not consume a download attempt before a transfer is made.
+Selected smart folders are never resolved from historical membership rows.
+They require an explicit successful fresh-query marker from the normal sync
+flow before the pending path hash can be promoted. Interruption, refresh
+failure, or a stale pass plan retains the pending hash for the next cycle.
 
 For a genuine path change, reconciliation copies verified bytes through
 no-overwrite publication only when the copied bytes match the recorded local

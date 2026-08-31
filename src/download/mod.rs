@@ -300,6 +300,9 @@ pub struct SyncStats {
     /// True when this cycle durably reduced metadata-capture work.
     #[serde(skip)]
     pub(crate) metadata_capture_progressed: bool,
+    /// True when every selected smart-folder pass completed a fresh query.
+    #[serde(skip)]
+    pub(crate) smart_folder_refresh_complete: bool,
     pub state_write_failures: usize,
     pub enumeration_errors: usize,
     /// Best-effort count-probe failures observed before full enumeration.
@@ -475,6 +478,7 @@ impl SyncStats {
         self.metadata_capture_failures += other.metadata_capture_failures;
         self.metadata_capture_remaining += other.metadata_capture_remaining;
         self.metadata_capture_progressed |= other.metadata_capture_progressed;
+        self.smart_folder_refresh_complete |= other.smart_folder_refresh_complete;
         self.state_write_failures += other.state_write_failures;
         self.enumeration_errors += other.enumeration_errors;
         self.count_probe_failures += other.count_probe_failures;
@@ -3385,6 +3389,7 @@ fn take_matching_retry_tasks<I>(
 #[derive(Debug, Default)]
 pub(crate) struct PathReconciliationResult {
     pub(crate) complete: bool,
+    pub(crate) smart_folder_refresh_required: bool,
     pub(crate) stats: SyncStats,
 }
 
@@ -3424,6 +3429,9 @@ pub(crate) async fn reconcile_catalog_paths(
     let Some(provider_pass) = passes.first() else {
         return Ok(PathReconciliationResult::default());
     };
+    let smart_folder_refresh_required = passes
+        .iter()
+        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
 
     let mut records = Vec::new();
     let mut offset = 0u64;
@@ -3442,6 +3450,7 @@ pub(crate) async fn reconcile_catalog_paths(
     if records.is_empty() {
         return Ok(PathReconciliationResult {
             complete: true,
+            smart_folder_refresh_required,
             stats: SyncStats::default(),
         });
     }
@@ -3513,10 +3522,7 @@ pub(crate) async fn reconcile_catalog_paths(
                     &album_container_refs,
                 )
                 .await?);
-    let selection_complete = album_membership_complete
-        && !passes
-            .iter()
-            .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
+    let selection_complete = album_membership_complete;
     let batch = provider_pass.album.resolve_records(&requests).await;
     let mut task_planner = planner::TaskPlanner::new();
     let mut tasks = Vec::new();
@@ -3813,7 +3819,11 @@ pub(crate) async fn reconcile_catalog_paths(
         && stats.failed == 0
         && stats.state_write_failures == 0
         && !stats.interrupted;
-    Ok(PathReconciliationResult { complete, stats })
+    Ok(PathReconciliationResult {
+        complete,
+        smart_folder_refresh_required,
+        stats,
+    })
 }
 
 /// Re-enumerate iCloud and rebuild only the failed tasks with fresh CDN URLs.
@@ -5814,6 +5824,19 @@ pub async fn download_photos_with_sync(
     }
     if metadata_capture_repair.stats.sync_token_blocked {
         result.sync_token = None;
+    }
+    if passes
+        .iter()
+        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder)
+        && result.full_enumeration_ran
+        && matches!(result.outcome, DownloadOutcome::Success)
+        && !result.stats.interrupted
+        && result.stats.failed == 0
+        && result.stats.exif_failures == 0
+        && result.stats.state_write_failures == 0
+        && result.stats.enumeration_errors == 0
+    {
+        result.stats.smart_folder_refresh_complete = true;
     }
 
     // Pending is transient — anything still pending after a complete sync either
@@ -13205,6 +13228,7 @@ mod tests {
             !result.stats.sync_token_blocked,
             "successful smart-folder refresh should not block an otherwise safe incremental cycle"
         );
+        assert!(result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -13250,6 +13274,7 @@ mod tests {
             !result.stats.sync_token_blocked,
             "blank smart-folder query token is telemetry for the refresh, not a reason to block the incremental zone token"
         );
+        assert!(result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -13278,6 +13303,7 @@ mod tests {
             1 + crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize,
             "smart-folder refresh must enumerate only the selected smart-folder stream"
         );
+        assert!(result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -13313,6 +13339,7 @@ mod tests {
             Some(SMART_FOLDER_REFRESH_FAILED_REASON)
         );
         assert_eq!(result.sync_token, None);
+        assert!(!result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -19747,6 +19774,7 @@ mod tests {
             metadata_capture_failures: 1,
             metadata_capture_remaining: 5,
             metadata_capture_progressed: false,
+            smart_folder_refresh_complete: false,
             state_write_failures: 2,
             enumeration_errors: 3,
             count_probe_failures: 4,
@@ -19819,6 +19847,7 @@ mod tests {
             metadata_capture_failures: 2,
             metadata_capture_remaining: 7,
             metadata_capture_progressed: true,
+            smart_folder_refresh_complete: true,
             state_write_failures: 5,
             enumeration_errors: 6,
             count_probe_failures: 7,
@@ -19886,6 +19915,7 @@ mod tests {
         assert_eq!(acc.metadata_capture_failures, 3);
         assert_eq!(acc.metadata_capture_remaining, 12);
         assert!(acc.metadata_capture_progressed);
+        assert!(acc.smart_folder_refresh_complete);
         assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
         assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");
         assert_eq!(

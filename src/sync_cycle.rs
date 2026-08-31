@@ -741,6 +741,7 @@ pub(crate) async fn run_cycle(
         .copied()
         .filter(|state| has_active_passes(state))
     {
+        let mut smart_folder_refresh_required = false;
         if shutdown_token.is_cancelled() {
             break;
         }
@@ -859,6 +860,7 @@ pub(crate) async fn run_cycle(
             )
             .await?;
             path_reconciliation_complete = path_reconciliation_complete && reconciliation.complete;
+            smart_folder_refresh_required = reconciliation.smart_folder_refresh_required;
             cycle_failed_count = cycle_failed_count
                 .saturating_add(reconciliation.stats.failed)
                 .saturating_add(reconciliation.stats.exif_failures)
@@ -873,6 +875,10 @@ pub(crate) async fn run_cycle(
             shutdown_token.clone(),
         )
         .await?;
+        if smart_folder_refresh_required {
+            path_reconciliation_complete =
+                path_reconciliation_complete && sync_result.stats.smart_folder_refresh_complete;
+        }
 
         let mut checkpoint_basis = if sync_result.full_enumeration_ran {
             CheckpointBasis::CompleteInventory
@@ -1226,6 +1232,7 @@ pub(crate) async fn run_cycle(
     }
 
     if path_reconciliation_complete
+        && !cycle_has_stale_plan
         && !cycle_session_expired
         && !shutdown_token.is_cancelled()
         && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
