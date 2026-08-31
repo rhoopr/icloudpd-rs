@@ -412,6 +412,18 @@ pub(super) async fn adopt_pending_on_disk_for_retry(
     if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
         return PendingRetryAdoption::NotFound;
     }
+    for task in planned_tasks.iter().filter(|task| {
+        task.version_size == evidence.version_size
+            && task.checksum.as_ref() == evidence.checksum
+            && task.size == evidence.size
+    }) {
+        if tokio::fs::symlink_metadata(&task.download_path)
+            .await
+            .is_ok_and(|metadata| !metadata.file_type().is_file())
+        {
+            return PendingRetryAdoption::NotFound;
+        }
+    }
 
     if let PendingRetryLocalPath::Current(recorded_file) = evidence.local_path {
         let local_path = &recorded_file.path;
@@ -637,8 +649,9 @@ async fn adopt_pending_task_path(
     recorded_file: Option<&RecordedLocalFile>,
 ) -> Option<PendingOnDiskAdoption> {
     let version_size = task.version_size.as_str();
-    let (existing_path, existing_size) =
-        task_planner.existing_path_with_size(&task.download_path)?;
+    let (existing_path, existing_size) = task_planner
+        .existing_regular_path_with_size(&task.download_path)
+        .await?;
     if !pending_file_size_allows_adoption(
         asset,
         version_size,
@@ -706,7 +719,7 @@ async fn adopt_pending_derived_path_at(
     mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
     let version_size = derived.version_size.as_str();
-    let (existing_path, existing_size) = task_planner.existing_path_with_size(path)?;
+    let (existing_path, existing_size) = task_planner.existing_regular_path_with_size(path).await?;
     if !pending_file_size_allows_adoption(
         asset,
         version_size,
@@ -855,39 +868,37 @@ pub(super) async fn state_proven_primary_path(
     if !stored_path_matches_current_collision_family(
         asset.state_id(),
         primary,
-        &derived_paths,
         config,
         None,
         &recorded_file.path,
-    ) {
+    )
+    .await
+    {
         return None;
     }
 
     task_planner.prepare_path_parent(&recorded_file.path).await;
-    let (existing_path, existing_size) =
-        task_planner.existing_path_with_size(&recorded_file.path)?;
-    let metadata = tokio::fs::symlink_metadata(&existing_path).await.ok()?;
-    if !metadata.file_type().is_file()
-        || metadata.len() != existing_size
-        || !state_path_size_allows_skip(
-            asset.id(),
-            primary.version_size,
-            &existing_path,
-            existing_size,
-            primary.size,
-            recorded_file,
-        )
-        .await
+    let (existing_path, existing_size) = task_planner
+        .existing_regular_path_with_size(&recorded_file.path)
+        .await?;
+    if !state_path_size_allows_skip(
+        asset.id(),
+        primary.version_size,
+        &existing_path,
+        existing_size,
+        primary.size,
+        recorded_file,
+    )
+    .await
     {
         return None;
     }
     Some(existing_path)
 }
 
-pub(super) fn stored_path_matches_current_collision_family(
+pub(super) async fn stored_path_matches_current_collision_family(
     asset_id: &str,
     derived: &DerivedPath,
-    derived_paths: &[DerivedPath],
     config: &DownloadConfig,
     proven_primary_path: Option<&Path>,
     stored_path: &Path,
@@ -900,21 +911,35 @@ pub(super) fn stored_path_matches_current_collision_family(
         return false;
     };
 
-    collision_family_base_filenames(
-        asset_id,
-        derived,
-        derived_paths,
-        config,
-        proven_primary_path,
-    )
-    .iter()
-    .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id))
+    let bases = collision_family_base_filenames(asset_id, derived, config, proven_primary_path);
+    if !derived.version_size.is_live_photo_motion() {
+        return bases
+            .iter()
+            .any(|base| stored_filename_matches_base_family(stored_filename, base, asset_id));
+    }
+
+    for base in bases {
+        if stored_filename_matches_base(stored_filename, &base) {
+            return true;
+        }
+        if stored_filename_matches_identity_collision(stored_filename, &base, asset_id) {
+            let base_path = derived
+                .path
+                .with_file_name(super::paths::clean_filename(&base).as_ref());
+            if tokio::fs::symlink_metadata(base_path)
+                .await
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn collision_family_base_filenames(
     asset_id: &str,
     derived: &DerivedPath,
-    derived_paths: &[DerivedPath],
     config: &DownloadConfig,
     proven_primary_path: Option<&Path>,
 ) -> Vec<String> {
@@ -929,16 +954,6 @@ fn collision_family_base_filenames(
                 primary_filename,
                 config,
             ));
-        } else if let Some(primary) = primary_derived_path(derived_paths) {
-            for primary_filename in [
-                super::paths::add_dedup_suffix(&primary.filename, primary.size),
-                super::paths::insert_asset_identity_suffix(&primary.filename, asset_id),
-            ] {
-                bases.push(live_photo_motion_filename_for_primary(
-                    &primary_filename,
-                    config,
-                ));
-            }
         }
     } else {
         bases.push(super::paths::add_dedup_suffix(
@@ -956,12 +971,6 @@ fn collision_family_base_filenames(
     bases
 }
 
-fn primary_derived_path(derived_paths: &[DerivedPath]) -> Option<&DerivedPath> {
-    derived_paths
-        .iter()
-        .find(|derived| derived.version_size.is_primary_media())
-}
-
 fn live_photo_motion_filename_for_primary(
     primary_filename: &str,
     config: &DownloadConfig,
@@ -977,10 +986,24 @@ fn live_photo_motion_filename_for_primary(
 }
 
 fn stored_filename_matches_base_family(stored_filename: &str, base: &str, asset_id: &str) -> bool {
+    stored_filename_matches_base(stored_filename, base)
+        || stored_filename_matches_identity_collision(stored_filename, base, asset_id)
+}
+
+fn stored_filename_matches_base(stored_filename: &str, base: &str) -> bool {
     let base = super::paths::clean_filename(base);
     let base = base.as_ref();
     filenames_match_ampm_equivalent(stored_filename, base)
-        || super::paths::filename_matches_identity_collision(base, asset_id, stored_filename)
+}
+
+fn stored_filename_matches_identity_collision(
+    stored_filename: &str,
+    base: &str,
+    asset_id: &str,
+) -> bool {
+    let base = super::paths::clean_filename(base);
+    let base = base.as_ref();
+    super::paths::filename_matches_identity_collision(base, asset_id, stored_filename)
         || super::paths::filename_matches_identity_collision(
             &super::paths::normalize_ampm(base),
             asset_id,
@@ -1008,8 +1031,9 @@ pub(super) async fn state_confirmed_current_path_exists(
         if derived.version_size != task.version_size {
             continue;
         }
-        let Some((existing_path, existing_size)) =
-            task_planner.existing_path_with_size(&derived.path)
+        let Some((existing_path, existing_size)) = task_planner
+            .existing_regular_path_with_size(&derived.path)
+            .await
         else {
             continue;
         };
@@ -1037,14 +1061,17 @@ pub(super) async fn state_confirmed_current_path_exists(
         if !stored_path_matches_current_collision_family(
             asset.state_id(),
             derived,
-            &derived_paths,
             config,
             proven_primary_path,
             stored_path,
-        ) {
+        )
+        .await
+        {
             continue;
         }
-        let (existing_path, existing_size) = task_planner.existing_path_with_size(stored_path)?;
+        let (existing_path, existing_size) = task_planner
+            .existing_regular_path_with_size(stored_path)
+            .await?;
         if state_path_size_allows_skip(
             asset.id(),
             task.version_size,
@@ -2132,8 +2159,10 @@ where
                                             continue;
                                         }
 
-                                        match task_planner.existing_path_match(&task.download_path)
-                                        {
+                                        let path_match = task_planner
+                                            .existing_path_match(&task.download_path)
+                                            .await;
+                                        match path_match {
                                             ExistingPathMatch::Exact => {
                                                 disposition =
                                                     disposition.max(AssetDisposition::OnDisk);
@@ -2152,12 +2181,21 @@ where
                                                     "Skipping (AM/PM variant exists on disk)"
                                                 );
                                             }
-                                            ExistingPathMatch::Missing => {
-                                                tracing::debug!(
-                                                    asset_id = %task.asset_id,
-                                                    path = %task.download_path.display(),
-                                                    "File missing, will re-download"
-                                                );
+                                            ExistingPathMatch::NonRegular
+                                            | ExistingPathMatch::Missing => {
+                                                if path_match == ExistingPathMatch::NonRegular {
+                                                    tracing::warn!(
+                                                        asset_id = %task.asset_id,
+                                                        path = %task.download_path.display(),
+                                                        "Download target exists and is not a regular file"
+                                                    );
+                                                } else {
+                                                    tracing::debug!(
+                                                        asset_id = %task.asset_id,
+                                                        path = %task.download_path.display(),
+                                                        "File missing, will re-download"
+                                                    );
+                                                }
                                                 disposition =
                                                     disposition.max(AssetDisposition::Forwarded);
                                                 if record_seen_for_forwarded_task(
@@ -3420,6 +3458,17 @@ async fn download_single_task<C: super::file::DownloadClient>(
     metadata_flags: MetadataFlags,
     context: DownloadSingleContext<'_>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
+    match tokio::fs::symlink_metadata(&task.download_path).await {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            anyhow::bail!(
+                "Download target exists and is not a regular file: {}",
+                task.download_path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(_) => {}
+    }
+
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -8210,11 +8259,13 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn live_photo_motion_collision_family_uses_proven_primary_stem() {
+    #[tokio::test]
+    async fn live_photo_motion_collision_family_requires_regular_base_not_state_owner() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
         let asset = live_photo_collision_asset("LIVE_FAMILY");
         let derived_paths = derive_expected_paths(&asset, &config);
         let motion = derived_paths
@@ -8230,38 +8281,78 @@ mod tests {
         let identity_primary = path_for_filename(&config, &asset, "IMG_0001-LIVE_FAMILY.HEIC");
         let paired_motion = path_for_filename(&config, &asset, "IMG_0001-LIVE_FAMILY_HEVC.MOV");
 
-        assert!(stored_path_matches_current_collision_family(
-            asset.state_id(),
-            motion,
-            &derived_paths,
-            &config,
-            Some(&bare_primary),
+        assert!(
+            stored_path_matches_current_collision_family(
+                asset.state_id(),
+                motion,
+                &config,
+                Some(&bare_primary),
+                &bare_motion,
+            )
+            .await
+        );
+        assert!(
+            !stored_path_matches_current_collision_family(
+                asset.state_id(),
+                motion,
+                &config,
+                Some(&bare_primary),
+                &wrong_primary_collision,
+            )
+            .await
+        );
+        assert!(
+            !stored_path_matches_current_collision_family(
+                asset.state_id(),
+                motion,
+                &config,
+                Some(&bare_primary),
+                &direct_motion_collision,
+            )
+            .await
+        );
+        fs::create_dir_all(bare_motion.parent().unwrap()).unwrap();
+        fs::write(&bare_motion, vec![8u8; 3000]).unwrap();
+        assert!(
+            stored_path_matches_current_collision_family(
+                asset.state_id(),
+                motion,
+                &config,
+                Some(&bare_primary),
+                &direct_motion_collision,
+            )
+            .await
+        );
+        let owner = live_photo_collision_asset("MOTION_BASE_OWNER");
+        record_downloaded_test_version(
+            db.as_ref(),
+            &owner,
+            VersionSizeKey::LiveOriginal,
+            "owner_ck",
+            3000,
             &bare_motion,
-        ));
-        assert!(!stored_path_matches_current_collision_family(
-            asset.state_id(),
-            motion,
-            &derived_paths,
-            &config,
-            Some(&bare_primary),
-            &wrong_primary_collision,
-        ));
-        assert!(stored_path_matches_current_collision_family(
-            asset.state_id(),
-            motion,
-            &derived_paths,
-            &config,
-            Some(&bare_primary),
-            &direct_motion_collision,
-        ));
-        assert!(stored_path_matches_current_collision_family(
-            asset.state_id(),
-            motion,
-            &derived_paths,
-            &config,
-            Some(&identity_primary),
-            &paired_motion,
-        ));
+        )
+        .await;
+        assert!(
+            stored_path_matches_current_collision_family(
+                asset.state_id(),
+                motion,
+                &config,
+                Some(&bare_primary),
+                &direct_motion_collision,
+            )
+            .await
+        );
+        assert!(
+            stored_path_matches_current_collision_family(
+                asset.state_id(),
+                motion,
+                &config,
+                Some(&identity_primary),
+                &paired_motion,
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -8637,6 +8728,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_photo_direct_motion_identity_with_untracked_regular_base_is_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset = live_photo_collision_asset("LIVE_DIRECT_COLLISION");
+        let bare_primary = path_for_filename(&config, &asset, "IMG_0001.HEIC");
+        let bare_motion = path_for_filename(&config, &asset, "IMG_0001_HEVC.MOV");
+        let stored_motion = identity_suffixed_path_for(&bare_motion, asset.state_id());
+        let ordinal_motion = bare_motion.with_file_name(
+            crate::download::paths::insert_asset_identity_ordinal_suffix(
+                bare_motion.file_name().unwrap().to_str().unwrap(),
+                asset.state_id(),
+                2,
+            ),
+        );
+        fs::create_dir_all(bare_primary.parent().unwrap()).unwrap();
+        fs::write(&bare_primary, vec![1u8; 2000]).unwrap();
+        fs::write(&bare_motion, vec![8u8; 3000]).unwrap();
+        fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
+
+        record_downloaded_test_version(
+            db.as_ref(),
+            &asset,
+            VersionSizeKey::Original,
+            "heic_ck",
+            2000,
+            &bare_primary,
+        )
+        .await;
+        record_downloaded_test_version(
+            db.as_ref(),
+            &asset,
+            VersionSizeKey::LiveOriginal,
+            "mov_ck",
+            3000,
+            &stored_motion,
+        )
+        .await;
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.skip_summary.on_disk, 1);
+        assert!(result.failed.is_empty());
+        assert!(
+            !ordinal_motion.exists(),
+            "sync must not create an ordinal duplicate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_photo_direct_motion_identity_with_symlink_base_fails_without_download_or_ordinal()
+    {
+        use std::os::unix::fs::symlink;
+
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let asset = TestPhotoAsset::new("LIVE_DIRECT_SYMLINK")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(2000)
+            .orig_url(&format!("{}/still.heic", server.uri()))
+            .orig_checksum("heic_ck")
+            .live_photo(&format!("{}/motion.mov", server.uri()), "mov_ck", 3000)
+            .build();
+        let bare_primary = path_for_filename(&config, &asset, "IMG_0001.HEIC");
+        let bare_motion = path_for_filename(&config, &asset, "IMG_0001_HEVC.MOV");
+        let stored_motion = identity_suffixed_path_for(&bare_motion, asset.state_id());
+        let ordinal_motion = bare_motion.with_file_name(
+            crate::download::paths::insert_asset_identity_ordinal_suffix(
+                bare_motion.file_name().unwrap().to_str().unwrap(),
+                asset.state_id(),
+                2,
+            ),
+        );
+        fs::create_dir_all(bare_primary.parent().unwrap()).unwrap();
+        fs::write(&bare_primary, vec![1u8; 2000]).unwrap();
+        fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
+        symlink(&stored_motion, &bare_motion).unwrap();
+
+        record_downloaded_test_version(
+            db.as_ref(),
+            &asset,
+            VersionSizeKey::Original,
+            "heic_ck",
+            2000,
+            &bare_primary,
+        )
+        .await;
+        record_downloaded_test_version(
+            db.as_ref(),
+            &asset,
+            VersionSizeKey::LiveOriginal,
+            "mov_ck",
+            3000,
+            &stored_motion,
+        )
+        .await;
+        let config = Arc::new(config);
+        let state_before_read_only = format!("{:?}", db.get_downloaded_page(0, 10).await.unwrap());
+
+        let printed = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &config,
+            DownloadControls::new(
+                super::super::DownloadRunMode::PrintFilenames,
+                DownloadReporting::hidden(),
+            ),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(printed.printed_filenames, vec![bare_motion.clone()]);
+
+        let dry_run = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &config,
+            DownloadControls::dry_run_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dry_run.downloaded, 1);
+        assert_eq!(
+            format!("{:?}", db.get_downloaded_page(0, 10).await.unwrap()),
+            state_before_read_only
+        );
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].download_path, bare_motion);
+        assert!(!ordinal_motion.exists());
+        assert!(bare_motion.is_symlink());
+        assert_eq!(fs::read(&stored_motion).unwrap(), vec![2u8; 3000]);
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].local_path.as_deref(),
+            Some(stored_motion.as_path())
+        );
+    }
+
+    #[tokio::test]
     async fn live_photo_motion_with_identity_suffixed_primary_stem_is_on_disk_skipped() {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
@@ -8654,6 +8941,8 @@ mod tests {
         let asset = live_photo_collision_asset("LIVE_ID_COLLISION");
         let bare_primary = path_for_filename(&config, &asset, "IMG_0001.HEIC");
         let stored_primary = path_for_filename(&config, &asset, "IMG_0001-LIVE_ID_COLLISION.HEIC");
+        let collision_base_motion =
+            path_for_filename(&config, &asset, "IMG_0001-LIVE_ID_COLLISION_HEVC.MOV");
         let stored_motion = path_for_filename(
             &config,
             &asset,
@@ -8662,6 +8951,7 @@ mod tests {
         fs::create_dir_all(bare_primary.parent().unwrap()).unwrap();
         fs::write(&bare_primary, vec![9u8; 2000]).unwrap();
         fs::write(&stored_primary, vec![1u8; 2000]).unwrap();
+        fs::write(&collision_base_motion, vec![8u8; 3000]).unwrap();
         fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
 
         record_downloaded_test_version(
@@ -8718,6 +9008,8 @@ mod tests {
         let asset = live_photo_collision_asset("LIVE/ID_COLLISION");
         let bare_primary = path_for_filename(&config, &asset, "IMG_0001.HEIC");
         let stored_primary = path_for_filename(&config, &asset, "IMG_0001-LIVE_ID_COLLISION.HEIC");
+        let collision_base_motion =
+            path_for_filename(&config, &asset, "IMG_0001-LIVE_ID_COLLISION_HEVC.MOV");
         let stored_motion = path_for_filename(
             &config,
             &asset,
@@ -8726,8 +9018,19 @@ mod tests {
         fs::create_dir_all(bare_primary.parent().unwrap()).unwrap();
         fs::write(&bare_primary, vec![9u8; 2000]).unwrap();
         fs::write(&stored_primary, vec![1u8; 2000]).unwrap();
+        fs::write(&collision_base_motion, vec![8u8; 3000]).unwrap();
         fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
 
+        let collision_owner = live_photo_collision_asset("LIVE_ID_COLLISION_OWNER");
+        record_downloaded_test_version(
+            db.as_ref(),
+            &collision_owner,
+            VersionSizeKey::LiveOriginal,
+            "owner_ck",
+            3000,
+            &collision_base_motion,
+        )
+        .await;
         record_downloaded_test_version(
             db.as_ref(),
             &asset,

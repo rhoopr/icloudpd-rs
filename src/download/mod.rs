@@ -3646,22 +3646,7 @@ async fn reconcile_catalog_paths_inner(
                     if plan.filter_reason.is_some() {
                         continue;
                     }
-                    for mut task in plan.tasks {
-                        if let Some(derived) = derived_paths
-                            .iter()
-                            .find(|derived| derived.version_size == task.version_size)
-                            && task.download_path != derived.path
-                            && tokio::fs::symlink_metadata(&derived.path)
-                                .await
-                                .is_ok_and(|metadata| !metadata.file_type().is_file())
-                        {
-                            task_planner.rebind_claimed_path(
-                                &task.download_path,
-                                &derived.path,
-                                task.size,
-                            );
-                            task.download_path = derived.path.clone();
-                        }
+                    for task in plan.tasks {
                         let target = PendingRetryTarget::from_task(&task);
                         let Some(record) = records_by_target.get(&target) else {
                             continue;
@@ -3679,11 +3664,11 @@ async fn reconcile_catalog_paths_inner(
                                 pipeline::stored_path_matches_current_collision_family(
                                     asset.state_id(),
                                     derived,
-                                    &derived_paths,
                                     pass_config,
                                     proven_primary_path.as_deref(),
                                     recorded_path,
-                                );
+                                )
+                                .await;
                             if !provider_version_is_current || !matches_current_family {
                                 false
                             } else if let Ok(metadata) = tokio::fs::metadata(recorded_path).await {
@@ -14811,7 +14796,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn path_reconciliation_corrects_motion_name_from_state_proven_primary() {
+    async fn path_reconciliation_motion_identity_requires_regular_base() {
         use std::os::unix::fs::symlink;
 
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
@@ -14858,9 +14843,16 @@ mod tests {
             .path
             .clone();
         let state_id = "asset-RECONCILE_LIVE_NAME";
-        let wrong_primary = paths::insert_asset_identity_suffix("reconcile-live.heic", state_id);
-        let wrong_motion_path =
-            corrected_motion_path.with_file_name(paths::live_photo_mov_path_suffix(&wrong_primary));
+        let corrected_motion_filename = corrected_motion_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let wrong_motion_path = corrected_motion_path.with_file_name(
+            paths::insert_asset_identity_suffix(corrected_motion_filename, state_id),
+        );
+        let ordinal_motion_path = corrected_motion_path.with_file_name(
+            paths::insert_asset_identity_ordinal_suffix(corrected_motion_filename, state_id, 2),
+        );
         tokio::fs::create_dir_all(primary_path.parent().unwrap())
             .await
             .unwrap();
@@ -14934,6 +14926,29 @@ mod tests {
             Some(wrong_motion_path.as_path())
         );
         assert!(corrected_motion_path.is_symlink());
+        assert!(!ordinal_motion_path.exists());
+        tokio::fs::remove_file(&corrected_motion_path)
+            .await
+            .unwrap();
+
+        tokio::fs::write(&corrected_motion_path, vec![6u8; motion_bytes.len()])
+            .await
+            .unwrap();
+        let stable =
+            reconcile_catalog_paths(&passes, Arc::new(config.clone()), CancellationToken::new())
+                .await
+                .expect("regular collision base should keep the recorded motion path");
+        assert!(stable.complete);
+        assert_eq!(stable.stats.downloaded, 0);
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        let motion = downloaded
+            .iter()
+            .find(|record| record.version_size == VersionSizeKey::LiveOriginal)
+            .unwrap();
+        assert_eq!(
+            motion.local_path.as_deref(),
+            Some(wrong_motion_path.as_path())
+        );
         tokio::fs::remove_file(&corrected_motion_path)
             .await
             .unwrap();

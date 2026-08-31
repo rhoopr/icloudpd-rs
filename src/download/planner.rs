@@ -13,8 +13,9 @@ use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 
 use super::DownloadConfig;
 use super::filter::{
-    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, determine_media_type,
-    filter_asset_to_tasks_with_proven_primary_path, is_asset_filtered, pre_ensure_asset_dir,
+    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath, derive_expected_paths,
+    determine_media_type, filter_asset_to_tasks_with_proven_primary_path, is_asset_filtered,
+    pre_ensure_asset_dir,
 };
 use super::paths;
 
@@ -60,13 +61,30 @@ impl TaskPlanner {
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
-        let tasks = filter_asset_to_tasks_with_proven_primary_path(
+        let mut tasks = filter_asset_to_tasks_with_proven_primary_path(
             asset,
             config,
             proven_primary_path,
             &mut self.claimed_paths,
             &mut self.dir_cache,
         );
+        let expected_paths = derive_expected_paths(asset, config);
+        for task in &mut tasks {
+            let Some(expected) = expected_paths
+                .iter()
+                .find(|expected| expected.version_size == task.version_size)
+            else {
+                continue;
+            };
+            if task.download_path != expected.path
+                && tokio::fs::symlink_metadata(&expected.path)
+                    .await
+                    .is_ok_and(|metadata| !metadata.file_type().is_file())
+            {
+                self.rebind_claimed_path(&task.download_path, &expected.path, task.size);
+                task.download_path = expected.path.clone();
+            }
+        }
         let malformed_resource = if tasks.is_empty() {
             super::filter::malformed_no_task_resource(asset, config)
         } else {
@@ -79,11 +97,19 @@ impl TaskPlanner {
         }
     }
 
-    pub(super) fn existing_path_match(&mut self, path: &Path) -> ExistingPathMatch {
-        match self.existing_path(path) {
-            Some(found) if found == path => ExistingPathMatch::Exact,
-            Some(_) => ExistingPathMatch::AmpmVariant,
-            None => ExistingPathMatch::Missing,
+    pub(super) async fn existing_path_match(&mut self, path: &Path) -> ExistingPathMatch {
+        let Some(found) = self.existing_path(path) else {
+            return ExistingPathMatch::Missing;
+        };
+        if tokio::fs::symlink_metadata(&found)
+            .await
+            .is_ok_and(|metadata| !metadata.file_type().is_file())
+        {
+            ExistingPathMatch::NonRegular
+        } else if found == path {
+            ExistingPathMatch::Exact
+        } else {
+            ExistingPathMatch::AmpmVariant
         }
     }
 
@@ -104,13 +130,23 @@ impl TaskPlanner {
         }
     }
 
+    pub(super) async fn existing_regular_path_with_size(
+        &mut self,
+        path: &Path,
+    ) -> Option<(std::path::PathBuf, u64)> {
+        let (existing_path, existing_size) = self.existing_path_with_size(path)?;
+        let metadata = tokio::fs::symlink_metadata(&existing_path).await.ok()?;
+        (metadata.file_type().is_file() && metadata.len() == existing_size)
+            .then_some((existing_path, existing_size))
+    }
+
     pub(super) async fn prepare_path_parent(&mut self, path: &Path) {
         if let Some(parent) = path.parent() {
             self.dir_cache.ensure_dir_async(parent).await;
         }
     }
 
-    pub(super) fn rebind_claimed_path(
+    fn rebind_claimed_path(
         &mut self,
         planned_path: &Path,
         replacement_path: &Path,
@@ -233,6 +269,7 @@ pub(super) struct AssetTaskPlan {
 pub(super) enum ExistingPathMatch {
     Exact,
     AmpmVariant,
+    NonRegular,
     Missing,
 }
 
@@ -478,27 +515,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rebind_claimed_path_releases_the_abandoned_collision_path() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_rebinds_nonregular_expected_path_after_collision_planning() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let asset = TestPhotoAsset::new("NONREGULAR_MOTION_BASE")
+            .filename("IMG_0100.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(32)
+            .live_photo(
+                "https://p01.icloud-content.com/IMG_0100.MOV",
+                "motion-checksum",
+                24,
+            )
+            .build();
+        let expected = derive_expected_paths(&asset, &config);
+        let primary_path = expected
+            .iter()
+            .find(|path| path.version_size.is_primary_media())
+            .unwrap()
+            .path
+            .clone();
+        let motion_path = expected
+            .iter()
+            .find(|path| path.version_size.is_live_photo_motion())
+            .unwrap()
+            .path
+            .clone();
+        let motion_filename = motion_path.file_name().unwrap().to_str().unwrap();
+        let identity_path = motion_path.with_file_name(paths::insert_asset_identity_suffix(
+            motion_filename,
+            asset.state_id(),
+        ));
+        let ordinal_path = motion_path.with_file_name(paths::insert_asset_identity_ordinal_suffix(
+            motion_filename,
+            asset.state_id(),
+            2,
+        ));
+        tokio::fs::create_dir_all(primary_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&primary_path, vec![7u8; 32])
+            .await
+            .unwrap();
+        tokio::fs::write(&identity_path, vec![8u8; 24])
+            .await
+            .unwrap();
+        symlink(&identity_path, &motion_path).unwrap();
+
         let mut planner = TaskPlanner::new();
-        let abandoned = Path::new("/tmp/photo-ASSET.jpg");
-        let replacement = Path::new("/tmp/photo.jpg");
-        planner
-            .claimed_paths
-            .insert(NormalizedPath::new(abandoned), 1000);
+        let plan = planner
+            .plan_asset_with_proven_primary_path(&asset, &config, Some(&primary_path))
+            .await;
 
-        planner.rebind_claimed_path(abandoned, replacement, 1000);
-
-        assert!(
-            !planner
-                .claimed_paths
-                .contains_key(NormalizedPath::normalize(abandoned).as_ref())
-        );
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, motion_path);
         assert_eq!(
             planner
                 .claimed_paths
-                .get(NormalizedPath::normalize(replacement).as_ref()),
-            Some(&1000)
+                .get(NormalizedPath::normalize(&motion_path).as_ref()),
+            Some(&24)
+        );
+        assert!(
+            !planner
+                .claimed_paths
+                .contains_key(NormalizedPath::normalize(&ordinal_path).as_ref())
         );
     }
 
