@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+source "$script_dir/lib.sh"
+
+run_scenario_test lib path_reconciliation_copies_catalog_file_without_provider_inventory
+run_scenario_test lib local_reconciliation_copy_preserves_source_and_refuses_conflict
+run_scenario_test lib download_config_hash_drift_stages_reconciliation_without_clearing_token
+run_scenario_test lib download_config_revert_clears_pending_reconciliation
+run_scenario_test lib run_cycle_download_config_hash_drift_keeps_source_incremental
+run_scenario_test lib run_cycle_multi_pass_persists_base_download_config_hash
+run_scenario_test lib unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift
+run_scenario_test lib run_cycle_capture_offset_drives_date_filter_path_and_sidecar

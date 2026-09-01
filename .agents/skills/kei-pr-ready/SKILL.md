@@ -40,11 +40,31 @@ Trace shared types and literal consumers with `rg`. Identify the applicable
 safety-contract IDs and focused scenario slices. Do not treat the round-trip
 gate or a passing unit test as proof that all consumers were traced.
 
+For file or path behavior, list every alternate byte-landing and
+downloaded-state finalization route, including normal download, local path
+reconciliation, import/adoption, pending recovery, explicit repair, and
+metadata rewrite where applicable. Compare each reached route against
+checksum, no-overwrite publication, metadata, fsync, durable state, retry,
+checkpoint, and root-confinement invariants. A normal-download test does not
+prove another route.
+
+Record review depth by behavior and lens. Use separate coverage-ledger rows
+for correctness, safety, liveness, performance, and user-visible metadata when
+they apply. Do not label a complete owner or module "fully inspected" when the
+review covered only one lens, such as scale.
+
 ## Validate
 
 1. Run the smallest matching focused test or `just test scenario NAME`.
 2. For behavior changes, prefer at least one test through the production call
    graph and cover the relevant failure, retry, interruption, or boundary case.
+   Changes to durable configuration, filesystem paths, media publication,
+   metadata, SQLite state, retry work, or provider checkpoints require a
+   state-transition proof through the production call graph. Cover these five
+   stages: Initial durable state, Controlled mutation, Production cycle,
+   Durable outcome, and Steady-state cycle. State whether the destination was
+   empty, durable state was pre-seeded, what changed, and what the unchanged
+   follow-up cycle did.
 3. For CLI or user-flow changes, run the changed command and inspect help,
    Docker, service, Homebrew, and documentation consumers where applicable.
 4. For schema, primary-key, sentinel, durable-key, or serialization changes,
@@ -74,6 +94,9 @@ Report:
 - merge base and validation provenance
 - changed-file coverage ledger and separate context-file list
 - impact classification, owners, safety contracts, and scenario slices
+- behavior-specific review depth for correctness, safety, liveness,
+  performance, and user-visible metadata
+- state-transition proof or a concrete reason it does not apply
 - exact validation commands and results
 - unresolved failures, skipped checks, risks, and missing evidence
 - final verdict: ready or not ready
