@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::DownloadError;
 use super::limiter::BandwidthLimiter;
+use crate::fs_util::{ConfinedParents, ConfinedPath, FileIdentity, IdentityCleanup, file_identity};
 use crate::retry::{self, RetryAction, RetryConfig};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -627,13 +628,15 @@ pub(super) async fn publish_part_to_final(
         }
         Ok(PublishResult::DestinationExists) => {
             // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
-            let part_fingerprint = fingerprint_regular_file(part_path)
+            let part = FileLocation::Path(part_path.to_path_buf());
+            let part_fingerprint = tokio::task::spawn_blocking(move || fingerprint_location(&part))
                 .await
+                .map_err(std::io::Error::other)?
                 .with_context(|| format!("Could not verify {}", part_path.display()))?;
             let final_fingerprint = fingerprint_regular_file(final_path)
                 .await
                 .with_context(|| format!("Could not verify {}", final_path.display()))?;
-            if part_fingerprint != final_fingerprint {
+            if part_fingerprint.fingerprint != final_fingerprint {
                 return Err(FinalPathCollision {
                     part_path: part_path.to_path_buf(),
                     final_path: final_path.to_path_buf(),
@@ -645,49 +648,17 @@ pub(super) async fn publish_part_to_final(
                 path = %final_path.display(),
                 "Destination has identical bytes, removing redundant .part file"
             );
-            fs::remove_file(part_path).await.with_context(|| {
-                format!(
-                    "Could not remove redundant completed download {}",
-                    part_path.display()
-                )
-            })?;
+            let part = FileLocation::Path(part_path.to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                cleanup_published_location(&part, part_fingerprint.identity)
+            })
+            .await
+            .map_err(std::io::Error::other)?;
             Ok(())
         }
         Err(e) => Err(e).with_context(|| {
             format!(
                 "Could not move completed download from {} to {}",
-                part_path.display(),
-                final_path.display()
-            )
-        }),
-    }
-}
-
-/// Publish a prepared file only while the destination still matches the
-/// caller's initial observation. `None` means the destination did not exist;
-/// `Some` authorizes replacement of exactly those bytes and no others.
-#[cfg(feature = "xmp")]
-pub(super) async fn publish_file_if_unchanged(
-    part_path: &Path,
-    final_path: &Path,
-    expected: Option<ExistingFileFingerprint>,
-) -> anyhow::Result<()> {
-    if let Some(expected) = expected {
-        return replace_file_if_unchanged(part_path, final_path, expected).await;
-    }
-
-    match publish_part_no_replace(part_path, final_path).await {
-        Ok(PublishResult::Published) => {
-            crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
-            Ok(())
-        }
-        Ok(PublishResult::DestinationExists) => anyhow::bail!(
-            "Refusing to publish {} because it appeared after write planning",
-            final_path.display()
-        ),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "Could not publish prepared file {} -> {}",
                 part_path.display(),
                 final_path.display()
             )
@@ -703,7 +674,7 @@ async fn replace_file_if_unchanged(
     let part_path = part_path.to_path_buf();
     let final_path = final_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        replace_file_if_unchanged_blocking(&part_path, &final_path, expected, None)
+        publish_path_if_unchanged_blocking(&part_path, &final_path, Some(expected), None)
     })
     .await
     .map_err(std::io::Error::other)?
@@ -715,258 +686,240 @@ pub(super) fn publish_file_if_unchanged_blocking(
     expected: ExistingFileFingerprint,
     expected_replacement: ExistingFileFingerprint,
 ) -> anyhow::Result<()> {
-    replace_file_if_unchanged_blocking(part_path, final_path, expected, Some(expected_replacement))
+    publish_path_if_unchanged_blocking(
+        part_path,
+        final_path,
+        Some(expected),
+        Some(expected_replacement),
+    )
 }
 
-fn replace_file_if_unchanged_blocking(
+fn publish_path_if_unchanged_blocking(
     part_path: &Path,
     final_path: &Path,
-    expected: ExistingFileFingerprint,
+    expected: Option<ExistingFileFingerprint>,
     expected_replacement: Option<ExistingFileFingerprint>,
 ) -> anyhow::Result<()> {
-    let current = match fingerprint_regular_file_blocking(final_path) {
-        Ok(current) => current,
-        Err(error) => {
-            return Err(error).context(ConditionalPublishTargetChanged::Unverifiable {
-                path: final_path.to_path_buf(),
-            });
-        }
-    };
-    if current != expected {
-        return Err(ConditionalPublishTargetChanged::AfterPlanning {
-            path: final_path.to_path_buf(),
-        }
-        .into());
-    }
-
-    let replacement = match fingerprint_regular_file_blocking(part_path) {
+    let part = FileLocation::Path(part_path.to_path_buf());
+    let final_path = FileLocation::Path(final_path.to_path_buf());
+    let replacement = match fingerprint_location(&part) {
         Ok(replacement) => replacement,
         Err(error) => {
             return Err(error)
                 .with_context(|| {
-                    format!("Could not verify replacement file {}", part_path.display())
+                    format!(
+                        "Could not verify replacement file {}",
+                        part.path().display()
+                    )
                 })
                 .context(ConditionalPublishMustRetainPaths {
-                    paths: vec![part_path.to_path_buf()],
+                    paths: vec![part.path().to_path_buf()],
                 });
         }
     };
-    if expected_replacement.is_some_and(|approved| approved != replacement) {
+    if expected_replacement.is_some_and(|approved| approved != replacement.fingerprint) {
         return Err(anyhow::anyhow!(
             "Refusing to publish {} because its bytes changed after validation",
-            part_path.display()
+            part.path().display()
         ))
         .context(ConditionalPublishMustRetainPaths {
-            paths: vec![part_path.to_path_buf()],
+            paths: vec![part.path().to_path_buf()],
         });
     }
-    let displaced_path = match exchange_repair_files_blocking(part_path, final_path, expected) {
-        Ok(displaced_path) => displaced_path,
-        Err(error) if classify_conditional_publish_error(&error).target_changed => {
-            return Err(error).context(ConditionalPublishTargetChanged::Unverifiable {
-                path: final_path.to_path_buf(),
-            });
-        }
-        Err(error) => {
-            return match fingerprint_regular_file_blocking(final_path) {
-                Ok(current) if current == expected => Err(error),
-                Ok(_) | Err(_) => {
-                    Err(error).context(ConditionalPublishTargetChanged::Unverifiable {
-                        path: final_path.to_path_buf(),
-                    })
-                }
-            };
-        }
-    };
-    if let Some(expected_replacement) = expected_replacement {
-        match fingerprint_regular_file_blocking(final_path) {
-            Ok(installed) if installed == expected_replacement => {}
-            Ok(_) => {
-                return Err(anyhow::anyhow!(
-                    "Published replacement at {} no longer matches the validated bytes",
-                    final_path.display()
-                ))
-                .context(ConditionalPublishTargetChanged::Unverifiable {
-                    path: final_path.to_path_buf(),
+    let expected = match expected {
+        Some(expected) => {
+            let current = fingerprint_location(&final_path).map_err(|error| {
+                error.context(ConditionalPublishTargetChanged::Unverifiable {
+                    path: final_path.path().to_path_buf(),
                 })
-                .context(ConditionalPublishMustRetainPaths {
-                    paths: vec![displaced_path],
-                });
+            })?;
+            if current.fingerprint != expected {
+                return Err(ConditionalPublishTargetChanged::AfterPlanning {
+                    path: final_path.path().to_path_buf(),
+                }
+                .into());
             }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| {
-                        format!(
-                            "Could not verify the published replacement at {}",
-                            final_path.display()
-                        )
-                    })
-                    .context(ConditionalPublishTargetChanged::Unverifiable {
-                        path: final_path.to_path_buf(),
-                    })
-                    .context(ConditionalPublishMustRetainPaths {
-                        paths: vec![displaced_path],
-                    });
-            }
+            Some(current)
         }
+        None => None,
+    };
+    publish_location_if_unchanged_blocking(&part, &final_path, expected, replacement)
+}
+
+pub(super) fn publish_location_if_unchanged_blocking(
+    part_path: &FileLocation,
+    final_path: &FileLocation,
+    expected: Option<LocationFingerprint>,
+    replacement: LocationFingerprint,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        fingerprint_location(part_path)? == replacement,
+        "Refusing to publish {} because its bytes or identity changed after validation",
+        part_path.path().display()
+    );
+    let Some(expected) = expected else {
+        return match publish_location_no_replace(part_path, final_path)? {
+            PublishResult::Published => {
+                anyhow::ensure!(
+                    fingerprint_location(final_path)? == replacement,
+                    "Published file changed before validation: {}",
+                    final_path.path().display()
+                );
+                cleanup_published_location(part_path, replacement.identity);
+                final_path.sync_parent()?;
+                Ok(())
+            }
+            PublishResult::DestinationExists => {
+                Err(ConditionalPublishTargetChanged::AfterPlanning {
+                    path: final_path.path().to_path_buf(),
+                }
+                .into())
+            }
+        };
+    };
+    if fingerprint_location(final_path).ok() != Some(expected) {
+        return Err(ConditionalPublishTargetChanged::AfterPlanning {
+            path: final_path.path().to_path_buf(),
+        }
+        .into());
     }
-    let displaced = match fingerprint_regular_file_blocking(&displaced_path) {
-        Ok(displaced) => displaced,
+
+    let displaced_path = match exchange_location_files(part_path, final_path, expected.fingerprint)
+    {
+        Ok(path) => path,
         Err(error) => {
-            let restore_result = restore_repair_target_if_unchanged_blocking(
-                part_path,
-                final_path,
-                &displaced_path,
-                replacement,
-            );
-            return match restore_result {
-                Ok(true) => Err(error).context(
-                    ConditionalPublishTargetChanged::DuringPublication {
-                        path: final_path.to_path_buf(),
-                    },
-                ),
-                Ok(false) => Err(error)
-                    .context(ConditionalPublishTargetChanged::Unverifiable {
-                        path: final_path.to_path_buf(),
-                    })
-                    .context(ConditionalPublishMustRetainPaths {
-                        paths: vec![displaced_path],
-                    }),
-                Err(restore_error) => Err(restore_error)
-                    .with_context(|| {
-                        format!(
-                            "Could not restore {} after displaced-target verification failed: {error:#}",
-                            final_path.display()
-                        )
-                    })
-                    .context(ConditionalPublishTargetChanged::Unverifiable {
-                        path: final_path.to_path_buf(),
-                    }),
+            return if fingerprint_location(final_path).ok() == Some(expected) {
+                Err(error)
+            } else {
+                Err(error).context(ConditionalPublishTargetChanged::Unverifiable {
+                    path: final_path.path().to_path_buf(),
+                })
             };
         }
     };
-    if displaced != expected {
-        let restore_result = restore_repair_target_if_unchanged_blocking(
+    if fingerprint_location(final_path).ok() != Some(replacement)
+        || fingerprint_location(&displaced_path).ok() != Some(expected)
+    {
+        if restore_location_exchange_if_unchanged(
             part_path,
             final_path,
             &displaced_path,
+            expected,
             replacement,
-        );
-        return match restore_result {
-            Ok(true) => Err(ConditionalPublishTargetChanged::DuringPublication {
-                path: final_path.to_path_buf(),
+        )? {
+            return Err(ConditionalPublishTargetChanged::DuringPublication {
+                path: final_path.path().to_path_buf(),
             }
-            .into()),
-            Ok(false) => Err(anyhow::anyhow!(
-                "Refusing to replace {} because its bytes changed during conditional publication",
-                final_path.display()
-            ))
-            .context(ConditionalPublishTargetChanged::Unverifiable {
-                path: final_path.to_path_buf(),
-            })
-            .context(ConditionalPublishMustRetainPaths {
-                paths: vec![displaced_path],
-            }),
-            Err(error) => Err(error)
-                .with_context(|| {
-                    format!(
-                        "Could not restore {} after its bytes changed during conditional publication",
-                        final_path.display()
-                    )
-                })
-                .context(ConditionalPublishTargetChanged::Unverifiable {
-                    path: final_path.to_path_buf(),
-                }),
-        };
+            .into());
+        }
+        return Err(anyhow::anyhow!(
+            "Could not verify conditional publication at {}",
+            final_path.path().display()
+        ))
+        .context(ConditionalPublishTargetChanged::Unverifiable {
+            path: final_path.path().to_path_buf(),
+        })
+        .context(ConditionalPublishMustRetainPaths {
+            paths: retained_location_paths(part_path, &displaced_path),
+        });
     }
 
-    if let Err(error) = std::fs::remove_file(&displaced_path) {
-        tracing::warn!(
-            path = %displaced_path.display(),
-            %error,
-            "Failed to remove displaced file after verified replacement"
-        );
-    }
-    fsync_parent_dir_best_effort_blocking(final_path);
+    cleanup_published_location(&displaced_path, expected.identity);
+    final_path.sync_parent()?;
     Ok(())
 }
 
-fn restore_repair_target_if_unchanged_blocking(
-    part_path: &Path,
-    final_path: &Path,
-    displaced_path: &Path,
-    replacement: ExistingFileFingerprint,
+fn restore_location_exchange_if_unchanged(
+    part_path: &FileLocation,
+    final_path: &FileLocation,
+    displaced_path: &FileLocation,
+    expected_displaced: LocationFingerprint,
+    replacement: LocationFingerprint,
 ) -> anyhow::Result<bool> {
-    restore_repair_target_if_unchanged_with(
-        part_path,
-        final_path,
-        displaced_path,
-        replacement,
-        restore_exchanged_repair_files_blocking,
-    )
-}
-
-fn restore_repair_target_if_unchanged_with(
-    part_path: &Path,
-    final_path: &Path,
-    displaced_path: &Path,
-    replacement: ExistingFileFingerprint,
-    restore: impl FnOnce(&Path, &Path, &Path) -> std::io::Result<()>,
-) -> anyhow::Result<bool> {
-    if fingerprint_regular_file_blocking(final_path).ok() == Some(replacement) {
-        if let Err(error) = restore(part_path, final_path, displaced_path) {
-            return Err(error)
-                .context(ConditionalPublishTargetChanged::Unverifiable {
-                    path: final_path.to_path_buf(),
-                })
-                .context(ConditionalPublishMustRetainPaths {
-                    paths: retained_restore_paths(part_path, displaced_path),
-                });
-        }
-        match fingerprint_regular_file_blocking(part_path) {
-            Ok(displaced_replacement) if displaced_replacement == replacement => {}
-            Ok(_) => {
-                return Err(anyhow::anyhow!(
-                    "Restoring {} displaced different bytes to {}",
-                    final_path.display(),
-                    part_path.display()
-                ))
-                .context(ConditionalPublishTargetChanged::Unverifiable {
-                    path: final_path.to_path_buf(),
-                })
-                .context(ConditionalPublishMustRetainPaths {
-                    paths: retained_restore_paths(part_path, displaced_path),
-                });
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| {
-                        format!(
-                            "Could not verify the entry displaced while restoring {}",
-                            final_path.display()
-                        )
-                    })
-                    .context(ConditionalPublishTargetChanged::Unverifiable {
-                        path: final_path.to_path_buf(),
-                    })
-                    .context(ConditionalPublishMustRetainPaths {
-                        paths: retained_restore_paths(part_path, displaced_path),
-                    });
-            }
-        }
-        return Ok(true);
+    if fingerprint_location(final_path).ok() != Some(replacement)
+        || fingerprint_location(displaced_path).ok() != Some(expected_displaced)
+    {
+        return Ok(false);
     }
-    Ok(false)
+    restore_location_files(part_path, final_path, displaced_path)
+        .with_context(|| {
+            format!(
+                "Could not restore {} after conditional publication",
+                final_path.path().display()
+            )
+        })
+        .context(ConditionalPublishTargetChanged::Unverifiable {
+            path: final_path.path().to_path_buf(),
+        })
+        .context(ConditionalPublishMustRetainPaths {
+            paths: retained_location_paths(part_path, displaced_path),
+        })?;
+    let restored = (|| {
+        Ok::<_, anyhow::Error>(
+            fingerprint_location(final_path)? == expected_displaced
+                && fingerprint_location(part_path)? == replacement,
+        )
+    })()
+    .context(ConditionalPublishTargetChanged::Unverifiable {
+        path: final_path.path().to_path_buf(),
+    })
+    .context(ConditionalPublishMustRetainPaths {
+        paths: retained_location_paths(part_path, displaced_path),
+    })?;
+    if !restored {
+        return Err(anyhow::anyhow!(
+            "Conditional publication rollback did not restore both verified files"
+        ))
+        .context(ConditionalPublishTargetChanged::Unverifiable {
+            path: final_path.path().to_path_buf(),
+        })
+        .context(ConditionalPublishMustRetainPaths {
+            paths: retained_location_paths(part_path, displaced_path),
+        });
+    }
+    Ok(true)
 }
 
-fn retained_restore_paths(part_path: &Path, displaced_path: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![part_path.to_path_buf()];
-    if displaced_path != part_path {
-        paths.push(displaced_path.to_path_buf());
+fn retained_location_paths(
+    part_path: &FileLocation,
+    displaced_path: &FileLocation,
+) -> Vec<PathBuf> {
+    let mut paths = vec![part_path.path().to_path_buf()];
+    if displaced_path.path() != part_path.path() {
+        paths.push(displaced_path.path().to_path_buf());
     }
     paths
 }
 
+fn cleanup_published_location(path: &FileLocation, expected: FileIdentity) {
+    match path.remove_if_identity(expected) {
+        Ok(IdentityCleanup::Removed) => {}
+        Ok(IdentityCleanup::Retained {
+            path: retained,
+            verified: true,
+        }) => tracing::warn!(
+            path = %path.path().display(),
+            retained = %retained.display(),
+            "Publication succeeded; retaining verified temporary file because safe cleanup is unavailable"
+        ),
+        Ok(IdentityCleanup::Retained {
+            path: retained,
+            verified: false,
+        }) => tracing::warn!(
+            path = %path.path().display(),
+            retained = %retained.display(),
+            "Publication succeeded; retaining ambiguous temporary entry instead of risking data loss"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.path().display(),
+            %error,
+            "Publication succeeded; refusing unsafe temporary-file cleanup"
+        ),
+    }
+}
+
+#[cfg(windows)]
 fn fsync_parent_dir_best_effort_blocking(path: &Path) {
     if let Err(error) = crate::fs_util::fsync_parent_dir(path) {
         tracing::warn!(
@@ -983,34 +936,355 @@ enum PublishResult {
     DestinationExists,
 }
 
+pub(super) enum FileLocation {
+    Path(PathBuf),
+    Confined(ConfinedPath),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LocationFingerprint {
+    pub(super) fingerprint: ExistingFileFingerprint,
+    pub(super) identity: FileIdentity,
+}
+
+impl FileLocation {
+    pub(super) fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            Self::Confined(path) => path.path(),
+        }
+    }
+
+    pub(super) fn try_clone(&self) -> anyhow::Result<Self> {
+        Ok(match self {
+            Self::Path(path) => Self::Path(path.clone()),
+            Self::Confined(path) => Self::Confined(path.try_clone()?),
+        })
+    }
+
+    #[cfg(any(feature = "xmp", windows))]
+    pub(super) fn sibling(&self, path: &Path) -> anyhow::Result<Self> {
+        Ok(match self {
+            Self::Path(_) => Self::Path(path.to_path_buf()),
+            Self::Confined(confined) => Self::Confined(confined.sibling(path)?),
+        })
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn open_optional_regular(&self) -> std::io::Result<Option<std::fs::File>> {
+        match self {
+            Self::Path(path) => match open_regular_file_io(path, false) {
+                Ok(file) => Ok(Some(file)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            },
+            Self::Confined(path) => Ok(path.open_optional_regular()?),
+        }
+    }
+
+    fn open_regular(&self) -> anyhow::Result<std::fs::File> {
+        match self {
+            Self::Path(path) => open_regular_file_blocking(path),
+            Self::Confined(path) => Ok(path.open_regular()?),
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn create_new_regular(&self) -> std::io::Result<std::fs::File> {
+        match self {
+            Self::Path(path) => {
+                #[cfg(unix)]
+                use std::os::unix::fs::OpenOptionsExt;
+                #[cfg(windows)]
+                use std::os::windows::fs::OpenOptionsExt;
+
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                #[cfg(windows)]
+                options.custom_flags(
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                );
+                let file = options.open(path)?;
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Path is not a regular file: {}", path.display()),
+                    ));
+                }
+                Ok(file)
+            }
+            Self::Confined(path) => path.create_new_regular(),
+        }
+    }
+
+    pub(super) fn validate_identity(
+        &self,
+        expected: FileIdentity,
+    ) -> anyhow::Result<std::fs::File> {
+        match self {
+            Self::Path(path) => {
+                let file = open_regular_file_blocking(path)?;
+                anyhow::ensure!(
+                    file_identity(&file)? == expected,
+                    "File changed identity: {}",
+                    path.display()
+                );
+                Ok(file)
+            }
+            Self::Confined(path) => Ok(path.validate_identity(expected)?),
+        }
+    }
+
+    pub(super) fn validate_identity_for_metadata(
+        &self,
+        expected: FileIdentity,
+    ) -> anyhow::Result<std::fs::File> {
+        match self {
+            Self::Path(path) => {
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                Ok(ConfinedPath::open(parent, path, ConfinedParents::Existing)?
+                    .validate_identity_for_metadata(expected)?)
+            }
+            Self::Confined(path) => Ok(path.validate_identity_for_metadata(expected)?),
+        }
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn ensure_missing(&self) -> anyhow::Result<()> {
+        match self.entry_exists() {
+            Ok(false) => Ok(()),
+            Ok(true) => anyhow::bail!("{} already exists", self.path().display()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn entry_exists(&self) -> std::io::Result<bool> {
+        match self {
+            Self::Path(path) => path.try_exists(),
+            Self::Confined(path) => path.entry_exists(),
+        }
+    }
+
+    fn sync_parent(&self) -> std::io::Result<()> {
+        match self {
+            Self::Path(path) => crate::fs_util::fsync_parent_dir(path),
+            Self::Confined(path) => path.sync_parent(),
+        }
+    }
+
+    pub(super) fn remove_if_identity(
+        &self,
+        expected: FileIdentity,
+    ) -> std::io::Result<IdentityCleanup> {
+        match self {
+            Self::Path(path) => {
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                ConfinedPath::open(parent, path, ConfinedParents::Existing)?
+                    .remove_if_identity(expected)
+            }
+            Self::Confined(path) => path.remove_if_identity(expected),
+        }
+    }
+}
+
+pub(super) struct LocationCleanupGuard {
+    location: Box<FileLocation>,
+    pub(super) identity: FileIdentity,
+    armed: bool,
+}
+
+impl LocationCleanupGuard {
+    pub(super) fn new(location: FileLocation, identity: FileIdentity) -> Self {
+        Self {
+            location: Box::new(location),
+            identity,
+            armed: true,
+        }
+    }
+
+    pub(super) fn for_path(path: &Path) -> anyhow::Result<Self> {
+        let location = FileLocation::Path(path.to_path_buf());
+        let identity = file_identity(&location.open_regular()?)?;
+        Ok(Self::new(location, identity))
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn refresh_identity(&mut self) -> anyhow::Result<()> {
+        self.identity = file_identity(&self.location.open_regular()?)?;
+        Ok(())
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LocationCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.location.remove_if_identity(self.identity) {
+            Ok(IdentityCleanup::Removed) => {}
+            Ok(IdentityCleanup::Retained { path, .. }) => tracing::warn!(
+                path = %self.location.path().display(),
+                retained = %path.display(),
+                "Retaining unpublished temporary file because safe cleanup is unavailable"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %self.location.path().display(),
+                %error,
+                "Could not remove unpublished temporary file"
+            ),
+        }
+    }
+}
+
+fn fingerprint_location(path: &FileLocation) -> anyhow::Result<LocationFingerprint> {
+    let mut file = path.open_regular()?;
+    let identity = file_identity(&file)?;
+    let fingerprint =
+        fingerprint_open_file_from_start_blocking(&mut file, path.path())?.fingerprint;
+    path.validate_identity(identity)?;
+    Ok(LocationFingerprint {
+        fingerprint,
+        identity,
+    })
+}
+
 /// Copy an existing catalog file to a new derived path without replacing any
 /// file already present at the destination. The copy is verified before the
 /// same no-overwrite `.part` publication used by provider downloads.
-#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub(crate) enum VerifiedLocalCopy {
-    Verified(String),
+    Verified(Box<ReconciledFile>),
+    SourceMissing,
     SourceChanged,
     DestinationConflict,
 }
 
-async fn create_reconciliation_temp(
-    destination: &Path,
-) -> anyhow::Result<(PathBuf, tokio::fs::File, FileIdentity)> {
+pub(crate) struct ReconciledFile {
+    checksum: String,
+    #[cfg(feature = "xmp")]
+    source: ConfinedPath,
+    #[cfg(feature = "xmp")]
+    source_identity: FileIdentity,
+    destination: ConfinedPath,
+    destination_identity: FileIdentity,
+    source_permissions: std::fs::Permissions,
+}
+
+impl ReconciledFile {
+    pub(crate) fn checksum(&self) -> &str {
+        &self.checksum
+    }
+
+    pub(crate) fn set_capture_time(&self, timestamp: i64) -> anyhow::Result<()> {
+        let mut file = self
+            .destination
+            .validate_identity_for_metadata(self.destination_identity)?;
+        let fingerprint =
+            fingerprint_open_file_from_start_blocking(&mut file, self.destination.path())?
+                .fingerprint;
+        anyhow::ensure!(
+            data_encoding::HEXLOWER.encode(&fingerprint.sha256) == self.checksum,
+            "Reconciled file bytes changed before setting capture time: {}",
+            self.destination.path().display()
+        );
+        set_open_file_capture_time(&file, self.destination.path(), timestamp)?;
+        self.destination
+            .validate_identity(self.destination_identity)?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_parent(&self) -> std::io::Result<()> {
+        self.destination.sync_parent()
+    }
+
+    pub(crate) fn validate_final(&self, timestamp: i64) -> anyhow::Result<()> {
+        let mut file = self
+            .destination
+            .validate_identity_for_metadata(self.destination_identity)?;
+        let snapshot =
+            fingerprint_open_file_from_start_blocking(&mut file, self.destination.path())?;
+        anyhow::ensure!(
+            data_encoding::HEXLOWER.encode(&snapshot.fingerprint.sha256) == self.checksum,
+            "Reconciled file bytes changed before state finalization: {}",
+            self.destination.path().display()
+        );
+        set_open_file_capture_time(&file, self.destination.path(), timestamp)?;
+        file.set_permissions(self.source_permissions.clone())?;
+        #[cfg(not(windows))]
+        file.sync_all()?;
+        self.destination
+            .validate_identity(self.destination_identity)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn open_source_for_metadata(&self) -> anyhow::Result<std::fs::File> {
+        let mut file = self.source.validate_identity(self.source_identity)?;
+        let snapshot = fingerprint_open_file_from_start_blocking(&mut file, self.source.path())?;
+        anyhow::ensure!(
+            data_encoding::HEXLOWER.encode(&snapshot.fingerprint.sha256) == self.checksum,
+            "Reconciliation source changed before sidecar planning: {}",
+            self.source.path().display()
+        );
+        Ok(file)
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn source_sidecar(&self) -> anyhow::Result<ConfinedPath> {
+        let path = super::metadata::sidecar_path(self.source.path())?;
+        Ok(self.source.sibling(&path)?)
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn destination_sidecar(&self) -> anyhow::Result<ConfinedPath> {
+        let path = super::metadata::sidecar_path(self.destination.path())?;
+        Ok(self.destination.sibling(&path)?)
+    }
+
+    #[cfg(feature = "xmp")]
+    pub(super) fn source_path(&self) -> &Path {
+        self.source.path()
+    }
+}
+
+fn reconciliation_source_root(download_root: &Path, source: &Path) -> anyhow::Result<PathBuf> {
+    let download_root = crate::fs_util::absolute_lexical(download_root)?;
+    let source = crate::fs_util::absolute_lexical(source)?;
+    if source.starts_with(&download_root) {
+        return Ok(download_root);
+    }
+    let source_parent = source.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot confine reconciliation source without a parent: {}",
+            source.display()
+        )
+    })?;
+    Ok(source_parent
+        .ancestors()
+        .find(|ancestor| download_root.starts_with(ancestor))
+        .unwrap_or(source_parent)
+        .to_path_buf())
+}
+
+fn create_reconciliation_temp(
+    destination: &ConfinedPath,
+) -> anyhow::Result<(ConfinedPath, std::fs::File, FileIdentity)> {
     for _ in 0..128 {
-        let path =
-            destination.with_file_name(format!(".kei-reconcile-{}.tmp", uuid::Uuid::new_v4()));
-        match tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
+        let path = destination
+            .path()
+            .with_file_name(format!(".kei-reconcile-{}.tmp", uuid::Uuid::new_v4()));
+        let confined = destination.sibling(&path)?;
+        match confined.create_new_regular() {
             Ok(file) => {
-                let file = file.into_std().await;
                 let identity = file_identity(&file)?;
-                return Ok((path, tokio::fs::File::from_std(file), identity));
+                return Ok((confined, file, identity));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -1018,20 +1292,8 @@ async fn create_reconciliation_temp(
     }
     anyhow::bail!(
         "Could not allocate a unique reconciliation file beside {}",
-        destination.display()
+        destination.path().display()
     )
-}
-
-async fn fingerprint_regular_file_with_identity(
-    path: &Path,
-) -> anyhow::Result<(ExistingFileFingerprint, FileIdentity)> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let (snapshot, identity) = fingerprint_regular_file_with_identity_blocking(&path)?;
-        Ok::<_, anyhow::Error>((snapshot.fingerprint, identity))
-    })
-    .await
-    .map_err(std::io::Error::other)?
 }
 
 fn retain_reconciliation_temp(path: &Path, reason: &str) {
@@ -1043,228 +1305,537 @@ fn retain_reconciliation_temp(path: &Path, reason: &str) {
 }
 
 pub(crate) async fn copy_local_file_no_replace(
+    download_root: &Path,
     source: &Path,
     destination: &Path,
     expected_source_hash: &str,
 ) -> anyhow::Result<VerifiedLocalCopy> {
-    let source_fingerprint = fingerprint_regular_file(source).await?;
+    let download_root = download_root.to_path_buf();
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    let expected_source_hash = expected_source_hash.to_owned();
+    tokio::task::spawn_blocking(move || {
+        copy_local_file_no_replace_blocking(
+            &download_root,
+            &source,
+            &destination,
+            &expected_source_hash,
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+fn copy_local_file_no_replace_blocking(
+    download_root: &Path,
+    source: &Path,
+    destination: &Path,
+    expected_source_hash: &str,
+) -> anyhow::Result<VerifiedLocalCopy> {
+    copy_local_file_no_replace_blocking_with(
+        download_root,
+        source,
+        destination,
+        expected_source_hash,
+        || {},
+        || {},
+    )
+}
+
+fn copy_local_file_no_replace_blocking_with(
+    download_root: &Path,
+    source: &Path,
+    destination: &Path,
+    expected_source_hash: &str,
+    before_source_revalidation: impl FnOnce(),
+    before_publication: impl FnOnce(),
+) -> anyhow::Result<VerifiedLocalCopy> {
+    // CONTRACT: PATH_RECONCILIATION_REQUIRES_CONFINED_CAPABILITIES
+    let source_root = reconciliation_source_root(download_root, source)?;
+    let source = match ConfinedPath::open(&source_root, source, ConfinedParents::Existing) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VerifiedLocalCopy::SourceMissing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut source_file = match source.open_regular() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VerifiedLocalCopy::SourceMissing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let source_identity = file_identity(&source_file)?;
+    let source_permissions = source_file.metadata()?.permissions();
+    let source_fingerprint =
+        fingerprint_open_file_from_start_blocking(&mut source_file, source.path())?.fingerprint;
     let source_hash = data_encoding::HEXLOWER.encode(&source_fingerprint.sha256);
     if source_hash != expected_source_hash {
         return Ok(VerifiedLocalCopy::SourceChanged);
     }
-    match fs::symlink_metadata(destination).await {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Ok(VerifiedLocalCopy::DestinationConflict);
-        }
-        Ok(_) => {
-            let destination_fingerprint = fingerprint_regular_file(destination).await?;
+    source.validate_identity(source_identity)?;
+
+    let destination = ConfinedPath::open(download_root, destination, ConfinedParents::Create)?;
+    match destination.open_optional_regular() {
+        Ok(Some(mut file)) => {
+            let identity = file_identity(&file)?;
+            let destination_fingerprint =
+                fingerprint_open_file_from_start_blocking(&mut file, destination.path())?
+                    .fingerprint;
+            destination.validate_identity(identity)?;
             return Ok(if source_fingerprint == destination_fingerprint {
-                VerifiedLocalCopy::Verified(source_hash)
+                VerifiedLocalCopy::Verified(Box::new(ReconciledFile {
+                    checksum: source_hash,
+                    #[cfg(feature = "xmp")]
+                    source,
+                    #[cfg(feature = "xmp")]
+                    source_identity,
+                    destination,
+                    destination_identity: identity,
+                    source_permissions,
+                }))
             } else {
                 VerifiedLocalCopy::DestinationConflict
             });
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(None) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Ok(VerifiedLocalCopy::DestinationConflict);
+        }
         Err(error) => return Err(error.into()),
     }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).await?;
+    let (part_path, mut part_file, part_identity) = create_reconciliation_temp(&destination)?;
+    if let Err(error) = std::io::copy(&mut source_file, &mut part_file) {
+        retain_reconciliation_temp(part_path.path(), "copy failed");
+        return Err(error.into());
     }
-    let (part_path, mut part_file, part_identity) = create_reconciliation_temp(destination).await?;
-    let source_path = source.to_path_buf();
-    let mut source_file =
-        match tokio::task::spawn_blocking(move || open_regular_file_blocking(&source_path)).await {
-            Ok(Ok(file)) => tokio::fs::File::from_std(file),
-            Ok(Err(error)) => {
-                retain_reconciliation_temp(&part_path, "source open failed");
+    if let Err(error) = part_file.sync_all() {
+        retain_reconciliation_temp(part_path.path(), "temporary file sync failed");
+        return Err(error.into());
+    }
+    before_source_revalidation();
+    let source_after =
+        match fingerprint_open_file_from_start_blocking(&mut source_file, source.path()) {
+            Ok(snapshot) => snapshot.fingerprint,
+            Err(error) => {
+                retain_reconciliation_temp(part_path.path(), "source revalidation failed");
                 return Err(error);
             }
-            Err(error) => {
-                retain_reconciliation_temp(&part_path, "source open task failed");
-                return Err(std::io::Error::other(error).into());
-            }
         };
-    if let Err(error) = tokio::io::copy(&mut source_file, &mut part_file).await {
-        retain_reconciliation_temp(&part_path, "copy failed");
-        return Err(error.into());
-    }
-    if let Err(error) = part_file.sync_all().await {
-        retain_reconciliation_temp(&part_path, "temporary file sync failed");
-        return Err(error.into());
-    }
-    let source_after = match fingerprint_regular_file(source).await {
-        Ok(fingerprint) => fingerprint,
+    let source_path_unchanged = match source.validate_identity(source_identity) {
+        Ok(_) => true,
         Err(error) => {
-            retain_reconciliation_temp(&part_path, "source revalidation failed");
-            return Err(error);
+            retain_reconciliation_temp(part_path.path(), "source path changed during copy");
+            if error.kind() == std::io::ErrorKind::NotFound {
+                false
+            } else {
+                return Err(error.into());
+            }
         }
     };
-    if source_after != source_fingerprint {
-        retain_reconciliation_temp(&part_path, "source changed during copy");
+    if source_after != source_fingerprint || !source_path_unchanged {
+        retain_reconciliation_temp(part_path.path(), "source changed during copy");
         return Ok(VerifiedLocalCopy::SourceChanged);
     }
-    let (copied_fingerprint, part_path_identity) =
-        match fingerprint_regular_file_with_identity(&part_path).await {
-            Ok(fingerprint) => fingerprint,
+    let copied_fingerprint =
+        match fingerprint_open_file_from_start_blocking(&mut part_file, part_path.path()) {
+            Ok(snapshot) => snapshot.fingerprint,
             Err(error) => {
-                retain_reconciliation_temp(&part_path, "temporary file validation failed");
+                retain_reconciliation_temp(part_path.path(), "temporary file validation failed");
                 return Err(error);
             }
         };
-    let part_path_is_owned = part_path_identity == part_identity;
+    let part_path_is_owned = part_path.validate_identity(part_identity).is_ok();
     if copied_fingerprint != source_fingerprint || !part_path_is_owned {
-        retain_reconciliation_temp(&part_path, "temporary file changed after validation");
+        retain_reconciliation_temp(part_path.path(), "temporary file changed after validation");
         anyhow::bail!("local path reconciliation checksum mismatch");
     }
-    let part_file = part_file.into_std().await;
-    let publication = match publish_reconciliation_part_no_replace(&part_path, destination).await {
+    before_publication();
+    let part_location = FileLocation::Confined(part_path.try_clone()?);
+    let destination_location = FileLocation::Confined(destination.try_clone()?);
+    let publication = match publish_location_no_replace(&part_location, &destination_location) {
         Ok(publication) => publication,
         Err(error) => {
-            retain_reconciliation_temp(&part_path, "publication failed");
+            retain_reconciliation_temp(part_path.path(), "publication failed");
             return Err(error.into());
         }
     };
     match publication {
         PublishResult::Published => {
-            crate::fs_util::fsync_parent_dir_async_best_effort(destination).await;
-            let (installed, installed_identity) =
-                fingerprint_regular_file_with_identity(destination).await?;
-            let published_identity = file_identity(&part_file)?;
-            if installed == source_fingerprint && installed_identity == published_identity {
-                if fs::symlink_metadata(&part_path).await.is_ok() {
-                    retain_reconciliation_temp(
-                        &part_path,
-                        "platform retained the verified hard-link source",
-                    );
-                }
-                Ok(VerifiedLocalCopy::Verified(source_hash))
+            let mut installed = destination.validate_identity(part_identity)?;
+            let installed_fingerprint =
+                fingerprint_open_file_from_start_blocking(&mut installed, destination.path())?
+                    .fingerprint;
+            if installed_fingerprint == source_fingerprint {
+                cleanup_published_location(&part_location, part_identity);
+                Ok(VerifiedLocalCopy::Verified(Box::new(ReconciledFile {
+                    checksum: source_hash,
+                    #[cfg(feature = "xmp")]
+                    source,
+                    #[cfg(feature = "xmp")]
+                    source_identity,
+                    destination,
+                    destination_identity: part_identity,
+                    source_permissions,
+                })))
             } else {
                 anyhow::bail!(
                     "Published reconciliation file changed at {}",
-                    destination.display()
+                    destination.path().display()
                 )
             }
         }
         PublishResult::DestinationExists => {
-            retain_reconciliation_temp(&part_path, "destination appeared during publication");
-            match fs::symlink_metadata(destination).await {
-                Ok(metadata) if metadata.file_type().is_file() => {
-                    let destination_fingerprint = fingerprint_regular_file(destination).await?;
+            retain_reconciliation_temp(part_path.path(), "destination appeared during publication");
+            match destination.open_optional_regular() {
+                Ok(Some(mut file)) => {
+                    let identity = file_identity(&file)?;
+                    let destination_fingerprint =
+                        fingerprint_open_file_from_start_blocking(&mut file, destination.path())?
+                            .fingerprint;
+                    destination.validate_identity(identity)?;
                     Ok(if destination_fingerprint == source_fingerprint {
-                        VerifiedLocalCopy::Verified(source_hash)
+                        VerifiedLocalCopy::Verified(Box::new(ReconciledFile {
+                            checksum: source_hash,
+                            #[cfg(feature = "xmp")]
+                            source,
+                            #[cfg(feature = "xmp")]
+                            source_identity,
+                            destination,
+                            destination_identity: identity,
+                            source_permissions,
+                        }))
                     } else {
                         VerifiedLocalCopy::DestinationConflict
                     })
                 }
-                Ok(_) => Ok(VerifiedLocalCopy::DestinationConflict),
+                Ok(None) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "Reconciliation destination disappeared: {}",
+                        destination.path().display()
+                    ),
+                )
+                .into()),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    Ok(VerifiedLocalCopy::DestinationConflict)
+                }
                 Err(error) => Err(error.into()),
             }
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn publish_reconciliation_part_no_replace(
-    part_path: &Path,
-    final_path: &Path,
+fn publish_location_no_replace(
+    part_path: &FileLocation,
+    final_path: &FileLocation,
 ) -> std::io::Result<PublishResult> {
-    let part = part_path.to_path_buf();
-    let final_path_buf = final_path.to_path_buf();
-    let rename_result =
-        tokio::task::spawn_blocking(move || renameat2_no_replace_blocking(&part, &final_path_buf))
-            .await
-            .map_err(std::io::Error::other)?;
+    #[cfg(target_os = "linux")]
+    {
+        let result = match (part_path, final_path) {
+            (FileLocation::Path(part), FileLocation::Path(final_path)) => {
+                renameat2_no_replace_blocking(part, final_path)
+            }
+            (FileLocation::Confined(part), FileLocation::Confined(final_path)) => {
+                renameat2_confined_blocking(part, final_path, libc::RENAME_NOREPLACE)
+            }
+            _ => return Err(mixed_location_error()),
+        };
+        match result {
+            Ok(()) => Ok(PublishResult::Published),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(PublishResult::DestinationExists)
+            }
+            Err(error) if is_renameat2_unsupported(&error) => {
+                hard_link_locations(part_path, final_path)
+                    .or_else(|link_error| location_destination_exists_or(link_error, final_path))
+            }
+            Err(error) => location_destination_exists_or(error, final_path),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let result = match (part_path, final_path) {
+            (FileLocation::Path(part), FileLocation::Path(final_path)) => {
+                rename_path_macos(part, final_path, libc::RENAME_EXCL)
+            }
+            (FileLocation::Confined(part), FileLocation::Confined(final_path)) => {
+                rename_confined_macos(part, final_path, libc::RENAME_EXCL)
+            }
+            _ => return Err(mixed_location_error()),
+        };
+        match result {
+            Ok(()) => Ok(PublishResult::Published),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(PublishResult::DestinationExists)
+            }
+            Err(error) => location_destination_exists_or(error, final_path),
+        }
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        hard_link_locations(part_path, final_path)
+            .or_else(|link_error| location_destination_exists_or(link_error, final_path))
+    }
+    #[cfg(windows)]
+    {
+        match move_file_no_replace_blocking(part_path.path(), final_path.path()) {
+            Ok(()) => Ok(PublishResult::Published),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(PublishResult::DestinationExists)
+            }
+            Err(error) => location_destination_exists_or(error, final_path),
+        }
+    }
+}
 
-    match rename_result {
-        Ok(()) => Ok(PublishResult::Published),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
-        }
-        Err(error) if is_renameat2_unsupported(&error) => {
-            publish_part_by_hard_link_retained(part_path, final_path)
-                .await
-                .or_else(|link_error| destination_exists_or(link_error, final_path))
-        }
-        Err(error) => destination_exists_or(error, final_path),
+#[cfg(target_os = "linux")]
+fn renameat2_confined_blocking(
+    part_path: &ConfinedPath,
+    final_path: &ConfinedPath,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
+    // SAFETY: both directory descriptors and NUL-terminated names remain live,
+    // and callers pass one documented renameat2 flag.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            part_path.parent_fd(),
+            part_path.name_cstr().as_ptr(),
+            final_path.parent_fd(),
+            final_path.name_cstr().as_ptr(),
+            flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
 #[cfg(target_os = "macos")]
-async fn publish_reconciliation_part_no_replace(
-    part_path: &Path,
-    final_path: &Path,
-) -> std::io::Result<PublishResult> {
-    let part = part_path.to_path_buf();
-    let final_path_buf = final_path.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
+fn rename_path_macos(
+    source: &Path,
+    destination: &Path,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
 
-        let part = CString::new(part.as_os_str().as_bytes())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let final_path = CString::new(final_path_buf.as_os_str().as_bytes())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        // SAFETY: both paths are valid NUL-terminated C strings and
-        // RENAME_EXCL atomically refuses an existing destination on macOS.
-        let result =
-            unsafe { libc::renamex_np(part.as_ptr(), final_path.as_ptr(), libc::RENAME_EXCL) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: both paths are live NUL-terminated strings and callers pass a
+    // documented renamex_np flag.
+    if unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_confined_macos(
+    source: &ConfinedPath,
+    destination: &ConfinedPath,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
+    // SAFETY: both retained directory descriptors and NUL-terminated names
+    // remain live and callers pass a documented renameatx_np flag.
+    if unsafe {
+        libc::renameatx_np(
+            source.parent_fd(),
+            source.name_cstr().as_ptr(),
+            destination.parent_fd(),
+            destination.name_cstr().as_ptr(),
+            flags,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn hard_link_locations(
+    part_path: &FileLocation,
+    final_path: &FileLocation,
+) -> std::io::Result<PublishResult> {
+    let result = match (part_path, final_path) {
+        (FileLocation::Path(part), FileLocation::Path(final_path)) => {
+            std::fs::hard_link(part, final_path)
         }
-    })
-    .await
-    .map_err(std::io::Error::other)?;
+        (FileLocation::Confined(part), FileLocation::Confined(final_path)) => {
+            // SAFETY: both retained directory descriptors and NUL-terminated
+            // names remain live. linkat refuses an existing destination.
+            if unsafe {
+                libc::linkat(
+                    part.parent_fd(),
+                    part.name_cstr().as_ptr(),
+                    final_path.parent_fd(),
+                    final_path.name_cstr().as_ptr(),
+                    0,
+                )
+            } == 0
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        _ => Err(mixed_location_error()),
+    };
     match result {
         Ok(()) => Ok(PublishResult::Published),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(PublishResult::DestinationExists)
         }
-        Err(error) => destination_exists_or(error, final_path),
+        Err(error) => Err(error),
     }
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-async fn publish_reconciliation_part_no_replace(
-    part_path: &Path,
-    final_path: &Path,
+fn location_destination_exists_or(
+    error: std::io::Error,
+    final_path: &FileLocation,
 ) -> std::io::Result<PublishResult> {
-    publish_part_by_hard_link_retained(part_path, final_path)
-        .await
-        .or_else(|link_error| destination_exists_or(link_error, final_path))
+    if final_path.entry_exists()? {
+        Ok(PublishResult::DestinationExists)
+    } else {
+        Err(error)
+    }
 }
 
-#[cfg(windows)]
-async fn publish_reconciliation_part_no_replace(
-    part_path: &Path,
-    final_path: &Path,
-) -> std::io::Result<PublishResult> {
-    publish_part_no_replace(part_path, final_path).await
+fn mixed_location_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "publication locations must use the same backend",
+    )
 }
 
-#[cfg(target_os = "linux")]
+fn exchange_location_files(
+    part_path: &FileLocation,
+    final_path: &FileLocation,
+    expected: ExistingFileFingerprint,
+) -> anyhow::Result<FileLocation> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = expected;
+        match (part_path, final_path) {
+            (FileLocation::Path(part), FileLocation::Path(final_path)) => {
+                renameat2_exchange_blocking(part, final_path)?
+            }
+            (FileLocation::Confined(part), FileLocation::Confined(final_path)) => {
+                renameat2_confined_blocking(part, final_path, libc::RENAME_EXCHANGE)?
+            }
+            _ => return Err(mixed_location_error().into()),
+        }
+        part_path.try_clone()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = expected;
+        match (part_path, final_path) {
+            (FileLocation::Path(part), FileLocation::Path(final_path)) => {
+                rename_exchange_blocking(part, final_path)?
+            }
+            (FileLocation::Confined(part), FileLocation::Confined(final_path)) => {
+                rename_confined_macos(part, final_path, libc::RENAME_SWAP)?
+            }
+            _ => return Err(mixed_location_error().into()),
+        }
+        part_path.try_clone()
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        let _ = (part_path, final_path, expected);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic file replacement is unsupported on this platform",
+        )
+        .into())
+    }
+    #[cfg(windows)]
+    {
+        let displaced =
+            exchange_repair_files_blocking(part_path.path(), final_path.path(), expected)?;
+        part_path.sibling(&displaced)
+    }
+}
+
+fn restore_location_files(
+    part_path: &FileLocation,
+    final_path: &FileLocation,
+    displaced_path: &FileLocation,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = displaced_path;
+        match (part_path, final_path) {
+            (FileLocation::Path(part), FileLocation::Path(final_path)) => {
+                renameat2_exchange_blocking(part, final_path)
+            }
+            (FileLocation::Confined(part), FileLocation::Confined(final_path)) => {
+                renameat2_confined_blocking(part, final_path, libc::RENAME_EXCHANGE)
+            }
+            _ => Err(mixed_location_error()),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = displaced_path;
+        match (part_path, final_path) {
+            (FileLocation::Path(part), FileLocation::Path(final_path)) => {
+                rename_exchange_blocking(part, final_path)
+            }
+            (FileLocation::Confined(part), FileLocation::Confined(final_path)) => {
+                rename_confined_macos(part, final_path, libc::RENAME_SWAP)
+            }
+            _ => Err(mixed_location_error()),
+        }
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        let _ = (part_path, final_path, displaced_path);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic file replacement is unsupported on this platform",
+        ))
+    }
+    #[cfg(windows)]
+    {
+        restore_exchanged_repair_files_blocking(
+            part_path.path(),
+            final_path.path(),
+            displaced_path.path(),
+        )
+    }
+}
+
 async fn publish_part_no_replace(
     part_path: &Path,
     final_path: &Path,
 ) -> std::io::Result<PublishResult> {
     let part = part_path.to_path_buf();
-    let final_path_buf = final_path.to_path_buf();
-    let rename_result =
-        tokio::task::spawn_blocking(move || renameat2_no_replace_blocking(&part, &final_path_buf))
-            .await
-            .map_err(std::io::Error::other)?;
-
-    match rename_result {
-        Ok(()) => Ok(PublishResult::Published),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
+    let final_path = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let part = FileLocation::Path(part);
+        let final_path = FileLocation::Path(final_path);
+        let identity = file_identity(&part.open_regular().map_err(std::io::Error::other)?)?;
+        let result = publish_location_no_replace(&part, &final_path)?;
+        if result == PublishResult::Published {
+            final_path
+                .validate_identity(identity)
+                .map_err(std::io::Error::other)?;
+            cleanup_published_location(&part, identity);
         }
-        Err(e) if is_renameat2_unsupported(&e) => publish_part_by_hard_link(part_path, final_path)
-            .await
-            .or_else(|link_err| destination_exists_or(link_err, final_path)),
-        Err(e) => destination_exists_or(e, final_path),
-    }
+        Ok(result)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 #[cfg(target_os = "linux")]
@@ -1312,25 +1883,6 @@ fn renameat2_blocking(
 }
 
 #[cfg(target_os = "linux")]
-fn exchange_repair_files_blocking(
-    part_path: &Path,
-    final_path: &Path,
-    _expected: ExistingFileFingerprint,
-) -> anyhow::Result<PathBuf> {
-    renameat2_exchange_blocking(part_path, final_path)?;
-    Ok(part_path.to_path_buf())
-}
-
-#[cfg(target_os = "linux")]
-fn restore_exchanged_repair_files_blocking(
-    part_path: &Path,
-    final_path: &Path,
-    _displaced_path: &Path,
-) -> std::io::Result<()> {
-    renameat2_exchange_blocking(part_path, final_path)
-}
-
-#[cfg(target_os = "linux")]
 fn is_renameat2_unsupported(e: &std::io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -1338,136 +1890,9 @@ fn is_renameat2_unsupported(e: &std::io::Error) -> bool {
     )
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-async fn publish_part_no_replace(
-    part_path: &Path,
-    final_path: &Path,
-) -> std::io::Result<PublishResult> {
-    publish_part_by_hard_link(part_path, final_path)
-        .await
-        .or_else(|link_err| destination_exists_or(link_err, final_path))
-}
-
 #[cfg(target_os = "macos")]
 fn rename_exchange_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let part = CString::new(part_path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let final_path = CString::new(final_path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: both paths are valid NUL-terminated C strings and RENAME_SWAP
-    // atomically exchanges two existing directory entries on macOS.
-    let rc = unsafe { libc::renamex_np(part.as_ptr(), final_path.as_ptr(), libc::RENAME_SWAP) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn exchange_repair_files_blocking(
-    part_path: &Path,
-    final_path: &Path,
-    _expected: ExistingFileFingerprint,
-) -> anyhow::Result<PathBuf> {
-    rename_exchange_blocking(part_path, final_path)?;
-    Ok(part_path.to_path_buf())
-}
-
-#[cfg(target_os = "macos")]
-fn restore_exchanged_repair_files_blocking(
-    part_path: &Path,
-    final_path: &Path,
-    _displaced_path: &Path,
-) -> std::io::Result<()> {
-    rename_exchange_blocking(part_path, final_path)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn exchange_repair_files_blocking(
-    _part_path: &Path,
-    _final_path: &Path,
-    _expected: ExistingFileFingerprint,
-) -> anyhow::Result<PathBuf> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "atomic truncated-file replacement is unsupported on this platform",
-    )
-    .into())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn restore_exchanged_repair_files_blocking(
-    _part_path: &Path,
-    _final_path: &Path,
-    _displaced_path: &Path,
-) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "atomic truncated-file replacement is unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-async fn publish_part_by_hard_link(
-    part_path: &Path,
-    final_path: &Path,
-) -> std::io::Result<PublishResult> {
-    match fs::hard_link(part_path, final_path).await {
-        Ok(()) => {
-            if let Err(rm_err) = fs::remove_file(part_path).await {
-                tracing::warn!(
-                    path = %part_path.display(),
-                    error = %rm_err,
-                    "Failed to remove published .part file after no-overwrite hard link"
-                );
-            }
-
-            Ok(PublishResult::Published)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-#[cfg(unix)]
-async fn publish_part_by_hard_link_retained(
-    part_path: &Path,
-    final_path: &Path,
-) -> std::io::Result<PublishResult> {
-    match fs::hard_link(part_path, final_path).await {
-        Ok(()) => Ok(PublishResult::Published),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-async fn publish_part_no_replace(
-    part_path: &Path,
-    final_path: &Path,
-) -> std::io::Result<PublishResult> {
-    let part = part_path.to_path_buf();
-    let final_path_buf = final_path.to_path_buf();
-    let rename_result =
-        tokio::task::spawn_blocking(move || move_file_no_replace_blocking(&part, &final_path_buf))
-            .await
-            .map_err(std::io::Error::other)?;
-
-    match rename_result {
-        Ok(()) => Ok(PublishResult::Published),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
-        }
-        Err(e) => destination_exists_or(e, final_path),
-    }
+    rename_path_macos(part_path, final_path, libc::RENAME_SWAP)
 }
 
 #[cfg(windows)]
@@ -1655,131 +2080,19 @@ fn restore_exchanged_repair_files_blocking(
     replace_file_with_backup_blocking(final_path, displaced_path, part_path)
 }
 
-fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Result<PublishResult> {
-    if final_path.try_exists().unwrap_or(false) {
-        Ok(PublishResult::DestinationExists)
-    } else {
-        Err(err)
-    }
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileIdentity {
-    Extended { volume: u64, index: [u8; 16] },
-    Legacy { volume: u32, index: u64 },
-}
-
-fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = file.metadata()?;
-        Ok(FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        };
-
-        let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
-        // SAFETY: the file handle is live and `info` points to writable storage
-        // of the exact FileIdInfo structure requested from Windows.
-        let result = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle() as isize,
-                FileIdInfo,
-                info.as_mut_ptr().cast(),
-                std::mem::size_of::<FILE_ID_INFO>() as u32,
-            )
-        };
-        if result != 0 {
-            // SAFETY: the successful call initialized the complete structure.
-            let info = unsafe { info.assume_init() };
-            if info.FileId.Identifier != [0; 16] {
-                return Ok(FileIdentity::Extended {
-                    volume: info.VolumeSerialNumber,
-                    index: info.FileId.Identifier,
-                });
-            }
-        }
-
-        let mut legacy = std::mem::MaybeUninit::uninit();
-        // SAFETY: the file handle is live and `legacy` points to writable
-        // storage of the exact structure initialized by Windows.
-        let result = unsafe {
-            GetFileInformationByHandle(file.as_raw_handle() as isize, legacy.as_mut_ptr())
-        };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: the successful call initialized the complete structure.
-        let legacy = unsafe { legacy.assume_init() };
-        let index = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
-        if index == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "filesystem did not provide a stable file identity",
-            ));
-        }
-        Ok(FileIdentity::Legacy {
-            volume: legacy.dwVolumeSerialNumber,
-            index,
-        })
-    }
-}
-
 pub(super) fn open_regular_file_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
     open_regular_file_with_access_blocking(path, false)
-}
-
-#[cfg(feature = "xmp")]
-pub(super) fn open_optional_regular_file_blocking(
-    path: &Path,
-) -> anyhow::Result<Option<std::fs::File>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::OpenOptionsExt;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    #[cfg(windows)]
-    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Could not open regular file {}", path.display()));
-        }
-    };
-    anyhow::ensure!(
-        file.metadata()?.file_type().is_file(),
-        "Path is not a regular file: {}",
-        path.display()
-    );
-    Ok(Some(file))
 }
 
 fn open_regular_file_with_access_blocking(
     path: &Path,
     write: bool,
 ) -> anyhow::Result<std::fs::File> {
+    open_regular_file_io(path, write)
+        .with_context(|| format!("Could not open regular file {}", path.display()))
+}
+
+fn open_regular_file_io(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(windows)]
@@ -1791,69 +2104,14 @@ fn open_regular_file_with_access_blocking(
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     #[cfg(windows)]
     options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options
-        .open(path)
-        .with_context(|| format!("Could not open regular file {}", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.file_type().is_file(),
-        "Path is not a regular file: {}",
-        path.display()
-    );
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Path is not a regular file: {}", path.display()),
+        ));
+    }
     Ok(file)
-}
-
-fn open_regular_file_for_metadata_blocking(path: &Path) -> anyhow::Result<std::fs::File> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::OpenOptionsExt;
-    #[cfg(windows)]
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_WRITE_ATTRIBUTES,
-    };
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    #[cfg(windows)]
-    options
-        .access_mode(FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options
-        .open(path)
-        .with_context(|| format!("Could not open regular file {}", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.file_type().is_file(),
-        "Path is not a regular file: {}",
-        path.display()
-    );
-    Ok(file)
-}
-
-pub(super) fn set_reconciled_file_mtime_blocking(
-    path: &Path,
-    expected_local_sha256: &str,
-    timestamp: i64,
-) -> anyhow::Result<()> {
-    let mut file = open_regular_file_for_metadata_blocking(path)?;
-    let opened_identity = file_identity(&file)?;
-    let fingerprint = fingerprint_open_file_snapshot_blocking(&mut file, path)?.fingerprint;
-    anyhow::ensure!(
-        data_encoding::HEXLOWER.encode(&fingerprint.sha256) == expected_local_sha256,
-        "Reconciled file bytes changed before setting capture time: {}",
-        path.display()
-    );
-
-    set_open_file_capture_time(&file, path, timestamp)?;
-
-    let current = open_regular_file_blocking(path)?;
-    anyhow::ensure!(
-        file_identity(&current)? == opened_identity,
-        "Reconciled file path changed while setting capture time: {}",
-        path.display()
-    );
-    Ok(())
 }
 
 fn set_open_file_capture_time(
@@ -1881,34 +2139,6 @@ fn set_open_file_capture_time(
     // Windows attribute-only handles cannot call FlushFileBuffers; the media bytes were flushed before publication.
     #[cfg(not(windows))]
     file.sync_all()?;
-    Ok(())
-}
-
-pub(super) fn validate_reconciled_file_blocking(
-    path: &Path,
-    expected_local_sha256: &str,
-    timestamp: i64,
-    source_permissions: std::fs::Permissions,
-) -> anyhow::Result<()> {
-    let mut file = open_regular_file_for_metadata_blocking(path)?;
-    let opened_identity = file_identity(&file)?;
-    let snapshot = fingerprint_open_file_snapshot_blocking(&mut file, path)?;
-    anyhow::ensure!(
-        data_encoding::HEXLOWER.encode(&snapshot.fingerprint.sha256) == expected_local_sha256,
-        "Reconciled file bytes changed before state finalization: {}",
-        path.display()
-    );
-    set_open_file_capture_time(&file, path, timestamp)?;
-    file.set_permissions(source_permissions)?;
-    // Keep the final restrictive attributes; Windows cannot flush this attribute-only handle.
-    #[cfg(not(windows))]
-    file.sync_all()?;
-    let current = open_regular_file_blocking(path)?;
-    anyhow::ensure!(
-        file_identity(&current)? == opened_identity,
-        "Reconciled file path changed before state finalization: {}",
-        path.display()
-    );
     Ok(())
 }
 
@@ -1984,6 +2214,20 @@ fn fingerprint_open_file_snapshot_blocking(
         prefix,
         prefix_len,
     })
+}
+
+fn fingerprint_open_file_from_start_blocking(
+    file: &mut std::fs::File,
+    path: &Path,
+) -> anyhow::Result<ExistingFileSnapshot> {
+    use std::io::{Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("Could not rewind {} for SHA-256", path.display()))?;
+    let snapshot = fingerprint_open_file_snapshot_blocking(file, path)?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("Could not rewind {} after SHA-256", path.display()))?;
+    Ok(snapshot)
 }
 
 /// Fingerprint a replacement entry and reject links or special files.
@@ -2077,6 +2321,81 @@ pub(crate) async fn local_file_size_matches_state(
     let fingerprint = fingerprint_regular_file(path).await?;
     let actual_checksum = data_encoding::HEXLOWER.encode(&fingerprint.sha256);
     Ok(local_checksum == Some(actual_checksum.as_str()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfinedLocalFileState {
+    Matches,
+    Mismatch,
+    Blocked,
+}
+
+pub(crate) async fn confined_local_file_size_matches_state(
+    root: &Path,
+    path: &Path,
+    expectation: LocalFileSizeExpectation,
+    local_checksum: Option<&str>,
+    download_checksum: Option<&str>,
+) -> anyhow::Result<ConfinedLocalFileState> {
+    let root = root.to_path_buf();
+    let path = path.to_path_buf();
+    let local_checksum = local_checksum.map(str::to_owned);
+    let download_checksum = download_checksum.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let confined = match ConfinedPath::open(&root, &path, ConfinedParents::Existing) {
+            Ok(confined) => confined,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => {
+                return Ok(ConfinedLocalFileState::Mismatch);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                return Ok(ConfinedLocalFileState::Blocked);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut file = match confined.open_regular() {
+            Ok(file) => file,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => {
+                return Ok(ConfinedLocalFileState::Mismatch);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(ConfinedLocalFileState::Blocked);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let identity = file_identity(&file)?;
+        let actual_size = file.metadata()?.len();
+        if expectation.accepts(actual_size) {
+            confined.validate_identity(identity)?;
+            return Ok(ConfinedLocalFileState::Matches);
+        }
+        let metadata_changed_download = matches!(
+            (local_checksum.as_deref(), download_checksum.as_deref()),
+            (Some(local), Some(download)) if local != download
+        );
+        if !metadata_changed_download {
+            return Ok(ConfinedLocalFileState::Mismatch);
+        }
+        let fingerprint =
+            fingerprint_open_file_from_start_blocking(&mut file, confined.path())?.fingerprint;
+        confined.validate_identity(identity)?;
+        let actual_checksum = data_encoding::HEXLOWER.encode(&fingerprint.sha256);
+        Ok(
+            if local_checksum.as_deref() == Some(actual_checksum.as_str()) {
+                ConfinedLocalFileState::Matches
+            } else {
+                ConfinedLocalFileState::Mismatch
+            },
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Decoded iCloud API checksum with its hash algorithm.
@@ -2381,6 +2700,20 @@ mod tests {
 
     const ISSUE_507_JPEG_HEADER: [u8; 8] = [0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x80, 0x45, 0x78];
 
+    fn compute_sha256_blocking(path: &Path) -> String {
+        let fingerprint = fingerprint_regular_file_blocking(path).unwrap();
+        data_encoding::HEXLOWER.encode(&fingerprint.sha256)
+    }
+
+    fn verified_copy_checksum(result: VerifiedLocalCopy) -> Option<String> {
+        match result {
+            VerifiedLocalCopy::Verified(file) => Some(file.checksum().to_owned()),
+            VerifiedLocalCopy::SourceMissing
+            | VerifiedLocalCopy::SourceChanged
+            | VerifiedLocalCopy::DestinationConflict => None,
+        }
+    }
+
     #[tokio::test]
     async fn local_reconciliation_copy_preserves_source_and_refuses_conflict() {
         let dir = tempfile::tempdir().unwrap();
@@ -2389,39 +2722,52 @@ mod tests {
         std::fs::write(&source, b"catalog bytes").unwrap();
         let expected_source_hash = compute_sha256(&source).await.unwrap();
 
-        let copied = copy_local_file_no_replace(&source, &destination, &expected_source_hash)
-            .await
-            .unwrap();
+        let copied =
+            copy_local_file_no_replace(dir.path(), &source, &destination, &expected_source_hash)
+                .await
+                .unwrap();
         assert_eq!(
-            copied,
-            VerifiedLocalCopy::Verified(expected_source_hash.clone())
+            verified_copy_checksum(copied).as_deref(),
+            Some(expected_source_hash.as_str())
         );
         assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
         assert_eq!(std::fs::read(&destination).unwrap(), b"catalog bytes");
 
         std::fs::write(&destination, b"user bytes").unwrap();
-        let conflict = copy_local_file_no_replace(&source, &destination, &expected_source_hash)
-            .await
-            .unwrap();
-        assert_eq!(conflict, VerifiedLocalCopy::DestinationConflict);
+        let conflict =
+            copy_local_file_no_replace(dir.path(), &source, &destination, &expected_source_hash)
+                .await
+                .unwrap();
+        assert!(matches!(conflict, VerifiedLocalCopy::DestinationConflict));
         assert_eq!(std::fs::read(&destination).unwrap(), b"user bytes");
 
         let changed_destination = dir.path().join("nested/changed.jpg");
         std::fs::write(&source, b"tampered byte").unwrap();
-        let changed =
-            copy_local_file_no_replace(&source, &changed_destination, &expected_source_hash)
-                .await
-                .unwrap();
-        assert_eq!(changed, VerifiedLocalCopy::SourceChanged);
+        let changed = copy_local_file_no_replace(
+            dir.path(),
+            &source,
+            &changed_destination,
+            &expected_source_hash,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(changed, VerifiedLocalCopy::SourceChanged));
         assert!(!changed_destination.exists());
 
         std::fs::write(&source, b"catalog bytes").unwrap();
         let long_destination = dir.path().join("a".repeat(240));
-        let long_name =
-            copy_local_file_no_replace(&source, &long_destination, &expected_source_hash)
-                .await
-                .unwrap();
-        assert_eq!(long_name, VerifiedLocalCopy::Verified(expected_source_hash));
+        let long_name = copy_local_file_no_replace(
+            dir.path(),
+            &source,
+            &long_destination,
+            &expected_source_hash,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            verified_copy_checksum(long_name).as_deref(),
+            Some(expected_source_hash.as_str())
+        );
         assert_eq!(std::fs::read(&long_destination).unwrap(), b"catalog bytes");
     }
 
@@ -2440,10 +2786,13 @@ mod tests {
 
         symlink(&target, &destination).unwrap();
         let symlink_result =
-            copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+            copy_local_file_no_replace(dir.path(), &source, &destination, &expected_source_hash)
                 .await
                 .unwrap();
-        assert_eq!(symlink_result, VerifiedLocalCopy::DestinationConflict);
+        assert!(matches!(
+            symlink_result,
+            VerifiedLocalCopy::DestinationConflict
+        ));
         assert!(
             std::fs::symlink_metadata(&destination)
                 .unwrap()
@@ -2455,10 +2804,13 @@ mod tests {
         std::fs::remove_file(&destination).unwrap();
         symlink(dir.path().join("missing.jpg"), &destination).unwrap();
         let dangling_result =
-            copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+            copy_local_file_no_replace(dir.path(), &source, &destination, &expected_source_hash)
                 .await
                 .unwrap();
-        assert_eq!(dangling_result, VerifiedLocalCopy::DestinationConflict);
+        assert!(matches!(
+            dangling_result,
+            VerifiedLocalCopy::DestinationConflict
+        ));
         assert!(
             std::fs::symlink_metadata(&destination)
                 .unwrap()
@@ -2469,16 +2821,20 @@ mod tests {
         std::fs::remove_file(&destination).unwrap();
         std::fs::create_dir(&destination).unwrap();
         let directory_result =
-            copy_local_file_no_replace(&source, &destination, &expected_source_hash)
+            copy_local_file_no_replace(dir.path(), &source, &destination, &expected_source_hash)
                 .await
                 .unwrap();
-        assert_eq!(directory_result, VerifiedLocalCopy::DestinationConflict);
+        assert!(matches!(
+            directory_result,
+            VerifiedLocalCopy::DestinationConflict
+        ));
         assert!(destination.is_dir());
 
         let source_link = dir.path().join("source-link.jpg");
         let source_link_destination = dir.path().join("source-link-destination.jpg");
         symlink(&source, &source_link).unwrap();
         let source_result = copy_local_file_no_replace(
+            dir.path(),
             &source_link,
             &source_link_destination,
             &expected_source_hash,
@@ -2498,6 +2854,183 @@ mod tests {
             .await
             .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn local_reconciliation_copy_rejects_destination_outside_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let destination = outside.path().join("destination.jpg");
+        std::fs::write(&source, b"catalog bytes").unwrap();
+        let expected_source_hash = compute_sha256(&source).await.unwrap();
+
+        let result =
+            copy_local_file_no_replace(root.path(), &source, &destination, &expected_source_hash)
+                .await;
+
+        assert!(result.is_err());
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contract_path_reconciliation_requires_confined_capabilities_rejects_linked_source_and_destination_parents()
+     {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_source = outside.path().join("source.jpg");
+        std::fs::write(&outside_source, b"catalog bytes").unwrap();
+        let expected_source_hash = compute_sha256(&outside_source).await.unwrap();
+        let linked_source_parent = root.path().join("linked-source");
+        symlink(outside.path(), &linked_source_parent).unwrap();
+        let source = linked_source_parent.join("source.jpg");
+        let destination = root.path().join("destination.jpg");
+
+        assert!(
+            copy_local_file_no_replace(root.path(), &source, &destination, &expected_source_hash,)
+                .await
+                .is_err()
+        );
+        assert!(!destination.exists());
+
+        let source = root.path().join("source.jpg");
+        std::fs::write(&source, b"catalog bytes").unwrap();
+        let linked_destination_parent = root.path().join("linked-destination");
+        symlink(outside.path(), &linked_destination_parent).unwrap();
+        let destination = linked_destination_parent.join("destination.jpg");
+
+        assert!(
+            copy_local_file_no_replace(root.path(), &source, &destination, &expected_source_hash,)
+                .await
+                .is_err()
+        );
+        assert!(!outside.path().join("destination.jpg").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_reconciliation_copy_detects_source_identity_change() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let destination = root.path().join("destination.jpg");
+        std::fs::write(&source, b"catalog bytes").unwrap();
+        let expected_source_hash = compute_sha256_blocking(&source);
+
+        let result = copy_local_file_no_replace_blocking_with(
+            root.path(),
+            &source,
+            &destination,
+            &expected_source_hash,
+            || {
+                std::fs::remove_file(&source).unwrap();
+                std::fs::write(&source, b"catalog bytes").unwrap();
+            },
+            || {},
+        )
+        .unwrap();
+
+        assert!(matches!(result, VerifiedLocalCopy::SourceChanged));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn local_reconciliation_copy_refuses_destination_race() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let destination = root.path().join("nested/destination.jpg");
+        std::fs::write(&source, b"catalog bytes").unwrap();
+        let expected_source_hash = compute_sha256_blocking(&source);
+
+        let result = copy_local_file_no_replace_blocking_with(
+            root.path(),
+            &source,
+            &destination,
+            &expected_source_hash,
+            || {},
+            || {
+                std::fs::write(&destination, b"external bytes").unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result, VerifiedLocalCopy::DestinationConflict));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"external bytes");
+        assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_reconciliation_copy_does_not_follow_replaced_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let parent = root.path().join("parent");
+        let retained_parent = root.path().join("retained-parent");
+        let destination = parent.join("destination.jpg");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&source, b"catalog bytes").unwrap();
+        let expected_source_hash = compute_sha256_blocking(&source);
+
+        let result = copy_local_file_no_replace_blocking_with(
+            root.path(),
+            &source,
+            &destination,
+            &expected_source_hash,
+            || {},
+            || {
+                std::fs::rename(&parent, &retained_parent).unwrap();
+                symlink(outside.path(), &parent).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(retained_parent.join("destination.jpg")).unwrap(),
+            b"catalog bytes"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confined_hard_link_cleanup_retains_replaced_source_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let part_path = root.path().join("part.tmp");
+        let final_path = root.path().join("final.jpg");
+        let part = ConfinedPath::open(root.path(), &part_path, ConfinedParents::Existing).unwrap();
+        let final_file =
+            ConfinedPath::open(root.path(), &final_path, ConfinedParents::Existing).unwrap();
+        let mut file = part.create_new_regular().unwrap();
+        std::io::Write::write_all(&mut file, b"published").unwrap();
+        file.sync_all().unwrap();
+        let expected_identity = file_identity(&file).unwrap();
+        drop(file);
+        let part_location = FileLocation::Confined(part);
+        let final_location = FileLocation::Confined(final_file);
+
+        assert_eq!(
+            hard_link_locations(&part_location, &final_location).unwrap(),
+            PublishResult::Published
+        );
+        std::fs::remove_file(&part_path).unwrap();
+        std::fs::write(&part_path, b"replacement").unwrap();
+
+        cleanup_published_location(&part_location, expected_identity);
+
+        let retained = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("entry"))
+            .find(|path| path.is_file())
+            .expect("replacement must be retained in quarantine");
+        assert_eq!(std::fs::read(retained).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"published");
     }
 
     #[test]
@@ -5031,33 +5564,29 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_second_edit_displaced_to_part_path() {
+    fn restore_rejects_changed_displaced_file_before_rollback() {
         let dir = TempDir::new().unwrap();
         let part = dir.path().join("photo.part");
         let final_path = dir.path().join("photo.jpg");
-        let swap_path = dir.path().join("swap.tmp");
         std::fs::write(&part, b"original target").unwrap();
         std::fs::write(&final_path, b"prepared replacement").unwrap();
-        let replacement = fingerprint_regular_file_blocking(&final_path).unwrap();
+        let part_location = FileLocation::Path(part.clone());
+        let final_location = FileLocation::Path(final_path.clone());
+        let expected_displaced = fingerprint_location(&part_location).unwrap();
+        let replacement = fingerprint_location(&final_location).unwrap();
+        std::fs::write(&part, b"second concurrent edit").unwrap();
 
-        let error = restore_repair_target_if_unchanged_with(
-            &part,
-            &final_path,
-            &part,
-            replacement,
-            |part, final_path, _displaced| {
-                std::fs::write(final_path, b"second concurrent edit")?;
-                std::fs::rename(final_path, &swap_path)?;
-                std::fs::rename(part, final_path)?;
-                std::fs::rename(&swap_path, part)
-            },
-        )
-        .unwrap_err();
-
-        let disposition = classify_conditional_publish_error(&error);
-        assert!(disposition.target_changed);
-        assert!(disposition.retained_paths.contains(&part));
-        assert_eq!(std::fs::read(&final_path).unwrap(), b"original target");
+        assert!(
+            !restore_location_exchange_if_unchanged(
+                &part_location,
+                &final_location,
+                &part_location,
+                expected_displaced,
+                replacement,
+            )
+            .unwrap()
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"prepared replacement");
         assert_eq!(std::fs::read(&part).unwrap(), b"second concurrent edit");
     }
 

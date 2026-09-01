@@ -1114,6 +1114,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             enum_config_hash: Some(Arc::clone(&enum_config_hash)),
             album_name: None,
             exclude_asset_ids,
+            reconciliation_blocked_asset_ids: Arc::new(rustc_hash::FxHashSet::default()),
             asset_groupings,
             bandwidth_limiter: bandwidth_limiter.clone(),
         })
@@ -1394,13 +1395,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         .iter()
                         .map(|library| library.zone_name())
                         .collect();
-                    download::drain_pending_metadata_rewrites(
+                    download::drain_pending_metadata_rewrites_with_blocks(
                         db,
                         &config.metadata,
                         capture_timestamp_repair,
                         &library_scope,
                         Arc::clone(&cfg_temp_suffix),
                         &shutdown_token,
+                        &cycle_result.reconciliation_blocked_asset_ids,
                     )
                     .await
                 } else {
@@ -3943,6 +3945,97 @@ mod tests {
                         "recordName": self.master_record_name.as_ref(),
                         "serverErrorCode": "UNKNOWN_ITEM",
                         "reason": "record not found"
+                    }]
+                }));
+            }
+            Ok(serde_json::json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CrossZoneCycleOwnerSession {
+        asset_record_name: Arc<str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for CrossZoneCycleOwnerSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(album_count_response(1));
+            }
+            if url.contains("/records/query?") {
+                return Ok(serde_json::json!({
+                    "records": [],
+                    "syncToken": "owner-token"
+                }));
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(serde_json::json!({
+                    "zones": [{
+                        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                        "syncToken": "owner-relations-token",
+                        "moreComing": false,
+                        "records": [{
+                            "recordName": format!("relation-{}", self.asset_record_name),
+                            "recordType": "CPLContainerRelation",
+                            "fields": {
+                                "containerId": {"value": "cross-zone-album", "type": "STRING"},
+                                "itemId": {"value": self.asset_record_name.as_ref(), "type": "STRING"}
+                            },
+                            "recordChangeTag": "ct-relation"
+                        }]
+                    }]
+                }));
+            }
+            Ok(serde_json::json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CrossZoneCycleSourceSession {
+        records: Arc<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for CrossZoneCycleSourceSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/records/lookup?") {
+                return Ok(serde_json::json!({"records": self.records.as_ref()}));
+            }
+            if url.contains("/internal/records/query/batch") {
+                return Ok(album_count_response(0));
+            }
+            if url.contains("/records/query?") {
+                return Ok(serde_json::json!({
+                    "records": [],
+                    "syncToken": "source-inventory-token"
+                }));
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(serde_json::json!({
+                    "zones": [{
+                        "zoneID": {"zoneName": "SharedSync-TEST", "ownerRecordName": "_defaultOwner"},
+                        "syncToken": "source-changes-token",
+                        "moreComing": false,
+                        "records": self.records.as_ref()
                     }]
                 }));
             }
@@ -8835,6 +8928,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_cross_zone_reconciliation_blocks_are_cycle_wide() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "old-download-hash")
+            .await
+            .expect("seed old download hash");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let download_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(download_body));
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/cross-zone.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/jpeg")
+                    .set_body_bytes(download_body),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let source_zone = "SharedSync-TEST";
+        let master_record_name = "master-cross-zone-block";
+        let asset_record_name = format!("asset-{master_record_name}");
+        let page = full_album_page_with_download(
+            source_zone,
+            master_record_name,
+            "source-query-token",
+            &format!("{}/cross-zone.jpg", server.uri()),
+            download_body.len() as u64,
+            &checksum,
+        );
+        let records = Arc::new(
+            page["records"]
+                .as_array()
+                .expect("cross-zone records")
+                .clone(),
+        );
+        let source_session = CrossZoneCycleSourceSession {
+            records: Arc::clone(&records),
+        };
+        let source_album = make_named_full_album_with_boxed_session(
+            source_zone,
+            "",
+            Box::new(source_session.clone()),
+        );
+        let owner_album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("Cross Zone"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(serde_json::json!({"zoneName": "PrimarySync"})),
+                retry_config: retry::RetryConfig::default(),
+                container_id: Some(Arc::from("cross-zone-album")),
+                cross_zone_sources: vec![source_album.clone_for_cross_zone_source()],
+            },
+            Box::new(CrossZoneCycleOwnerSession {
+                asset_record_name: Arc::from(asset_record_name.as_str()),
+            }),
+        );
+
+        let blocked_path = download_dir.path().join("unsafe-catalog-entry");
+        std::fs::create_dir(&blocked_path).expect("seed non-regular catalog entry");
+        let record = crate::test_helpers::TestAssetRecord::new(master_record_name)
+            .library(source_zone)
+            .filename("photo.jpg")
+            .checksum(&checksum)
+            .size(download_body.len() as u64)
+            .build();
+        db.upsert_seen(&record).await.expect("seed source-zone row");
+        db.mark_downloaded(
+            source_zone,
+            master_record_name,
+            state::VersionSizeKey::Original.as_str(),
+            &blocked_path,
+            "local-checksum",
+            Some(&checksum),
+        )
+        .await
+        .expect("mark source-zone row downloaded");
+        db.upsert_asset_master_mapping(source_zone, &asset_record_name, master_record_name)
+            .await
+            .expect("seed source-zone identity");
+
+        let owner_state = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            vec![crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Album,
+                album: owner_album,
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            }],
+        );
+        let source_state = make_run_cycle_library_state_with_album(
+            source_zone,
+            "sync_token:SharedSync-TEST",
+            source_album,
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &[&owner_state, &source_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cross-zone path reconciliation cycle");
+
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.failed_count, 1);
+        assert!(
+            result
+                .reconciliation_blocked_asset_ids
+                .iter()
+                .any(|blocked| blocked.matches(source_zone, master_record_name))
+        );
+        assert!(blocked_path.is_dir());
+    }
+
+    #[tokio::test]
     async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
         let config = make_run_cycle_config();
         let db = make_state_db();
@@ -9882,6 +10112,7 @@ mod tests {
                 ..download::SyncStats::default()
             },
             db_sync_token_advance_safe: true,
+            reconciliation_blocked_asset_ids: rustc_hash::FxHashSet::default(),
         };
 
         merge_refresh_tail_outcome(&mut cycle_result, 2, false);

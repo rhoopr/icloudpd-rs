@@ -245,6 +245,23 @@ pub(crate) struct DownloadControls {
     pub(crate) reporting: DownloadReporting,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ReconciliationBlock(Box<str>, Box<str>);
+
+impl ReconciliationBlock {
+    pub(crate) fn matches(&self, library: &str, asset_id: &str) -> bool {
+        self.0.as_ref() == library && self.1.as_ref() == asset_id
+    }
+}
+
+fn block_reconciliation_asset(
+    blocked: &mut FxHashSet<ReconciliationBlock>,
+    library: &str,
+    asset_id: &str,
+) {
+    blocked.insert(ReconciliationBlock(library.into(), asset_id.into()));
+}
+
 impl DownloadControls {
     pub(crate) const fn new(run_mode: DownloadRunMode, reporting: DownloadReporting) -> Self {
         Self {
@@ -1244,6 +1261,9 @@ pub(crate) struct DownloadConfig {
     pub(crate) library: Arc<str>,
     /// Asset IDs to exclude (from `--exclude-album` without `--album`).
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
+    /// Asset IDs blocked only for this cycle because path reconciliation
+    /// could not prove a confined filesystem location.
+    pub(crate) reconciliation_blocked_asset_ids: Arc<FxHashSet<ReconciliationBlock>>,
     /// Maximum download attempts per asset before giving up (0 = unlimited).
     pub(crate) max_download_attempts: u32,
     /// Preloaded asset→album and asset→person indices, shared across clones.
@@ -1328,6 +1348,25 @@ impl DownloadConfig {
             exclude_asset_ids: exclude_ids,
             ..self.clone()
         }
+    }
+
+    pub(crate) fn with_reconciliation_blocks(
+        &self,
+        blocked_asset_ids: Arc<FxHashSet<ReconciliationBlock>>,
+    ) -> Self {
+        Self {
+            reconciliation_blocked_asset_ids: blocked_asset_ids,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn is_reconciliation_blocked(&self, asset: &PhotoAsset) -> bool {
+        let library = asset.source_zone().unwrap_or(&self.library);
+        self.reconciliation_blocked_asset_ids.iter().any(|blocked| {
+            blocked.matches(library, asset.state_id())
+                || blocked.matches(library, asset.id())
+                || blocked.matches(library, asset.asset_record_name())
+        })
     }
 
     fn with_recent_scope(&self, recent_scope: crate::cli::RecentScope) -> Self {
@@ -1428,6 +1467,7 @@ impl DownloadConfig {
             enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
+            reconciliation_blocked_asset_ids: std::sync::Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),
             bandwidth_limiter: None,
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
@@ -3433,6 +3473,7 @@ fn take_matching_retry_tasks<I>(
 pub(crate) struct PathReconciliationResult {
     pub(crate) complete: bool,
     pub(crate) smart_folder_refresh_required: bool,
+    pub(crate) blocked_asset_ids: FxHashSet<ReconciliationBlock>,
     pub(crate) stats: SyncStats,
 }
 
@@ -3443,16 +3484,13 @@ const PATH_RECONCILIATION_SOURCE_CHANGED_REASON: &str =
 
 #[cfg(feature = "xmp")]
 async fn reconcile_xmp_sidecar(
-    source_media_path: &Path,
+    reconciled_file: Arc<file::ReconciledFile>,
     task: &DownloadTask,
     temp_suffix: &str,
 ) -> Result<()> {
-    let source_sidecar_path = metadata::sidecar_path(source_media_path)?;
     anyhow::ensure!(
         metadata_rewrite::write_reconciled_sidecar(
-            source_media_path,
-            &task.download_path,
-            &source_sidecar_path,
+            reconciled_file,
             Arc::clone(&task.metadata),
             task.created_local,
             temp_suffix,
@@ -3623,6 +3661,7 @@ async fn reconcile_catalog_paths_inner(
         return Ok(PathReconciliationResult {
             complete: true,
             smart_folder_refresh_required,
+            blocked_asset_ids: FxHashSet::default(),
             stats: SyncStats::default(),
         });
     }
@@ -3668,6 +3707,8 @@ async fn reconcile_catalog_paths_inner(
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
     let mut invalid_owned_targets = FxHashSet::default();
+    let mut blocked_owned_targets = FxHashSet::default();
+    let mut cycle_blocked_asset_ids = FxHashSet::default();
     let records_by_target: FxHashMap<PendingRetryTarget, &crate::state::AssetRecord> = records
         .iter()
         .map(|record| (PendingRetryTarget::from_record(record), record))
@@ -3836,33 +3877,46 @@ async fn reconcile_catalog_paths_inner(
                                 .await;
                             if !provider_version_is_current || !matches_current_family {
                                 false
-                            } else if let Ok(metadata) = tokio::fs::metadata(recorded_path).await {
-                                let recorded_file = RecordedLocalFile {
-                                    path: recorded_path.to_path_buf(),
-                                    local_checksum: record
-                                        .local_checksum
-                                        .clone()
-                                        .map(String::into_boxed_str),
-                                    download_checksum: record
-                                        .download_checksum
-                                        .clone()
-                                        .map(String::into_boxed_str),
-                                };
-                                let intact = pipeline::state_path_size_allows_skip(
-                                    task.asset_id.as_ref(),
-                                    task.version_size,
-                                    recorded_path,
-                                    metadata.len(),
-                                    derived.size,
-                                    &recorded_file,
-                                )
-                                .await;
-                                if !intact {
-                                    invalid_owned_targets.insert(target.clone());
-                                }
-                                intact
                             } else {
-                                false
+                                match file::confined_local_file_size_matches_state(
+                                    &config.directory,
+                                    recorded_path,
+                                    file::LocalFileSizeExpectation::AtLeastProvider(derived.size),
+                                    record.local_checksum.as_deref(),
+                                    record.download_checksum.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(file::ConfinedLocalFileState::Matches) => true,
+                                    Ok(file::ConfinedLocalFileState::Mismatch) => {
+                                        invalid_owned_targets.insert(target.clone());
+                                        false
+                                    }
+                                    Ok(file::ConfinedLocalFileState::Blocked) => {
+                                        blocked_owned_targets.insert(target.clone());
+                                        block_reconciliation_asset(
+                                            &mut cycle_blocked_asset_ids,
+                                            &target.library,
+                                            &target.asset_id,
+                                        );
+                                        false
+                                    }
+                                    Err(error) => {
+                                        blocked_owned_targets.insert(target.clone());
+                                        block_reconciliation_asset(
+                                            &mut cycle_blocked_asset_ids,
+                                            &target.library,
+                                            &target.asset_id,
+                                        );
+                                        tracing::warn!(
+                                            asset_id = %task.asset_id,
+                                            path = %recorded_path.display(),
+                                            %error,
+                                            "Path reconciliation could not validate the current catalog path"
+                                        );
+                                        false
+                                    }
+                                }
                             }
                         } else {
                             false
@@ -3924,26 +3978,6 @@ async fn reconcile_catalog_paths_inner(
             tracing::debug!(asset_id = %task.asset_id, "Path reconciliation deferred catalog row without a local file to targeted retry");
             continue;
         };
-        let source_metadata = match tokio::fs::symlink_metadata(source_path).await {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                deferred_to_pending_retry = true;
-                requeue_catalog_file(
-                    db.as_ref(),
-                    &task,
-                    crate::commands::reconcile::FILE_MISSING_REASON,
-                    &mut stats,
-                )
-                .await;
-                tracing::debug!(asset_id = %task.asset_id, path = %source_path.display(), "Path reconciliation deferred missing local file to targeted retry");
-                continue;
-            }
-            Err(error) => {
-                stats.failed += 1;
-                tracing::warn!(asset_id = %task.asset_id, path = %source_path.display(), %error, "Path reconciliation could not inspect the catalog file");
-                continue;
-            }
-        };
         if record.checksum.as_ref() != task.checksum.as_ref() || record.size_bytes != task.size {
             deferred_to_pending_retry = true;
             requeue_catalog_file(
@@ -3967,33 +4001,67 @@ async fn reconcile_catalog_paths_inner(
             .await;
             continue;
         }
-        let recorded_file = RecordedLocalFile {
-            path: source_path.to_path_buf(),
-            local_checksum: record.local_checksum.clone().map(String::into_boxed_str),
-            download_checksum: record.download_checksum.clone().map(String::into_boxed_str),
-        };
-        if !pipeline::state_path_size_allows_skip(
-            task.asset_id.as_ref(),
-            task.version_size,
-            source_path,
-            source_metadata.len(),
-            task.size,
-            &recorded_file,
-        )
-        .await
-        {
-            deferred_to_pending_retry = true;
-            requeue_catalog_file(
-                db.as_ref(),
-                &task,
-                crate::commands::reconcile::FILE_TRUNCATED_REASON,
-                &mut stats,
-            )
-            .await;
+        if blocked_owned_targets.contains(&target) {
+            block_reconciliation_asset(&mut cycle_blocked_asset_ids, &task.library, &task.asset_id);
+            stats.failed += 1;
+            tracing::warn!(
+                asset_id = %task.asset_id,
+                path = %source_path.display(),
+                "Path reconciliation blocked an unsafe catalog path without queuing an ordinary download"
+            );
             continue;
         }
         if source_path == task.download_path.as_path() {
-            targets.remove(&target);
+            match file::confined_local_file_size_matches_state(
+                &config.directory,
+                source_path,
+                file::LocalFileSizeExpectation::AtLeastProvider(task.size),
+                record.local_checksum.as_deref(),
+                record.download_checksum.as_deref(),
+            )
+            .await
+            {
+                Ok(file::ConfinedLocalFileState::Matches) => {
+                    targets.remove(&target);
+                }
+                Ok(file::ConfinedLocalFileState::Mismatch) => {
+                    deferred_to_pending_retry = true;
+                    requeue_catalog_file(
+                        db.as_ref(),
+                        &task,
+                        crate::commands::reconcile::FILE_TRUNCATED_REASON,
+                        &mut stats,
+                    )
+                    .await;
+                }
+                Ok(file::ConfinedLocalFileState::Blocked) => {
+                    block_reconciliation_asset(
+                        &mut cycle_blocked_asset_ids,
+                        &task.library,
+                        &task.asset_id,
+                    );
+                    stats.failed += 1;
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        path = %source_path.display(),
+                        "Path reconciliation blocked an unsafe current catalog path without queuing an ordinary download"
+                    );
+                }
+                Err(error) => {
+                    block_reconciliation_asset(
+                        &mut cycle_blocked_asset_ids,
+                        &task.library,
+                        &task.asset_id,
+                    );
+                    stats.failed += 1;
+                    tracing::warn!(
+                        asset_id = %task.asset_id,
+                        path = %source_path.display(),
+                        %error,
+                        "Path reconciliation could not inspect the current catalog path"
+                    );
+                }
+            }
             continue;
         }
         let Some(expected_local_checksum) = record
@@ -4012,27 +4080,28 @@ async fn reconcile_catalog_paths_inner(
             continue;
         };
         match file::copy_local_file_no_replace(
+            &config.directory,
             source_path,
             &task.download_path,
             expected_local_checksum,
         )
         .await
         {
-            Ok(file::VerifiedLocalCopy::Verified(local_checksum)) => {
-                let mtime_path = task.download_path.clone();
-                let mtime_checksum = local_checksum.clone();
+            Ok(file::VerifiedLocalCopy::Verified(reconciled_file)) => {
+                let reconciled_file: Arc<file::ReconciledFile> = Arc::from(reconciled_file);
+                let mtime_file = Arc::clone(&reconciled_file);
                 let timestamp = task.created_local.timestamp();
-                let mtime_result = tokio::task::spawn_blocking(move || {
-                    file::set_reconciled_file_mtime_blocking(
-                        &mtime_path,
-                        &mtime_checksum,
-                        timestamp,
-                    )
-                })
-                .await
-                .context("Reconciled mtime task panicked")
-                .and_then(std::convert::identity);
+                let mtime_result =
+                    tokio::task::spawn_blocking(move || mtime_file.set_capture_time(timestamp))
+                        .await
+                        .context("Reconciled mtime task panicked")
+                        .and_then(std::convert::identity);
                 if let Err(error) = mtime_result {
+                    block_reconciliation_asset(
+                        &mut cycle_blocked_asset_ids,
+                        &task.library,
+                        &task.asset_id,
+                    );
                     stats.failed += 1;
                     tracing::warn!(
                         asset_id = %task.asset_id,
@@ -4045,9 +4114,18 @@ async fn reconcile_catalog_paths_inner(
 
                 #[cfg(feature = "xmp")]
                 if config.metadata.xmp_sidecar
-                    && let Err(error) =
-                        reconcile_xmp_sidecar(source_path, &task, &config.temp_suffix).await
+                    && let Err(error) = reconcile_xmp_sidecar(
+                        Arc::clone(&reconciled_file),
+                        &task,
+                        &config.temp_suffix,
+                    )
+                    .await
                 {
+                    block_reconciliation_asset(
+                        &mut cycle_blocked_asset_ids,
+                        &task.library,
+                        &task.asset_id,
+                    );
                     stats.exif_failures += 1;
                     tracing::warn!(
                         asset_id = %task.asset_id,
@@ -4058,14 +4136,18 @@ async fn reconcile_catalog_paths_inner(
                     continue;
                 }
 
-                let durable_path = task.download_path.clone();
-                let durability_result = tokio::task::spawn_blocking(move || {
-                    crate::fs_util::fsync_parent_dir(&durable_path)
-                })
-                .await
-                .map_err(std::io::Error::other)
-                .and_then(std::convert::identity);
+                let durable_file = Arc::clone(&reconciled_file);
+                let durability_result =
+                    tokio::task::spawn_blocking(move || durable_file.sync_parent())
+                        .await
+                        .map_err(std::io::Error::other)
+                        .and_then(std::convert::identity);
                 if let Err(error) = durability_result {
+                    block_reconciliation_asset(
+                        &mut cycle_blocked_asset_ids,
+                        &task.library,
+                        &task.asset_id,
+                    );
                     stats.failed += 1;
                     tracing::warn!(
                         asset_id = %task.asset_id,
@@ -4081,22 +4163,19 @@ async fn reconcile_catalog_paths_inner(
                     hook();
                 }
 
-                let final_path = task.download_path.clone();
-                let final_checksum = local_checksum.clone();
                 let timestamp = task.created_local.timestamp();
-                let source_permissions = source_metadata.permissions();
-                let final_validation = tokio::task::spawn_blocking(move || {
-                    file::validate_reconciled_file_blocking(
-                        &final_path,
-                        &final_checksum,
-                        timestamp,
-                        source_permissions,
-                    )
-                })
-                .await
-                .context("Final reconciled media validation task panicked")
-                .and_then(std::convert::identity);
+                let final_file = Arc::clone(&reconciled_file);
+                let final_validation =
+                    tokio::task::spawn_blocking(move || final_file.validate_final(timestamp))
+                        .await
+                        .context("Final reconciled media validation task panicked")
+                        .and_then(std::convert::identity);
                 if let Err(error) = final_validation {
+                    block_reconciliation_asset(
+                        &mut cycle_blocked_asset_ids,
+                        &task.library,
+                        &task.asset_id,
+                    );
                     stats.failed += 1;
                     tracing::warn!(
                         asset_id = %task.asset_id,
@@ -4107,6 +4186,7 @@ async fn reconcile_catalog_paths_inner(
                     continue;
                 }
 
+                let local_checksum = reconciled_file.checksum().to_owned();
                 if let Err(error) = db
                     .mark_downloaded(
                         &task.library,
@@ -4118,6 +4198,11 @@ async fn reconcile_catalog_paths_inner(
                     )
                     .await
                 {
+                    block_reconciliation_asset(
+                        &mut cycle_blocked_asset_ids,
+                        &task.library,
+                        &task.asset_id,
+                    );
                     stats.state_write_failures += 1;
                     tracing::warn!(asset_id = %task.asset_id, %error, "Failed to persist reconciled local path");
                 } else {
@@ -4135,6 +4220,16 @@ async fn reconcile_catalog_paths_inner(
                         stats.disk_bytes_written.saturating_add(record.size_bytes);
                 }
             }
+            Ok(file::VerifiedLocalCopy::SourceMissing) => {
+                deferred_to_pending_retry = true;
+                requeue_catalog_file(
+                    db.as_ref(),
+                    &task,
+                    crate::commands::reconcile::FILE_MISSING_REASON,
+                    &mut stats,
+                )
+                .await;
+            }
             Ok(file::VerifiedLocalCopy::SourceChanged) => {
                 deferred_to_pending_retry = true;
                 requeue_catalog_file(
@@ -4146,10 +4241,20 @@ async fn reconcile_catalog_paths_inner(
                 .await;
             }
             Ok(file::VerifiedLocalCopy::DestinationConflict) => {
+                block_reconciliation_asset(
+                    &mut cycle_blocked_asset_ids,
+                    &task.library,
+                    &task.asset_id,
+                );
                 stats.failed += 1;
                 tracing::warn!(asset_id = %task.asset_id, path = %task.download_path.display(), "Path reconciliation found conflicting destination bytes");
             }
             Err(error) => {
+                block_reconciliation_asset(
+                    &mut cycle_blocked_asset_ids,
+                    &task.library,
+                    &task.asset_id,
+                );
                 stats.failed += 1;
                 tracing::warn!(asset_id = %task.asset_id, %error, "Failed to copy existing media into reconciled path");
             }
@@ -4167,6 +4272,7 @@ async fn reconcile_catalog_paths_inner(
     Ok(PathReconciliationResult {
         complete,
         smart_folder_refresh_required,
+        blocked_asset_ids: cycle_blocked_asset_ids,
         stats,
     })
 }
@@ -4569,13 +4675,25 @@ fn remove_owned_orphan_parts_with<F>(
 where
     F: FnMut(&Path),
 {
-    use crate::fs_util::ConfinedFileOpen;
+    use crate::fs_util::{ConfinedParents, ConfinedPath, file_identity};
 
     let mut cleanup = OwnedTempCleanup::default();
     for record in owned {
         debug_assert!(record.claimed_at < cutoff_secs);
-        let candidate = match crate::fs_util::open_confined_regular_file(root, &record.path) {
+        let candidate = match ConfinedPath::open(root, &record.path, ConfinedParents::Existing) {
             Ok(candidate) => candidate,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::InvalidData
+                ) || (cfg!(unix) && error.raw_os_error() == Some(libc::ELOOP)) =>
+            {
+                cleanup.retire.push(record.path.clone());
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => continue,
             Err(error) => {
                 tracing::warn!(
                     path = %record.path.display(),
@@ -4585,41 +4703,73 @@ where
                 continue;
             }
         };
-        match candidate {
-            ConfinedFileOpen::OutsideRoot => continue,
-            ConfinedFileOpen::Retire => {
+        let file = match candidate.open_regular() {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                ) =>
+            {
+                cleanup.retire.push(record.path.clone());
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %record.path.display(),
+                    error = %error,
+                    "Could not safely open owned temporary file during cleanup"
+                );
+                continue;
+            }
+        };
+        let mtime_secs = match file.metadata().and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs() as i64),
+            Err(error) => {
+                tracing::warn!(path = %record.path.display(), %error, "Could not inspect owned temporary file timestamp");
+                continue;
+            }
+        };
+        // A path modified after the completed-sync cutoff no longer matches
+        // the stale claim, so retire the claim without touching the file.
+        if mtime_secs >= cutoff_secs {
+            cleanup.retire.push(record.path.clone());
+            continue;
+        }
+        if recent_grace_secs > 0 && mtime_secs > now_secs.saturating_sub(recent_grace_secs) {
+            continue;
+        }
+        let identity = match file_identity(&file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!(path = %record.path.display(), %error, "Could not identify owned temporary file");
+                continue;
+            }
+        };
+        before_remove(&record.path);
+        match candidate.remove_if_identity(identity) {
+            Ok(crate::fs_util::IdentityCleanup::Removed) => {
+                cleanup.removed += 1;
                 cleanup.retire.push(record.path.clone());
             }
-            ConfinedFileOpen::Regular(file) => {
-                let mtime_secs = file.modified_secs();
-                // A path modified after the completed-sync cutoff no longer
-                // matches the stale claim. Retire the claim without touching
-                // the file so it can never authorize a later deletion.
-                if mtime_secs >= cutoff_secs {
-                    cleanup.retire.push(record.path.clone());
-                    continue;
-                }
-                let is_recently_touched = recent_grace_secs > 0
-                    && mtime_secs > now_secs.saturating_sub(recent_grace_secs);
-                if is_recently_touched {
-                    continue;
-                }
-                before_remove(&record.path);
-                match file.remove() {
-                    Ok(()) => {
-                        cleanup.removed += 1;
-                        cleanup.retire.push(record.path.clone());
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        cleanup.retire.push(record.path.clone());
-                    }
-                    Err(error) => tracing::warn!(
-                        path = %record.path.display(),
-                        error = %error,
-                        "Failed to remove owned orphan temporary file"
-                    ),
-                }
+            Ok(crate::fs_util::IdentityCleanup::Retained { path: retained, .. }) => {
+                cleanup.retire.push(record.path.clone());
+                tracing::warn!(
+                    path = %record.path.display(),
+                    retained = %retained.display(),
+                    "Retained owned orphan temporary file because safe deletion was unavailable"
+                );
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                cleanup.retire.push(record.path.clone());
+            }
+            Err(error) => tracing::warn!(
+                path = %record.path.display(),
+                error = %error,
+                "Failed to remove owned orphan temporary file"
+            ),
         }
     }
     cleanup
@@ -4692,6 +4842,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
 /// Drain pending metadata-rewrite markers in bounded batches so a
 /// `--refresh-metadata` migration finishes in its own run. Returns the number
 /// of markers left failing when the drain stops.
+#[cfg(test)]
 pub(crate) async fn drain_pending_metadata_rewrites(
     db: &dyn DownloadStore,
     metadata: &crate::config::MetadataConfig,
@@ -4699,6 +4850,27 @@ pub(crate) async fn drain_pending_metadata_rewrites(
     library_scope: &[&str],
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
+) -> usize {
+    drain_pending_metadata_rewrites_with_blocks(
+        db,
+        metadata,
+        capture_timestamp_repair,
+        library_scope,
+        temp_suffix,
+        shutdown_token,
+        &FxHashSet::default(),
+    )
+    .await
+}
+
+pub(crate) async fn drain_pending_metadata_rewrites_with_blocks(
+    db: &dyn DownloadStore,
+    metadata: &crate::config::MetadataConfig,
+    capture_timestamp_repair: CaptureTimestampRepair,
+    library_scope: &[&str],
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+    blocked_asset_ids: &FxHashSet<ReconciliationBlock>,
 ) -> usize {
     let flags = MetadataFlags::from(metadata);
     if !flags.has_any_write() {
@@ -4715,6 +4887,7 @@ pub(crate) async fn drain_pending_metadata_rewrites(
             shutdown_token,
             Some(library_scope),
             offset,
+            blocked_asset_ids,
         )
         .await;
         failed = failed.saturating_add(pass.failed);
@@ -4799,6 +4972,13 @@ async fn refresh_metadata_capture_candidate(
     asset: PhotoAsset,
     repair: &mut MetadataCaptureRepair,
 ) {
+    if config
+        .reconciliation_blocked_asset_ids
+        .iter()
+        .any(|blocked| blocked.matches(&candidate.library, &candidate.asset_id))
+    {
+        return;
+    }
     if let Err(error) = db
         .upsert_asset_master_mapping(&candidate.library, asset.asset_record_name(), asset.id())
         .await
@@ -7231,6 +7411,7 @@ async fn download_photos_full_with_token_policy(
             metadata_flags,
             Arc::clone(&config.temp_suffix),
             &shutdown_token,
+            config.reconciliation_blocked_asset_ids.as_ref(),
         )
         .await
         .failed;
@@ -8449,6 +8630,9 @@ async fn apply_changed_provider_metadata(
     download_ctx: &DownloadContext,
     summary: &mut IncrementalDeltaSummary,
 ) {
+    if config.is_reconciliation_blocked(asset) {
+        return;
+    }
     let Some(db) = &config.state_db else {
         return;
     };
@@ -8519,6 +8703,7 @@ async fn run_collecting_metadata_rewrite_batch(
         metadata,
         Arc::clone(&config.temp_suffix),
         shutdown_token,
+        config.reconciliation_blocked_asset_ids.as_ref(),
     )
     .await
     .failed
@@ -15654,6 +15839,116 @@ mod tests {
         assert_recorded_path(&fixture, &fixture.source_path).await;
     }
 
+    #[cfg(all(unix, feature = "xmp"))]
+    #[tokio::test]
+    async fn path_reconciliation_replaced_destination_parent_keeps_old_state_and_external_tree_clean()
+     {
+        use std::os::unix::fs::symlink;
+
+        let fixture = path_reconciliation_fixture("RECONCILE_PARENT_REPLACED", true).await;
+        let outside = TempDir::new().expect("outside dir");
+        let destination_parent = fixture
+            .destination_path
+            .parent()
+            .expect("destination parent")
+            .to_path_buf();
+        let retained_parent = destination_parent.with_file_name("retained-destination-parent");
+        let destination_name = fixture
+            .destination_path
+            .file_name()
+            .expect("destination filename")
+            .to_owned();
+
+        let result = reconcile_catalog_paths_with_before_final_media_validation(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+            &|| {
+                std::fs::rename(&destination_parent, &retained_parent)
+                    .expect("retain original destination parent");
+                symlink(outside.path(), &destination_parent)
+                    .expect("replace destination parent with outside link");
+            },
+        )
+        .await
+        .expect("parent replacement result");
+
+        assert!(!result.complete);
+        assert_eq!(result.stats.failed, 1);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(retained_parent.join(&destination_name)).unwrap(),
+            fixture.media_bytes
+        );
+        assert!(
+            metadata::sidecar_path(&retained_parent.join(destination_name))
+                .expect("retained sidecar path")
+                .exists()
+        );
+        assert_recorded_path(&fixture, &fixture.source_path).await;
+    }
+
+    #[cfg(all(unix, feature = "xmp"))]
+    #[tokio::test]
+    async fn path_reconciliation_rejects_linked_source_sidecar_without_external_write() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = path_reconciliation_fixture("RECONCILE_SOURCE_SIDECAR_LINK", true).await;
+        let outside = TempDir::new().expect("outside dir");
+        let outside_sidecar = outside.path().join("outside.xmp");
+        let outside_bytes = xmp_with_creator("Outside Source");
+        std::fs::write(&outside_sidecar, &outside_bytes).unwrap();
+        let source_sidecar = metadata::sidecar_path(&fixture.source_path).expect("source sidecar");
+        symlink(&outside_sidecar, &source_sidecar).unwrap();
+
+        let result = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("linked source sidecar result");
+
+        assert!(!result.complete);
+        assert_eq!(result.stats.exif_failures, 1);
+        assert_eq!(std::fs::read(&outside_sidecar).unwrap(), outside_bytes);
+        assert!(
+            !metadata::sidecar_path(&fixture.destination_path)
+                .expect("destination sidecar")
+                .exists()
+        );
+        assert_recorded_path(&fixture, &fixture.source_path).await;
+    }
+
+    #[cfg(all(unix, feature = "xmp"))]
+    #[tokio::test]
+    async fn path_reconciliation_rejects_linked_destination_sidecar_without_external_write() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = path_reconciliation_fixture("RECONCILE_DESTINATION_SIDECAR_LINK", true).await;
+        let outside = TempDir::new().expect("outside dir");
+        let outside_sidecar = outside.path().join("outside.xmp");
+        let outside_bytes = xmp_with_creator("Outside Destination");
+        std::fs::write(&outside_sidecar, &outside_bytes).unwrap();
+        let destination_sidecar =
+            metadata::sidecar_path(&fixture.destination_path).expect("destination sidecar");
+        std::fs::create_dir_all(destination_sidecar.parent().expect("destination parent")).unwrap();
+        symlink(&outside_sidecar, &destination_sidecar).unwrap();
+
+        let result = reconcile_catalog_paths(
+            &fixture.passes,
+            Arc::new(fixture.config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("linked destination sidecar result");
+
+        assert!(!result.complete);
+        assert_eq!(result.stats.exif_failures, 1);
+        assert_eq!(std::fs::read(&outside_sidecar).unwrap(), outside_bytes);
+        assert_recorded_path(&fixture, &fixture.source_path).await;
+    }
+
     #[tokio::test]
     async fn path_reconciliation_no_metadata_moves_only_media_and_mtime() {
         let fixture = path_reconciliation_fixture("RECONCILE_NO_METADATA", false).await;
@@ -22761,6 +23056,41 @@ mod tests {
         assert_eq!(cleanup.retire.as_slice(), std::slice::from_ref(&owned_path));
         assert!(!moved_parent.join("owned.kei-tmp").exists());
         assert_eq!(std::fs::read(outside_path).unwrap(), b"external");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_orphan_cleanup_retains_leaf_replaced_after_open() {
+        let root = tempfile::tempdir().unwrap();
+        let owned_path = root.path().join("owned.kei-tmp");
+        std::fs::write(&owned_path, b"owned").unwrap();
+        let owned = [crate::state::OwnedTempFile {
+            path: owned_path.clone(),
+            claimed_at: 1,
+        }];
+
+        let cleanup = remove_owned_orphan_parts_with(
+            root.path(),
+            &owned,
+            i64::MAX / 2,
+            i64::MAX / 2,
+            0,
+            |path| {
+                std::fs::remove_file(path).unwrap();
+                std::fs::write(path, b"replacement").unwrap();
+            },
+        );
+
+        assert_eq!(cleanup.removed, 0);
+        assert_eq!(cleanup.retire.as_slice(), std::slice::from_ref(&owned_path));
+        assert!(!owned_path.exists());
+        let retained = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("entry"))
+            .find(|path| path.is_file())
+            .expect("replacement must be quarantined");
+        assert_eq!(std::fs::read(retained).unwrap(), b"replacement");
     }
 
     #[test]

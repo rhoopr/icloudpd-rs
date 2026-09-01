@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(feature = "xmp")]
+use anyhow::Context;
 use chrono::{DateTime, FixedOffset};
 use tokio_util::sync::CancellationToken;
 
@@ -413,16 +415,30 @@ async fn write_sidecar_metadata(
 
 #[cfg(feature = "xmp")]
 pub(super) async fn write_reconciled_sidecar(
-    source_media_path: &Path,
-    destination_media_path: &Path,
-    source_sidecar_path: &Path,
+    reconciled_file: Arc<super::file::ReconciledFile>,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     temp_suffix: &str,
 ) -> bool {
-    let source_media_path = source_media_path.to_path_buf();
+    let planning_file = Arc::clone(&reconciled_file);
     let planned = tokio::task::spawn_blocking(move || {
-        plan_sidecar_write(&source_media_path, &payload, &created_local)
+        let path = planning_file.source_path();
+        let (source_gps, source_error) = match planning_file
+            .open_source_for_metadata()
+            .and_then(|mut file| super::metadata::read_source_gps_from_file(&mut file, path))
+        {
+            Ok(metadata) => (metadata, None),
+            Err(error) => (super::metadata::SourceGpsMetadata::default(), Some(error)),
+        };
+        (
+            plan_sidecar_write_from_source_gps(
+                &payload,
+                &created_local,
+                source_gps,
+                source_error.is_some(),
+            ),
+            source_error,
+        )
     })
     .await;
     let (write, source_error) = match planned {
@@ -432,33 +448,39 @@ pub(super) async fn write_reconciled_sidecar(
             return false;
         }
     };
-    let written = match tokio::fs::symlink_metadata(source_sidecar_path).await {
-        Ok(_) => {
-            super::metadata::write_sidecar_from_seed(
-                destination_media_path,
-                source_sidecar_path,
-                &write,
-                temp_suffix,
-            )
-            .await
+    let source_sidecar = match reconciled_file.source_sidecar() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "Could not confine source XMP sidecar");
+            return false;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            super::metadata::write_sidecar_from_empty_seed(
-                destination_media_path,
-                source_sidecar_path,
-                &write,
-                temp_suffix,
-            )
-            .await
-        }
-        Err(error) => Err(error.into()),
     };
+    let destination_sidecar = match reconciled_file.destination_sidecar() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "Could not confine destination XMP sidecar");
+            return false;
+        }
+    };
+    let temp_suffix = temp_suffix.to_owned();
+    let log_path = destination_sidecar.path().to_path_buf();
+    let written = tokio::task::spawn_blocking(move || {
+        super::metadata::write_confined_sidecar_from_seed(
+            &source_sidecar,
+            &destination_sidecar,
+            &write,
+            &temp_suffix,
+        )
+    })
+    .await
+    .context("Confined XMP sidecar write task panicked")
+    .and_then(std::convert::identity);
     match written {
         Ok(()) if source_error.is_none() => true,
         Ok(()) => {
             if let Some(error) = source_error {
                 tracing::warn!(
-                    path = %destination_media_path.display(),
+                    path = %log_path.display(),
                     %error,
                     "Source GPS read failed after sidecar publication; leaving marker for retry"
                 );
@@ -467,7 +489,7 @@ pub(super) async fn write_reconciled_sidecar(
         }
         Err(error) => {
             tracing::warn!(
-                path = %destination_media_path.display(),
+                path = %log_path.display(),
                 %error,
                 "Failed to write reconciled XMP sidecar"
             );
@@ -512,6 +534,22 @@ fn plan_sidecar_write(
         Ok(metadata) => (metadata, None),
         Err(error) => (super::metadata::SourceGpsMetadata::default(), Some(error)),
     };
+    let write = plan_sidecar_write_from_source_gps(
+        payload,
+        created_local,
+        source_gps,
+        source_error.is_some(),
+    );
+    (write, source_error)
+}
+
+#[cfg(feature = "xmp")]
+fn plan_sidecar_write_from_source_gps(
+    payload: &MetadataPayload,
+    created_local: &DateTime<FixedOffset>,
+    source_gps: super::metadata::SourceGpsMetadata,
+    preserve_source_gps: bool,
+) -> super::metadata::MetadataWrite {
     let mut write = super::metadata::MetadataWrite {
         datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
         offset_time_original: offset_time_original(payload),
@@ -519,7 +557,7 @@ fn plan_sidecar_write(
         gps_speed: source_gps.speed,
         gps_speed_ref: source_gps.speed_ref,
         gps_h_positioning_error: source_gps.horizontal_positioning_error,
-        preserve_source_gps: source_error.is_some(),
+        preserve_source_gps,
         rating: payload.rating,
         gps: gps_from_payload(payload),
         is_hidden: payload.is_hidden,
@@ -532,7 +570,7 @@ fn plan_sidecar_write(
     write.people.clone_from(&payload.people);
     write.media_subtype.clone_from(&payload.media_subtype);
     write.burst_id.clone_from(&payload.burst_id);
-    (write, source_error)
+    write
 }
 
 /// Plan the embed-path write. Per-tag gates:
@@ -734,6 +772,7 @@ pub(super) async fn run_pending<D>(
     metadata_flags: MetadataFlags,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
+    blocked_asset_ids: &rustc_hash::FxHashSet<super::ReconciliationBlock>,
 ) -> RewritePass
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
@@ -746,6 +785,7 @@ where
         shutdown_token,
         None,
         0,
+        blocked_asset_ids,
     )
     .await
 }
@@ -801,6 +841,7 @@ pub(super) async fn run_pending_page<D>(
     shutdown_token: &CancellationToken,
     library_scope: Option<&[&str]>,
     offset: usize,
+    blocked_asset_ids: &rustc_hash::FxHashSet<super::ReconciliationBlock>,
 ) -> RewritePass
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
@@ -857,6 +898,13 @@ where
             deferred += pending_count - idx;
             tracing::info!("Shutdown requested, deferring remaining metadata rewrites");
             break;
+        }
+        if blocked_asset_ids
+            .iter()
+            .any(|blocked| blocked.matches(&record.library, &record.id))
+        {
+            deferred += 1;
+            continue;
         }
         if grouping_read_failures.contains(record.library.as_ref()) {
             errored += 1;
@@ -1263,6 +1311,51 @@ mod tests {
 
     use super::*;
     use chrono::TimeZone;
+
+    async fn run_pending<D>(
+        db: &D,
+        metadata_flags: MetadataFlags,
+        temp_suffix: Arc<str>,
+        shutdown_token: &CancellationToken,
+    ) -> RewritePass
+    where
+        D: MembershipStore + MetadataRewriteStore + ?Sized,
+    {
+        super::run_pending(
+            db,
+            metadata_flags,
+            temp_suffix,
+            shutdown_token,
+            &rustc_hash::FxHashSet::default(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "xmp")]
+    async fn run_pending_page<D>(
+        db: &D,
+        metadata_flags: MetadataFlags,
+        capture_timestamp_repair: CaptureTimestampRepair,
+        temp_suffix: Arc<str>,
+        shutdown_token: &CancellationToken,
+        library_scope: Option<&[&str]>,
+        offset: usize,
+    ) -> RewritePass
+    where
+        D: MembershipStore + MetadataRewriteStore + ?Sized,
+    {
+        super::run_pending_page(
+            db,
+            metadata_flags,
+            capture_timestamp_repair,
+            temp_suffix,
+            shutdown_token,
+            library_scope,
+            offset,
+            &rustc_hash::FxHashSet::default(),
+        )
+        .await
+    }
 
     /// Capture-local time for an asset whose stored offset is +11:00, which is
     /// what every payload below carries. Production derives this offset and

@@ -227,6 +227,13 @@ struct PendingRetryPlanning<'a> {
 
 impl PendingRetryPlanning<'_> {
     async fn plan_resolved_asset(&mut self, asset: &PhotoAsset, state_id: &str) -> Result<()> {
+        if self
+            .pass_configs
+            .first()
+            .is_some_and(|config| config.is_reconciliation_blocked(asset))
+        {
+            return Ok(());
+        }
         let mut malformed_targets = FxHashSet::default();
         let mut state_write_failed_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();

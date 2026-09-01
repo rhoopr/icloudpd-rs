@@ -54,6 +54,13 @@ impl TaskPlanner {
         config: &DownloadConfig,
         proven_primary_path: Option<&Path>,
     ) -> AssetTaskPlan {
+        if config.is_reconciliation_blocked(asset) {
+            return AssetTaskPlan {
+                tasks: Vec::new(),
+                filter_reason: None,
+                malformed_resource: None,
+            };
+        }
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return AssetTaskPlan {
                 tasks: Vec::new(),

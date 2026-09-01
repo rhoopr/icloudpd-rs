@@ -1858,6 +1858,14 @@ where
                                 }
                             }
                         }
+                        if config.is_reconciliation_blocked(&asset) {
+                            tracing::warn!(
+                                asset_id = %asset.state_id(),
+                                "Skipping cycle-blocked asset after unsafe path reconciliation"
+                            );
+                            producer_pb.inc(1);
+                            continue;
+                        }
                         // Apply changed provider metadata before filtering and
                         // path planning, so a metadata-only edit reaches the
                         // catalogue even when the media task is filtered or
@@ -2706,6 +2714,7 @@ async fn finalize_streaming_download(
                 metadata_flags,
                 Arc::clone(&config.temp_suffix),
                 &pipeline_shutdown,
+                config.reconciliation_blocked_asset_ids.as_ref(),
             )
             .await
             .failed;
@@ -5902,6 +5911,7 @@ mod tests {
             enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            reconciliation_blocked_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
             library: std::sync::Arc::from("PrimarySync"),
@@ -5982,6 +5992,7 @@ mod tests {
             enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            reconciliation_blocked_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
             library: std::sync::Arc::from("PrimarySync"),

@@ -115,6 +115,8 @@ pub(crate) struct CycleResult {
     pub(crate) session_expired: bool,
     pub(crate) stats: download::SyncStats,
     pub(crate) db_sync_token_advance_safe: bool,
+    pub(crate) reconciliation_blocked_asset_ids:
+        rustc_hash::FxHashSet<download::ReconciliationBlock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +427,13 @@ pub(crate) type BuildDownloadConfigFn<'a> = dyn Fn(
     ) -> Arc<download::DownloadConfig>
     + 'a;
 
+struct PreparedLibraryCycle<'a> {
+    state: &'a LibraryState,
+    sync_mode_decision: SyncModeDecision,
+    download_config: Arc<download::DownloadConfig>,
+    smart_folder_refresh_required: bool,
+}
+
 /// Outcome of [`check_and_persist_enum_config_hash`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnumConfigHashOutcome {
@@ -708,6 +717,7 @@ pub(crate) async fn run_cycle(
     let mut enum_config_hash_outcome = EnumConfigHashOutcome::Unchanged;
     let mut pending_download_config_hash = None;
     let mut path_reconciliation_complete = true;
+    let mut cycle_reconciliation_blocked_asset_ids = rustc_hash::FxHashSet::default();
     let mut checkpoint_hold_action: Option<&'static str> = None;
     let enum_config_hash = download::compute_config_hash(config);
 
@@ -788,12 +798,12 @@ pub(crate) async fn run_cycle(
         }
     }
 
+    let mut prepared_library_cycles = Vec::new();
     for lib_state in library_states
         .iter()
         .copied()
         .filter(|state| has_active_passes(state))
     {
-        let mut smart_folder_refresh_required = false;
         if shutdown_token.is_cancelled() {
             break;
         }
@@ -861,7 +871,7 @@ pub(crate) async fn run_cycle(
             )
             .await
         };
-        let sync_mode = sync_mode_decision.mode;
+        let sync_mode = sync_mode_decision.mode.clone();
 
         let sync_mode_label = match &sync_mode {
             download::SyncMode::Full => "full",
@@ -903,7 +913,7 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
-        let download_client = shared_session.read().await.download_client().clone();
+        let mut smart_folder_refresh_required = false;
         if pending_download_config_hash.is_some() {
             let reconciliation = download::reconcile_catalog_paths(
                 &lib_state.plan.passes,
@@ -913,12 +923,36 @@ pub(crate) async fn run_cycle(
             .await?;
             path_reconciliation_complete = path_reconciliation_complete && reconciliation.complete;
             smart_folder_refresh_required = reconciliation.smart_folder_refresh_required;
+            cycle_reconciliation_blocked_asset_ids
+                .extend(reconciliation.blocked_asset_ids.iter().cloned());
             cycle_failed_count = cycle_failed_count
                 .saturating_add(reconciliation.stats.failed)
                 .saturating_add(reconciliation.stats.exif_failures)
                 .saturating_add(reconciliation.stats.state_write_failures);
             cycle_stats.accumulate(&reconciliation.stats);
         }
+        prepared_library_cycles.push(PreparedLibraryCycle {
+            state: lib_state,
+            sync_mode_decision,
+            download_config,
+            smart_folder_refresh_required,
+        });
+    }
+
+    let reconciliation_blocks = Arc::new(cycle_reconciliation_blocked_asset_ids.clone());
+    for prepared in prepared_library_cycles {
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        let lib_state = prepared.state;
+        let sync_mode_decision = prepared.sync_mode_decision;
+        let asset_groupings = Arc::clone(&prepared.download_config.asset_groupings);
+        let download_config = Arc::new(
+            prepared
+                .download_config
+                .with_reconciliation_blocks(Arc::clone(&reconciliation_blocks)),
+        );
+        let download_client = shared_session.read().await.download_client().clone();
         let mut sync_result = download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
@@ -927,7 +961,7 @@ pub(crate) async fn run_cycle(
             shutdown_token.clone(),
         )
         .await?;
-        if smart_folder_refresh_required {
+        if prepared.smart_folder_refresh_required {
             path_reconciliation_complete =
                 path_reconciliation_complete && sync_result.stats.smart_folder_refresh_complete;
         }
@@ -967,6 +1001,10 @@ pub(crate) async fn run_cycle(
                         Arc::new(rustc_hash::FxHashSet::default()),
                         Arc::clone(&asset_groupings),
                         Arc::from(lib_state.zone_name.as_str()),
+                    );
+                    let bridge_config = Arc::new(
+                        bridge_config
+                            .with_reconciliation_blocks(Arc::clone(&reconciliation_blocks)),
                     );
                     tracing::info!(
                         zone = %lib_state.zone_name,
@@ -1306,6 +1344,7 @@ pub(crate) async fn run_cycle(
         session_expired: cycle_session_expired,
         stats: cycle_stats,
         db_sync_token_advance_safe,
+        reconciliation_blocked_asset_ids: cycle_reconciliation_blocked_asset_ids,
     })
 }
 

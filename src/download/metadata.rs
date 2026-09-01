@@ -453,8 +453,24 @@ fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
 pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
     let mut source = std::fs::File::open(path)
         .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
+    read_source_gps_from_file(&mut source, path)
+}
+
+#[cfg(feature = "xmp")]
+pub(crate) fn read_source_gps_from_file(
+    source: &mut std::fs::File,
+    path: &Path,
+) -> Result<SourceGpsMetadata> {
+    use std::io::{Seek, SeekFrom};
+
+    source.seek(SeekFrom::Start(0)).with_context(|| {
+        format!(
+            "Could not rewind {} for source GPS metadata",
+            path.display()
+        )
+    })?;
     let mut head = [0_u8; 12];
-    let bytes_read = std::io::Read::read(&mut source, &mut head)
+    let bytes_read = std::io::Read::read(source, &mut head)
         .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
     let Some(file_type) = source_file_type(head.get(..bytes_read).unwrap_or_default()) else {
         return Ok(SourceGpsMetadata::default());
@@ -465,7 +481,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        return match read_jpeg_source_gps(&mut source, source_len) {
+        return match read_jpeg_source_gps(source, source_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -479,7 +495,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        return match read_tiff_source_gps(&mut source, 0, source_len) {
+        return match read_tiff_source_gps(source, 0, source_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -493,7 +509,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        return match read_png_source_gps(&mut source, source_len) {
+        return match read_png_source_gps(source, source_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -507,7 +523,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
             .metadata()
             .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?
             .len();
-        let extent = match heif::locate_exif_tiff(&mut source, source_len) {
+        let extent = match heif::locate_exif_tiff(source, source_len) {
             Ok(extent) => extent,
             Err(heif::HeifExifError::Malformed) => {
                 return Ok(SourceGpsMetadata::default());
@@ -521,7 +537,7 @@ pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
         let Some((tiff_start, tiff_len)) = extent else {
             return Ok(SourceGpsMetadata::default());
         };
-        return match read_tiff_source_gps(&mut source, tiff_start, tiff_len) {
+        return match read_tiff_source_gps(source, tiff_start, tiff_len) {
             Ok(metadata) => Ok(metadata),
             Err(TiffGpsError::Malformed) => Ok(SourceGpsMetadata::default()),
             Err(TiffGpsError::Io(error)) => Err(error).with_context(|| {
@@ -1305,7 +1321,7 @@ fn prepare_metadata_heif(
         .metadata()
         .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
         .permissions();
-    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
+    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions)?;
     let mut writer = std::io::BufWriter::new(file);
     heif::rewrite_xmp(rewrite_input, &xmp, &mut writer)
         .with_context(|| format!("Could not update XMP in {}", path.display()))?;
@@ -1545,268 +1561,237 @@ pub(crate) async fn write_sidecar(
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<()> {
-    write_sidecar_with_seed(media_path, SidecarSeed::Destination, write, temp_suffix).await
-}
-
-#[cfg(feature = "xmp")]
-pub(crate) async fn write_sidecar_from_seed(
-    media_path: &Path,
-    seed_path: &Path,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-) -> Result<()> {
-    write_sidecar_with_seed(
-        media_path,
-        SidecarSeed::Source(seed_path.to_path_buf()),
-        write,
-        temp_suffix,
-    )
-    .await
-}
-
-#[cfg(feature = "xmp")]
-pub(crate) async fn write_sidecar_from_empty_seed(
-    media_path: &Path,
-    seed_path: &Path,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-) -> Result<()> {
-    write_sidecar_with_seed(
-        media_path,
-        SidecarSeed::Empty(seed_path.to_path_buf()),
-        write,
-        temp_suffix,
-    )
-    .await
-}
-
-#[cfg(feature = "xmp")]
-#[derive(Clone)]
-enum SidecarSeed {
-    Destination,
-    Source(PathBuf),
-    Empty(PathBuf),
-}
-
-#[cfg(feature = "xmp")]
-enum PreparedSidecarSeed {
-    Missing(PathBuf),
-    Present(PathBuf, super::file::ExistingFileFingerprint),
-}
-
-#[cfg(feature = "xmp")]
-async fn write_sidecar_with_seed(
-    media_path: &Path,
-    seed: SidecarSeed,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-) -> Result<()> {
-    let media_path = media_path.to_path_buf();
+    let sidecar_path = match sidecar_path(media_path) {
+        Ok(path) => path,
+        Err(_) if write.is_empty() => return Ok(()),
+        Err(error) => return Err(error),
+    };
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
-    let prepared = tokio::task::spawn_blocking(move || {
-        prepare_sidecar_write(&media_path, &seed, &write, &temp_suffix)
+    tokio::task::spawn_blocking(move || {
+        let destination = super::file::FileLocation::Path(sidecar_path);
+        write_sidecar_locations_with(None, &destination, &write, &temp_suffix, || {})
     })
     .await
-    .context("XMP sidecar preparation task panicked")??;
-    let Some(prepared) = prepared else {
+    .context("XMP sidecar write task panicked")?
+}
+
+#[cfg(feature = "xmp")]
+pub(crate) fn write_confined_sidecar_from_seed(
+    source_sidecar: &crate::fs_util::ConfinedPath,
+    destination_sidecar: &crate::fs_util::ConfinedPath,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+) -> Result<()> {
+    let source = super::file::FileLocation::Confined(source_sidecar.try_clone()?);
+    let destination = super::file::FileLocation::Confined(destination_sidecar.try_clone()?);
+    write_sidecar_locations_with(Some(&source), &destination, write, temp_suffix, || {})
+}
+
+#[cfg(feature = "xmp")]
+fn write_sidecar_locations_with(
+    seed: Option<&super::file::FileLocation>,
+    destination_sidecar: &super::file::FileLocation,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    before_publication: impl FnOnce(),
+) -> Result<()> {
+    let seed_path = seed.unwrap_or(destination_sidecar);
+    let seed_snapshot = read_sidecar_location(seed_path)?;
+    let Some(bytes) = render_sidecar_bytes(
+        seed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.bytes.as_slice()),
+        seed_path.path(),
+        write,
+    )?
+    else {
         return Ok(());
     };
-
-    // The source seed is stable through this check. Conditional destination
-    // publication below is the sidecar snapshot linearization point.
-    if let Some(seed) = &prepared.seed {
-        let validation = match seed {
-            PreparedSidecarSeed::Missing(path) => match tokio::fs::symlink_metadata(path).await {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Ok(_) => Err(anyhow::anyhow!(
-                    "Source XMP sidecar appeared: {}",
-                    path.display()
-                )),
-                Err(error) => Err(error.into()),
-            },
-            PreparedSidecarSeed::Present(path, expected) => {
-                match super::file::fingerprint_regular_file(path).await {
-                    Ok(current) if current == *expected => Ok(()),
-                    Ok(_) => Err(anyhow::anyhow!(
-                        "Source XMP sidecar changed: {}",
-                        path.display()
-                    )),
-                    Err(error) => Err(error),
-                }
-            }
-        };
-        if let Err(error) = validation {
-            if let Some(tmp_path) = &prepared.tmp_path
-                && let Err(error) = tokio::fs::remove_file(tmp_path).await
-            {
-                tracing::warn!(path = %tmp_path.display(), %error, "Could not remove unpublished XMP sidecar");
-            }
-            return Err(error).context("Source XMP sidecar changed during write planning");
-        }
-    }
-    let Some(tmp_path) = &prepared.tmp_path else {
-        let current = super::file::fingerprint_regular_file(&prepared.sidecar_path).await?;
-        anyhow::ensure!(
-            current == prepared.output,
-            "Destination XMP sidecar changed during write planning: {}",
-            prepared.sidecar_path.display()
-        );
-        return Ok(());
-    };
-
-    // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
-    super::file::publish_file_if_unchanged(tmp_path, &prepared.sidecar_path, prepared.expected)
-        .await
-        .with_context(|| {
-            format!(
-                "Could not install XMP sidecar {} -> {}",
-                tmp_path.display(),
-                prepared.sidecar_path.display()
+    let output = fingerprint_bytes(&bytes)?;
+    let destination = read_sidecar_location(destination_sidecar)?;
+    if let Some(expected) = destination
+        .as_ref()
+        .filter(|snapshot| snapshot.location.fingerprint == output)
+    {
+        validate_sidecar_seed(seed_path, seed_snapshot.as_ref())?;
+        let current = read_sidecar_location(destination_sidecar)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Destination XMP sidecar disappeared: {}",
+                destination_sidecar.path().display()
             )
         })?;
-    tracing::debug!(path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
+        anyhow::ensure!(
+            current.location == expected.location,
+            "Destination XMP sidecar changed during write planning: {}",
+            destination_sidecar.path().display()
+        );
+        return Ok(());
+    }
+    let expected = match (seed.is_none(), &seed_snapshot, destination) {
+        (_, _, None) => None,
+        (true, _, Some(destination)) => Some(destination.location),
+        (false, Some(source), Some(destination))
+            if destination.location.fingerprint == source.location.fingerprint =>
+        {
+            Some(destination.location)
+        }
+        (false, Some(_), Some(_)) => anyhow::bail!(
+            "Destination XMP sidecar conflicts with the source seed: {}",
+            destination_sidecar.path().display()
+        ),
+        (false, None, Some(_)) => anyhow::bail!(
+            "Destination XMP sidecar conflicts with the empty source seed: {}",
+            destination_sidecar.path().display()
+        ),
+    };
+
+    let (temp_path, replacement, mut guard) = loop {
+        let candidate = sidecar_temp_path(
+            destination_sidecar.path(),
+            temp_suffix,
+            SIDECAR_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let temp = destination_sidecar.sibling(&candidate)?;
+        match temp.create_new_regular() {
+            Ok(mut file) => {
+                let identity = crate::fs_util::file_identity(&file)?;
+                let guard = super::file::LocationCleanupGuard::new(temp.try_clone()?, identity);
+                std::io::Write::write_all(&mut file, &bytes).with_context(|| {
+                    format!(
+                        "Could not write temporary XMP sidecar {}",
+                        temp.path().display()
+                    )
+                })?;
+                file.sync_all().with_context(|| {
+                    format!(
+                        "Could not sync temporary XMP sidecar {}",
+                        temp.path().display()
+                    )
+                })?;
+                break (
+                    temp,
+                    super::file::LocationFingerprint {
+                        fingerprint: output,
+                        identity,
+                    },
+                    guard,
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    validate_sidecar_seed(seed_path, seed_snapshot.as_ref())?;
+    before_publication();
+    // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
+    if let Err(error) = super::file::publish_location_if_unchanged_blocking(
+        &temp_path,
+        destination_sidecar,
+        expected,
+        replacement,
+    ) {
+        let disposition = super::file::classify_conditional_publish_error(&error);
+        if disposition
+            .retained_paths
+            .iter()
+            .any(|path| path == temp_path.path())
+        {
+            guard.disarm();
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "Could not install XMP sidecar {} -> {}",
+                temp_path.path().display(),
+                destination_sidecar.path().display()
+            )
+        });
+    }
+    guard.disarm();
+    tracing::debug!(path = %destination_sidecar.path().display(), "Wrote XMP sidecar");
     Ok(())
 }
 
 #[cfg(feature = "xmp")]
-struct PreparedSidecar {
-    tmp_path: Option<PathBuf>,
-    sidecar_path: PathBuf,
-    expected: Option<super::file::ExistingFileFingerprint>,
-    output: super::file::ExistingFileFingerprint,
-    seed: Option<PreparedSidecarSeed>,
+struct SidecarSnapshot {
+    bytes: Vec<u8>,
+    location: super::file::LocationFingerprint,
 }
 
 #[cfg(feature = "xmp")]
-fn prepare_sidecar_write(
-    media_path: &Path,
-    seed: &SidecarSeed,
-    write: &MetadataWrite,
-    temp_suffix: &str,
-) -> Result<Option<PreparedSidecar>> {
-    ensure_initialized();
-
-    let sidecar_path = match sidecar_path(media_path) {
-        Ok(path) => path,
-        Err(_) if write.is_empty() => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let input_path = match seed {
-        SidecarSeed::Destination => Some(sidecar_path.clone()),
-        SidecarSeed::Source(path) => Some(path.clone()),
-        SidecarSeed::Empty(_) => None,
-    };
-    let (mut meta, input_fingerprint) = match input_path.as_deref() {
-        Some(input_path) => match read_regular_sidecar(input_path)? {
-            Some((existing_bytes, fingerprint)) => {
-                let existing = std::str::from_utf8(&existing_bytes).with_context(|| {
-                    format!(
-                        "Existing XMP sidecar is not valid UTF-8: {}",
-                        input_path.display()
-                    )
-                })?;
-                let parsed = parse_existing_sidecar(existing).with_context(|| {
-                    format!(
-                        "Could not parse existing XMP sidecar {}",
-                        input_path.display()
-                    )
-                })?;
-                (parsed, Some(fingerprint))
-            }
-            None if matches!(seed, SidecarSeed::Destination) => {
-                (XmpMeta::new().context("creating XmpMeta")?, None)
-            }
-            None => anyhow::bail!("Source XMP sidecar disappeared: {}", input_path.display()),
-        },
-        None => (XmpMeta::new().context("creating XmpMeta")?, None),
-    };
-    if write.is_empty() && !meta.contains_property(KEI_XMP_NS, KEI_MANAGED_FIELDS) {
+fn read_sidecar_location(path: &super::file::FileLocation) -> Result<Option<SidecarSnapshot>> {
+    let Some(mut file) = path.open_optional_regular()? else {
         return Ok(None);
-    }
-    apply_to_owned_sidecar(&mut meta, write)?;
-    let bytes = meta.to_string().into_bytes();
-    let output = fingerprint_bytes(&bytes)?;
-
-    let expected = match seed {
-        SidecarSeed::Destination => input_fingerprint,
-        SidecarSeed::Source(path) => match read_regular_sidecar(&sidecar_path)? {
-            None => None,
-            Some((_, destination)) if destination == output => {
-                return Ok(Some(PreparedSidecar {
-                    tmp_path: None,
-                    sidecar_path,
-                    expected: Some(destination),
-                    output,
-                    seed: input_fingerprint
-                        .map(|fingerprint| PreparedSidecarSeed::Present(path.clone(), fingerprint)),
-                }));
-            }
-            Some((_, destination)) if Some(destination) == input_fingerprint => Some(destination),
-            Some(_) => anyhow::bail!(
-                "Destination XMP sidecar conflicts with the source seed: {}",
-                sidecar_path.display()
-            ),
-        },
-        SidecarSeed::Empty(path) => match read_regular_sidecar(&sidecar_path)? {
-            None => None,
-            Some((_, destination)) if destination == output => {
-                return Ok(Some(PreparedSidecar {
-                    tmp_path: None,
-                    sidecar_path,
-                    expected: Some(destination),
-                    output,
-                    seed: Some(PreparedSidecarSeed::Missing(path.clone())),
-                }));
-            }
-            Some(_) => anyhow::bail!(
-                "Destination XMP sidecar conflicts with the empty source seed: {}",
-                sidecar_path.display()
-            ),
-        },
     };
-
-    let (mut temp, tmp_path) = create_unique_sidecar_temp(&sidecar_path, temp_suffix)?;
-    let guard = TmpGuard::new(&tmp_path);
-    std::io::Write::write_all(&mut temp, &bytes).with_context(|| {
-        format!(
-            "Could not write temporary XMP sidecar {}",
-            tmp_path.display()
-        )
-    })?;
-    temp.sync_all().with_context(|| {
-        format!(
-            "Could not sync temporary XMP sidecar {}",
-            tmp_path.display()
-        )
-    })?;
-    guard.disarm();
-    Ok(Some(PreparedSidecar {
-        tmp_path: Some(tmp_path),
-        sidecar_path,
-        expected,
-        output,
-        seed: match seed {
-            SidecarSeed::Source(path) => input_fingerprint
-                .map(|fingerprint| PreparedSidecarSeed::Present(path.clone(), fingerprint)),
-            SidecarSeed::Empty(path) => Some(PreparedSidecarSeed::Missing(path.clone())),
-            SidecarSeed::Destination => None,
+    let identity = crate::fs_util::file_identity(&file)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .with_context(|| format!("Could not read XMP sidecar {}", path.path().display()))?;
+    path.validate_identity(identity)?;
+    let fingerprint = fingerprint_bytes(&bytes)?;
+    Ok(Some(SidecarSnapshot {
+        bytes,
+        location: super::file::LocationFingerprint {
+            fingerprint,
+            identity,
         },
     }))
 }
 
 #[cfg(feature = "xmp")]
-fn read_regular_sidecar(
-    path: &Path,
-) -> Result<Option<(Vec<u8>, super::file::ExistingFileFingerprint)>> {
-    let Some(mut file) = super::file::open_optional_regular_file_blocking(path)? else {
-        return Ok(None);
+fn validate_sidecar_seed(
+    path: &super::file::FileLocation,
+    expected: Option<&SidecarSnapshot>,
+) -> Result<()> {
+    match expected {
+        Some(expected) => {
+            let current = read_sidecar_location(path)?.ok_or_else(|| {
+                anyhow::anyhow!("Source XMP sidecar disappeared: {}", path.path().display())
+            })?;
+            anyhow::ensure!(
+                current.location == expected.location,
+                "Source XMP sidecar changed: {}",
+                path.path().display()
+            );
+        }
+        None => path
+            .ensure_missing()
+            .with_context(|| format!("Source XMP sidecar appeared: {}", path.path().display()))?,
+    }
+    Ok(())
+}
+
+#[cfg(feature = "xmp")]
+fn render_sidecar_bytes(
+    input: Option<&[u8]>,
+    input_path: &Path,
+    write: &MetadataWrite,
+) -> Result<Option<Vec<u8>>> {
+    ensure_initialized();
+    let mut meta = match input {
+        Some(existing_bytes) => {
+            let existing = std::str::from_utf8(existing_bytes).with_context(|| {
+                format!(
+                    "Existing XMP sidecar is not valid UTF-8: {}",
+                    input_path.display()
+                )
+            })?;
+            parse_existing_sidecar(existing).with_context(|| {
+                format!(
+                    "Could not parse existing XMP sidecar {}",
+                    input_path.display()
+                )
+            })?
+        }
+        None => XmpMeta::new().context("creating XmpMeta")?,
     };
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes)
-        .with_context(|| format!("Could not read XMP sidecar {}", path.display()))?;
-    let fingerprint = fingerprint_bytes(&bytes)?;
-    Ok(Some((bytes, fingerprint)))
+    if write.is_empty() && !meta.contains_property(KEI_XMP_NS, KEI_MANAGED_FIELDS) {
+        return Ok(None);
+    }
+    apply_to_owned_sidecar(&mut meta, write)?;
+    Ok(Some(meta.to_string().into_bytes()))
 }
 
 #[cfg(feature = "xmp")]
@@ -1816,36 +1801,6 @@ fn sidecar_temp_path(sidecar_path: &Path, temp_suffix: &str, sequence: u64) -> P
         ".kei-xmp-{}-{sequence}{temp_suffix}",
         std::process::id()
     ))
-}
-
-#[cfg(feature = "xmp")]
-fn create_unique_sidecar_temp(
-    sidecar_path: &Path,
-    temp_suffix: &str,
-) -> Result<(std::fs::File, PathBuf)> {
-    loop {
-        let candidate = sidecar_temp_path(
-            sidecar_path,
-            temp_suffix,
-            SIDECAR_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        );
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((file, candidate)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "Could not create temporary XMP sidecar {}",
-                        candidate.display()
-                    )
-                });
-            }
-        }
-    }
 }
 
 #[cfg(feature = "xmp")]
@@ -1923,51 +1878,55 @@ fn apply_to_owned_sidecar(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_tool
 
 /// Remove the tmp file on drop unless disarmed. Protects metadata temp files
 /// against panics or writer failures; no orphan sweep matches this suffix.
-#[derive(Debug)]
 struct TmpGuard {
     path: PathBuf,
+    cleanup: super::file::LocationCleanupGuard,
     armed: bool,
     cleanup_permissions: Option<std::fs::Permissions>,
 }
 
 impl TmpGuard {
-    #[cfg(any(test, feature = "xmp"))]
-    fn new(path: &Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            armed: true,
-            cleanup_permissions: None,
-        }
+    #[cfg(test)]
+    fn new(path: &Path) -> Result<Self> {
+        Self::with_cleanup(path, None)
     }
 
-    fn with_cleanup_permissions(path: &Path, permissions: std::fs::Permissions) -> Self {
-        Self {
+    fn with_cleanup_permissions(path: &Path, permissions: std::fs::Permissions) -> Result<Self> {
+        Self::with_cleanup(path, Some(permissions))
+    }
+
+    fn with_cleanup(
+        path: &Path,
+        cleanup_permissions: Option<std::fs::Permissions>,
+    ) -> Result<Self> {
+        Ok(Self {
             path: path.to_path_buf(),
+            cleanup: super::file::LocationCleanupGuard::for_path(path)?,
             armed: true,
-            cleanup_permissions: Some(permissions),
-        }
+            cleanup_permissions,
+        })
     }
 
     fn disarm(mut self) {
         self.armed = false;
+        self.cleanup.disarm();
     }
 }
 
 impl Drop for TmpGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if self.path.exists()
-                && let Some(permissions) = self.cleanup_permissions.take()
-                && let Err(error) = std::fs::set_permissions(&self.path, permissions)
-            {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    %error,
-                    "Could not restore temporary metadata permissions for cleanup; retaining file"
-                );
-                return;
+        if !self.armed {
+            return;
+        }
+        if let Some(permissions) = self.cleanup_permissions.take() {
+            let location = super::file::FileLocation::Path(self.path.clone());
+            let restored = location
+                .validate_identity_for_metadata(self.cleanup.identity)
+                .and_then(|file| Ok(file.set_permissions(permissions)?));
+            if let Err(error) = restored {
+                self.cleanup.disarm();
+                tracing::warn!(path = %self.path.display(), %error, "Could not safely restore temporary metadata permissions for cleanup; retaining file");
             }
-            crate::fs_util::log_remove(&self.path);
         }
     }
 }
@@ -2050,20 +2009,23 @@ fn prepare_metadata_xmp_toolkit(
             .into(),
         );
     }
-    let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
-    let cleanup_permissions = file
+    let (mut temp, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
+    let cleanup_permissions = temp
         .metadata()
         .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
         .permissions();
-    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
-    drop(file);
-    std::fs::copy(path, &tmp_path).with_context(|| {
+    let mut guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions)?;
+    let mut source = super::file::open_regular_file_blocking(path)?;
+    let source_permissions = source.metadata()?.permissions();
+    std::io::copy(&mut source, &mut temp).with_context(|| {
         format!(
             "Could not copy {} to {}",
             path.display(),
             tmp_path.display()
         )
     })?;
+    temp.set_permissions(source_permissions)?;
+    drop((source, temp));
     let copied = super::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
         .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
         .fingerprint;
@@ -2119,6 +2081,7 @@ fn prepare_metadata_xmp_toolkit(
     let output = super::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
         .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
         .fingerprint;
+    guard.cleanup.refresh_identity()?;
     Ok(PreparedMetadataFile {
         guard,
         expected_input: expected,
@@ -2230,7 +2193,7 @@ fn prepare_metadata_native(
         .metadata()
         .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
         .permissions();
-    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
+    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions)?;
     let mut writer = std::io::BufWriter::new(file);
     std::io::Write::write_all(&mut writer, &output).with_context(|| {
         format!(
@@ -2589,7 +2552,7 @@ mod tests {
         let path = dir.join("armed.meta-tmp");
         fs::write(&path, b"pending").unwrap();
         {
-            let _guard = TmpGuard::new(&path);
+            let _guard = TmpGuard::new(&path).unwrap();
             assert!(path.exists(), "precondition: tmp file exists");
         }
         assert!(
@@ -2605,7 +2568,7 @@ mod tests {
         let path = dir.join("disarmed.meta-tmp");
         fs::write(&path, b"keep me").unwrap();
         {
-            let guard = TmpGuard::new(&path);
+            let guard = TmpGuard::new(&path).unwrap();
             guard.disarm();
         }
         assert!(path.exists(), "disarmed TmpGuard must not delete the file");
@@ -2686,7 +2649,7 @@ mod tests {
 
         let path_for_closure = path.clone();
         let joined = std::panic::catch_unwind(move || {
-            let _guard = TmpGuard::new(&path_for_closure);
+            let _guard = TmpGuard::new(&path_for_closure).unwrap();
             panic!("simulated xmp_toolkit FFI panic");
         });
         assert!(joined.is_err(), "closure was expected to panic");
@@ -4978,6 +4941,137 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn confined_sidecar_does_not_follow_replaced_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source_parent = root.path().join("source");
+        let destination_parent = root.path().join("destination");
+        let retained_parent = root.path().join("retained-destination");
+        std::fs::create_dir(&source_parent).unwrap();
+        std::fs::create_dir(&destination_parent).unwrap();
+        let source_sidecar_path = source_parent.join("photo.jpg.xmp");
+        let destination_sidecar_path = destination_parent.join("photo.jpg.xmp");
+        ensure_initialized();
+        let mut source = XmpMeta::new().unwrap();
+        source
+            .set_property(
+                xmp_ns::DC,
+                "creator",
+                &XmpValue::new("Source Creator".to_owned()),
+            )
+            .unwrap();
+        std::fs::write(&source_sidecar_path, source.to_string()).unwrap();
+        let source_sidecar = crate::fs_util::ConfinedPath::open(
+            root.path(),
+            &source_sidecar_path,
+            crate::fs_util::ConfinedParents::Existing,
+        )
+        .unwrap();
+        let destination_sidecar = crate::fs_util::ConfinedPath::open(
+            root.path(),
+            &destination_sidecar_path,
+            crate::fs_util::ConfinedParents::Existing,
+        )
+        .unwrap();
+        let source_sidecar = crate::download::file::FileLocation::Confined(source_sidecar);
+        let destination_sidecar =
+            crate::download::file::FileLocation::Confined(destination_sidecar);
+
+        let result = write_sidecar_locations_with(
+            Some(&source_sidecar),
+            &destination_sidecar,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            || {
+                std::fs::rename(&destination_parent, &retained_parent).unwrap();
+                symlink(outside.path(), &destination_parent).unwrap();
+            },
+        );
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&retained_parent).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_sidecar_guard_retains_replaced_temp_leaf() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let root = tempfile::tempdir().unwrap();
+        let source_parent = root.path().join("source");
+        let destination_parent = root.path().join("destination");
+        std::fs::create_dir(&source_parent).unwrap();
+        std::fs::create_dir(&destination_parent).unwrap();
+        let source_sidecar_path = source_parent.join("photo.jpg.xmp");
+        let destination_sidecar_path = destination_parent.join("photo.jpg.xmp");
+        let source_sidecar = crate::fs_util::ConfinedPath::open(
+            root.path(),
+            &source_sidecar_path,
+            crate::fs_util::ConfinedParents::Existing,
+        )
+        .unwrap();
+        let destination_sidecar = crate::fs_util::ConfinedPath::open(
+            root.path(),
+            &destination_sidecar_path,
+            crate::fs_util::ConfinedParents::Existing,
+        )
+        .unwrap();
+        let source_sidecar = crate::download::file::FileLocation::Confined(source_sidecar);
+        let destination_sidecar =
+            crate::download::file::FileLocation::Confined(destination_sidecar);
+        let replaced_temp = std::cell::RefCell::new(None);
+
+        let result = write_sidecar_locations_with(
+            Some(&source_sidecar),
+            &destination_sidecar,
+            &MetadataWrite {
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            || {
+                let temp = std::fs::read_dir(&destination_parent)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with(".kei-xmp-"))
+                    })
+                    .expect("confined sidecar temp");
+                std::fs::remove_file(&temp).unwrap();
+                std::fs::write(&temp, b"replacement").unwrap();
+                replaced_temp.replace(Some(temp));
+            },
+        );
+
+        assert!(result.is_err(), "{result:?}");
+        let replaced_temp = replaced_temp.into_inner().expect("replaced temp path");
+        assert!(!replaced_temp.exists());
+        let retained = std::fs::read_dir(&destination_parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("entry"))
+            .find(|path| path.is_file())
+            .expect("replacement must be retained in quarantine");
+        assert_eq!(std::fs::read(retained).unwrap(), b"replacement");
+        assert!(!destination_sidecar_path.exists());
+        assert!(capture.events().iter().any(|event| {
+            event.level == tracing::Level::WARN
+                && event.message()
+                    == Some(
+                        "Retaining unpublished temporary file because safe cleanup is unavailable",
+                    )
+        }));
+    }
+
     #[tokio::test]
     async fn write_sidecar_refuses_existing_file_changed_after_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -4996,38 +5090,33 @@ mod tests {
             .unwrap();
         std::fs::write(&sidecar_path, original.to_string().into_bytes()).unwrap();
 
-        let prepared = prepare_sidecar_write(
-            &media_path,
-            &SidecarSeed::Destination,
+        let destination = crate::download::file::FileLocation::Path(sidecar_path.clone());
+        let external = b"external replacement after initial read";
+        let error = write_sidecar_locations_with(
+            None,
+            &destination,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
             },
             ".meta-tmp",
+            || std::fs::write(&sidecar_path, external).unwrap(),
         )
-        .unwrap()
-        .expect("sidecar update should be prepared");
-        let temp_path = prepared.tmp_path.clone().expect("prepared path");
-
-        let external = b"external replacement after initial read";
-        std::fs::write(&sidecar_path, external).unwrap();
-        let error = crate::download::file::publish_file_if_unchanged(
-            prepared.tmp_path.as_ref().expect("prepared path"),
-            &prepared.sidecar_path,
-            prepared.expected,
-        )
-        .await
         .unwrap_err();
 
-        assert!(error.to_string().contains("bytes changed"), "{error:#}");
+        assert!(format!("{error:#}").contains("bytes changed"), "{error:#}");
         assert_eq!(
             std::fs::read(&sidecar_path).unwrap(),
             external,
             "an external change after the initial read must not be replaced"
         );
-        assert!(
-            temp_path.exists(),
-            "refused publication retains the prepared file because an exchange failure could have displaced user bytes there"
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".kei-xmp-"))
+                .count(),
+            0
         );
     }
 
@@ -5038,34 +5127,29 @@ mod tests {
         let sidecar_path = dir.path().join("appeared.jpg.xmp");
         std::fs::write(&media_path, b"placeholder").unwrap();
 
-        let prepared = prepare_sidecar_write(
-            &media_path,
-            &SidecarSeed::Destination,
+        let destination = crate::download::file::FileLocation::Path(sidecar_path.clone());
+        let external = b"sidecar created by another application";
+        let error = write_sidecar_locations_with(
+            None,
+            &destination,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
             },
             ".meta-tmp",
+            || std::fs::write(&sidecar_path, external).unwrap(),
         )
-        .unwrap()
-        .expect("new sidecar should be prepared");
-        let temp_path = prepared.tmp_path.clone().expect("prepared path");
-
-        let external = b"sidecar created by another application";
-        std::fs::write(&sidecar_path, external).unwrap();
-        let error = crate::download::file::publish_file_if_unchanged(
-            prepared.tmp_path.as_ref().expect("prepared path"),
-            &prepared.sidecar_path,
-            prepared.expected,
-        )
-        .await
         .unwrap_err();
 
-        assert!(error.to_string().contains("appeared"), "{error:#}");
+        assert!(format!("{error:#}").contains("write planning"), "{error:#}");
         assert_eq!(std::fs::read(&sidecar_path).unwrap(), external);
-        assert!(
-            temp_path.exists(),
-            "refused publication retains the prepared file for operator inspection"
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".kei-xmp-"))
+                .count(),
+            0
         );
     }
 
@@ -5076,20 +5160,6 @@ mod tests {
         let sidecar_path = dir.path().join("temp-conflict.jpg.xmp");
         std::fs::write(&media_path, b"placeholder").unwrap();
 
-        let prepared = prepare_sidecar_write(
-            &media_path,
-            &SidecarSeed::Destination,
-            &MetadataWrite {
-                rating: Some(4),
-                ..MetadataWrite::default()
-            },
-            ".meta-tmp",
-        )
-        .unwrap()
-        .expect("initial sidecar should be prepared");
-        let retained_path = prepared.tmp_path.clone().expect("prepared path");
-        let retained_bytes = std::fs::read(&retained_path).unwrap();
-
         ensure_initialized();
         let mut external = XmpMeta::new().unwrap();
         external
@@ -5099,14 +5169,40 @@ mod tests {
                 &XmpValue::new("External author".to_string()),
             )
             .unwrap();
-        std::fs::write(&sidecar_path, external.to_string().into_bytes()).unwrap();
-        crate::download::file::publish_file_if_unchanged(
-            prepared.tmp_path.as_ref().expect("prepared path"),
-            &prepared.sidecar_path,
-            prepared.expected,
+        let external = external.to_string().into_bytes();
+        let destination = crate::download::file::FileLocation::Path(sidecar_path.clone());
+        let ambiguous = b"ambiguous retained bytes";
+        let result = write_sidecar_locations_with(
+            None,
+            &destination,
+            &MetadataWrite {
+                rating: Some(4),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            || {
+                std::fs::write(&sidecar_path, &external).unwrap();
+                let temp = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with(".kei-xmp-"))
+                    })
+                    .expect("sidecar temp");
+                std::fs::remove_file(&temp).unwrap();
+                std::fs::write(temp, ambiguous).unwrap();
+            },
         )
-        .await
         .unwrap_err();
+        assert!(format!("{result:#}").contains("changed after validation"));
+        let retained_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("entry"))
+            .find(|path| path.is_file())
+            .expect("ambiguous temp must be retained");
 
         super::write_sidecar(
             &media_path,
@@ -5121,7 +5217,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read(&retained_path).unwrap(),
-            retained_bytes,
+            ambiguous,
             "the later attempt must not overwrite or delete ambiguous retained bytes"
         );
         let written = std::fs::read_to_string(&sidecar_path).unwrap();
@@ -5888,7 +5984,7 @@ mod native_tests {
         let path = dir.path().join("guarded.kei-tmp");
         fs::write(&path, b"pending").unwrap();
         {
-            let _guard = TmpGuard::new(&path);
+            let _guard = TmpGuard::new(&path).unwrap();
             assert!(path.exists(), "precondition: tmp file exists");
         }
         assert!(

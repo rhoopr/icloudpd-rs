@@ -1616,6 +1616,7 @@ mod wiremock_tests {
             enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            reconciliation_blocked_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),
             bandwidth_limiter: None,
         }

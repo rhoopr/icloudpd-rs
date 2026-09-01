@@ -218,26 +218,46 @@ Selected smart folders are never resolved from historical membership rows.
 They require an explicit successful fresh-query marker from the normal sync
 flow before the pending path hash can be promoted. Interruption, refresh
 failure, or a stale pass plan retains the pending hash for the next cycle.
+While a path hash is pending, the cycle reconciles every active library plan
+before any library starts inventory, retry, bridge, metadata capture, provider
+metadata refresh, or rewrite-drain work. It unions exact `(library, asset)`
+blocks across those reconciliations and passes the complete set to every
+library, including cross-zone album producers. Smart-folder refresh
+requirements remain library-scoped and promotion waits for every required
+fresh-query result.
 
 For a genuine path change, reconciliation copies verified bytes and source
 permissions through no-overwrite publication only when the copied bytes match
-the recorded local SHA-256. Before updating the recorded local path, it
-strictly sets the copied media's access and modification times through the same
-no-follow, checksum-verified file handle, reproduces and merges configured XMP
-sidecars without embedded writes, and makes the destination directory durable.
-A source sidecar
-is rendered from an explicit regular-file snapshot or an explicit empty seed.
-That seed is revalidated immediately before conditional destination
-publication, which is the sidecar snapshot linearization point. A later source
-edit is an external concurrent change, as it is after normal sync, and does not
-block state finalization. The destination sidecar may be absent, byte-identical
-to the source seed, or already byte-identical to the expected provider-merged
-output; any other destination is a conflict. Immediately before state
-finalization, reconciliation reopens the destination media without following
-links, verifies that the path still identifies the regular-file handle that
-was hashed, and requires its SHA-256 to equal the copied checksum. Metadata,
-timestamp, durability, final media validation, or state failure leaves the old
-path authoritative and the pending path hash retryable.
+the recorded local SHA-256. The current download root and every destination
+parent are retained as filesystem capabilities before temporary or final bytes
+are created. Unix traverses and creates descendants with no-follow
+`openat`/`mkdirat`, publishes through descriptor-relative
+`renameat2`/`renameatx_np` or `linkat`, and fsyncs the retained parent.
+Windows rejects reparse-point ancestors and retains directory handles without
+delete sharing while guarded `MoveFileExW` or `ReplaceFileW` publication runs.
+A catalogue source already under the current root uses that same confinement.
+A source under a previous configured root is read-only and is opened through a
+retained common-ancestor capability, or its exact parent when the roots are on
+different volumes. It never grants publication authority.
+
+Before updating the recorded local path, reconciliation strictly sets the
+copied media's access and modification times through the same
+checksum-verified file identity, reproduces and merges configured XMP sidecars
+without embedded writes, and makes the retained destination directory durable.
+A source sidecar is rendered from an explicit confined regular-file snapshot or
+an explicit confined empty seed. That seed is revalidated immediately before
+conditional descriptor-relative destination publication, which is the sidecar
+snapshot linearization point. A later source edit is an external concurrent
+change, as it is after normal sync, and does not block state finalization. The
+destination sidecar may be absent, byte-identical to the source seed, or
+already byte-identical to the expected provider-merged output; any other
+destination is a conflict. Immediately before state finalization,
+reconciliation reopens the destination media through the retained parent,
+verifies its stable file identity and SHA-256, reapplies the capture time and
+source permissions, and proves the configured root and descendant namespace
+still identify the retained directories. Metadata, timestamp, durability,
+final media validation, or state failure leaves the old path authoritative and
+the pending path hash retryable.
 Missing or changed checksum evidence stays retryable. Existing source,
 temporary, and destination entries must remain regular files across
 fingerprinting; links and special files are never followed or accepted as
@@ -327,10 +347,15 @@ Schema v19 records the exact temporary path before a state-backed download can
 write or resume it. Normal completion and graceful interruption retire that
 claim. A process crash leaves the claim as durable cleanup authority. Later
 cleanup inspects only claimed paths, rejects every symlink in the path, and
-holds verified directory or file handles through removal so an ancestor swap
-cannot redirect deletion. It retires the claim after deletion or when the path
-is missing or no longer the claimed stale file. A suffix and file age alone
-never authorize deletion.
+holds the opened file identity through removal so an ancestor or same-parent
+leaf swap cannot redirect deletion. Linux and macOS move the current leaf into
+a fresh mode-0700 quarantine directory beneath the retained parent, then verify
+it there. Only the expected file is unlinked through that private directory
+handle; an ambiguous entry remains at its reported quarantine path. Unsupported
+Unix platforms leave the entry in place. Windows deletes through the verified
+handle. The claim retires after deletion, quarantine, or proof that the path no
+longer names the claimed stale file. A suffix and file age alone never
+authorizes deletion.
 
 `kei sync --repair-truncated` is the only media-replacement path. Pending
 retry planning requires the durable reconcile truncation marker, confirms the
@@ -396,7 +421,10 @@ files and links at candidate temporary paths remain untouched. Safe pre-exchange
 failures remove only the uniquely owned prepared file. Concurrent edits preserve
 the source and its catalogue checksum evidence, keep the durable rewrite marker,
 and leave any ambiguously displaced entry at its reported sibling path. The
-replacement file retains the source permissions.
+replacement file retains the source permissions. Normal and confined sidecar,
+hard-link, and exchange publication use the same concrete location backend and
+private quarantine cleanup, so a replacement at a temporary leaf is retained
+instead of being unlinked after a separate identity check.
 
 `METADATA_CAPTURE_REVISION` identifies the catalogue semantics produced by the
 current binary. Schema v18 stores per-asset revisions and per-library active
@@ -523,7 +551,8 @@ Stable IDs connect safety rules to production owners and focused tests.
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
 | `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
-| `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/mod.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
+| `PATH_RECONCILIATION_REQUIRES_CONFINED_CAPABILITIES` | `src/fs_util.rs`, `src/download/file.rs`, `src/download/metadata.rs`, `src/download/metadata_rewrite.rs`, `src/download/mod.rs` | Reconciliation derives every media and sidecar read, temporary write, parent creation, publication, validation, cleanup, and durability operation from retained no-follow filesystem capabilities. Linked or replaced ancestors cannot redirect writes outside the configured download root, same-parent temporary-leaf replacement cannot redirect cleanup, and namespace or identity drift keeps the old state path authoritative. |
+| `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/mod.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup acts only on an exact stale path claimed in durable state. Unix moves the leaf into a private retained quarantine before verification and unlink, retaining ambiguous entries; Windows deletes through the verified handle. No path follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/mod.rs` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
 | `MALFORMED_REQUIRED_ASSET_FIELDS_BLOCK_CHECKPOINT` | `src/icloud/photos/asset.rs`, `src/icloud/photos/album.rs`, `src/download/mod.rs`, `src/sync_cycle.rs` | A live asset with a missing or invalid required identity or capture date blocks its zone checkpoint before filtering or path planning. |
