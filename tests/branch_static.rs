@@ -29,6 +29,18 @@ fn repo_path(path: &str) -> PathBuf {
     full
 }
 
+fn missing_required_fragments(contents: &str, required: &[&str]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|fragment| !contents.contains(**fragment))
+        .map(|fragment| (*fragment).to_owned())
+        .collect()
+}
+
+fn normalize_whitespace(contents: &str) -> String {
+    contents.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(target_os = "linux")]
 fn write_executable(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
@@ -490,6 +502,99 @@ fn focused_scenario_catalog_lists_every_runner_slice() {
     assert_eq!(
         documented, scripts,
         "tests README focused scenario catalog must match runnable scenario scripts"
+    );
+}
+
+#[test]
+fn config_reconciliation_scenario_pins_transition_seed_tests() {
+    let scenario = repo_file("scripts/test-scenarios/config-reconciliation.sh");
+    let required = [
+        "path_reconciliation_copies_catalog_file_without_provider_inventory",
+        "local_reconciliation_copy_preserves_source_and_refuses_conflict",
+        "download_config_hash_drift_stages_reconciliation_without_clearing_token",
+        "download_config_revert_clears_pending_reconciliation",
+        "run_cycle_download_config_hash_drift_keeps_source_incremental",
+        "run_cycle_multi_pass_persists_base_download_config_hash",
+        "unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift",
+        "run_cycle_capture_offset_drives_date_filter_path_and_sidecar",
+    ];
+
+    let missing = missing_required_fragments(&scenario, &required);
+    assert!(
+        missing.is_empty(),
+        "config-reconciliation scenario missing seed tests: {missing:?}"
+    );
+
+    let deliberately_broken = scenario.replacen(required[0], "removed_seed_test", 1);
+    assert_eq!(
+        missing_required_fragments(&deliberately_broken, &required),
+        vec![required[0].to_owned()],
+        "the scenario contract check must detect a deliberately removed seed test"
+    );
+}
+
+#[test]
+fn state_transition_proof_is_pinned_across_process_surfaces() {
+    let applicability = "Changes to durable configuration, filesystem paths, media publication, metadata, SQLite state, retry work, or provider checkpoints require a state-transition proof through the production call graph.";
+    let stages = [
+        "Initial durable state",
+        "Controlled mutation",
+        "Production cycle",
+        "Durable outcome",
+        "Steady-state cycle",
+    ];
+    for path in [
+        "CONTRIBUTING.md",
+        "tests/README.md",
+        ".github/pull_request_template.md",
+        ".agents/skills/kei-pr-ready/SKILL.md",
+    ] {
+        let contents = repo_file(path);
+        let normalized = normalize_whitespace(&contents);
+        assert!(
+            normalized.contains(applicability),
+            "{path} state-transition applicability categories drifted"
+        );
+        let missing = missing_required_fragments(&contents, &stages);
+        assert!(
+            missing.is_empty(),
+            "{path} missing state-transition proof stages: {missing:?}"
+        );
+    }
+
+    let deliberately_drifted = repo_file("CONTRIBUTING.md").replacen("retry work, ", "", 1);
+    assert!(
+        !normalize_whitespace(&deliberately_drifted).contains(applicability),
+        "the process contract check must detect a deliberately removed applicability category"
+    );
+
+    let readiness = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
+    let readiness_requirements = [
+        "alternate byte-landing and",
+        "downloaded-state finalization route",
+        "correctness, safety, liveness, performance, and user-visible metadata",
+        "A normal-download test does not",
+        "Do not label a complete owner or module \"fully inspected\"",
+    ];
+    let missing = missing_required_fragments(&readiness, &readiness_requirements);
+    assert!(
+        missing.is_empty(),
+        "kei-pr-ready missing cross-route review requirements: {missing:?}"
+    );
+
+    let template = repo_file(".github/pull_request_template.md");
+    let template_requirements = ["Deliberate defect mutation", "Not applicable"];
+    let missing = missing_required_fragments(&template, &template_requirements);
+    assert!(
+        missing.is_empty(),
+        "pull request template missing transition evidence fields: {missing:?}"
+    );
+
+    let deliberately_broken = template.replacen(stages[4], "Repeat run", 1);
+    assert_eq!(
+        missing_required_fragments(&deliberately_broken, &stages),
+        vec![stages[4].to_owned()],
+        "the process contract check must detect a deliberately removed transition stage"
     );
 }
 

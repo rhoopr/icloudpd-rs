@@ -14,6 +14,17 @@
 
 <!-- For a bug fix or safety-contract change, name the focused test and how you confirmed it fails with the defect present. Write "Not applicable" when it is not a regression. -->
 
+## State transition proof
+
+<!-- Changes to durable configuration, filesystem paths, media publication, metadata, SQLite state, retry work, or provider checkpoints require a state-transition proof through the production call graph. Fill in each item, or write "Not applicable" with a concrete reason. -->
+
+- Initial durable state:
+- Controlled mutation:
+- Production cycle:
+- Durable outcome:
+- Steady-state cycle:
+- Deliberate defect mutation:
+
 ## Checklist
 
 - [ ] `just gate` passes, or the unchecked item is explained in the test plan
