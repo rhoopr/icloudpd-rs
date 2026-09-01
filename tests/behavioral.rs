@@ -82,7 +82,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 20;
+const HELPER_SCHEMA_VERSION: i32 = 21;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -294,6 +294,36 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             claimed_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS asset_replicas (
+            path_key BLOB PRIMARY KEY NOT NULL,
+            local_path BLOB NOT NULL,
+            library TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            version_size TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'downloaded', 'failed', 'historical')),
+            last_seen_at INTEGER NOT NULL,
+            downloaded_at INTEGER,
+            download_attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            local_checksum TEXT,
+            download_checksum TEXT,
+            metadata_write_failed_at INTEGER,
+            imported_size INTEGER,
+            imported_mtime INTEGER,
+            capture_repair_metadata_hash TEXT,
+            capture_repair_output_checksum TEXT,
+            capture_repair_output_size INTEGER,
+            FOREIGN KEY (library, asset_id, version_size)
+                REFERENCES assets (library, id, version_size) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_asset_replicas_identity
+            ON asset_replicas (library, asset_id, version_size);
+        CREATE INDEX IF NOT EXISTS idx_asset_replicas_state
+            ON asset_replicas (status, last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_asset_replicas_metadata_failure
+            ON asset_replicas (metadata_write_failed_at)
+            WHERE metadata_write_failed_at IS NOT NULL;
+
         CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
             provider TEXT NOT NULL,
             account TEXT NOT NULL,
@@ -339,7 +369,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 20). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 21). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -357,7 +387,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 20;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 21;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -3392,6 +3422,11 @@ fn status_downloaded_with_null_local_path_surfaces_missing_marker() {
         "missing-path marker not surfaced: {stdout}"
     );
     assert!(stdout.contains("broken.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("No path:    1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Backup status: unsafe"),
+        "pathless downloaded state must not be reported backup-safe: {stdout}"
+    );
 }
 #[test]
 fn status_all_three_flags_render_all_sections() {
@@ -3939,6 +3974,32 @@ fn behavioral_helper_carries_every_migrated_column() {
         assert!(
             has_column(&conn, "assets", column),
             "v20 column assets.{column} must exist in the behavioral helper's DDL"
+        );
+    }
+
+    for column in [
+        "path_key",
+        "local_path",
+        "library",
+        "asset_id",
+        "version_size",
+        "status",
+        "last_seen_at",
+        "downloaded_at",
+        "download_attempts",
+        "last_error",
+        "local_checksum",
+        "download_checksum",
+        "metadata_write_failed_at",
+        "imported_size",
+        "imported_mtime",
+        "capture_repair_metadata_hash",
+        "capture_repair_output_checksum",
+        "capture_repair_output_size",
+    ] {
+        assert!(
+            has_column(&conn, "asset_replicas", column),
+            "v21 column asset_replicas.{column} must exist in the behavioral helper's DDL"
         );
     }
 }

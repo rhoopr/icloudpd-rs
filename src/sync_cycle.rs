@@ -115,8 +115,6 @@ pub(crate) struct CycleResult {
     pub(crate) session_expired: bool,
     pub(crate) stats: download::SyncStats,
     pub(crate) db_sync_token_advance_safe: bool,
-    pub(crate) reconciliation_blocked_asset_ids:
-        rustc_hash::FxHashSet<download::ReconciliationBlock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -577,12 +575,28 @@ pub(crate) async fn check_download_config_hash_for_cycle<D>(
 where
     D: state::ReportStateStore + state::SyncTokenStore + ?Sized,
 {
+    let replica_reconciliation_required = match db
+        .get_metadata(state::schema::REPLICA_RECONCILIATION_REQUIRED_KEY)
+        .await
+    {
+        Ok(marker) => marker.is_some(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to inspect replica reconciliation marker");
+            return DownloadConfigHashOutcome::ReadFailed;
+        }
+    };
     match db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY).await {
         Ok(Some(stored)) if stored == current_hash => {
             match db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY).await {
                 Ok(Some(_)) => {
                     tracing::info!(
                         "Download path config returned to the active hash while reconciliation was pending; staging reconciliation back to the active paths"
+                    );
+                    stage_download_config_hash_reconciliation(db, current_hash).await
+                }
+                Ok(None) if replica_reconciliation_required => {
+                    tracing::info!(
+                        "Replica ownership migration requires local path reconciliation"
                     );
                     stage_download_config_hash_reconciliation(db, current_hash).await
                 }
@@ -638,6 +652,12 @@ where
             }
             tracing::info!("Migrated legacy download path config hash");
             DownloadConfigHashOutcome::Unchanged
+        }
+        Ok(None) if replica_reconciliation_required => {
+            tracing::info!(
+                "Replica ownership migration requires local path reconciliation before the first path hash is promoted"
+            );
+            stage_download_config_hash_reconciliation(db, current_hash).await
         }
         Ok(None) => {
             if let Err(e) = db
@@ -716,7 +736,6 @@ pub(crate) async fn run_cycle(
     let mut enum_config_hash_outcome = EnumConfigHashOutcome::Unchanged;
     let mut pending_download_config_hash = None;
     let mut path_reconciliation_complete = true;
-    let mut cycle_reconciliation_blocked_asset_ids = rustc_hash::FxHashSet::default();
     let mut checkpoint_hold_action: Option<&'static str> = None;
     let enum_config_hash = download::compute_config_hash(config);
 
@@ -920,8 +939,6 @@ pub(crate) async fn run_cycle(
             )
             .await?;
             path_reconciliation_complete = path_reconciliation_complete && reconciliation.complete;
-            cycle_reconciliation_blocked_asset_ids
-                .extend(reconciliation.blocked_asset_ids.iter().cloned());
             cycle_failed_count = cycle_failed_count
                 .saturating_add(reconciliation.stats.failed)
                 .saturating_add(reconciliation.stats.exif_failures)
@@ -935,7 +952,6 @@ pub(crate) async fn run_cycle(
         });
     }
 
-    let reconciliation_blocks = Arc::new(cycle_reconciliation_blocked_asset_ids.clone());
     for prepared in prepared_library_cycles {
         if shutdown_token.is_cancelled() {
             break;
@@ -943,11 +959,7 @@ pub(crate) async fn run_cycle(
         let lib_state = prepared.state;
         let sync_mode_decision = prepared.sync_mode_decision;
         let asset_groupings = Arc::clone(&prepared.download_config.asset_groupings);
-        let download_config = Arc::new(
-            prepared
-                .download_config
-                .with_reconciliation_blocks(Arc::clone(&reconciliation_blocks)),
-        );
+        let download_config = Arc::clone(&prepared.download_config);
         let download_client = shared_session.read().await.download_client().clone();
         let mut sync_result = download::download_photos_with_sync(
             &download_client,
@@ -993,10 +1005,6 @@ pub(crate) async fn run_cycle(
                         Arc::new(rustc_hash::FxHashSet::default()),
                         Arc::clone(&asset_groupings),
                         Arc::from(lib_state.zone_name.as_str()),
-                    );
-                    let bridge_config = Arc::new(
-                        bridge_config
-                            .with_reconciliation_blocks(Arc::clone(&reconciliation_blocks)),
                     );
                     tracing::info!(
                         zone = %lib_state.zone_name,
@@ -1328,7 +1336,10 @@ pub(crate) async fn run_cycle(
                     download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
                     download_config_hash,
                 )],
-                metadata_deletes: vec![PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned()],
+                metadata_deletes: vec![
+                    PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                    state::schema::REPLICA_RECONCILIATION_REQUIRED_KEY.to_owned(),
+                ],
             })
             .await
     {
@@ -1340,7 +1351,6 @@ pub(crate) async fn run_cycle(
         session_expired: cycle_session_expired,
         stats: cycle_stats,
         db_sync_token_advance_safe,
-        reconciliation_blocked_asset_ids: cycle_reconciliation_blocked_asset_ids,
     })
 }
 

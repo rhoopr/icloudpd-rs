@@ -54,13 +54,6 @@ impl TaskPlanner {
         config: &DownloadConfig,
         proven_primary_path: Option<&Path>,
     ) -> AssetTaskPlan {
-        if config.is_reconciliation_blocked(asset) {
-            return AssetTaskPlan {
-                tasks: Vec::new(),
-                filter_reason: None,
-                malformed_resource: None,
-            };
-        }
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return AssetTaskPlan {
                 tasks: Vec::new(),
@@ -333,7 +326,7 @@ pub(super) async fn upsert_seen_for_task<D>(
     task: &DownloadTask,
 ) -> Result<(), crate::state::error::StateError>
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadStateStore + crate::state::ReplicaStateStore + ?Sized,
 {
     upsert_asset_master_mapping(db, &task.library, asset).await?;
 
@@ -354,7 +347,25 @@ where
         media_type,
     )
     .with_metadata_arc(asset.metadata_arc());
-    db.upsert_seen(&record).await
+    db.upsert_seen(&record).await?;
+    if !db
+        .claim_pending_replica(
+            &task.library,
+            &task.asset_id,
+            task.version_size.as_str(),
+            &task.download_path,
+        )
+        .await?
+    {
+        return Err(crate::state::error::StateError::Invariant {
+            operation: "upsert_seen_for_task",
+            detail: format!(
+                "download path is owned by another asset replica: {}",
+                task.download_path.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Persist the durable CloudKit identifier bridge used to resolve future
@@ -772,6 +783,14 @@ mod tests {
         upsert_seen_for_task(&db, &config, &asset, task)
             .await
             .unwrap();
+        db.mark_replica_historical(
+            task.library.as_ref(),
+            task.asset_id.as_ref(),
+            task.version_size.as_str(),
+            &task.download_path,
+        )
+        .await
+        .unwrap();
         assert!(
             db.mark_policy_excluded(
                 task.library.as_ref(),

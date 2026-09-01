@@ -18,8 +18,10 @@ password or a valid iCloud session.
 
 ## JSON
 
-JSON output is a pretty-printed array. Each item is one asset version known to
-the local state DB:
+JSON output is a pretty-printed array. Each item is one durable local replica.
+An asset version with two owned paths produces two items with the same asset
+fields and different path-owned fields. A legacy pathless asset still produces
+one item:
 
 ```json
 [
@@ -46,12 +48,14 @@ the local state DB:
 
 Fields may be `null` when kei doesn't have that value. The schema may grow in
 later releases, so consumers should ignore fields they don't recognize.
+Because JSON and CSV paths are UTF-8 strings, the command fails rather than
+silently changing a native path that cannot be represented as UTF-8.
 
 ## CSV
 
-CSV output has the same information with one row per asset version. The
-`albums` cell is a JSON array string so album names with commas stay
-unambiguous.
+CSV output has the same information with one row per durable replica, or one
+row for a legacy pathless asset. The `albums` cell is a JSON array string so
+album names with commas stay unambiguous.
 
 Columns:
 

@@ -553,6 +553,14 @@ pub struct SyncSummary {
     pub policy_excluded: u64,
     /// Number of assets that failed to download.
     pub failed: u64,
+    /// Number of exact replica paths currently downloaded.
+    pub downloaded_replica_paths: u64,
+    /// Number of downloaded compatibility rows with no recorded path.
+    pub downloaded_without_path: u64,
+    /// Number of exact replica paths pending download.
+    pub pending_replica_paths: u64,
+    /// Number of exact replica paths that failed to download.
+    pub failed_replica_paths: u64,
     /// Pending or failed rows whose targeted provider lookup was inconclusive.
     pub awaiting_provider_verification: u64,
     /// Provider-confirmed deletions retained as catalog history.

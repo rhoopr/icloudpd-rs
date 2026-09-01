@@ -511,10 +511,12 @@ fn config_reconciliation_scenario_pins_transition_seed_tests() {
     let required = [
         "path_reconciliation_copies_catalog_file_without_provider_inventory",
         "local_reconciliation_copy_preserves_source_and_refuses_conflict",
+        "reconciled_sidecar_source_gps_failure_publishes_nothing_and_retry_converges",
         "download_config_hash_drift_stages_reconciliation_without_clearing_token",
-        "download_config_revert_clears_pending_reconciliation",
-        "run_cycle_download_config_hash_drift_keeps_source_incremental",
-        "run_cycle_multi_pass_persists_base_download_config_hash",
+        "download_config_revert_restages_active_reconciliation",
+        "run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_steady_state",
+        "run_cycle_reconciles_excluded_smart_folder_member_and_reaches_steady_state",
+        "run_cycle_multi_pass_persists_scoped_download_config_hash",
         "unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift",
         "run_cycle_capture_offset_drives_date_filter_path_and_sidecar",
     ];

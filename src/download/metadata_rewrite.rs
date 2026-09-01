@@ -420,29 +420,51 @@ pub(super) async fn write_reconciled_sidecar(
     created_local: DateTime<FixedOffset>,
     temp_suffix: &str,
 ) -> bool {
+    write_reconciled_sidecar_with_source_gps_reader(
+        reconciled_file,
+        payload,
+        created_local,
+        temp_suffix,
+        super::metadata::read_source_gps_from_file,
+    )
+    .await
+}
+
+#[cfg(feature = "xmp")]
+async fn write_reconciled_sidecar_with_source_gps_reader(
+    reconciled_file: Arc<super::file::ReconciledFile>,
+    payload: Arc<MetadataPayload>,
+    created_local: DateTime<FixedOffset>,
+    temp_suffix: &str,
+    read_source_gps: fn(
+        &mut std::fs::File,
+        &Path,
+    ) -> anyhow::Result<super::metadata::SourceGpsMetadata>,
+) -> bool {
     let planning_file = Arc::clone(&reconciled_file);
     let planned = tokio::task::spawn_blocking(move || {
         let path = planning_file.source_path();
-        let (source_gps, source_error) = match planning_file
+        let source_gps = planning_file
             .open_source_for_metadata()
-            .and_then(|mut file| super::metadata::read_source_gps_from_file(&mut file, path))
-        {
-            Ok(metadata) => (metadata, None),
-            Err(error) => (super::metadata::SourceGpsMetadata::default(), Some(error)),
-        };
-        (
-            plan_sidecar_write_from_source_gps(
-                &payload,
-                &created_local,
-                source_gps,
-                source_error.is_some(),
-            ),
-            source_error,
-        )
+            .and_then(|mut file| read_source_gps(&mut file, path))?;
+        Ok::<_, anyhow::Error>(plan_sidecar_write_from_source_gps(
+            &payload,
+            &created_local,
+            source_gps,
+            false,
+        ))
     })
     .await;
-    let (write, source_error) = match planned {
-        Ok(planned) => planned,
+    let write = match planned {
+        Ok(Ok(write)) => write,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                path = %reconciled_file.source_path().display(),
+                %error,
+                "Source GPS read failed before reconciled sidecar publication; leaving marker for retry"
+            );
+            return false;
+        }
         Err(error) => {
             tracing::warn!(error = %error, "XMP sidecar planning task panicked");
             return false;
@@ -476,17 +498,7 @@ pub(super) async fn write_reconciled_sidecar(
     .context("Confined XMP sidecar write task panicked")
     .and_then(std::convert::identity);
     match written {
-        Ok(()) if source_error.is_none() => true,
-        Ok(()) => {
-            if let Some(error) = source_error {
-                tracing::warn!(
-                    path = %log_path.display(),
-                    %error,
-                    "Source GPS read failed after sidecar publication; leaving marker for retry"
-                );
-            }
-            false
-        }
+        Ok(()) => true,
         Err(error) => {
             tracing::warn!(
                 path = %log_path.display(),
@@ -772,7 +784,6 @@ pub(super) async fn run_pending<D>(
     metadata_flags: MetadataFlags,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
-    blocked_asset_ids: &rustc_hash::FxHashSet<super::ReconciliationBlock>,
 ) -> RewritePass
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
@@ -785,7 +796,6 @@ where
         shutdown_token,
         None,
         0,
-        blocked_asset_ids,
     )
     .await
 }
@@ -841,7 +851,6 @@ pub(super) async fn run_pending_page<D>(
     shutdown_token: &CancellationToken,
     library_scope: Option<&[&str]>,
     offset: usize,
-    blocked_asset_ids: &rustc_hash::FxHashSet<super::ReconciliationBlock>,
 ) -> RewritePass
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
@@ -898,13 +907,6 @@ where
             deferred += pending_count - idx;
             tracing::info!("Shutdown requested, deferring remaining metadata rewrites");
             break;
-        }
-        if blocked_asset_ids
-            .iter()
-            .any(|blocked| blocked.matches(&record.library, &record.id))
-        {
-            deferred += 1;
-            continue;
         }
         if grouping_read_failures.contains(record.library.as_ref()) {
             errored += 1;
@@ -1321,14 +1323,7 @@ mod tests {
     where
         D: MembershipStore + MetadataRewriteStore + ?Sized,
     {
-        super::run_pending(
-            db,
-            metadata_flags,
-            temp_suffix,
-            shutdown_token,
-            &rustc_hash::FxHashSet::default(),
-        )
-        .await
+        super::run_pending(db, metadata_flags, temp_suffix, shutdown_token).await
     }
 
     #[cfg(feature = "xmp")]
@@ -1352,7 +1347,6 @@ mod tests {
             shutdown_token,
             library_scope,
             offset,
-            &rustc_hash::FxHashSet::default(),
         )
         .await
     }
@@ -3071,6 +3065,80 @@ mod tests {
 
     #[cfg(feature = "xmp")]
     #[tokio::test]
+    async fn reconciled_sidecar_source_gps_failure_publishes_nothing_and_retry_converges() {
+        fn fail_source_gps(
+            _source: &mut std::fs::File,
+            _path: &Path,
+        ) -> anyhow::Result<super::super::metadata::SourceGpsMetadata> {
+            anyhow::bail!("simulated transient source GPS read failure")
+        }
+
+        let dir = tempfile::tempdir().expect("metadata temp dir");
+        let source_path = dir.path().join("source.jpg");
+        let destination_path = dir.path().join("new/source.jpg");
+        std::fs::write(
+            &source_path,
+            crate::test_helpers::minimal_jpeg_with_source_gps_and_location(),
+        )
+        .expect("write source media");
+        let checksum = super::super::file::compute_sha256(&source_path)
+            .await
+            .expect("source checksum");
+        let reconciled_file = match super::super::file::copy_local_file_no_replace(
+            dir.path(),
+            &source_path,
+            &destination_path,
+            &checksum,
+        )
+        .await
+        .expect("copy reconciled media")
+        {
+            super::super::file::VerifiedLocalCopy::Verified(file) => Arc::from(file),
+            _ => panic!("expected verified local copy"),
+        };
+        let payload = Arc::new(MetadataPayload {
+            timezone_offset: Some(39_600),
+            latitude: Some(12.3456),
+            longitude: Some(-78.9012),
+            altitude: Some(9.250_123_456_789),
+            ..MetadataPayload::default()
+        });
+        let destination_sidecar =
+            super::super::metadata::sidecar_path(&destination_path).expect("destination sidecar");
+
+        assert!(
+            !write_reconciled_sidecar_with_source_gps_reader(
+                Arc::clone(&reconciled_file),
+                Arc::clone(&payload),
+                authority_cloudkit_time(),
+                ".gps-reconcile-test",
+                fail_source_gps,
+            )
+            .await
+        );
+        assert!(
+            !destination_sidecar.exists(),
+            "a failed source GPS read must not publish an incomplete sidecar"
+        );
+
+        assert!(
+            write_reconciled_sidecar(
+                reconciled_file,
+                payload,
+                authority_cloudkit_time(),
+                ".gps-reconcile-test",
+            )
+            .await
+        );
+        let retry_xmp = std::fs::read_to_string(destination_sidecar)
+            .expect("read retried sidecar")
+            .parse::<XmpMeta>()
+            .expect("parse retried sidecar");
+        assert_cloudkit_authority_with_source_gps(&retry_xmp);
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
     async fn sidecar_write_reads_source_gps_from_dng_content() {
         let dir = tempfile::tempdir().expect("metadata temp dir");
         let media_path = dir.path().join("source.DNG");
@@ -3800,18 +3868,12 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         for i in 0..(METADATA_REWRITE_BATCH + 100) {
             let id = format!("A{i}");
+            let missing_path = std::path::PathBuf::from(format!("/nonexistent/{id}.jpg"));
             let record = crate::test_helpers::TestAssetRecord::new(&id).build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded(
-                "PrimarySync",
-                &id,
-                "original",
-                std::path::Path::new("/nonexistent/missing.jpg"),
-                "ck",
-                None,
-            )
-            .await
-            .unwrap();
+            db.mark_downloaded("PrimarySync", &id, "original", &missing_path, "ck", None)
+                .await
+                .unwrap();
             db.record_metadata_write_failure("PrimarySync", &id, "original")
                 .await
                 .unwrap();
@@ -3841,30 +3903,24 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         for i in 0..3 {
             let id = format!("M{i}");
+            let missing_path = std::path::PathBuf::from(format!("/nonexistent/{id}.jpg"));
             let record = crate::test_helpers::TestAssetRecord::new(&id).build();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded(
-                "PrimarySync",
-                &id,
-                "original",
-                std::path::Path::new("/nonexistent/missing.jpg"),
-                "ck",
-                None,
-            )
-            .await
-            .unwrap();
+            db.mark_downloaded("PrimarySync", &id, "original", &missing_path, "ck", None)
+                .await
+                .unwrap();
             db.record_metadata_write_failure("PrimarySync", &id, "original")
                 .await
                 .unwrap();
         }
 
         let invalid_dir = tempfile::tempdir().unwrap();
-        let invalid_path = invalid_dir.path().join("invalid.jpg");
-        std::fs::write(&invalid_path, b"not an image").unwrap();
         for (library, id, soft_deleted) in [
             ("SharedSync-OTHER", "UNSELECTED", false),
             ("PrimarySync", "SOFT_DELETED", true),
         ] {
+            let invalid_path = invalid_dir.path().join(format!("{id}.jpg"));
+            std::fs::write(&invalid_path, b"not an image").unwrap();
             let record = crate::test_helpers::TestAssetRecord::new(id)
                 .library(library)
                 .build();
@@ -4637,13 +4693,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let db = SqliteStateDb::open_in_memory().unwrap();
-        let invalid_path = dir.path().join("invalid.jpg");
-        std::fs::write(&invalid_path, b"not a jpeg").unwrap();
-        let invalid_checksum = crate::download::file::compute_sha256(&invalid_path)
-            .await
-            .unwrap();
         for i in 0..METADATA_REWRITE_BATCH {
             let id = format!("A{i:04}");
+            let invalid_path = dir.path().join(format!("{id}.jpg"));
+            std::fs::write(&invalid_path, b"not a jpeg").unwrap();
+            let invalid_checksum = crate::download::file::compute_sha256(&invalid_path)
+                .await
+                .unwrap();
             let metadata = AssetMetadata {
                 rating: Some(3),
                 metadata_hash: Some(format!("h{i}")),

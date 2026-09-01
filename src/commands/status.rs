@@ -43,6 +43,11 @@ pub(crate) async fn run_status(
         "  Awaiting provider verification: {}",
         summary.awaiting_provider_verification
     );
+    println!("Replica paths:");
+    println!("  Downloaded: {}", summary.downloaded_replica_paths);
+    println!("  No path:    {}", summary.downloaded_without_path);
+    println!("  Pending:    {}", summary.pending_replica_paths);
+    println!("  Failed:     {}", summary.failed_replica_paths);
     println!();
     println!(
         "Provider checkpoint: {}",
@@ -156,7 +161,14 @@ pub(crate) async fn run_status(
         println!();
         println!("Downloaded assets:");
         let printed = paginate_print(&db, Section::Downloaded).await?;
-        print_truncation_tail(summary_count_to_usize(summary.downloaded), printed);
+        print_truncation_tail(
+            summary_count_to_usize(
+                summary
+                    .downloaded_replica_paths
+                    .saturating_add(summary.downloaded_without_path),
+            ),
+            printed,
+        );
     }
 
     Ok(())
@@ -214,6 +226,31 @@ fn backup_status_line(summary: &state::types::SyncSummary) -> String {
             "{} {}",
             count_phrase(summary.pending, "pending asset"),
             remain_verb(summary.pending)
+        ));
+    }
+    if summary.failed == 0 && summary.failed_replica_paths > 0 {
+        reasons.push(format!(
+            "{} {}",
+            count_phrase(summary.failed_replica_paths, "failed replica path"),
+            remain_verb(summary.failed_replica_paths)
+        ));
+    }
+    if summary.pending == 0 && summary.pending_replica_paths > 0 {
+        reasons.push(format!(
+            "{} {}",
+            count_phrase(summary.pending_replica_paths, "pending replica path"),
+            remain_verb(summary.pending_replica_paths)
+        ));
+    }
+    if summary.downloaded_without_path > 0 {
+        reasons.push(format!(
+            "{} {} no recorded path",
+            count_phrase(summary.downloaded_without_path, "downloaded asset"),
+            if summary.downloaded_without_path == 1 {
+                "has"
+            } else {
+                "have"
+            }
         ));
     }
     if summary.awaiting_provider_verification > 0 {
@@ -316,7 +353,7 @@ async fn paginate_print(db: &state::SqliteStateDb, section: Section) -> anyhow::
         let page = match section {
             Section::Failed => db.get_failed_page(offset, page_size).await?,
             Section::Pending => db.get_pending_page(offset, page_size).await?,
-            Section::Downloaded => db.get_downloaded_page(offset, page_size).await?,
+            Section::Downloaded => db.get_downloaded_replica_page(offset, page_size).await?,
         };
         if page.is_empty() {
             break;

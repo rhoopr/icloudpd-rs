@@ -14,13 +14,18 @@ pub mod types;
 
 #[cfg(test)]
 pub use db::ImportedRecord;
+#[allow(
+    unused_imports,
+    reason = "schema v21 exports the replica role before download callers migrate to it"
+)]
+pub use db::{
+    AssetReplica, DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore,
+    ReplicaDownloadEvidence, ReplicaStateStore, ReplicaStatus, ReportStateStore, SqliteStateDb,
+    SyncTokenStore,
+};
 pub(crate) use db::{
     AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
     OwnedTempFile, RetryErrorRetention, ScopedDbSyncToken, TempFileOwnershipStore,
-};
-pub use db::{
-    DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,
-    SqliteStateDb, SyncTokenStore,
 };
 #[cfg(test)]
 pub(crate) use types::MetadataCaptureStatus;

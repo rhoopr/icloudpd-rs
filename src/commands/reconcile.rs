@@ -1,9 +1,9 @@
 //! `kei reconcile` - reconcile the state database with files on disk.
 //!
-//! Scans every asset marked `downloaded` in the state database and checks
-//! that its recorded `local_path` still exists and is not shorter than the
-//! provider-reported size. Drifted files are marked as failed so the next sync
-//! re-downloads them.
+//! Scans every downloaded replica in the state database and checks that its
+//! recorded path still exists and is not shorter than the provider-reported
+//! size. Drifted replicas are marked as failed so the next sync re-downloads
+//! only those paths.
 //!
 //! This guards against:
 //! - User manually deleting files from the photo directory.
@@ -71,7 +71,38 @@ pub(crate) struct LocalDriftUpdate {
     pub(crate) library: Arc<str>,
     pub(crate) id: Box<str>,
     pub(crate) version_size: VersionSizeKey,
+    pub(crate) local_path: PathBuf,
     pub(crate) kind: LocalDriftKind,
+}
+
+pub(crate) async fn mark_local_drift_failed(
+    db: &dyn state::ReplicaStateStore,
+    library: &str,
+    asset_id: &str,
+    version_size: VersionSizeKey,
+    local_path: &std::path::Path,
+    kind: LocalDriftKind,
+) -> Result<(), state::error::StateError> {
+    if !db
+        .claim_pending_replica(library, asset_id, version_size.as_str(), local_path)
+        .await?
+    {
+        return Err(state::error::StateError::Invariant {
+            operation: "mark_local_drift_failed",
+            detail: format!(
+                "recorded local path is owned by another asset replica: {}",
+                local_path.display()
+            ),
+        });
+    }
+    db.finalize_failed_replica(
+        library,
+        asset_id,
+        version_size.as_str(),
+        local_path,
+        kind.reason(),
+    )
+    .await
 }
 
 impl From<LocalDriftAsset> for LocalDriftUpdate {
@@ -80,6 +111,7 @@ impl From<LocalDriftAsset> for LocalDriftUpdate {
             library: asset.library,
             id: asset.id,
             version_size: asset.version_size,
+            local_path: asset.local_path,
             kind: asset.kind,
         }
     }
@@ -170,7 +202,9 @@ where
 
     let mut offset = 0u64;
     loop {
-        let page = db.get_downloaded_page(offset, SCAN_PAGE_SIZE).await?;
+        let page = db
+            .get_downloaded_replica_page(offset, SCAN_PAGE_SIZE)
+            .await?;
         if page.is_empty() {
             break;
         }
@@ -279,9 +313,15 @@ pub(crate) async fn run_reconcile(
     let mut mark_errors = 0u64;
     if !args.dry_run {
         for m in &drifted {
-            match db
-                .mark_failed(&m.library, &m.id, m.version_size.as_str(), m.kind.reason())
-                .await
+            match mark_local_drift_failed(
+                &db,
+                &m.library,
+                &m.id,
+                m.version_size,
+                &m.local_path,
+                m.kind,
+            )
+            .await
             {
                 Ok(()) => marked_failed += 1,
                 Err(e) => {
@@ -393,11 +433,13 @@ mod tests {
         assert_eq!(&*missing[0].id, "MISSING_1");
 
         for m in &missing {
-            db.mark_failed(
+            mark_local_drift_failed(
+                &db,
                 &m.library,
                 &m.id,
-                m.version_size.as_str(),
-                FILE_MISSING_REASON,
+                m.version_size,
+                &m.local_path,
+                m.kind,
             )
             .await
             .unwrap();
@@ -455,11 +497,13 @@ mod tests {
         assert_eq!(missing.len(), total);
 
         for m in &missing {
-            db.mark_failed(
+            mark_local_drift_failed(
+                &db,
                 &m.library,
                 &m.id,
-                m.version_size.as_str(),
-                FILE_MISSING_REASON,
+                m.version_size,
+                &m.local_path,
+                m.kind,
             )
             .await
             .unwrap();
@@ -534,14 +578,84 @@ mod tests {
         ));
 
         for m in &drift {
-            db.mark_failed(&m.library, &m.id, m.version_size.as_str(), m.kind.reason())
-                .await
-                .unwrap();
+            mark_local_drift_failed(
+                &db,
+                &m.library,
+                &m.id,
+                m.version_size,
+                &m.local_path,
+                m.kind,
+            )
+            .await
+            .unwrap();
         }
 
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].last_error.as_deref(), Some(FILE_TRUNCATED_REASON));
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_only_the_drifted_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let present_path = dir.path().join("present.jpg");
+        let missing_path = dir.path().join("missing.jpg");
+        std::fs::write(&present_path, vec![0u8; 100]).unwrap();
+        seed_downloaded(&db, "SIBLINGS", &present_path).await;
+        db.mark_downloaded(
+            "PrimarySync",
+            "SIBLINGS",
+            "original",
+            &missing_path,
+            "ck_SIBLINGS",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (counts, drift) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
+            .await
+            .unwrap();
+        assert_eq!(counts.present, 1);
+        assert_eq!(counts.missing, 1);
+        assert_eq!(drift.len(), 1);
+        mark_local_drift_failed(
+            &db,
+            &drift[0].library,
+            &drift[0].id,
+            drift[0].version_size,
+            &drift[0].local_path,
+            drift[0].kind,
+        )
+        .await
+        .unwrap();
+
+        let replicas = db
+            .list_replicas_for_asset_version("PrimarySync", "SIBLINGS", "original")
+            .await
+            .unwrap();
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == present_path)
+                .unwrap()
+                .status,
+            state::ReplicaStatus::Downloaded
+        );
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == missing_path)
+                .unwrap()
+                .status,
+            state::ReplicaStatus::Failed
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.downloaded_replica_paths, 1);
+        assert_eq!(summary.failed_replica_paths, 1);
     }
 
     #[tokio::test]

@@ -26,10 +26,10 @@ use super::types::{
 const DEFAULT_SOURCE: &str = "icloud";
 
 #[derive(Debug, Clone)]
-struct OwnedTempPathKey(Vec<u8>);
+pub(super) struct OwnedPathBytes(Vec<u8>);
 
-impl OwnedTempPathKey {
-    fn from_path(path: &Path) -> Result<Self, StateError> {
+impl OwnedPathBytes {
+    pub(super) fn from_path(path: &Path) -> Result<Self, StateError> {
         let absolute =
             crate::fs_util::absolute_lexical(path).map_err(|source| StateError::TempPath {
                 path: path.to_path_buf(),
@@ -54,7 +54,19 @@ impl OwnedTempPathKey {
         }
     }
 
-    fn into_path(self) -> Result<PathBuf, StateError> {
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub(super) fn ownership_key(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+
+    pub(super) fn into_path(self) -> Result<PathBuf, StateError> {
         #[cfg(unix)]
         {
             use std::ffi::OsString;
@@ -163,6 +175,51 @@ impl CaptureRepairReceipt {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaStatus {
+    Pending,
+    Downloaded,
+    Failed,
+    Historical,
+}
+
+impl ReplicaStatus {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "downloaded" => Some(Self::Downloaded),
+            "failed" => Some(Self::Failed),
+            "historical" => Some(Self::Historical),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetReplica {
+    pub library: String,
+    pub asset_id: String,
+    pub version_size: VersionSizeKey,
+    pub local_path: PathBuf,
+    pub status: ReplicaStatus,
+    pub last_seen_at: DateTime<Utc>,
+    pub downloaded_at: Option<DateTime<Utc>>,
+    pub download_attempts: u32,
+    pub last_error: Option<String>,
+    pub local_checksum: Option<String>,
+    pub download_checksum: Option<String>,
+    pub metadata_write_failed_at: Option<DateTime<Utc>>,
+    pub imported_size: Option<u64>,
+    pub imported_mtime: Option<i64>,
+    pub capture_repair_receipt: Option<CaptureRepairReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaDownloadEvidence {
+    pub local_checksum: String,
+    pub download_checksum: Option<String>,
+}
+
 /// One queued metadata rewrite and its independently persisted capture debt.
 #[derive(Debug, Clone)]
 pub struct PendingMetadataRewrite {
@@ -214,6 +271,49 @@ pub(crate) trait TempFileOwnershipStore: Send + Sync {
         claimed_before: i64,
     ) -> Result<Vec<OwnedTempFile>, StateError>;
     async fn retire_temp_files(&self, paths: &[PathBuf]) -> Result<u64, StateError>;
+}
+
+#[async_trait]
+pub trait ReplicaStateStore: Send + Sync {
+    async fn list_replicas(&self) -> Result<Vec<AssetReplica>, StateError>;
+    async fn list_replicas_for_asset_version(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<Vec<AssetReplica>, StateError>;
+    async fn claim_pending_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+    ) -> Result<bool, StateError>;
+    async fn finalize_downloaded_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+        evidence: &ReplicaDownloadEvidence,
+        metadata_write_succeeded: bool,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError>;
+    async fn finalize_failed_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+        error: &str,
+    ) -> Result<(), StateError>;
+    async fn mark_replica_historical(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+    ) -> Result<(), StateError>;
 }
 
 /// Live album-membership row keyed by CloudKit asset record name.
@@ -572,7 +672,7 @@ pub trait ImportStateStore: Send + Sync {
     async fn get_all_imported_records(
         &self,
         library: &str,
-    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError>;
+    ) -> Result<HashMap<(String, String, PathBuf), ImportedRecord>, StateError>;
 }
 
 /// Summary, status-page, failed-sample, and sync-run ledger reads/writes.
@@ -600,6 +700,13 @@ pub trait ReportStateStore: Send + Sync {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<AssetRecord>, StateError>;
+    async fn get_downloaded_replica_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        self.get_downloaded_page(offset, limit).await
+    }
     async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError>;
     async fn start_sync_run(&self) -> Result<i64, StateError>;
     async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError>;
@@ -616,14 +723,6 @@ pub trait SyncTokenStore: Send + Sync {
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
-    async fn has_downloaded_live_photo_videos(&self) -> Result<bool, StateError> {
-        Err(StateError::Invariant {
-            operation: "has_downloaded_live_photo_videos",
-            detail:
-                "downloaded Live Photo video migration query is not implemented by this state store"
-                    .into(),
-        })
-    }
     async fn commit_checkpoint_transition(
         &self,
         _transition: CheckpointTransition,
@@ -1367,6 +1466,30 @@ fn upsert_asset_row(
     Ok(())
 }
 
+fn provider_checksum_changed(conn: &Connection, record: &AssetRecord) -> Result<bool, StateError> {
+    let stored = conn
+        .query_row(
+            "SELECT checksum FROM assets \
+             WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+            rusqlite::params![&record.library, &record.id, record.version_size.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| StateError::query("upsert_seen::read_checksum", e))?;
+    Ok(stored.is_some_and(|checksum| checksum != record.checksum.as_ref()))
+}
+
+fn clear_replica_capture_repair(conn: &Connection, record: &AssetRecord) -> Result<(), StateError> {
+    conn.execute(
+        "UPDATE asset_replicas SET capture_repair_metadata_hash = NULL, \
+            capture_repair_output_checksum = NULL, capture_repair_output_size = NULL \
+         WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3",
+        rusqlite::params![&record.library, &record.id, record.version_size.as_str()],
+    )
+    .map_err(|e| StateError::query("upsert_seen::clear_replica_capture_repair", e))?;
+    Ok(())
+}
+
 fn record_metadata_capture_revision(
     conn: &Connection,
     library: &str,
@@ -1452,8 +1575,21 @@ fn ensure_asset_has_no_prepared_capture_repair(
     let prepared: i64 = conn
         .query_row(
             "SELECT EXISTS( \
+                SELECT 1 FROM asset_replicas \
+                WHERE library = ?1 AND asset_id = ?2 \
+                  AND capture_repair_metadata_hash IS NOT NULL \
+                  AND capture_repair_metadata_hash <> '' \
+                  AND capture_repair_output_checksum IS NOT NULL \
+                  AND capture_repair_output_checksum <> '' \
+                  AND capture_repair_output_size IS NOT NULL \
+                  AND capture_repair_output_size >= 0 \
+                UNION ALL \
                 SELECT 1 FROM assets \
                 WHERE library = ?1 AND id = ?2 \
+                  AND NOT EXISTS ( \
+                      SELECT 1 FROM asset_replicas \
+                      WHERE library = ?1 AND asset_id = ?2 \
+                  ) \
                   AND capture_repair_metadata_hash IS NOT NULL \
                   AND capture_repair_metadata_hash <> '' \
                   AND capture_repair_output_checksum IS NOT NULL \
@@ -1483,12 +1619,29 @@ fn ensure_master_family_has_no_prepared_capture_repair(
     let prepared: i64 = conn
         .query_row(
             "SELECT EXISTS( \
+                SELECT 1 FROM asset_replicas \
+                WHERE library = ?1 \
+                  AND (asset_id = ?2 OR asset_id IN ( \
+                      SELECT asset_record_name FROM asset_master_mappings \
+                      WHERE library = ?1 AND master_record_name = ?2 \
+                  )) \
+                  AND capture_repair_metadata_hash IS NOT NULL \
+                  AND capture_repair_metadata_hash <> '' \
+                  AND capture_repair_output_checksum IS NOT NULL \
+                  AND capture_repair_output_checksum <> '' \
+                  AND capture_repair_output_size IS NOT NULL \
+                  AND capture_repair_output_size >= 0 \
+                UNION ALL \
                 SELECT 1 FROM assets \
                 WHERE library = ?1 \
                   AND (id = ?2 OR id IN ( \
                       SELECT asset_record_name FROM asset_master_mappings \
                       WHERE library = ?1 AND master_record_name = ?2 \
                   )) \
+                  AND NOT EXISTS ( \
+                      SELECT 1 FROM asset_replicas \
+                      WHERE library = assets.library AND asset_id = assets.id \
+                  ) \
                   AND capture_repair_metadata_hash IS NOT NULL \
                   AND capture_repair_metadata_hash <> '' \
                   AND capture_repair_output_checksum IS NOT NULL \
@@ -1557,9 +1710,469 @@ fn album_membership_record_from_row(
     })
 }
 
+const REPLICA_COLUMNS: &str = "library, asset_id, version_size, local_path, status, \
+    last_seen_at, downloaded_at, download_attempts, last_error, local_checksum, \
+    download_checksum, metadata_write_failed_at, imported_size, imported_mtime, \
+    capture_repair_metadata_hash, capture_repair_output_checksum, capture_repair_output_size";
+
+struct ReplicaSqlRow {
+    library: String,
+    asset_id: String,
+    version_size: String,
+    local_path: Vec<u8>,
+    status: String,
+    last_seen_at: i64,
+    downloaded_at: Option<i64>,
+    download_attempts: i64,
+    last_error: Option<String>,
+    local_checksum: Option<String>,
+    download_checksum: Option<String>,
+    metadata_write_failed_at: Option<i64>,
+    imported_size: Option<i64>,
+    imported_mtime: Option<i64>,
+    capture_repair_metadata_hash: Option<String>,
+    capture_repair_output_checksum: Option<String>,
+    capture_repair_output_size: Option<i64>,
+}
+
+fn replica_sql_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplicaSqlRow> {
+    Ok(ReplicaSqlRow {
+        library: row.get(0)?,
+        asset_id: row.get(1)?,
+        version_size: row.get(2)?,
+        local_path: row.get(3)?,
+        status: row.get(4)?,
+        last_seen_at: row.get(5)?,
+        downloaded_at: row.get(6)?,
+        download_attempts: row.get(7)?,
+        last_error: row.get(8)?,
+        local_checksum: row.get(9)?,
+        download_checksum: row.get(10)?,
+        metadata_write_failed_at: row.get(11)?,
+        imported_size: row.get(12)?,
+        imported_mtime: row.get(13)?,
+        capture_repair_metadata_hash: row.get(14)?,
+        capture_repair_output_checksum: row.get(15)?,
+        capture_repair_output_size: row.get(16)?,
+    })
+}
+
+fn replica_from_sql_row(
+    row: ReplicaSqlRow,
+    operation: &'static str,
+) -> Result<AssetReplica, StateError> {
+    let version_size =
+        VersionSizeKey::from_str(&row.version_size).ok_or_else(|| StateError::Invariant {
+            operation,
+            detail: format!(
+                "stored asset replica has invalid version_size {:?}",
+                row.version_size
+            ),
+        })?;
+    let status = ReplicaStatus::from_str(&row.status).ok_or_else(|| StateError::Invariant {
+        operation,
+        detail: format!("stored asset replica has invalid status {:?}", row.status),
+    })?;
+    let capture_repair_receipt = match (
+        row.capture_repair_metadata_hash,
+        row.capture_repair_output_checksum,
+        row.capture_repair_output_size,
+    ) {
+        (None, None, None) => None,
+        (Some(metadata_hash), None, None) if !metadata_hash.is_empty() => {
+            Some(CaptureRepairReceipt::Pending { metadata_hash })
+        }
+        (Some(metadata_hash), Some(output_checksum), Some(output_size))
+            if !metadata_hash.is_empty() && !output_checksum.is_empty() && output_size >= 0 =>
+        {
+            Some(CaptureRepairReceipt::Prepared {
+                metadata_hash,
+                output_checksum,
+                output_size: u64::try_from(output_size).unwrap_or(0),
+            })
+        }
+        _ => {
+            return Err(StateError::Invariant {
+                operation,
+                detail: "stored asset replica has a malformed capture-repair receipt".into(),
+            });
+        }
+    };
+    Ok(AssetReplica {
+        library: row.library,
+        asset_id: row.asset_id,
+        version_size,
+        local_path: OwnedPathBytes::from_bytes(row.local_path).into_path()?,
+        status,
+        last_seen_at: ts_to_utc(row.last_seen_at),
+        downloaded_at: optional_ts_to_utc(row.downloaded_at),
+        download_attempts: u32::try_from(row.download_attempts).unwrap_or(u32::MAX),
+        last_error: row.last_error,
+        local_checksum: row.local_checksum,
+        download_checksum: row.download_checksum,
+        metadata_write_failed_at: optional_ts_to_utc(row.metadata_write_failed_at),
+        imported_size: row.imported_size.and_then(|size| u64::try_from(size).ok()),
+        imported_mtime: row.imported_mtime,
+        capture_repair_receipt,
+    })
+}
+
+fn replica_path_key(path: &Path) -> Result<Vec<u8>, StateError> {
+    Ok(OwnedPathBytes::from_path(path)?.ownership_key())
+}
+
+fn require_replica_update(rows: usize, operation: &'static str) -> Result<(), StateError> {
+    if rows == 0 {
+        return Err(StateError::Invariant {
+            operation,
+            detail: "exact asset replica was not found for the requested owner".into(),
+        });
+    }
+    Ok(())
+}
+
+impl SqliteStateDb {
+    pub async fn list_replicas(&self) -> Result<Vec<AssetReplica>, StateError> {
+        self.with_conn("list_replicas", move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {REPLICA_COLUMNS} FROM asset_replicas \
+                     ORDER BY library, asset_id, version_size, path_key"
+                ))
+                .map_err(|e| StateError::query("list_replicas::prepare", e))?;
+            let rows = stmt
+                .query_map([], replica_sql_row_from_row)
+                .map_err(|e| StateError::query("list_replicas::query", e))?;
+            let mut replicas = Vec::new();
+            for row in rows {
+                replicas.push(replica_from_sql_row(
+                    row.map_err(|e| StateError::query("list_replicas::row", e))?,
+                    "list_replicas",
+                )?);
+            }
+            Ok(replicas)
+        })
+        .await
+    }
+
+    pub async fn list_replicas_for_asset_version(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<Vec<AssetReplica>, StateError> {
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        self.with_conn("list_replicas_for_asset_version", move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {REPLICA_COLUMNS} FROM asset_replicas \
+                     WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                     ORDER BY path_key"
+                ))
+                .map_err(|e| StateError::query("list_replicas_for_asset_version::prepare", e))?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![library, asset_id, version_size],
+                    replica_sql_row_from_row,
+                )
+                .map_err(|e| StateError::query("list_replicas_for_asset_version::query", e))?;
+            let mut replicas = Vec::new();
+            for row in rows {
+                replicas.push(replica_from_sql_row(
+                    row.map_err(|e| StateError::query("list_replicas_for_asset_version::row", e))?,
+                    "list_replicas_for_asset_version",
+                )?);
+            }
+            Ok(replicas)
+        })
+        .await
+    }
+
+    pub async fn claim_pending_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+    ) -> Result<bool, StateError> {
+        let path = OwnedPathBytes::from_path(local_path)?;
+        let path_key = path.ownership_key();
+        let local_path = path.into_bytes();
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        let last_seen_at = Utc::now().timestamp();
+        self.with_conn_mut("claim_pending_replica", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("claim_pending_replica::begin", e))?;
+            let owner: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT library, asset_id, version_size FROM asset_replicas \
+                     WHERE path_key = ?1",
+                    [&path_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| StateError::query("claim_pending_replica::owner", e))?;
+            if let Some(owner) = owner {
+                let owned = owner == (library.clone(), asset_id.clone(), version_size.clone());
+                if owned {
+                    tx.execute(
+                        "UPDATE asset_replicas SET last_seen_at = ?1 WHERE path_key = ?2",
+                        rusqlite::params![last_seen_at, &path_key],
+                    )
+                    .map_err(|e| StateError::query("claim_pending_replica::touch", e))?;
+                    tx.execute(
+                        "UPDATE asset_replicas SET status = 'historical' \
+                         WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                           AND status = 'downloaded' AND path_key <> ?4 \
+                           AND EXISTS (SELECT 1 FROM assets \
+                               WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                                 AND status = 'pending')",
+                        rusqlite::params![library, asset_id, version_size, path_key],
+                    )
+                    .map_err(|e| {
+                        StateError::query("claim_pending_replica::retire_superseded", e)
+                    })?;
+                }
+                tx.commit()
+                    .map_err(|e| StateError::query("claim_pending_replica::commit", e))?;
+                return Ok(owned);
+            }
+            let inserted = tx
+                .execute(
+                    "INSERT INTO asset_replicas (
+                        path_key, local_path, library, asset_id, version_size, status, last_seen_at
+                     )
+                     SELECT ?1, ?2, ?3, ?4, ?5, 'pending', ?6
+                     WHERE EXISTS (
+                        SELECT 1 FROM assets
+                        WHERE library = ?3 AND id = ?4 AND version_size = ?5
+                     )",
+                    rusqlite::params![
+                        path_key,
+                        local_path,
+                        library,
+                        asset_id,
+                        version_size,
+                        last_seen_at
+                    ],
+                )
+                .map_err(|e| StateError::query("claim_pending_replica::insert", e))?;
+            if inserted == 0 {
+                return Err(StateError::AssetRowMissing {
+                    asset_id,
+                    version_size,
+                });
+            }
+            tx.execute(
+                "UPDATE asset_replicas SET status = 'historical' \
+                 WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                   AND status = 'downloaded' AND path_key <> ?4 \
+                   AND EXISTS (SELECT 1 FROM assets \
+                       WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                         AND status = 'pending')",
+                rusqlite::params![library, asset_id, version_size, path_key],
+            )
+            .map_err(|e| StateError::query("claim_pending_replica::retire_superseded", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("claim_pending_replica::commit", e))?;
+            Ok(true)
+        })
+        .await
+    }
+
+    pub async fn finalize_downloaded_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+        evidence: &ReplicaDownloadEvidence,
+        metadata_write_succeeded: bool,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
+        let path_key = replica_path_key(local_path)?;
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        let local_path = local_path.to_path_buf();
+        let local_checksum = evidence.local_checksum.clone();
+        let download_checksum = evidence.download_checksum.clone();
+        let now = Utc::now().timestamp();
+        self.with_conn_mut("finalize_downloaded_replica", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("finalize_downloaded_replica::begin", e))?;
+            let asset_rows = update_status_to_downloaded(
+                &tx,
+                &library,
+                &asset_id,
+                &version_size,
+                &local_path,
+                &local_checksum,
+                download_checksum.as_deref(),
+                mark_capture_repair,
+                now,
+            )?;
+            if asset_rows == 0 {
+                crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.inc();
+                return Err(StateError::AssetRowMissing {
+                    asset_id,
+                    version_size,
+                });
+            }
+            let replica_rows = tx
+                .execute(
+                    "UPDATE asset_replicas SET status = 'downloaded', downloaded_at = ?1, \
+                        local_checksum = ?2, download_checksum = COALESCE(?3, download_checksum), \
+                        imported_size = NULL, imported_mtime = NULL, last_error = NULL, \
+                        metadata_write_failed_at = CASE \
+                            WHEN ?4 THEN COALESCE(metadata_write_failed_at, \
+                                (SELECT metadata_write_failed_at FROM assets \
+                                 WHERE library = ?6 AND id = ?7 AND version_size = ?8)) \
+                            ELSE ?1 END, \
+                        capture_repair_metadata_hash = CASE \
+                            WHEN ?5 THEN (SELECT metadata_hash FROM assets \
+                                WHERE library = ?6 AND id = ?7 AND version_size = ?8) \
+                            ELSE capture_repair_metadata_hash END, \
+                        capture_repair_output_checksum = CASE \
+                            WHEN ?5 THEN NULL ELSE capture_repair_output_checksum END, \
+                        capture_repair_output_size = CASE \
+                            WHEN ?5 THEN NULL ELSE capture_repair_output_size END \
+                     WHERE path_key = ?9 AND library = ?6 AND asset_id = ?7 \
+                       AND version_size = ?8",
+                    rusqlite::params![
+                        now,
+                        local_checksum,
+                        download_checksum,
+                        metadata_write_succeeded,
+                        mark_capture_repair,
+                        library,
+                        asset_id,
+                        version_size,
+                        path_key,
+                    ],
+                )
+                .map_err(|e| StateError::query("finalize_downloaded_replica::replica", e))?;
+            require_replica_update(replica_rows, "finalize_downloaded_replica")?;
+            record_metadata_capture_revision(
+                &tx,
+                &library,
+                &asset_id,
+                METADATA_CAPTURE_REVISION,
+                now,
+            )?;
+            tx.commit()
+                .map_err(|e| StateError::query("finalize_downloaded_replica::commit", e))
+        })
+        .await
+    }
+
+    pub async fn finalize_failed_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+        error: &str,
+    ) -> Result<(), StateError> {
+        let path_key = replica_path_key(local_path)?;
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        let error = error.to_owned();
+        self.with_conn_mut("finalize_failed_replica", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("finalize_failed_replica::begin", e))?;
+            let replica_rows = tx
+                .execute(
+                    "UPDATE asset_replicas SET status = 'failed', \
+                        download_attempts = download_attempts + 1, last_error = ?1 \
+                     WHERE path_key = ?2 AND library = ?3 AND asset_id = ?4 AND version_size = ?5",
+                    rusqlite::params![error, path_key, library, asset_id, version_size],
+                )
+                .map_err(|e| StateError::query("finalize_failed_replica::replica", e))?;
+            require_replica_update(replica_rows, "finalize_failed_replica")?;
+            let asset_rows = tx
+                .execute(
+                    "UPDATE assets SET status = CASE \
+                            WHEN EXISTS (
+                                SELECT 1 FROM asset_replicas \
+                                WHERE library = ?2 AND asset_id = ?3 AND version_size = ?4 \
+                                  AND status = 'downloaded'
+                            ) THEN 'downloaded' ELSE 'failed' END, \
+                        download_attempts = download_attempts + 1, last_error = ?1 \
+                     WHERE library = ?2 AND id = ?3 AND version_size = ?4",
+                    rusqlite::params![error, library, asset_id, version_size],
+                )
+                .map_err(|e| StateError::query("finalize_failed_replica::asset", e))?;
+            if asset_rows == 0 {
+                crate::metrics::MARK_FAILED_ZERO_ROWS.inc();
+                return Err(StateError::Invariant {
+                    operation: "finalize_failed_replica",
+                    detail: "asset row is missing before exact replica failure".into(),
+                });
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("finalize_failed_replica::commit", e))
+        })
+        .await
+    }
+
+    pub async fn mark_replica_historical(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+    ) -> Result<(), StateError> {
+        let path_key = replica_path_key(local_path)?;
+        let library = library.to_owned();
+        let asset_id = asset_id.to_owned();
+        let version_size = version_size.to_owned();
+        self.with_conn_mut("mark_replica_historical", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("mark_replica_historical::begin", e))?;
+            let rows = tx
+                .execute(
+                    "UPDATE asset_replicas SET status = 'historical' \
+                     WHERE path_key = ?1 AND library = ?2 AND asset_id = ?3 AND version_size = ?4",
+                    rusqlite::params![path_key, &library, &asset_id, &version_size],
+                )
+                .map_err(|e| StateError::query("mark_replica_historical", e))?;
+            require_replica_update(rows, "mark_replica_historical")?;
+            tx.execute(
+                "UPDATE assets SET status = CASE \
+                        WHEN EXISTS (SELECT 1 FROM asset_replicas \
+                            WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                              AND status = 'downloaded') THEN 'downloaded' \
+                        WHEN EXISTS (SELECT 1 FROM asset_replicas \
+                            WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                              AND status = 'pending') THEN 'pending' \
+                        WHEN EXISTS (SELECT 1 FROM asset_replicas \
+                            WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                              AND status = 'failed') THEN 'failed' \
+                        ELSE 'pending' END \
+                 WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+                rusqlite::params![library, asset_id, version_size],
+            )
+            .map_err(|e| StateError::query("mark_replica_historical::asset", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("mark_replica_historical::commit", e))
+        })
+        .await
+    }
+}
+
 impl SqliteStateDb {
     pub(crate) async fn claim_temp_file(&self, path: &Path) -> Result<(), StateError> {
-        let path_key = OwnedTempPathKey::from_path(path)?.0;
+        let path_key = OwnedPathBytes::from_path(path)?.into_bytes();
         let claimed_at = Utc::now().timestamp();
         self.with_conn("claim_temp_file", move |conn| {
             conn.execute(
@@ -1595,7 +2208,7 @@ impl SqliteStateDb {
                 let (path_key, claimed_at) =
                     row.map_err(|e| StateError::query("get_owned_temp_files_before", e))?;
                 owned.push(OwnedTempFile {
-                    path: OwnedTempPathKey(path_key).into_path()?,
+                    path: OwnedPathBytes::from_bytes(path_key).into_path()?,
                     claimed_at,
                 });
             }
@@ -1610,7 +2223,7 @@ impl SqliteStateDb {
         }
         let path_keys = paths
             .iter()
-            .map(|path| OwnedTempPathKey::from_path(path).map(|key| key.0))
+            .map(|path| OwnedPathBytes::from_path(path).map(OwnedPathBytes::into_bytes))
             .collect::<Result<Vec<_>, _>>()?;
         self.with_conn_mut("retire_temp_files", move |conn| {
             let tx = conn
@@ -1719,8 +2332,17 @@ impl SqliteStateDb {
 
     pub(crate) async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
         let record = record.clone();
-        self.with_conn("upsert_seen", move |conn| {
-            upsert_asset_row(conn, &record, Utc::now().timestamp())
+        self.with_conn_mut("upsert_seen", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("upsert_seen::begin", e))?;
+            let checksum_changed = provider_checksum_changed(&tx, &record)?;
+            upsert_asset_row(&tx, &record, Utc::now().timestamp())?;
+            if checksum_changed {
+                clear_replica_capture_repair(&tx, &record)?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("upsert_seen::commit", e))
         })
         .await
     }
@@ -1756,45 +2378,38 @@ impl SqliteStateDb {
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
     ) -> Result<(), StateError> {
-        let downloaded_at = Utc::now().timestamp();
-        let library = library.to_owned();
-        let id = id.to_owned();
-        let version_size = version_size.to_owned();
-        let local_path = local_path.to_path_buf();
-        let local_checksum = local_checksum.to_owned();
-        let download_checksum = download_checksum.map(str::to_owned);
-
-        self.with_conn("mark_downloaded", move |conn| {
-            let rows = update_status_to_downloaded(
-                conn,
-                &library,
-                &id,
-                &version_size,
-                &local_path,
-                &local_checksum,
-                download_checksum.as_deref(),
-                mark_capture_repair,
-                downloaded_at,
-            )?;
-
-            if rows == 0 {
+        let claimed = self
+            .claim_pending_replica(library, id, version_size, local_path)
+            .await;
+        let claimed = match claimed {
+            Ok(claimed) => claimed,
+            Err(error @ StateError::AssetRowMissing { .. }) => {
                 crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.inc();
-                return Err(StateError::AssetRowMissing {
-                    asset_id: id,
-                    version_size,
-                });
+                return Err(error);
             }
-
-            record_metadata_capture_revision(
-                conn,
-                &library,
-                &id,
-                METADATA_CAPTURE_REVISION,
-                downloaded_at,
-            )?;
-
-            Ok(())
-        })
+            Err(error) => return Err(error),
+        };
+        if !claimed {
+            return Err(StateError::Invariant {
+                operation: "mark_downloaded",
+                detail: format!(
+                    "download path is owned by another asset replica: {}",
+                    local_path.display()
+                ),
+            });
+        }
+        self.finalize_downloaded_replica(
+            library,
+            id,
+            version_size,
+            local_path,
+            &ReplicaDownloadEvidence {
+                local_checksum: local_checksum.to_owned(),
+                download_checksum: download_checksum.map(str::to_owned),
+            },
+            true,
+            mark_capture_repair,
+        )
         .await
     }
 
@@ -1807,6 +2422,9 @@ impl SqliteStateDb {
         imported_mtime: Option<i64>,
     ) -> Result<(), StateError> {
         let record = record.clone();
+        let path = OwnedPathBytes::from_path(local_path)?;
+        let path_key = path.ownership_key();
+        let replica_path = path.into_bytes();
         let local_path = local_path.to_path_buf();
         let local_checksum = local_checksum.to_owned();
 
@@ -1816,7 +2434,11 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("import_adopt::begin", e))?;
 
             let now = Utc::now().timestamp();
+            let checksum_changed = provider_checksum_changed(&tx, &record)?;
             upsert_asset_row(&tx, &record, now)?;
+            if checksum_changed {
+                clear_replica_capture_repair(&tx, &record)?;
+            }
             let rows = update_status_to_downloaded(
                 &tx,
                 &record.library,
@@ -1857,6 +2479,45 @@ impl SqliteStateDb {
                 ],
             )
             .map_err(|e| StateError::query("import_adopt::imported_meta", e))?;
+            let replica_rows = tx
+                .execute(
+                    "INSERT INTO asset_replicas (
+                        path_key, local_path, library, asset_id, version_size, status,
+                        last_seen_at, downloaded_at, local_checksum, imported_size, imported_mtime
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'downloaded', ?6, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(path_key) DO UPDATE SET
+                        status = 'downloaded',
+                        last_seen_at = excluded.last_seen_at,
+                        downloaded_at = excluded.downloaded_at,
+                        local_checksum = excluded.local_checksum,
+                        imported_size = excluded.imported_size,
+                        imported_mtime = excluded.imported_mtime,
+                        last_error = NULL
+                     WHERE asset_replicas.library = excluded.library
+                       AND asset_replicas.asset_id = excluded.asset_id
+                       AND asset_replicas.version_size = excluded.version_size",
+                    rusqlite::params![
+                        path_key,
+                        replica_path,
+                        &record.library,
+                        &record.id,
+                        record.version_size.as_str(),
+                        now,
+                        local_checksum,
+                        i64::try_from(imported_size).unwrap_or(i64::MAX),
+                        imported_mtime,
+                    ],
+                )
+                .map_err(|e| StateError::query("import_adopt::replica", e))?;
+            if replica_rows == 0 {
+                return Err(StateError::Invariant {
+                    operation: "import_adopt",
+                    detail: format!(
+                        "import path is owned by another asset replica: {}",
+                        local_path.display()
+                    ),
+                });
+            }
 
             tx.commit()
                 .map_err(|e| StateError::query("import_adopt::commit", e))?;
@@ -1868,15 +2529,15 @@ impl SqliteStateDb {
     pub(crate) async fn get_all_imported_records(
         &self,
         library: &str,
-    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
+    ) -> Result<HashMap<(String, String, PathBuf), ImportedRecord>, StateError> {
         let library = library.to_owned();
 
         self.with_conn("get_all_imported_records", move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, version_size, local_path, local_checksum, \
+                    "SELECT asset_id, version_size, local_path, local_checksum, \
                             imported_size, imported_mtime \
-                     FROM assets \
+                     FROM asset_replicas \
                      WHERE library = ?1 AND status = 'downloaded'",
                 )
                 .map_err(|e| StateError::query("get_all_imported_records::prepare", e))?;
@@ -1884,14 +2545,16 @@ impl SqliteStateDb {
                 .query_map([&library], |row| {
                     let id: String = row.get(0)?;
                     let version_size: String = row.get(1)?;
-                    let local_path: String = row.get(2)?;
+                    let local_path: Vec<u8> = row.get(2)?;
                     let local_checksum: String = row.get(3)?;
                     let imported_size: Option<i64> = row.get(4)?;
                     let imported_mtime: Option<i64> = row.get(5)?;
                     Ok((
-                        (id, version_size),
+                        id,
+                        version_size,
+                        local_path,
                         ImportedRecord {
-                            local_path: PathBuf::from(local_path),
+                            local_path: PathBuf::new(),
                             local_checksum,
                             imported_size: imported_size.and_then(|v| u64::try_from(v).ok()),
                             imported_mtime,
@@ -1901,9 +2564,11 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("get_all_imported_records::query", e))?;
             let mut out = HashMap::new();
             for r in rows {
-                let (k, v) =
+                let (id, version_size, local_path, mut record) =
                     r.map_err(|e| StateError::query("get_all_imported_records::row", e))?;
-                out.insert(k, v);
+                let local_path = OwnedPathBytes::from_bytes(local_path).into_path()?;
+                record.local_path.clone_from(&local_path);
+                out.insert((id, version_size, local_path), record);
             }
             Ok(out)
         })
@@ -1917,6 +2582,24 @@ impl SqliteStateDb {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError> {
+        let current_replicas: Vec<AssetReplica> = self
+            .list_replicas_for_asset_version(library, id, version_size)
+            .await?
+            .into_iter()
+            .filter(|replica| replica.status != ReplicaStatus::Historical)
+            .collect();
+        if let [replica] = current_replicas.as_slice() {
+            return self
+                .finalize_failed_replica(library, id, version_size, &replica.local_path, error)
+                .await;
+        }
+        if current_replicas.len() > 1 {
+            return Err(StateError::Invariant {
+                operation: "mark_failed",
+                detail: "exact replica path is required when an asset version owns multiple paths"
+                    .into(),
+            });
+        }
         let library = library.to_owned();
         let id = id.to_owned();
         let version_size = version_size.to_owned();
@@ -2230,6 +2913,52 @@ impl SqliteStateDb {
                 )
                 .map_err(|e| StateError::query("get_summary::oldest_provider_verification", e))?
                 .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
+            let (
+                downloaded_replica_paths,
+                downloaded_without_path,
+                pending_replica_paths,
+                failed_replica_paths,
+            ) = conn
+                .query_row(
+                    "SELECT \
+                         COUNT(CASE WHEN replicas.status = 'downloaded' THEN 1 END) + \
+                           (SELECT COUNT(*) FROM assets AS legacy \
+                            WHERE legacy.status = 'downloaded' \
+                              AND legacy.local_path IS NOT NULL \
+                              AND NOT EXISTS (SELECT 1 FROM asset_replicas \
+                                  WHERE library = legacy.library AND asset_id = legacy.id \
+                                    AND version_size = legacy.version_size)), \
+                         (SELECT COUNT(*) FROM assets AS legacy \
+                          WHERE legacy.status = 'downloaded' AND legacy.local_path IS NULL \
+                            AND NOT EXISTS (SELECT 1 FROM asset_replicas \
+                                WHERE library = legacy.library AND asset_id = legacy.id \
+                                  AND version_size = legacy.version_size)), \
+                         COUNT(CASE WHEN replicas.status = 'pending' AND assets.is_deleted = 0 THEN 1 END), \
+                         COUNT(CASE WHEN replicas.status = 'failed' AND assets.is_deleted = 0 THEN 1 END) \
+                     FROM asset_replicas AS replicas \
+                     JOIN assets \
+                       ON assets.library = replicas.library \
+                      AND assets.id = replicas.asset_id \
+                      AND assets.version_size = replicas.version_size",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .map(|(downloaded, without_path, pending, failed)| {
+                    (
+                        u64::try_from(downloaded).unwrap_or(0),
+                        u64::try_from(without_path).unwrap_or(0),
+                        u64::try_from(pending).unwrap_or(0),
+                        u64::try_from(failed).unwrap_or(0),
+                    )
+                })
+                .map_err(|e| StateError::query("get_summary::replicas", e))?;
             let metadata_value = |key: &str| {
                 conn.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
                     row.get::<_, String>(0)
@@ -2395,6 +3124,10 @@ impl SqliteStateDb {
                 pending,
                 policy_excluded,
                 failed,
+                downloaded_replica_paths,
+                downloaded_without_path,
+                pending_replica_paths,
+                failed_replica_paths,
                 awaiting_provider_verification,
                 source_deleted,
                 oldest_provider_verification_at,
@@ -2450,6 +3183,108 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_downloaded_replica_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        self.with_conn("get_downloaded_replica_page", move |conn| {
+            let replica_count = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM asset_replicas WHERE status = 'downloaded'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| StateError::query("get_downloaded_replica_page::count", e))?;
+            let replica_count = u64::try_from(replica_count).unwrap_or(0);
+            let mut replicas = Vec::new();
+            if offset < replica_count {
+                let mut replica_stmt = conn
+                    .prepare(&format!(
+                        "SELECT {REPLICA_COLUMNS} FROM asset_replicas \
+                         WHERE status = 'downloaded' \
+                         ORDER BY library, asset_id, version_size, path_key LIMIT ?1 OFFSET ?2"
+                    ))
+                    .map_err(|e| StateError::query("get_downloaded_replica_page::prepare", e))?;
+                let replica_rows = replica_stmt
+                    .query_map(
+                        rusqlite::params![
+                            i64::from(limit),
+                            i64::try_from(offset).unwrap_or(i64::MAX)
+                        ],
+                        replica_sql_row_from_row,
+                    )
+                    .map_err(|e| StateError::query("get_downloaded_replica_page::query", e))?;
+                for row in replica_rows {
+                    replicas.push(replica_from_sql_row(
+                        row.map_err(|e| StateError::query("get_downloaded_replica_page::row", e))?,
+                        "get_downloaded_replica_page",
+                    )?);
+                }
+            }
+
+            let asset_sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets \
+                 WHERE library = ?1 AND id = ?2 AND version_size = ?3"
+            );
+            let mut asset_stmt = conn
+                .prepare_cached(&asset_sql)
+                .map_err(|e| StateError::query("get_downloaded_replica_page::asset_prepare", e))?;
+            let mut records = Vec::with_capacity(replicas.len());
+            for replica in replicas {
+                let mut record = asset_stmt
+                    .query_row(
+                        rusqlite::params![
+                            replica.library,
+                            replica.asset_id,
+                            replica.version_size.as_str()
+                        ],
+                        row_to_asset_record,
+                    )
+                    .map_err(|e| StateError::query("get_downloaded_replica_page::asset", e))?;
+                record.local_path = Some(replica.local_path);
+                record.local_checksum = replica.local_checksum;
+                record.download_checksum = replica.download_checksum;
+                record.downloaded_at = replica.downloaded_at;
+                record.last_seen_at = replica.last_seen_at;
+                record.download_attempts = replica.download_attempts;
+                record.last_error = replica.last_error;
+                records.push(record);
+            }
+            let remaining = usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(records.len());
+            if remaining > 0 {
+                let legacy_offset = offset.saturating_sub(replica_count);
+                let sql = format!(
+                    "SELECT {ASSET_COLUMNS} FROM assets AS legacy \
+                     WHERE status = 'downloaded' \
+                       AND NOT EXISTS (SELECT 1 FROM asset_replicas \
+                           WHERE library = legacy.library AND asset_id = legacy.id \
+                             AND version_size = legacy.version_size) \
+                     ORDER BY rowid LIMIT ?1 OFFSET ?2"
+                );
+                let mut legacy_stmt = conn.prepare(&sql).map_err(|e| {
+                    StateError::query("get_downloaded_replica_page::legacy_prepare", e)
+                })?;
+                let legacy = legacy_stmt
+                    .query_map(
+                        rusqlite::params![
+                            i64::try_from(remaining).unwrap_or(i64::MAX),
+                            i64::try_from(legacy_offset).unwrap_or(i64::MAX)
+                        ],
+                        row_to_asset_record,
+                    )
+                    .map_err(|e| StateError::query("get_downloaded_replica_page::legacy", e))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| StateError::query("get_downloaded_replica_page::legacy", e))?;
+                records.extend(legacy);
+            }
+            Ok(records)
+        })
+        .await
+    }
+
     pub(crate) async fn get_manifest_assets(&self) -> Result<Vec<ManifestAssetRow>, StateError> {
         self.with_conn("get_manifest_assets", move |conn| {
             let mut stmt = conn
@@ -2460,23 +3295,29 @@ impl SqliteStateDb {
                         a.id,
                         a.version_size,
                         a.filename,
+                        r.local_path,
                         a.local_path,
                         a.checksum,
-                        a.local_checksum,
-                        a.download_checksum,
+                        CASE WHEN r.path_key IS NULL THEN a.local_checksum ELSE r.local_checksum END,
+                        CASE WHEN r.path_key IS NULL THEN a.download_checksum ELSE r.download_checksum END,
                         a.size_bytes,
                         a.created_at,
                         a.added_at,
-                        a.downloaded_at,
-                        a.last_seen_at,
+                        CASE WHEN r.path_key IS NULL THEN a.downloaded_at ELSE r.downloaded_at END,
+                        COALESCE(r.last_seen_at, a.last_seen_at),
                         a.media_type,
-                        a.status,
+                        COALESCE(r.status, a.status),
+                        r.path_key,
                         aa.album_name
                     FROM assets a
+                    LEFT JOIN asset_replicas r
+                        ON r.library = a.library
+                       AND r.asset_id = a.id
+                       AND r.version_size = a.version_size
                     LEFT JOIN asset_albums aa
                         ON aa.library = a.library
                        AND aa.asset_id = a.id
-                    ORDER BY a.library, a.id, a.version_size, aa.album_name
+                    ORDER BY a.library, a.id, a.version_size, r.path_key, aa.album_name
                     ",
                 )
                 .map_err(|e| StateError::query("get_manifest_assets::prepare", e))?;
@@ -2485,13 +3326,15 @@ impl SqliteStateDb {
                 .query_map([], manifest_joined_row_from_row)
                 .map_err(|e| StateError::query("get_manifest_assets::query", e))?;
 
-            let mut assets: BTreeMap<(String, String, String), ManifestAssetRow> = BTreeMap::new();
+            type ManifestKey = (String, String, String, Option<Vec<u8>>);
+            let mut assets: BTreeMap<ManifestKey, ManifestAssetRow> = BTreeMap::new();
             for row in rows {
                 let joined = row.map_err(|e| StateError::query("get_manifest_assets::row", e))?;
                 let key = (
                     joined.asset.library.clone(),
                     joined.asset.asset_id.clone(),
                     joined.asset.version.clone(),
+                    joined.path_key,
                 );
                 let asset = assets.entry(key).or_insert(joined.asset);
                 if let Some(album) = joined.album_name {
@@ -2905,42 +3748,53 @@ impl SqliteStateDb {
         self.with_conn("get_downloaded_file_records", move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT library, id, version_size, checksum, local_path, \
-                            local_checksum, download_checksum \
-                     FROM assets WHERE status = 'downloaded'",
+                    "SELECT assets.library, assets.id, assets.version_size, assets.checksum, \
+                            replicas.local_path, replicas.local_checksum, \
+                            replicas.download_checksum \
+                     FROM asset_replicas AS replicas \
+                     JOIN assets ON assets.library = replicas.library \
+                        AND assets.id = replicas.asset_id \
+                        AND assets.version_size = replicas.version_size \
+                     WHERE replicas.status = 'downloaded' AND assets.status = 'downloaded'",
                 )
                 .map_err(|e| StateError::query("get_downloaded_file_records", e))?;
 
-            stmt.query_map([], |row| {
-                let version_size: String = row.get(2)?;
-                let local_path: Option<String> = row.get(4)?;
-                Ok(DownloadedFileRecord {
-                    library: row.get(0)?,
-                    id: row.get(1)?,
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })
+                .map_err(|e| StateError::query("get_downloaded_file_records", e))?;
+            let mut records = Vec::new();
+            for row in rows {
+                let (
+                    library,
+                    id,
+                    version_size,
+                    checksum,
+                    local_path,
+                    local_checksum,
+                    download_checksum,
+                ) = row.map_err(|e| StateError::query("get_downloaded_file_records", e))?;
+                records.push(DownloadedFileRecord {
+                    library,
+                    id,
                     version_size: VersionSizeKey::from_str(&version_size)
                         .unwrap_or(VersionSizeKey::Original),
-                    checksum: row.get(3)?,
-                    local_path: local_path.map(PathBuf::from),
-                    local_checksum: row.get(5)?,
-                    download_checksum: row.get(6)?,
-                })
-            })
-            .map_err(|e| StateError::query("get_downloaded_file_records", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query("get_downloaded_file_records", e))
-        })
-        .await
-    }
-
-    pub(crate) async fn has_downloaded_live_photo_videos(&self) -> Result<bool, StateError> {
-        self.with_conn("has_downloaded_live_photo_videos", move |conn| {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM assets \
-                 WHERE status = 'downloaded' AND media_type = 'live_photo_video' LIMIT 1)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| StateError::query("has_downloaded_live_photo_videos", e))
+                    checksum,
+                    local_path: Some(OwnedPathBytes::from_bytes(local_path).into_path()?),
+                    local_checksum,
+                    download_checksum,
+                });
+            }
+            Ok(records)
         })
         .await
     }
@@ -4077,7 +4931,10 @@ impl SqliteStateDb {
                 .execute(
                     "UPDATE assets SET status = 'policy_excluded', last_error = NULL \
                      WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
-                       AND status = 'pending' AND is_deleted = 0",
+                       AND status = 'pending' AND is_deleted = 0 \
+                       AND NOT EXISTS (SELECT 1 FROM asset_replicas \
+                           WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                             AND status IN ('pending', 'failed'))",
                     rusqlite::params![library, id, version_size],
                 )
                 .map_err(|e| StateError::query("mark_policy_excluded::update", e))?;
@@ -4319,14 +5176,25 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         let version_size = version_size.to_owned();
-        self.with_conn("record_metadata_write_failure", move |conn| {
-            conn.execute(
+        self.with_conn_mut("record_metadata_write_failure", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("record_metadata_write_failure::begin", e))?;
+            tx.execute(
                 "UPDATE assets SET metadata_write_failed_at = ?1 \
                  WHERE library = ?2 AND id = ?3 AND version_size = ?4",
-                rusqlite::params![ts, library, asset_id, version_size],
+                rusqlite::params![ts, &library, &asset_id, &version_size],
             )
             .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
-            Ok(())
+            tx.execute(
+                "UPDATE asset_replicas SET metadata_write_failed_at = ?1 \
+                 WHERE library = ?2 AND asset_id = ?3 AND version_size = ?4 \
+                   AND status = 'downloaded'",
+                rusqlite::params![ts, library, asset_id, version_size],
+            )
+            .map_err(|e| StateError::query("record_metadata_write_failure::replicas", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("record_metadata_write_failure::commit", e))
         })
         .await
     }
@@ -4372,6 +5240,10 @@ impl SqliteStateDb {
         let Some(input_checksum) = pending.asset.local_checksum.as_deref() else {
             return Ok(None);
         };
+        let Some(local_path) = pending.asset.local_path.as_deref() else {
+            return Ok(None);
+        };
+        let path_key = replica_path_key(local_path)?;
         let library = pending.asset.library.to_string();
         let asset_id = pending.asset.id.to_string();
         let version_size = pending.asset.version_size.as_str().to_owned();
@@ -4383,18 +5255,26 @@ impl SqliteStateDb {
                 operation: "record_capture_repair_prepared",
                 detail: "capture-repair output size exceeds SQLite INTEGER".into(),
             })?;
-        self.with_conn("record_capture_repair_prepared", move |conn| {
-            let updated = conn
+        self.with_conn_mut("record_capture_repair_prepared", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("record_capture_repair_prepared::begin", e))?;
+            let updated = tx
                 .execute(
-                    "UPDATE assets SET capture_repair_output_checksum = ?8, \
-                        capture_repair_output_size = ?9 \
-                     WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
-                       AND status = 'downloaded' AND is_deleted = 0 \
-                       AND metadata_hash IS ?4 AND local_checksum IS ?5 \
-                       AND capture_repair_metadata_hash IS ?4 \
-                       AND capture_repair_output_checksum IS ?6 \
-                       AND capture_repair_output_size IS ?7",
+                    "UPDATE asset_replicas SET capture_repair_output_checksum = ?9, \
+                        capture_repair_output_size = ?10 \
+                     WHERE path_key = ?1 AND library = ?2 AND asset_id = ?3 \
+                      AND version_size = ?4 AND status IN ('downloaded', 'historical') \
+                       AND local_checksum IS ?6 \
+                       AND capture_repair_metadata_hash IS ?5 \
+                       AND capture_repair_output_checksum IS ?7 \
+                       AND capture_repair_output_size IS ?8 \
+                       AND EXISTS (SELECT 1 FROM assets \
+                           WHERE library = ?2 AND id = ?3 AND version_size = ?4 \
+                            AND is_deleted = 0 \
+                             AND metadata_hash IS ?5)",
                     rusqlite::params![
+                        path_key,
                         library,
                         asset_id,
                         version_size,
@@ -4407,6 +5287,23 @@ impl SqliteStateDb {
                     ],
                 )
                 .map_err(|e| StateError::query("record_capture_repair_prepared", e))?;
+            if updated > 0 {
+                tx.execute(
+                    "UPDATE assets SET capture_repair_output_checksum = ?1, \
+                        capture_repair_output_size = ?2 \
+                     WHERE library = ?3 AND id = ?4 AND version_size = ?5",
+                    rusqlite::params![
+                        output_checksum,
+                        output_size_sql,
+                        library,
+                        asset_id,
+                        version_size
+                    ],
+                )
+                .map_err(|e| StateError::query("record_capture_repair_prepared::asset", e))?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("record_capture_repair_prepared::commit", e))?;
             Ok((updated > 0).then_some(CaptureRepairReceipt::Prepared {
                 metadata_hash,
                 output_checksum,
@@ -4432,8 +5329,11 @@ impl SqliteStateDb {
             metadata.refresh_hash();
         }
         let rewrite_at = Utc::now().timestamp();
-        self.with_conn("refresh_downloaded_asset_metadata", move |conn| {
-            let updated = conn
+        self.with_conn_mut("refresh_downloaded_asset_metadata", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("refresh_downloaded_asset_metadata::begin", e))?;
+            let updated = tx
                 .execute(
                     r"
                     UPDATE assets SET
@@ -4513,9 +5413,9 @@ impl SqliteStateDb {
                     WHERE library = ?27 AND id = ?28
                       AND status = 'downloaded' AND is_deleted = 0
                       AND NOT EXISTS (
-                          SELECT 1 FROM assets AS blocked
-                          WHERE blocked.library = ?27 AND blocked.id = ?28
-                            AND blocked.status = 'downloaded' AND blocked.is_deleted = 0
+                          SELECT 1 FROM asset_replicas AS blocked
+                          WHERE blocked.library = ?27 AND blocked.asset_id = ?28
+                            AND blocked.status = 'downloaded'
                             AND blocked.capture_repair_metadata_hash IS NOT NULL
                             AND blocked.capture_repair_metadata_hash <> ''
                             AND blocked.capture_repair_output_checksum IS NOT NULL
@@ -4557,6 +5457,73 @@ impl SqliteStateDb {
                     ],
                 )
                 .map_err(|e| StateError::query("refresh_downloaded_asset_metadata", e))?;
+            if updated > 0 {
+                tx.execute(
+                    r"
+                    UPDATE asset_replicas SET
+                        capture_repair_output_checksum =
+                            CASE
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum <> ''
+                                     AND capture_repair_output_size >= 0
+                                    THEN capture_repair_output_checksum
+                                WHEN capture_repair_metadata_hash IS NULL
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                ELSE capture_repair_output_checksum
+                            END,
+                        capture_repair_output_size =
+                            CASE
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum <> ''
+                                     AND capture_repair_output_size >= 0
+                                    THEN capture_repair_output_size
+                                WHEN capture_repair_metadata_hash IS NULL
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN NULL
+                                ELSE capture_repair_output_size
+                            END,
+                        capture_repair_metadata_hash =
+                            CASE
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum <> ''
+                                     AND capture_repair_output_size >= 0
+                                    THEN capture_repair_metadata_hash
+                                WHEN capture_repair_metadata_hash <> ''
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN ?1
+                                WHEN capture_repair_metadata_hash IS NULL
+                                     AND capture_repair_output_checksum IS NULL
+                                     AND capture_repair_output_size IS NULL
+                                    THEN CASE WHEN ?3 = 1 THEN ?1 ELSE NULL END
+                                ELSE capture_repair_metadata_hash
+                            END,
+                        metadata_write_failed_at =
+                            CASE WHEN ?2 = 1 THEN ?4 ELSE metadata_write_failed_at END
+                    WHERE library = ?5 AND asset_id = ?6 AND status = 'downloaded'
+                    ",
+                    rusqlite::params![
+                        metadata.metadata_hash.as_deref(),
+                        i64::from(mark_for_rewrite),
+                        i64::from(mark_capture_repair),
+                        rewrite_at,
+                        library,
+                        asset_id,
+                    ],
+                )
+                .map_err(|e| StateError::query("refresh_downloaded_asset_metadata::replicas", e))?;
+            }
             let durable = if updated > 0 {
                 updated
             } else {
@@ -4565,16 +5532,15 @@ impl SqliteStateDb {
                 // incoming metadata as it resets the row for re-download. The
                 // metadata is durable, so report the match rather than a lost
                 // write. A missing or still-stale row stays a failure.
-                let durable: i64 = conn
+                let durable: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM assets \
                          WHERE library = ?1 AND id = ?2 AND is_deleted = 0 \
                            AND metadata_hash IS NOT NULL AND metadata_hash = ?3 \
                            AND NOT EXISTS ( \
-                               SELECT 1 FROM assets AS blocked \
-                               WHERE blocked.library = ?1 AND blocked.id = ?2 \
+                               SELECT 1 FROM asset_replicas AS blocked \
+                               WHERE blocked.library = ?1 AND blocked.asset_id = ?2 \
                                  AND blocked.status = 'downloaded' \
-                                 AND blocked.is_deleted = 0 \
                                  AND blocked.capture_repair_metadata_hash IS NOT NULL \
                                  AND blocked.capture_repair_metadata_hash <> '' \
                                  AND blocked.capture_repair_output_checksum IS NOT NULL \
@@ -4591,13 +5557,15 @@ impl SqliteStateDb {
             };
             if durable > 0 {
                 record_metadata_capture_revision(
-                    conn,
+                    &tx,
                     &library,
                     &asset_id,
                     capture_revision,
                     rewrite_at,
                 )?;
             }
+            tx.commit()
+                .map_err(|e| StateError::query("refresh_downloaded_asset_metadata::commit", e))?;
             Ok(durable)
         })
         .await
@@ -4613,14 +5581,24 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         let version_size = version_size.to_owned();
-        self.with_conn("clear_metadata_write_failure", move |conn| {
-            conn.execute(
+        self.with_conn_mut("clear_metadata_write_failure", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("clear_metadata_write_failure::begin", e))?;
+            tx.execute(
                 "UPDATE assets SET metadata_write_failed_at = NULL \
                  WHERE library = ?1 AND id = ?2 AND version_size = ?3",
-                rusqlite::params![library, asset_id, version_size],
+                rusqlite::params![&library, &asset_id, &version_size],
             )
             .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
-            Ok(())
+            tx.execute(
+                "UPDATE asset_replicas SET metadata_write_failed_at = NULL \
+                 WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3",
+                rusqlite::params![library, asset_id, version_size],
+            )
+            .map_err(|e| StateError::query("clear_metadata_write_failure::replicas", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("clear_metadata_write_failure::commit", e))
         })
         .await
     }
@@ -4763,6 +5741,16 @@ impl SqliteStateDb {
         let library = pending.asset.library.to_string();
         let asset_id = pending.asset.id.to_string();
         let version_size = pending.asset.version_size.as_str().to_owned();
+        let local_path =
+            pending
+                .asset
+                .local_path
+                .as_deref()
+                .ok_or_else(|| StateError::Invariant {
+                    operation: "finish_metadata_rewrite",
+                    detail: "the selected replica has no local path".into(),
+                })?;
+        let path_key = replica_path_key(local_path)?;
         let input_checksum = pending.asset.local_checksum.clone();
         let local_checksum = local_checksum.map(str::to_owned);
         let pre_rewrite_checksum = pre_rewrite_checksum.map(str::to_owned);
@@ -4787,10 +5775,13 @@ impl SqliteStateDb {
         let selected_capture = i64::from(selected_queue == MetadataRewriteQueue::CaptureRepair);
         let clear_ordinary = i64::from(completion.clears(MetadataRewriteQueue::Ordinary));
         let clear_capture = i64::from(completion.clears(MetadataRewriteQueue::CaptureRepair));
-        self.with_conn("finish_metadata_rewrite", move |conn| {
-            let updated = conn
+        self.with_conn_mut("finish_metadata_rewrite", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("finish_metadata_rewrite::begin", e))?;
+            let updated = tx
                 .execute(
-                    "UPDATE assets SET \
+                    "UPDATE asset_replicas SET \
                         local_checksum = ?6, \
                         download_checksum = COALESCE(download_checksum, ?7), \
                         metadata_write_failed_at = CASE WHEN ?8 = 1 \
@@ -4804,9 +5795,10 @@ impl SqliteStateDb {
                         capture_repair_output_size = CASE \
                             WHEN ?9 = 1 OR local_checksum IS NOT ?6 \
                                 THEN NULL ELSE capture_repair_output_size END \
-                     WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
-                       AND status = 'downloaded' AND is_deleted = 0 \
-                       AND metadata_hash IS ?4 AND local_checksum IS ?5 \
+                     WHERE path_key = ?1 AND library = ?2 AND asset_id = ?3 \
+                       AND version_size = ?4 \
+                       AND (status = 'downloaded' OR (?10 = 1 AND status = 'historical')) \
+                       AND local_checksum IS ?5 \
                        AND ((?10 = 0 AND metadata_write_failed_at IS NOT NULL) \
                          OR (?10 = 1 \
                            AND capture_repair_metadata_hash IS ?11 \
@@ -4815,12 +5807,16 @@ impl SqliteStateDb {
                        AND (?9 = 0 OR ( \
                            capture_repair_metadata_hash IS ?11 \
                            AND capture_repair_output_checksum IS ?12 \
-                           AND capture_repair_output_size IS ?13))",
+                           AND capture_repair_output_size IS ?13)) \
+                       AND EXISTS (SELECT 1 FROM assets \
+                           WHERE library = ?2 AND id = ?3 AND version_size = ?4 \
+                             AND is_deleted = 0 \
+                             AND metadata_hash IS ?14)",
                     rusqlite::params![
+                        path_key,
                         library,
                         asset_id,
                         version_size,
-                        metadata_hash,
                         input_checksum,
                         local_checksum,
                         pre_rewrite_checksum,
@@ -4829,10 +5825,58 @@ impl SqliteStateDb {
                         selected_capture,
                         capture_metadata_hash,
                         capture_output_checksum,
-                        capture_output_size
+                        capture_output_size,
+                        metadata_hash,
                     ],
                 )
                 .map_err(|e| StateError::query("finish_metadata_rewrite", e))?;
+            if updated > 0 {
+                tx.execute(
+                    "UPDATE assets SET \
+                        local_checksum = ?4, \
+                        download_checksum = COALESCE(download_checksum, ?5), \
+                        metadata_write_failed_at = ( \
+                            SELECT MIN(metadata_write_failed_at) FROM asset_replicas \
+                            WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                              AND status = 'downloaded' \
+                        ), \
+                        capture_repair_metadata_hash = ( \
+                            SELECT capture_repair_metadata_hash FROM asset_replicas \
+                            WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                              AND status = 'downloaded' \
+                              AND capture_repair_metadata_hash IS NOT NULL \
+                            ORDER BY path_key LIMIT 1 \
+                        ), \
+                        capture_repair_output_checksum = ( \
+                            SELECT capture_repair_output_checksum FROM asset_replicas \
+                            WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                              AND status = 'downloaded' \
+                              AND capture_repair_metadata_hash IS NOT NULL \
+                            ORDER BY path_key LIMIT 1 \
+                        ), \
+                        capture_repair_output_size = ( \
+                            SELECT capture_repair_output_size FROM asset_replicas \
+                            WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3 \
+                              AND status = 'downloaded' \
+                              AND capture_repair_metadata_hash IS NOT NULL \
+                            ORDER BY path_key LIMIT 1 \
+                        ) \
+                     WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                       AND status = 'downloaded' AND is_deleted = 0 \
+                       AND metadata_hash IS ?6",
+                    rusqlite::params![
+                        library,
+                        asset_id,
+                        version_size,
+                        local_checksum,
+                        pre_rewrite_checksum,
+                        metadata_hash,
+                    ],
+                )
+                .map_err(|e| StateError::query("finish_metadata_rewrite::asset", e))?;
+            }
+            tx.commit()
+                .map_err(|e| StateError::query("finish_metadata_rewrite::commit", e))?;
             Ok(updated > 0 && completion.clears(selected_queue))
         })
         .await
@@ -4844,7 +5888,7 @@ impl SqliteStateDb {
         self.with_conn("get_metadata_retry_markers", move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT library, id, version_size FROM assets \
+                    "SELECT DISTINCT library, asset_id, version_size FROM asset_replicas \
                      WHERE metadata_write_failed_at IS NOT NULL",
                 )
                 .map_err(|e| StateError::query("get_metadata_retry_markers", e))?;
@@ -5215,6 +6259,86 @@ impl TempFileOwnershipStore for SqliteStateDb {
 }
 
 #[async_trait]
+impl ReplicaStateStore for SqliteStateDb {
+    async fn list_replicas(&self) -> Result<Vec<AssetReplica>, StateError> {
+        SqliteStateDb::list_replicas(self).await
+    }
+
+    async fn list_replicas_for_asset_version(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<Vec<AssetReplica>, StateError> {
+        SqliteStateDb::list_replicas_for_asset_version(self, library, asset_id, version_size).await
+    }
+
+    async fn claim_pending_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::claim_pending_replica(self, library, asset_id, version_size, local_path)
+            .await
+    }
+
+    async fn finalize_downloaded_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+        evidence: &ReplicaDownloadEvidence,
+        metadata_write_succeeded: bool,
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::finalize_downloaded_replica(
+            self,
+            library,
+            asset_id,
+            version_size,
+            local_path,
+            evidence,
+            metadata_write_succeeded,
+            mark_capture_repair,
+        )
+        .await
+    }
+
+    async fn finalize_failed_replica(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+        error: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::finalize_failed_replica(
+            self,
+            library,
+            asset_id,
+            version_size,
+            local_path,
+            error,
+        )
+        .await
+    }
+
+    async fn mark_replica_historical(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        local_path: &Path,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::mark_replica_historical(self, library, asset_id, version_size, local_path)
+            .await
+    }
+}
+
+#[async_trait]
 impl DownloadStateStore for SqliteStateDb {
     #[cfg(test)]
     async fn should_download(
@@ -5572,7 +6696,7 @@ impl ImportStateStore for SqliteStateDb {
     async fn get_all_imported_records(
         &self,
         library: &str,
-    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
+    ) -> Result<HashMap<(String, String, PathBuf), ImportedRecord>, StateError> {
         SqliteStateDb::get_all_imported_records(self, library).await
     }
 }
@@ -5615,6 +6739,14 @@ impl ReportStateStore for SqliteStateDb {
         SqliteStateDb::get_downloaded_page(self, offset, limit).await
     }
 
+    async fn get_downloaded_replica_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        SqliteStateDb::get_downloaded_replica_page(self, offset, limit).await
+    }
+
     async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError> {
         SqliteStateDb::start_sync_run_at(self, started_at).await
     }
@@ -5644,10 +6776,6 @@ impl SyncTokenStore for SqliteStateDb {
 
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
-    }
-
-    async fn has_downloaded_live_photo_videos(&self) -> Result<bool, StateError> {
-        SqliteStateDb::has_downloaded_live_photo_videos(self).await
     }
 
     async fn commit_checkpoint_transition(
@@ -6085,6 +7213,15 @@ impl SqliteStateDb {
             rusqlite::params![library, asset_id, version_size],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE asset_replicas SET local_checksum = NULL, \
+                capture_repair_metadata_hash = NULL, \
+                capture_repair_output_checksum = NULL, \
+                capture_repair_output_size = NULL \
+             WHERE library = ?1 AND asset_id = ?2 AND version_size = ?3",
+            rusqlite::params![library, asset_id, version_size],
+        )
+        .unwrap();
     }
 
     /// Overwrite `last_seen_at` for a specific asset in `PrimarySync`. Used
@@ -6152,6 +7289,7 @@ const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
 
 /// Total number of columns in `ASSET_COLUMNS`. Validated by a unit test that
 /// asserts `row_to_asset_record` reads exactly this many indices (0..N).
+#[cfg(test)]
 const ASSET_COLUMN_COUNT: usize = 40;
 
 fn query_pending_metadata_rewrites(
@@ -6161,26 +7299,31 @@ fn query_pending_metadata_rewrites(
     offset: usize,
     limit: usize,
 ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
-    let (queue_predicate, order) = match queue {
+    let (queue_predicate, status_predicate, order) = match queue {
         MetadataRewriteQueue::Ordinary => (
             "metadata_write_failed_at IS NOT NULL",
-            "metadata_write_failed_at ASC, library, id, version_size",
+            "status = 'downloaded'",
+            "metadata_write_failed_at ASC, library, asset_id, version_size, path_key",
         ),
         MetadataRewriteQueue::CaptureRepair => (
             "(capture_repair_metadata_hash IS NOT NULL \
               OR capture_repair_output_checksum IS NOT NULL \
               OR capture_repair_output_size IS NOT NULL)",
-            "library, id, version_size",
+            "status IN ('downloaded', 'historical')",
+            "library, asset_id, version_size, path_key",
         ),
     };
     let scope = libraries
         .map(|libraries| format!(" AND library IN ({})", sqlite_placeholders(libraries.len())))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT {ASSET_COLUMNS}, capture_repair_metadata_hash, \
-            capture_repair_output_checksum, capture_repair_output_size \
-         FROM assets WHERE {queue_predicate} \
-           AND status = 'downloaded' AND is_deleted = 0 AND local_path IS NOT NULL \
+        "SELECT {REPLICA_COLUMNS} FROM asset_replicas WHERE {queue_predicate} \
+           AND {status_predicate} \
+           AND EXISTS (SELECT 1 FROM assets \
+               WHERE library = asset_replicas.library \
+                 AND id = asset_replicas.asset_id \
+                 AND version_size = asset_replicas.version_size \
+                 AND is_deleted = 0) \
            {scope} ORDER BY {order} LIMIT ? OFFSET ?"
     );
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -6198,55 +7341,51 @@ fn query_pending_metadata_rewrites(
         .prepare(&sql)
         .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))?;
     let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(params),
-            row_to_pending_metadata_rewrite,
-        )
+        .query_map(rusqlite::params_from_iter(params), replica_sql_row_from_row)
         .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))
-}
+    let mut replicas = Vec::new();
+    for row in rows {
+        replicas.push(replica_from_sql_row(
+            row.map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue", e))?,
+            "get_pending_metadata_rewrites_for_queue",
+        )?);
+    }
+    drop(stmt);
 
-fn row_to_pending_metadata_rewrite(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PendingMetadataRewrite> {
-    let metadata_hash: Option<String> = row.get(ASSET_COLUMN_COUNT)?;
-    let output_checksum: Option<String> = row.get(ASSET_COLUMN_COUNT + 1)?;
-    let output_size: Option<i64> = row.get(ASSET_COLUMN_COUNT + 2)?;
-    let capture_repair_receipt = match (metadata_hash, output_checksum, output_size) {
-        (None, None, None) => None,
-        (Some(metadata_hash), None, None) if !metadata_hash.is_empty() => {
-            Some(CaptureRepairReceipt::Pending { metadata_hash })
-        }
-        (Some(metadata_hash), Some(output_checksum), Some(output_size))
-            if !metadata_hash.is_empty() && !output_checksum.is_empty() && output_size >= 0 =>
-        {
-            Some(CaptureRepairReceipt::Prepared {
-                metadata_hash,
-                output_checksum,
-                output_size: u64::try_from(output_size).unwrap_or(0),
-            })
-        }
-        state => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                ASSET_COLUMN_COUNT,
-                rusqlite::types::Type::Null,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("malformed capture-repair receipt: {state:?}"),
-                )
-                .into(),
-            ));
-        }
-    };
-    Ok(PendingMetadataRewrite {
-        asset: row_to_asset_record(row)?,
-        capture_repair_receipt,
-    })
+    let asset_sql = format!(
+        "SELECT {ASSET_COLUMNS} FROM assets \
+         WHERE library = ?1 AND id = ?2 AND version_size = ?3 AND is_deleted = 0"
+    );
+    let mut asset_stmt = conn
+        .prepare_cached(&asset_sql)
+        .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue::asset", e))?;
+    let mut pending = Vec::with_capacity(replicas.len());
+    for replica in replicas {
+        let mut asset = asset_stmt
+            .query_row(
+                rusqlite::params![
+                    replica.library,
+                    replica.asset_id,
+                    replica.version_size.as_str()
+                ],
+                row_to_asset_record,
+            )
+            .map_err(|e| StateError::query("get_pending_metadata_rewrites_for_queue::asset", e))?;
+        asset.local_path = Some(replica.local_path);
+        asset.local_checksum = replica.local_checksum;
+        asset.download_checksum = replica.download_checksum;
+        asset.downloaded_at = replica.downloaded_at;
+        pending.push(PendingMetadataRewrite {
+            asset,
+            capture_repair_receipt: replica.capture_repair_receipt,
+        });
+    }
+    Ok(pending)
 }
 
 struct ManifestJoinedRow {
     asset: ManifestAssetRow,
+    path_key: Option<Vec<u8>>,
     album_name: Option<String>,
 }
 
@@ -6255,18 +7394,34 @@ fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Man
     let asset_id: String = row.get(1)?;
     let version: String = row.get(2)?;
     let filename: String = row.get(3)?;
-    let local_path: Option<String> = row.get(4)?;
-    let checksum: String = row.get(5)?;
-    let local_checksum: Option<String> = row.get(6)?;
-    let download_checksum: Option<String> = row.get(7)?;
-    let size_bytes: i64 = row.get(8)?;
-    let created_at_ts: i64 = row.get(9)?;
-    let added_at_ts: Option<i64> = row.get(10)?;
-    let downloaded_at_ts: Option<i64> = row.get(11)?;
-    let last_seen_at_ts: i64 = row.get(12)?;
-    let media_type: String = row.get(13)?;
-    let status: String = row.get(14)?;
-    let album_name: Option<String> = row.get(15)?;
+    let replica_path: Option<Vec<u8>> = row.get(4)?;
+    let asset_path: Option<String> = row.get(5)?;
+    let checksum: String = row.get(6)?;
+    let local_checksum: Option<String> = row.get(7)?;
+    let download_checksum: Option<String> = row.get(8)?;
+    let size_bytes: i64 = row.get(9)?;
+    let created_at_ts: i64 = row.get(10)?;
+    let added_at_ts: Option<i64> = row.get(11)?;
+    let downloaded_at_ts: Option<i64> = row.get(12)?;
+    let last_seen_at_ts: i64 = row.get(13)?;
+    let media_type: String = row.get(14)?;
+    let status: String = row.get(15)?;
+    let path_key: Option<Vec<u8>> = row.get(16)?;
+    let album_name: Option<String> = row.get(17)?;
+    let local_path = replica_path
+        .map(|path| {
+            OwnedPathBytes::from_bytes(path)
+                .into_path()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })
+        })
+        .transpose()?
+        .or_else(|| asset_path.map(PathBuf::from));
 
     Ok(ManifestJoinedRow {
         asset: ManifestAssetRow {
@@ -6274,7 +7429,7 @@ fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Man
             asset_id,
             version,
             filename,
-            local_path: local_path.map(PathBuf::from),
+            local_path,
             checksum,
             local_checksum,
             download_checksum,
@@ -6287,6 +7442,7 @@ fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Man
             status,
             albums: Vec::new(),
         },
+        path_key,
         album_name,
     })
 }
@@ -6448,6 +7604,443 @@ mod tests {
         let owned = db.get_owned_temp_files_before(i64::MAX).await.unwrap();
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0].path, path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replica_non_utf_path_round_trips_losslessly() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_seen(&TestAssetRecord::new("NON_UTF_REPLICA").build())
+            .await
+            .unwrap();
+        let dir = test_dir();
+        let path = dir
+            .path()
+            .join(OsString::from_vec(b"replica-\xff.jpg".to_vec()));
+
+        assert!(
+            db.claim_pending_replica("PrimarySync", "NON_UTF_REPLICA", "original", &path)
+                .await
+                .unwrap()
+        );
+
+        let replicas = db.list_replicas().await.unwrap();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(replicas[0].local_path, path);
+    }
+
+    #[tokio::test]
+    async fn replica_claim_does_not_steal_an_exact_path() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for id in ["OWNER", "OTHER"] {
+            db.upsert_seen(&TestAssetRecord::new(id).build())
+                .await
+                .unwrap();
+        }
+        let path = test_dir().path().join("owned.jpg");
+
+        assert!(
+            db.claim_pending_replica("PrimarySync", "OWNER", "original", &path)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.claim_pending_replica("PrimarySync", "OTHER", "original", &path)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_pending_replica("PrimarySync", "OWNER", "original", &path)
+                .await
+                .unwrap()
+        );
+
+        let replicas = db.list_replicas().await.unwrap();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(replicas[0].asset_id, "OWNER");
+    }
+
+    #[tokio::test]
+    async fn sibling_replicas_keep_independent_status_and_repair_evidence() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_seen(&TestAssetRecord::new("SIBLINGS").build())
+            .await
+            .unwrap();
+        let dir = test_dir();
+        let downloaded_path = dir.path().join("downloaded.jpg");
+        let failed_path = dir.path().join("failed.jpg");
+        for path in [&downloaded_path, &failed_path] {
+            assert!(
+                db.claim_pending_replica("PrimarySync", "SIBLINGS", "original", path)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        db.finalize_downloaded_replica(
+            "PrimarySync",
+            "SIBLINGS",
+            "original",
+            &downloaded_path,
+            &ReplicaDownloadEvidence {
+                local_checksum: "local".into(),
+                download_checksum: Some("download".into()),
+            },
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        db.finalize_failed_replica(
+            "PrimarySync",
+            "SIBLINGS",
+            "original",
+            &failed_path,
+            "failed",
+        )
+        .await
+        .unwrap();
+
+        let replicas = db
+            .list_replicas_for_asset_version("PrimarySync", "SIBLINGS", "original")
+            .await
+            .unwrap();
+        let downloaded = replicas
+            .iter()
+            .find(|replica| replica.local_path == downloaded_path)
+            .unwrap();
+        assert_eq!(downloaded.status, ReplicaStatus::Downloaded);
+        assert_eq!(downloaded.local_checksum.as_deref(), Some("local"));
+        assert_eq!(downloaded.download_checksum.as_deref(), Some("download"));
+        assert!(downloaded.metadata_write_failed_at.is_none());
+        assert!(downloaded.capture_repair_receipt.is_none());
+        let failed = replicas
+            .iter()
+            .find(|replica| replica.local_path == failed_path)
+            .unwrap();
+        assert_eq!(failed.status, ReplicaStatus::Failed);
+        assert_eq!(failed.download_attempts, 1);
+        assert_eq!(failed.last_error.as_deref(), Some("failed"));
+        assert!(failed.local_checksum.is_none());
+        assert!(failed.metadata_write_failed_at.is_none());
+        assert!(failed.capture_repair_receipt.is_none());
+
+        db.mark_replica_historical("PrimarySync", "SIBLINGS", "original", &downloaded_path)
+            .await
+            .unwrap();
+
+        let replicas = db
+            .list_replicas_for_asset_version("PrimarySync", "SIBLINGS", "original")
+            .await
+            .unwrap();
+        let historical = replicas
+            .iter()
+            .find(|replica| replica.local_path == downloaded_path)
+            .unwrap();
+        assert_eq!(historical.status, ReplicaStatus::Historical);
+        assert!(historical.metadata_write_failed_at.is_none());
+        assert!(historical.capture_repair_receipt.is_none());
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == failed_path)
+                .unwrap()
+                .status,
+            ReplicaStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_completion_retires_only_the_selected_replica() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut record = TestAssetRecord::new("METADATA_SIBLINGS").build();
+        Arc::make_mut(&mut record.metadata).metadata_hash = Some("metadata".into());
+        db.upsert_seen(&record).await.unwrap();
+        let dir = test_dir();
+        let first = dir.path().join("first.jpg");
+        let second = dir.path().join("second.jpg");
+        for path in [&first, &second] {
+            db.mark_downloaded(
+                "PrimarySync",
+                "METADATA_SIBLINGS",
+                "original",
+                path,
+                "local",
+                Some("download"),
+            )
+            .await
+            .unwrap();
+        }
+        db.record_metadata_write_failure("PrimarySync", "METADATA_SIBLINGS", "original")
+            .await
+            .unwrap();
+
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        let selected = pending
+            .iter()
+            .find(|pending| pending.asset.local_path.as_deref() == Some(first.as_path()))
+            .unwrap();
+        assert!(
+            db.finish_metadata_rewrite(
+                selected,
+                MetadataRewriteQueue::Ordinary,
+                Some("local"),
+                None,
+                MetadataRewriteCompletion::Ordinary,
+            )
+            .await
+            .unwrap()
+        );
+
+        let remaining = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].asset.local_path.as_deref(),
+            Some(second.as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_snapshots_are_keyed_by_exact_path() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("IMPORTED_SIBLINGS").build();
+        let dir = test_dir();
+        let first = dir.path().join("first.jpg");
+        let second = dir.path().join("second.jpg");
+        db.import_adopt(&record, &first, "first", 1, Some(10))
+            .await
+            .unwrap();
+        db.import_adopt(&record, &second, "second", 2, Some(20))
+            .await
+            .unwrap();
+
+        let imported = db.get_all_imported_records("PrimarySync").await.unwrap();
+        assert_eq!(imported.len(), 2);
+        assert_eq!(
+            imported[&("IMPORTED_SIBLINGS".into(), "original".into(), first)].local_checksum,
+            "first"
+        );
+        assert_eq!(
+            imported[&("IMPORTED_SIBLINGS".into(), "original".into(), second)].local_checksum,
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn claiming_provider_replacement_retires_stale_downloaded_replicas() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let old_path = test_dir().path().join("old.jpg");
+        let new_path = test_dir().path().join("new.jpg");
+        let old = TestAssetRecord::new("REPLACED")
+            .checksum("provider-v1")
+            .build();
+        db.upsert_seen(&old).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "REPLACED",
+            "original",
+            &old_path,
+            "local-v1",
+            None,
+        )
+        .await
+        .unwrap();
+        let replacement = TestAssetRecord::new("REPLACED")
+            .checksum("provider-v2")
+            .build();
+        db.upsert_seen(&replacement).await.unwrap();
+        assert!(
+            db.get_downloaded_file_records().await.unwrap().is_empty(),
+            "a restart before the replacement claim must not bless stale bytes"
+        );
+        assert!(
+            db.claim_pending_replica("PrimarySync", "REPLACED", "original", &new_path)
+                .await
+                .unwrap()
+        );
+
+        let replicas = db
+            .list_replicas_for_asset_version("PrimarySync", "REPLACED", "original")
+            .await
+            .unwrap();
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == old_path)
+                .unwrap()
+                .status,
+            ReplicaStatus::Historical
+        );
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == new_path)
+                .unwrap()
+                .status,
+            ReplicaStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_capture_repair_remains_actionable() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("HISTORICAL_CAPTURE")
+            .metadata(AssetMetadata {
+                metadata_hash: Some("metadata".into()),
+                ..AssetMetadata::default()
+            })
+            .build();
+        let path = test_dir().path().join("historical.jpg");
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "HISTORICAL_CAPTURE",
+            "original",
+            &path,
+            "local",
+            None,
+        )
+        .await
+        .unwrap();
+        db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "HISTORICAL_CAPTURE",
+            &record.metadata,
+            false,
+            true,
+            METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+        db.mark_replica_historical("PrimarySync", "HISTORICAL_CAPTURE", "original", &path)
+            .await
+            .unwrap();
+
+        let mut pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].asset.local_path.as_deref(), Some(path.as_path()));
+        let mut pending = pending.pop().unwrap();
+        pending.capture_repair_receipt = db
+            .record_capture_repair_prepared(&pending, "local", 1)
+            .await
+            .unwrap();
+        assert!(
+            db.finish_metadata_rewrite(
+                &pending,
+                MetadataRewriteQueue::CaptureRepair,
+                Some("local"),
+                None,
+                MetadataRewriteCompletion::CaptureRepair,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_exclusion_retires_exact_debt_without_hiding_a_sibling() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("POLICY_SIBLINGS").build();
+        let dir = test_dir();
+        let downloaded = dir.path().join("downloaded.jpg");
+        let excluded = dir.path().join("excluded.jpg");
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "POLICY_SIBLINGS",
+            "original",
+            &downloaded,
+            "local",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.claim_pending_replica("PrimarySync", "POLICY_SIBLINGS", "original", &excluded)
+                .await
+                .unwrap()
+        );
+        db.finalize_failed_replica(
+            "PrimarySync",
+            "POLICY_SIBLINGS",
+            "original",
+            &excluded,
+            "failed",
+        )
+        .await
+        .unwrap();
+        db.mark_replica_historical("PrimarySync", "POLICY_SIBLINGS", "original", &excluded)
+            .await
+            .unwrap();
+        assert!(
+            !db.mark_policy_excluded("PrimarySync", "POLICY_SIBLINGS", "original")
+                .await
+                .unwrap(),
+            "a downloaded sibling keeps the aggregate downloaded"
+        );
+
+        let replicas = db
+            .list_replicas_for_asset_version("PrimarySync", "POLICY_SIBLINGS", "original")
+            .await
+            .unwrap();
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == downloaded)
+                .unwrap()
+                .status,
+            ReplicaStatus::Downloaded
+        );
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == excluded)
+                .unwrap()
+                .status,
+            ReplicaStatus::Historical
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.failed_replica_paths, 0);
     }
 
     #[tokio::test]
@@ -8166,31 +9759,6 @@ mod tests {
             downloaded.download_checksum.as_deref(),
             Some("download-checksum")
         );
-    }
-
-    #[tokio::test]
-    async fn downloaded_live_photo_video_query_only_counts_downloaded_motion_rows() {
-        let db = SqliteStateDb::open_in_memory().unwrap();
-        assert!(!db.has_downloaded_live_photo_videos().await.unwrap());
-
-        let pending = TestAssetRecord::new("PENDING_LIVE_VIDEO")
-            .version_size(VersionSizeKey::LiveOriginal)
-            .media_type(MediaType::LivePhotoVideo)
-            .build();
-        db.upsert_seen(&pending).await.unwrap();
-        assert!(!db.has_downloaded_live_photo_videos().await.unwrap());
-
-        db.mark_downloaded(
-            "PrimarySync",
-            "PENDING_LIVE_VIDEO",
-            VersionSizeKey::LiveOriginal.as_str(),
-            Path::new("IMG_0001_HEVC.MOV"),
-            "local-checksum",
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(db.has_downloaded_live_photo_videos().await.unwrap());
     }
 
     #[tokio::test]
@@ -11209,6 +12777,7 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         for version in [VersionSizeKey::Original, VersionSizeKey::Medium] {
+            let path = PathBuf::from(format!("/photo-{}.jpg", version.as_str()));
             let record = TestAssetRecord::new("PHOTO")
                 .version_size(version)
                 .metadata(AssetMetadata {
@@ -11221,7 +12790,7 @@ mod tests {
                 "PrimarySync",
                 "PHOTO",
                 version.as_str(),
-                Path::new("/photo.jpg"),
+                &path,
                 "checksum",
                 None,
             )
@@ -11269,7 +12838,13 @@ mod tests {
         let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(downloaded.len(), 2, "both versions must remain downloaded");
         for record in &downloaded {
-            assert_eq!(record.local_path.as_deref(), Some(Path::new("/photo.jpg")));
+            assert_eq!(
+                record.local_path,
+                Some(PathBuf::from(format!(
+                    "/photo-{}.jpg",
+                    record.version_size.as_str()
+                )))
+            );
             assert_eq!(record.local_checksum.as_deref(), Some("checksum"));
             assert_eq!(record.checksum.as_ref(), "checksum123");
             assert_eq!(record.metadata.rating, Some(4));
@@ -12064,17 +13639,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            db.get_pending_metadata_rewrites_page_for_queue(
+        let remaining = db
+            .get_pending_metadata_rewrites_page_for_queue(
                 MetadataRewriteQueue::CaptureRepair,
                 None,
                 0,
                 10,
             )
             .await
-            .unwrap()
-            .is_empty(),
-            "changed installed bytes must invalidate capture evidence"
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "changed bytes at one path must not clear a sibling's prepared evidence"
         );
 
         db.refresh_downloaded_asset_metadata(
@@ -12106,14 +13683,26 @@ mod tests {
             .unwrap()
         };
         assert_eq!(receipt, (None, None, None));
+        assert!(
+            db.get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::CaptureRepair,
+                None,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "provider replacement must invalidate every old-path repair receipt"
+        );
 
         seed_downloaded_capture_asset(&db, "MALFORMED", "metadata-v1", "provider-v1", "local-v1")
             .await;
         {
             let conn = db.acquire_lock("write malformed capture receipt").unwrap();
             conn.execute(
-                "UPDATE assets SET capture_repair_output_checksum = 'orphaned' \
-                 WHERE id = 'MALFORMED'",
+                "UPDATE asset_replicas SET capture_repair_output_checksum = 'orphaned' \
+                 WHERE asset_id = 'MALFORMED'",
                 [],
             )
             .unwrap();
@@ -12272,16 +13861,10 @@ mod tests {
             let mut record = TestAssetRecord::new(id).build();
             record.library = Arc::from(library);
             db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded(
-                library,
-                id,
-                "original",
-                Path::new("/photos/photo.jpg"),
-                "local-checksum",
-                None,
-            )
-            .await
-            .unwrap();
+            let path = PathBuf::from(format!("/photos/{library}-{id}.jpg"));
+            db.mark_downloaded(library, id, "original", &path, "local-checksum", None)
+                .await
+                .unwrap();
         }
         {
             let conn = db.acquire_lock("test_metadata_capture_scope").unwrap();

@@ -1427,6 +1427,10 @@ fn copy_local_file_no_replace_blocking_with(
         retain_reconciliation_temp(part_path.path(), "copy failed");
         return Err(error.into());
     }
+    if let Err(error) = part_file.set_permissions(source_permissions.clone()) {
+        retain_reconciliation_temp(part_path.path(), "permission copy failed");
+        return Err(error.into());
+    }
     if let Err(error) = part_file.sync_all() {
         retain_reconciliation_temp(part_path.path(), "temporary file sync failed");
         return Err(error.into());
@@ -1914,24 +1918,42 @@ fn rename_exchange_blocking(part_path: &Path, final_path: &Path) -> std::io::Res
 }
 
 #[cfg(windows)]
-fn move_file_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
+fn nul_terminated_windows_path(path: &Path) -> std::io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+
+    const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const UNC_PREFIX: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+    const DEVICE_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16];
+
+    let absolute = std::path::absolute(path)?;
+    let raw: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    if raw.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        ));
+    }
+    let mut wide = Vec::with_capacity(raw.len() + 8);
+    if raw.starts_with(VERBATIM_PREFIX) || raw.starts_with(DEVICE_PREFIX) {
+        wide.extend_from_slice(&raw);
+    } else if raw.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        wide.extend_from_slice(VERBATIM_PREFIX);
+        wide.extend_from_slice(UNC_PREFIX);
+        wide.extend_from_slice(raw.get(2..).unwrap_or_default());
+    } else {
+        wide.extend_from_slice(VERBATIM_PREFIX);
+        wide.extend_from_slice(&raw);
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn move_file_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
-    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path contains NUL",
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
-
-    let part = nul_terminated(part_path)?;
-    let final_path = nul_terminated(final_path)?;
+    let part = nul_terminated_windows_path(part_path)?;
+    let final_path = nul_terminated_windows_path(final_path)?;
     // SAFETY: both path arguments are valid NUL-terminated Windows strings.
     // MOVEFILE_WRITE_THROUGH keeps the existing durable-publish intent, and
     // omitting MOVEFILE_REPLACE_EXISTING gives this promotion no-overwrite
@@ -1950,24 +1972,11 @@ fn replace_file_with_backup_blocking(
     replacement_path: &Path,
     backup_path: &Path,
 ) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
 
-    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path contains NUL",
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
-
-    let final_path = nul_terminated(final_path)?;
-    let replacement = nul_terminated(replacement_path)?;
-    let backup = nul_terminated(backup_path)?;
+    let final_path = nul_terminated_windows_path(final_path)?;
+    let replacement = nul_terminated_windows_path(replacement_path)?;
+    let backup = nul_terminated_windows_path(backup_path)?;
     // SAFETY: every path is a valid NUL-terminated Windows string. The final
     // path exists, the replacement is the verified `.part` file, and Windows
     // atomically moves the displaced bytes to the distinct backup path.

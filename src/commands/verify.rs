@@ -40,7 +40,7 @@ pub(crate) async fn run_verify(
     const PAGE_SIZE: u32 = 1000;
     let mut offset = 0u64;
     loop {
-        let page = db.get_downloaded_page(offset, PAGE_SIZE).await?;
+        let page = db.get_downloaded_replica_page(offset, PAGE_SIZE).await?;
         if page.is_empty() {
             break;
         }

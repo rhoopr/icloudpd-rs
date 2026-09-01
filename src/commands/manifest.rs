@@ -31,14 +31,25 @@ struct ManifestRow {
     albums: Vec<String>,
 }
 
-impl From<ManifestAssetRow> for ManifestRow {
-    fn from(row: ManifestAssetRow) -> Self {
-        Self {
+impl TryFrom<ManifestAssetRow> for ManifestRow {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ManifestAssetRow) -> Result<Self, Self::Error> {
+        let local_path = row
+            .local_path
+            .as_deref()
+            .map(|path| {
+                path.to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("Manifest cannot represent a non-UTF-8 path"))
+            })
+            .transpose()?;
+        Ok(Self {
             library: row.library,
             asset_id: row.asset_id,
             version: row.version,
             filename: row.filename,
-            local_path: row.local_path.map(|p| p.display().to_string()),
+            local_path,
             checksum: row.checksum,
             local_checksum: row.local_checksum,
             download_checksum: row.download_checksum,
@@ -50,7 +61,7 @@ impl From<ManifestAssetRow> for ManifestRow {
             media_type: row.media_type,
             status: row.status,
             albums: row.albums,
-        }
+        })
     }
 }
 
@@ -82,13 +93,11 @@ pub(crate) async fn run_manifest(
 
 async fn load_manifest_rows(path: &Path) -> anyhow::Result<Vec<ManifestRow>> {
     let db = state::SqliteStateDb::open_read_only(path).await?;
-    let rows = db
-        .get_manifest_assets()
+    db.get_manifest_assets()
         .await?
         .into_iter()
-        .map(ManifestRow::from)
-        .collect();
-    Ok(rows)
+        .map(ManifestRow::try_from)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn render_csv(rows: &[ManifestRow]) -> anyhow::Result<String> {
@@ -240,6 +249,52 @@ mod tests {
         assert_eq!(row.albums, ["Family", "Vacation"]);
     }
 
+    #[tokio::test]
+    async fn manifest_emits_each_owned_replica() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("manifest.db");
+        let first = dir.path().join("first.jpg");
+        let second = dir.path().join("second.jpg");
+        let pending = dir.path().join("pending.jpg");
+        let db = SqliteStateDb::open(&db_path).await.expect("open state");
+        let record = TestAssetRecord::new("MULTI").build();
+        db.upsert_seen(&record).await.expect("insert asset");
+        for (path, checksum) in [(&first, "first"), (&second, "second")] {
+            db.mark_downloaded("PrimarySync", "MULTI", "original", path, checksum, None)
+                .await
+                .expect("mark downloaded");
+        }
+        assert!(
+            db.claim_pending_replica("PrimarySync", "MULTI", "original", &pending)
+                .await
+                .unwrap()
+        );
+        drop(db);
+
+        let rows = load_manifest_rows(&db_path).await.expect("manifest rows");
+        assert_eq!(rows.len(), 3);
+        let paths: std::collections::BTreeSet<_> = rows
+            .iter()
+            .filter_map(|row| row.local_path.as_deref())
+            .collect();
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from([
+                first.to_string_lossy().as_ref(),
+                pending.to_string_lossy().as_ref(),
+                second.to_string_lossy().as_ref(),
+            ])
+        );
+        let pending = rows
+            .iter()
+            .find(|row| row.local_path.as_deref() == pending.to_str())
+            .unwrap();
+        assert_eq!(pending.status, "pending");
+        assert!(pending.local_checksum.is_none());
+        assert!(pending.download_checksum.is_none());
+        assert!(pending.downloaded_at.is_none());
+    }
+
     #[test]
     fn csv_escapes_special_fields_and_keeps_albums_as_json() {
         let rows = vec![ManifestRow {
@@ -266,5 +321,25 @@ mod tests {
         assert!(csv.contains("\"ASSET,1\""));
         assert!(csv.contains("\"quote\"\"photo.jpg\""));
         assert!(csv.contains("\"[\"\"Family\"\",\"\"Vacation, 2024\"\"]\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_rejects_non_utf_replica_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("manifest.db");
+        let path = dir.path().join(OsString::from_vec(vec![b'f', 0x80]));
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let record = TestAssetRecord::new("NON_UTF").build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("PrimarySync", "NON_UTF", "original", &path, "local", None)
+            .await
+            .unwrap();
+        drop(db);
+
+        assert!(load_manifest_rows(&db_path).await.is_err());
     }
 }

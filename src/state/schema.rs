@@ -1,11 +1,15 @@
 //! Database schema definitions and migrations.
 
-use rusqlite::Connection;
+use std::path::Path;
 
+use rusqlite::{Connection, OptionalExtension};
+
+use super::db::OwnedPathBytes;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 20;
+pub(crate) const SCHEMA_VERSION: i32 = 21;
+pub(crate) const REPLICA_RECONCILIATION_REQUIRED_KEY: &str = "replica_reconciliation_required";
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -74,7 +78,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
         match migrate_to_version(conn, current_version, version) {
             Ok(()) => conn.execute_batch("RELEASE migration")?,
             Err(e) => {
-                if let Err(rollback_err) = conn.execute_batch("ROLLBACK TO migration") {
+                if let Err(rollback_err) =
+                    conn.execute_batch("ROLLBACK TO migration; RELEASE migration")
+                {
                     tracing::error!(
                         version,
                         migration_error = %e,
@@ -529,6 +535,176 @@ const V20_ASSET_COLUMNS: &[(&str, &str)] = &[
     ("capture_repair_output_size", "INTEGER"),
 ];
 
+const SCHEMA_V21: &str = r"
+CREATE TABLE IF NOT EXISTS asset_replicas (
+    path_key BLOB PRIMARY KEY NOT NULL,
+    local_path BLOB NOT NULL,
+    library TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    version_size TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'downloaded', 'failed', 'historical')),
+    last_seen_at INTEGER NOT NULL,
+    downloaded_at INTEGER,
+    download_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    local_checksum TEXT,
+    download_checksum TEXT,
+    metadata_write_failed_at INTEGER,
+    imported_size INTEGER,
+    imported_mtime INTEGER,
+    capture_repair_metadata_hash TEXT,
+    capture_repair_output_checksum TEXT,
+    capture_repair_output_size INTEGER,
+    FOREIGN KEY (library, asset_id, version_size)
+        REFERENCES assets (library, id, version_size) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_replicas_identity
+    ON asset_replicas (library, asset_id, version_size);
+CREATE INDEX IF NOT EXISTS idx_asset_replicas_state
+    ON asset_replicas (status, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_asset_replicas_metadata_failure
+    ON asset_replicas (metadata_write_failed_at)
+    WHERE metadata_write_failed_at IS NOT NULL;
+";
+
+struct LegacyReplica {
+    library: String,
+    asset_id: String,
+    version_size: String,
+    status: String,
+    local_path: String,
+    last_seen_at: i64,
+    downloaded_at: Option<i64>,
+    download_attempts: i64,
+    last_error: Option<String>,
+    local_checksum: Option<String>,
+    download_checksum: Option<String>,
+    metadata_write_failed_at: Option<i64>,
+    imported_size: Option<i64>,
+    imported_mtime: Option<i64>,
+    capture_repair_metadata_hash: Option<String>,
+    capture_repair_output_checksum: Option<String>,
+    capture_repair_output_size: Option<i64>,
+}
+
+fn migrate_v21(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(SCHEMA_V21)?;
+    let legacy_replicas = {
+        let mut stmt = conn.prepare(
+            "SELECT library, id, version_size, status, local_path, last_seen_at, \
+                downloaded_at, download_attempts, last_error, local_checksum, \
+                download_checksum, metadata_write_failed_at, imported_size, imported_mtime, \
+                capture_repair_metadata_hash, capture_repair_output_checksum, \
+                capture_repair_output_size \
+             FROM assets WHERE local_path IS NOT NULL \
+             ORDER BY library, id, version_size",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(LegacyReplica {
+                library: row.get(0)?,
+                asset_id: row.get(1)?,
+                version_size: row.get(2)?,
+                status: row.get(3)?,
+                local_path: row.get(4)?,
+                last_seen_at: row.get(5)?,
+                downloaded_at: row.get(6)?,
+                download_attempts: row.get(7)?,
+                last_error: row.get(8)?,
+                local_checksum: row.get(9)?,
+                download_checksum: row.get(10)?,
+                metadata_write_failed_at: row.get(11)?,
+                imported_size: row.get(12)?,
+                imported_mtime: row.get(13)?,
+                capture_repair_metadata_hash: row.get(14)?,
+                capture_repair_output_checksum: row.get(15)?,
+                capture_repair_output_size: row.get(16)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut downloaded_backfilled = false;
+    for legacy in legacy_replicas {
+        let path = OwnedPathBytes::from_path(Path::new(&legacy.local_path))?;
+        let path_key = path.ownership_key();
+        let local_path = path.into_bytes();
+        let existing_owner: Option<(Vec<u8>, String, String, String)> = conn
+            .query_row(
+                "SELECT local_path, library, asset_id, version_size \
+                 FROM asset_replicas WHERE path_key = ?1",
+                [&path_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some(existing_owner) = existing_owner {
+            if existing_owner
+                != (
+                    local_path.clone(),
+                    legacy.library.clone(),
+                    legacy.asset_id.clone(),
+                    legacy.version_size.clone(),
+                )
+            {
+                return Err(StateError::Invariant {
+                    operation: "migrate_v21",
+                    detail: "normalised local path is already owned by a different asset replica"
+                        .into(),
+                });
+            }
+            downloaded_backfilled |= legacy.status == "downloaded";
+            continue;
+        }
+
+        let replica_status = match legacy.status.as_str() {
+            "pending" => "pending",
+            "downloaded" => "downloaded",
+            "failed" => "failed",
+            _ => "historical",
+        };
+        conn.execute(
+            "INSERT INTO asset_replicas (
+                path_key, local_path, library, asset_id, version_size, status, last_seen_at,
+                downloaded_at, download_attempts, last_error, local_checksum, download_checksum,
+                metadata_write_failed_at, imported_size, imported_mtime,
+                capture_repair_metadata_hash, capture_repair_output_checksum,
+                capture_repair_output_size
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+             )",
+            rusqlite::params![
+                path_key,
+                local_path,
+                legacy.library,
+                legacy.asset_id,
+                legacy.version_size,
+                replica_status,
+                legacy.last_seen_at,
+                legacy.downloaded_at,
+                legacy.download_attempts,
+                legacy.last_error,
+                legacy.local_checksum,
+                legacy.download_checksum,
+                legacy.metadata_write_failed_at,
+                legacy.imported_size,
+                legacy.imported_mtime,
+                legacy.capture_repair_metadata_hash,
+                legacy.capture_repair_output_checksum,
+                legacy.capture_repair_output_size,
+            ],
+        )?;
+        downloaded_backfilled |= replica_status == "downloaded";
+    }
+
+    if downloaded_backfilled {
+        conn.execute(
+            "INSERT OR IGNORE INTO metadata (key, value) VALUES (?1, '1')",
+            [REPLICA_RECONCILIATION_REQUIRED_KEY],
+        )?;
+    }
+    Ok(())
+}
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -694,6 +870,7 @@ fn migrate_to_version(
                 }
             }
         }
+        21 => migrate_v21(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -2088,6 +2265,264 @@ mod tests {
         for (column, _) in V20_ASSET_COLUMNS {
             assert!(column_exists(&conn, "assets", column).unwrap());
         }
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    fn migrate_to_v20(conn: &Connection) {
+        for version in 1..=20 {
+            migrate_to_version(conn, 0, version).unwrap();
+        }
+        set_schema_version(conn, 20).unwrap();
+    }
+
+    #[test]
+    fn test_v21_fresh_schema_has_exact_path_replica_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let columns: Vec<(String, String, i64)> = conn
+            .prepare("PRAGMA table_info(asset_replicas)")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(5)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(columns.len(), 18);
+        assert!(
+            columns
+                .iter()
+                .any(|(name, kind, pk)| name == "path_key" && kind == "BLOB" && *pk == 1)
+        );
+        assert!(
+            columns
+                .iter()
+                .any(|(name, kind, _)| name == "local_path" && kind == "BLOB")
+        );
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name LIKE 'idx_asset_replicas_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3);
+    }
+
+    #[test]
+    fn test_v21_backfills_replica_evidence_and_reconciliation_marker() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_to_v20(&conn);
+        let local_path = std::env::current_dir().unwrap().join("legacy-photo.jpg");
+        conn.execute(
+            "INSERT INTO assets (
+                library, id, version_size, checksum, filename, created_at, size_bytes,
+                media_type, status, downloaded_at, local_path, last_seen_at,
+                download_attempts, last_error, local_checksum, download_checksum,
+                metadata_write_failed_at, imported_size, imported_mtime,
+                capture_repair_metadata_hash, capture_repair_output_checksum,
+                capture_repair_output_size
+             ) VALUES (
+                'SharedSync-A', 'legacy', 'original', 'provider', 'legacy-photo.jpg', 10, 123,
+                'photo', 'downloaded', 20, ?1, 30, 4, 'old error', 'local', 'download',
+                40, 123, 50, 'metadata', 'output', 124
+             )",
+            [local_path.to_string_lossy()],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        struct BackfilledReplica {
+            path_key: Vec<u8>,
+            local_path: Vec<u8>,
+            library: String,
+            asset_id: String,
+            version_size: String,
+            status: String,
+            last_seen_at: i64,
+            downloaded_at: Option<i64>,
+            download_attempts: i64,
+            last_error: Option<String>,
+            local_checksum: Option<String>,
+            download_checksum: Option<String>,
+            metadata_write_failed_at: Option<i64>,
+            imported_size: Option<i64>,
+            imported_mtime: Option<i64>,
+            capture_repair_metadata_hash: Option<String>,
+            capture_repair_output_checksum: Option<String>,
+            capture_repair_output_size: Option<i64>,
+        }
+        let replica = conn
+            .query_row(
+                "SELECT path_key, local_path, library, asset_id, version_size, status,
+                    last_seen_at, downloaded_at, download_attempts, last_error,
+                    local_checksum, download_checksum, metadata_write_failed_at,
+                    imported_size, imported_mtime, capture_repair_metadata_hash,
+                    capture_repair_output_checksum, capture_repair_output_size
+                 FROM asset_replicas",
+                [],
+                |row| {
+                    Ok(BackfilledReplica {
+                        path_key: row.get(0)?,
+                        local_path: row.get(1)?,
+                        library: row.get(2)?,
+                        asset_id: row.get(3)?,
+                        version_size: row.get(4)?,
+                        status: row.get(5)?,
+                        last_seen_at: row.get(6)?,
+                        downloaded_at: row.get(7)?,
+                        download_attempts: row.get(8)?,
+                        last_error: row.get(9)?,
+                        local_checksum: row.get(10)?,
+                        download_checksum: row.get(11)?,
+                        metadata_write_failed_at: row.get(12)?,
+                        imported_size: row.get(13)?,
+                        imported_mtime: row.get(14)?,
+                        capture_repair_metadata_hash: row.get(15)?,
+                        capture_repair_output_checksum: row.get(16)?,
+                        capture_repair_output_size: row.get(17)?,
+                    })
+                },
+            )
+            .unwrap();
+        let encoded = OwnedPathBytes::from_path(&local_path).unwrap();
+        assert_eq!(replica.path_key, encoded.ownership_key());
+        assert_eq!(replica.local_path, encoded.into_bytes());
+        assert_eq!(replica.library, "SharedSync-A");
+        assert_eq!(replica.asset_id, "legacy");
+        assert_eq!(replica.version_size, "original");
+        assert_eq!(replica.status, "downloaded");
+        assert_eq!(replica.last_seen_at, 30);
+        assert_eq!(replica.downloaded_at, Some(20));
+        assert_eq!(replica.download_attempts, 4);
+        assert_eq!(replica.last_error.as_deref(), Some("old error"));
+        assert_eq!(replica.local_checksum.as_deref(), Some("local"));
+        assert_eq!(replica.download_checksum.as_deref(), Some("download"));
+        assert_eq!(replica.metadata_write_failed_at, Some(40));
+        assert_eq!(replica.imported_size, Some(123));
+        assert_eq!(replica.imported_mtime, Some(50));
+        assert_eq!(
+            replica.capture_repair_metadata_hash.as_deref(),
+            Some("metadata")
+        );
+        assert_eq!(
+            replica.capture_repair_output_checksum.as_deref(),
+            Some("output")
+        );
+        assert_eq!(replica.capture_repair_output_size, Some(124));
+        let marker: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                [REPLICA_RECONCILIATION_REQUIRED_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "1");
+    }
+
+    #[test]
+    fn test_v21_leaves_null_paths_only_in_assets() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_to_v20(&conn);
+        conn.execute(
+            "INSERT INTO assets (
+                library, id, version_size, checksum, filename, created_at,
+                size_bytes, media_type, status, last_seen_at
+             ) VALUES (
+                'PrimarySync', 'no-path', 'original', 'provider', 'no-path.jpg', 10,
+                123, 'photo', 'downloaded', 30
+             )",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM assets", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM asset_replicas", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let marker: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                [REPLICA_RECONCILIATION_REQUIRED_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(marker, None);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn test_v21_case_variant_paths_remain_distinct() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_to_v20(&conn);
+        #[cfg(target_os = "macos")]
+        let paths = ("/Photos/Case.JPG", "/photos/case.jpg");
+        #[cfg(target_os = "windows")]
+        let paths = (r"C:\Photos\Case.JPG", r"c:\photos\case.jpg");
+        for (id, path) in [("first", paths.0), ("second", paths.1)] {
+            conn.execute(
+                "INSERT INTO assets (
+                    library, id, version_size, checksum, filename, created_at,
+                    size_bytes, media_type, status, local_path, last_seen_at
+                 ) VALUES (
+                    'PrimarySync', ?1, 'original', 'provider', ?1, 10,
+                    123, 'photo', 'downloaded', ?2, 30
+                 )",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM asset_replicas", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_v21_migration_is_idempotent_after_schema_application() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_to_v20(&conn);
+        let local_path = std::env::current_dir().unwrap().join("idempotent.jpg");
+        conn.execute(
+            "INSERT INTO assets (
+                library, id, version_size, checksum, filename, created_at,
+                size_bytes, media_type, status, local_path, last_seen_at
+             ) VALUES (
+                'PrimarySync', 'idempotent', 'original', 'provider', 'idempotent.jpg', 10,
+                123, 'photo', 'downloaded', ?1, 30
+             )",
+            [local_path.to_string_lossy()],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        set_schema_version(&conn, 20).unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM asset_replicas", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 

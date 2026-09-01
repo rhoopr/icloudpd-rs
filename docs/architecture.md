@@ -185,18 +185,27 @@ Path-hash staging, reconciliation, and promotion run only in download mode.
 Print-only and dry-run planning use catalogue and filesystem evidence without
 mutating path-hash metadata, catalogue rows, or local files.
 
-Path reconciliation resolves every exact downloaded version in the selected
+`assets` owns provider identity, metadata, deletion state, and compatibility
+aggregates. `asset_replicas` owns each exact local path and its transfer,
+checksum, metadata, capture-repair, import, and retry evidence. Paths use a
+lossless native encoding as their exact ownership key. Filesystem collision and
+no-overwrite checks remain authoritative where a volume aliases distinct path
+spellings. Content equality never grants ownership of an unrecorded path.
+Pending tasks claim the exact replica before file I/O, and success or failure
+finalises only that path.
+
+Path reconciliation resolves every downloaded replica in the selected
 catalogue scope, independently of current date, media, filename, resolution,
 RAW, edited, alternative, or Live Photo eligibility. It recognises exact,
-AM/PM-equivalent, size-suffixed, and identity-suffixed paths owned by that row
-before ordinary collision handling, so an asset cannot collide with its own
-file. An exact target is retired only after its current path is validated,
-verified publication and state finalisation succeed, or provider deletion is
-durably applied. Newly eligible versions without downloaded rows remain the
-following full enumeration's responsibility. A changed provider checksum or
-size is requeued for download rather than copying stale local bytes.
-Reconciliation-detected retry work does not consume a download attempt before
-a transfer is made.
+AM/PM-equivalent, size-suffixed, and identity-suffixed paths owned by that
+replica before ordinary collision handling, so an asset cannot collide with
+its own file. A downloaded source becomes historical only after all selected
+destinations converge or durable replacement work owns the new path. Historical
+files remain on disk and retain ownership evidence. Newly eligible versions
+without downloaded replicas remain the following full enumeration's
+responsibility. A changed provider checksum or size is requeued rather than
+copying stale local bytes. Reconciliation-detected retry work does not consume
+a download attempt before a transfer is made.
 Normal full and incremental planning applies the same proof before primary
 collision handling: the selected primary version, effective library, provider
 checksum, recorded collision family, regular-file type, and recorded integrity
@@ -221,9 +230,9 @@ provider errors, interruption, or a stale pass plan retains the pending hash
 for the next cycle.
 While a path hash is pending, the cycle reconciles every active library plan
 before any library starts inventory, retry, bridge, metadata capture, provider
-metadata refresh, or rewrite-drain work. It unions exact `(library, asset)`
-blocks across those reconciliations and passes the complete set to every
-library, including cross-zone album producers. Promotion waits for every selected smart-folder membership query and matching
+metadata refresh, or rewrite-drain work. Failed work remains represented by its
+exact pending or failed replica instead of suppressing every path for the
+asset. Promotion waits for every selected collection membership query and
 selected-pass path reconciliation to complete.
 
 For a genuine path change, reconciliation copies verified bytes and source
@@ -247,11 +256,13 @@ without embedded writes, and makes the retained destination directory durable.
 A source sidecar is rendered from an explicit confined regular-file snapshot or
 an explicit confined empty seed. That seed is revalidated immediately before
 conditional descriptor-relative destination publication, which is the sidecar
-snapshot linearization point. A later source edit is an external concurrent
-change, as it is after normal sync, and does not block state finalization. The
-destination sidecar may be absent, byte-identical to the source seed, or
-already byte-identical to the expected provider-merged output; any other
-destination is a conflict. Immediately before state finalization,
+snapshot linearization point. Source-media GPS must be read successfully before
+destination sidecar publication; a transient read failure publishes no sidecar
+and leaves reconciliation retryable. A later source edit is an external
+concurrent change, as it is after normal sync, and does not block state
+finalization. The destination sidecar may be absent, byte-identical to the
+source seed, or already byte-identical to the expected provider-merged output;
+any other destination is a conflict. Immediately before state finalization,
 reconciliation reopens the destination media through the retained parent,
 verifies its stable file identity and SHA-256, reapplies the capture time and
 source permissions, and proves the configured root and descendant namespace
@@ -263,9 +274,12 @@ temporary, and destination entries must remain regular files across
 fingerprinting; links and special files are never followed or accepted as
 reconciled media. The earlier copy stays where it is: kei never deletes local
 media, and no command removes a file that no longer matches a derived path.
-`import-existing` adopts through the same derivation. Assets without a usable
-offset retain host-local paths and remain compatible with icloudpd's
-date-folder layout.
+`import-existing` adopts each matched exact path through the same derivation.
+`verify` and `reconcile` inspect every downloaded replica. `manifest` emits one
+row per replica while retaining the existing fields. Status keeps asset totals
+and separately reports downloaded, pending, and failed replica paths so backup
+safety includes sibling debt. Assets without a usable offset retain host-local
+paths and remain compatible with icloudpd's date-folder layout.
 
 Existing embedded and sidecar timestamps are repaired only through the
 explicit `sync --refresh-metadata` flow, which is bounded by the same
@@ -493,14 +507,13 @@ kei-owned source GPS fields as unknown, and retain the metadata retry marker.
 Readable unsupported or malformed metadata permits a CloudKit-only sidecar.
 Source media is never opened for writing on this path.
 
-A drain only rewrites a file whose bytes still match the checksum on its row,
-because the alternative is embedding into damage and then vouching for it. A
-file that no longer matches keeps its marker and its recorded checksum, so
-`kei verify --checksums` and `kei reconcile` continue to report it. When a
-rewrite does change the media, the new hash is stored before the marker
-retires, and the pre-rewrite hash is kept as the provider download checksum so
-reconcile can still tell an intentional rewrite from a truncated file. A
-retired marker therefore implies the row describes the bytes on disk.
+A drain only rewrites a file whose bytes still match the checksum on its
+replica. A file that no longer matches keeps that replica's marker and recorded
+checksum, so `kei verify --checksums` and `kei reconcile` continue to report
+it. When a rewrite changes the media, the new hash is stored before that
+replica's marker retires, and the pre-rewrite hash is kept as its provider
+download checksum. A successful sibling cannot clear another path's metadata
+or capture-repair debt.
 
 Capture timestamp repair records the current provider metadata hash as durable
 intent. Before publishing changed media, it records the exact prepared output

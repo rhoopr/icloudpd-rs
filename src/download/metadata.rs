@@ -5204,8 +5204,21 @@ mod tests {
         let retained_path = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
-            .map(|entry| entry.path().join("entry"))
-            .find(|path| path.is_file())
+            .find_map(|entry| {
+                let path = entry.path();
+                let quarantined = path.join("entry");
+                if quarantined.is_file() {
+                    Some(quarantined)
+                } else if path.is_file()
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".kei-xmp-"))
+                {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
             .expect("ambiguous temp must be retained");
 
         super::write_sidecar(

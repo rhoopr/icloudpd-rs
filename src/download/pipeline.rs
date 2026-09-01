@@ -852,41 +852,46 @@ pub(super) async fn state_proven_primary_path(
 ) -> Option<PathBuf> {
     let primary = derive_primary_for_path_proof(asset, config)?;
     let library = effective_asset_library(asset, config);
-    let recorded_file = ctx.downloaded_file_matching_checksum(
+    let recorded_files = ctx.downloaded_files_matching_checksum(
         library,
         asset.state_id(),
         primary.version_size,
         &primary.checksum,
-    )?;
-    if !stored_path_matches_current_collision_family(
-        asset.state_id(),
-        &primary,
-        config,
-        None,
-        &recorded_file.path,
-    )
-    .await
-    {
-        return None;
-    }
+    );
+    for recorded_file in recorded_files {
+        if !stored_path_matches_current_collision_family(
+            asset.state_id(),
+            &primary,
+            config,
+            None,
+            &recorded_file.path,
+        )
+        .await
+        {
+            continue;
+        }
 
-    task_planner.prepare_path_parent(&recorded_file.path).await;
-    let (existing_path, existing_size) = task_planner
-        .existing_regular_path_with_size(&recorded_file.path)
-        .await?;
-    if !state_path_size_allows_skip(
-        asset.id(),
-        primary.version_size,
-        &existing_path,
-        existing_size,
-        primary.size,
-        recorded_file,
-    )
-    .await
-    {
-        return None;
+        task_planner.prepare_path_parent(&recorded_file.path).await;
+        let Some((existing_path, existing_size)) = task_planner
+            .existing_regular_path_with_size(&recorded_file.path)
+            .await
+        else {
+            continue;
+        };
+        if state_path_size_allows_skip(
+            asset.id(),
+            primary.version_size,
+            &existing_path,
+            existing_size,
+            primary.size,
+            recorded_file,
+        )
+        .await
+        {
+            return Some(existing_path);
+        }
     }
-    Some(existing_path)
+    None
 }
 
 pub(super) async fn stored_path_matches_current_collision_family(
@@ -1016,8 +1021,10 @@ pub(super) async fn state_confirmed_current_path_exists(
     task_planner: &mut TaskPlanner,
     proven_primary_path: Option<&Path>,
 ) -> Option<PathBuf> {
-    let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
-    let stored_path = &recorded_file.path;
+    let recorded_files = ctx.downloaded_files(&task.library, &task.asset_id, task.version_size);
+    if recorded_files.is_empty() {
+        return None;
+    }
     let derived_paths =
         derive_expected_paths_with_proven_primary_path(asset, config, proven_primary_path);
 
@@ -1031,7 +1038,10 @@ pub(super) async fn state_confirmed_current_path_exists(
         else {
             continue;
         };
-        if existing_path.as_path() == stored_path.as_path() {
+        if let Some(recorded_file) = recorded_files
+            .iter()
+            .find(|recorded| recorded.path == existing_path)
+        {
             if state_path_size_allows_skip(
                 asset.id(),
                 derived.version_size,
@@ -1052,31 +1062,37 @@ pub(super) async fn state_confirmed_current_path_exists(
         if derived.version_size != task.version_size {
             continue;
         }
-        if !stored_path_matches_current_collision_family(
-            asset.state_id(),
-            derived,
-            config,
-            proven_primary_path,
-            stored_path,
-        )
-        .await
-        {
-            continue;
-        }
-        let (existing_path, existing_size) = task_planner
-            .existing_regular_path_with_size(stored_path)
-            .await?;
-        if state_path_size_allows_skip(
-            asset.id(),
-            task.version_size,
-            &existing_path,
-            existing_size,
-            derived.size,
-            recorded_file,
-        )
-        .await
-        {
-            return Some(existing_path);
+        for recorded_file in recorded_files {
+            let stored_path = &recorded_file.path;
+            if !stored_path_matches_current_collision_family(
+                asset.state_id(),
+                derived,
+                config,
+                proven_primary_path,
+                stored_path,
+            )
+            .await
+            {
+                continue;
+            }
+            let Some((existing_path, existing_size)) = task_planner
+                .existing_regular_path_with_size(stored_path)
+                .await
+            else {
+                continue;
+            };
+            if state_path_size_allows_skip(
+                asset.id(),
+                task.version_size,
+                &existing_path,
+                existing_size,
+                derived.size,
+                recorded_file,
+            )
+            .await
+            {
+                return Some(existing_path);
+            }
         }
         return None;
     }
@@ -1858,14 +1874,6 @@ where
                                 }
                             }
                         }
-                        if config.is_reconciliation_blocked(&asset) {
-                            tracing::warn!(
-                                asset_id = %asset.state_id(),
-                                "Skipping cycle-blocked asset after unsafe path reconciliation"
-                            );
-                            producer_pb.inc(1);
-                            continue;
-                        }
                         // Apply changed provider metadata before filtering and
                         // path planning, so a metadata-only edit reaches the
                         // catalogue even when the media task is filtered or
@@ -2112,6 +2120,7 @@ where
                                         {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            continue;
                                         }
                                         let size = task.size;
                                         if task_tx.send(task).await.is_err() {
@@ -2213,6 +2222,7 @@ where
                                                         1,
                                                         std::sync::atomic::Ordering::Relaxed,
                                                     );
+                                                    continue;
                                                 }
                                                 let size = task.size;
                                                 if task_tx.send(task).await.is_err() {
@@ -2714,7 +2724,6 @@ async fn finalize_streaming_download(
                 metadata_flags,
                 Arc::clone(&config.temp_suffix),
                 &pipeline_shutdown,
-                config.reconciliation_blocked_asset_ids.as_ref(),
             )
             .await
             .failed;
@@ -4833,6 +4842,75 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::state::ReplicaStateStore for FailingDownloadStore {
+        async fn list_replicas(&self) -> Result<Vec<crate::state::AssetReplica>, StateError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_replicas_for_asset_version(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<crate::state::AssetReplica>, StateError> {
+            Ok(Vec::new())
+        }
+
+        async fn claim_pending_replica(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Path,
+        ) -> Result<bool, StateError> {
+            Ok(true)
+        }
+
+        async fn finalize_downloaded_replica(
+            &self,
+            library: &str,
+            asset_id: &str,
+            version_size: &str,
+            local_path: &Path,
+            evidence: &crate::state::ReplicaDownloadEvidence,
+            _: bool,
+            _: bool,
+        ) -> Result<(), StateError> {
+            self.mark_downloaded(
+                library,
+                asset_id,
+                version_size,
+                local_path,
+                &evidence.local_checksum,
+                evidence.download_checksum.as_deref(),
+            )
+            .await
+        }
+
+        async fn finalize_failed_replica(
+            &self,
+            library: &str,
+            asset_id: &str,
+            version_size: &str,
+            _: &Path,
+            error: &str,
+        ) -> Result<(), StateError> {
+            self.mark_failed(library, asset_id, version_size, error)
+                .await
+        }
+
+        async fn mark_replica_historical(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Path,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ImportStateStore for FailingDownloadStore {
         async fn import_adopt(
             &self,
@@ -4848,7 +4926,8 @@ mod tests {
         async fn get_all_imported_records(
             &self,
             _: &str,
-        ) -> Result<HashMap<(String, String), crate::state::ImportedRecord>, StateError> {
+        ) -> Result<HashMap<(String, String, PathBuf), crate::state::ImportedRecord>, StateError>
+        {
             Ok(HashMap::new())
         }
     }
@@ -5245,6 +5324,7 @@ mod tests {
             download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
+            metadata_write_succeeded: true,
             mark_capture_repair: false,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
@@ -5264,6 +5344,7 @@ mod tests {
             download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
+            metadata_write_succeeded: true,
             mark_capture_repair: false,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
@@ -5285,6 +5366,7 @@ mod tests {
             download_path: PathBuf::from("/tmp/codex/kei/photo.jpg"),
             local_checksum: "abc".into(),
             download_checksum: None,
+            metadata_write_succeeded: true,
             mark_capture_repair: false,
         }];
         let failures = flush_pending_state_writes(&db, &pending).await;
@@ -5305,6 +5387,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo1.jpg"),
                 local_checksum: "abc".into(),
                 download_checksum: None,
+                metadata_write_succeeded: true,
                 mark_capture_repair: false,
             },
             PendingStateWrite {
@@ -5314,6 +5397,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo2.jpg"),
                 local_checksum: "def".into(),
                 download_checksum: None,
+                metadata_write_succeeded: true,
                 mark_capture_repair: false,
             },
         ];
@@ -5338,6 +5422,7 @@ mod tests {
                 download_path: PathBuf::from(format!("/tmp/codex/kei/photo_{i}.jpg")),
                 local_checksum: format!("ck_{i}"),
                 download_checksum: Some(format!("dl_ck_{i}")),
+                metadata_write_succeeded: true,
                 mark_capture_repair: false,
             })
             .collect();
@@ -5358,6 +5443,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo1.jpg"),
                 local_checksum: "abc".into(),
                 download_checksum: None,
+                metadata_write_succeeded: true,
                 mark_capture_repair: false,
             },
             PendingStateWrite {
@@ -5367,6 +5453,7 @@ mod tests {
                 download_path: PathBuf::from("/tmp/codex/kei/photo2.jpg"),
                 local_checksum: "def".into(),
                 download_checksum: None,
+                metadata_write_succeeded: true,
                 mark_capture_repair: false,
             },
         ];
@@ -5571,6 +5658,16 @@ mod tests {
             ))
             .await
             .unwrap();
+            assert!(
+                db.claim_pending_replica(
+                    "PrimarySync",
+                    &task.asset_id,
+                    task.version_size.as_str(),
+                    &task.download_path,
+                )
+                .await
+                .unwrap()
+            );
         }
 
         let client = Client::new();
@@ -5911,7 +6008,6 @@ mod tests {
             enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
-            reconciliation_blocked_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
             library: std::sync::Arc::from("PrimarySync"),
@@ -5992,7 +6088,6 @@ mod tests {
             enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
-            reconciliation_blocked_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
             bandwidth_limiter: None,
             library: std::sync::Arc::from("PrimarySync"),
@@ -8063,13 +8158,7 @@ mod tests {
             result.skip_summary.by_state, 0,
             "deleted-but-DB-downloaded asset must not be state-skipped"
         );
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(
-            failed.len(),
-            1,
-            "deleted file must be forwarded for re-download (which fails against the dead URL)"
-        );
-        assert_eq!(&*failed[0].id, "DELETED");
+        assert_one_failed_replica(&db, "DELETED").await;
     }
 
     async fn assert_metadata_mutated_downloaded_file_is_not_redownloaded(on_disk_size: usize) {
@@ -8183,6 +8272,20 @@ mod tests {
         bare_path.with_file_name(crate::download::paths::insert_asset_identity_suffix(
             filename, asset_id,
         ))
+    }
+
+    async fn assert_one_failed_replica(db: &crate::state::SqliteStateDb, asset_id: &str) {
+        let replicas = db
+            .list_replicas_for_asset_version("PrimarySync", asset_id, "original")
+            .await
+            .unwrap();
+        assert_eq!(
+            replicas
+                .iter()
+                .filter(|replica| replica.status == crate::state::ReplicaStatus::Failed)
+                .count(),
+            1
+        );
     }
 
     fn suffixed_collision_asset(id: &str, checksum: &str) -> PhotoAsset {
@@ -8914,6 +9017,7 @@ mod tests {
             state_before_read_only
         );
 
+        let state_id = asset.state_id().to_string();
         let result = stream_and_download_from_stream(
             &reqwest::Client::new(),
             stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
@@ -8932,11 +9036,25 @@ mod tests {
         assert!(!ordinal_motion.exists());
         assert!(bare_motion.is_symlink());
         assert_eq!(fs::read(&stored_motion).unwrap(), vec![2u8; 3000]);
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(failed.len(), 1);
+        let replicas = db
+            .list_replicas_for_asset_version("PrimarySync", &state_id, "live_original")
+            .await
+            .unwrap();
         assert_eq!(
-            failed[0].local_path.as_deref(),
-            Some(stored_motion.as_path())
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == bare_motion)
+                .unwrap()
+                .status,
+            crate::state::ReplicaStatus::Failed
+        );
+        assert_eq!(
+            replicas
+                .iter()
+                .find(|replica| replica.local_path == stored_motion)
+                .unwrap()
+                .status,
+            crate::state::ReplicaStatus::Downloaded
         );
     }
 
@@ -9292,13 +9410,7 @@ mod tests {
             result.skip_summary.on_disk, 0,
             "truncated suffixed file must not be counted as an on-disk skip"
         );
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(
-            failed.len(),
-            1,
-            "truncated suffixed file must be forwarded for re-download"
-        );
-        assert_eq!(&*failed[0].id, "TRUNCATED_SUFFIXED_B");
+        assert_one_failed_replica(&db, "TRUNCATED_SUFFIXED_B").await;
     }
 
     /// A state-backed identity-suffixed skip is valid only for the current
@@ -9378,13 +9490,7 @@ mod tests {
             result.skip_summary.on_disk, 0,
             "old directory state path must not count as a current on-disk skip"
         );
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(
-            failed.len(),
-            1,
-            "missing new target must be forwarded for re-download"
-        );
-        assert_eq!(&*failed[0].id, "OLD_DIR_SUFFIXED_B");
+        assert_one_failed_replica(&db, "OLD_DIR_SUFFIXED_B").await;
     }
 
     /// Capture-local derivation can move an asset into a different date
@@ -9460,9 +9566,7 @@ mod tests {
             result.skip_summary.on_disk, 0,
             "a host-local stored path must not satisfy the capture-local target"
         );
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(failed.len(), 1, "missing capture-local target is forwarded");
-        assert_eq!(&*failed[0].id, "CAPTURE_OFFSET_MOVE");
+        assert_one_failed_replica(&db, "CAPTURE_OFFSET_MOVE").await;
         assert!(
             host_local_path.exists(),
             "the earlier copy must survive; kei does not delete local media"
@@ -9555,13 +9659,7 @@ mod tests {
             result.skip_summary.on_disk, 0,
             "truncated downloaded file must not be counted as an on-disk skip"
         );
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(
-            failed.len(),
-            1,
-            "truncated file must be forwarded for re-download (which fails against the dead URL)"
-        );
-        assert_eq!(&*failed[0].id, "TRUNCATED_DOWNLOADED");
+        assert_one_failed_replica(&db, "TRUNCATED_DOWNLOADED").await;
     }
 
     /// When zero assets were downloaded but the producer saw enumeration

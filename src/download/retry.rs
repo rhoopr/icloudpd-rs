@@ -20,6 +20,7 @@ pub(super) struct PendingRetryTarget {
     pub(super) library: Arc<str>,
     pub(super) asset_id: Arc<str>,
     pub(super) version_size: VersionSizeKey,
+    pub(super) local_path: Option<std::path::PathBuf>,
 }
 
 impl PendingRetryTarget {
@@ -28,14 +29,16 @@ impl PendingRetryTarget {
             library: Arc::clone(&record.library),
             asset_id: Arc::from(record.id.as_ref()),
             version_size: record.version_size,
+            local_path: record.local_path.clone(),
         }
     }
 
-    pub(super) fn from_task(task: &DownloadTask) -> Self {
+    fn from_replica(replica: &crate::state::AssetReplica) -> Self {
         Self {
-            library: Arc::clone(&task.library),
-            asset_id: Arc::clone(&task.asset_id),
-            version_size: task.version_size,
+            library: Arc::from(replica.library.as_str()),
+            asset_id: Arc::from(replica.asset_id.as_str()),
+            version_size: replica.version_size,
+            local_path: Some(replica.local_path.clone()),
         }
     }
 }
@@ -63,6 +66,24 @@ impl PendingRetryEvidence {
             downloaded_at: record.downloaded_at,
             size_bytes: record.size_bytes,
             last_error: record.last_error.as_deref().map(Into::into),
+        }
+    }
+
+    fn from_replica(
+        record: &crate::state::AssetRecord,
+        replica: &crate::state::AssetReplica,
+    ) -> Self {
+        Self {
+            checksum: Arc::from(record.checksum.as_ref()),
+            filename: Arc::from(record.filename.as_ref()),
+            local_file: Some(RecordedLocalFile {
+                path: replica.local_path.clone(),
+                local_checksum: replica.local_checksum.as_deref().map(Into::into),
+                download_checksum: replica.download_checksum.as_deref().map(Into::into),
+            }),
+            downloaded_at: replica.downloaded_at,
+            size_bytes: record.size_bytes,
+            last_error: replica.last_error.as_deref().map(Into::into),
         }
     }
 
@@ -196,24 +217,6 @@ fn select_legacy_candidate(
     }
 }
 
-pub(super) fn take_matching_pending_retry_tasks<I>(
-    tasks: I,
-    pending_targets: &mut FxHashSet<PendingRetryTarget>,
-    out: &mut Vec<DownloadTask>,
-) where
-    I: IntoIterator<Item = DownloadTask>,
-{
-    for task in tasks {
-        let target = PendingRetryTarget::from_task(&task);
-        if pending_targets.remove(&target) {
-            out.push(task);
-            if pending_targets.is_empty() {
-                break;
-            }
-        }
-    }
-}
-
 struct PendingRetryPlanning<'a> {
     db: &'a dyn DownloadStore,
     download_ctx: &'a super::DownloadContext,
@@ -223,17 +226,11 @@ struct PendingRetryPlanning<'a> {
     task_planner: &'a mut planner::TaskPlanner,
     tasks: &'a mut Vec<DownloadTask>,
     retry_sources: &'a mut FxHashMap<RetryTaskKey, UrlRetrySource>,
+    persist_state: bool,
 }
 
 impl PendingRetryPlanning<'_> {
     async fn plan_resolved_asset(&mut self, asset: &PhotoAsset, state_id: &str) -> Result<()> {
-        if self
-            .pass_configs
-            .first()
-            .is_some_and(|config| config.is_reconciliation_blocked(asset))
-        {
-            return Ok(());
-        }
         let mut malformed_targets = FxHashSet::default();
         let mut state_write_failed_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
@@ -253,46 +250,48 @@ impl PendingRetryPlanning<'_> {
                     proven_primary_path.as_deref(),
                 )
                 .await;
-            let targets: Vec<PendingRetryTarget> = self
-                .pending_targets
-                .iter()
-                .filter(|target| target.asset_id.as_ref() == state_id)
-                .cloned()
-                .collect();
-            for target in targets {
-                let Some(evidence) = self.pending_evidence.get(&target) else {
-                    continue;
-                };
-                match pipeline::adopt_pending_on_disk_for_retry(
-                    self.db,
-                    pass_config,
-                    asset,
-                    self.task_planner,
-                    &plan.tasks,
-                    pipeline::PendingRetryFileEvidence {
-                        version_size: target.version_size,
-                        filename: &evidence.filename,
-                        checksum: &evidence.checksum,
-                        local_path: evidence.local_path_evidence_under(&pass_config.directory),
-                        size: evidence.size_bytes,
-                    },
-                )
-                .await
-                {
-                    pipeline::PendingRetryAdoption::Adopted => {
-                        self.pending_targets.remove(&target);
-                        self.db
-                            .clear_asset_verification(
-                                &target.library,
-                                &target.asset_id,
-                                target.version_size.as_str(),
-                            )
-                            .await?;
+            if self.persist_state {
+                let targets: Vec<PendingRetryTarget> = self
+                    .pending_targets
+                    .iter()
+                    .filter(|target| target.asset_id.as_ref() == state_id)
+                    .cloned()
+                    .collect();
+                for target in targets {
+                    let Some(evidence) = self.pending_evidence.get(&target) else {
+                        continue;
+                    };
+                    match pipeline::adopt_pending_on_disk_for_retry(
+                        self.db,
+                        pass_config,
+                        asset,
+                        self.task_planner,
+                        &plan.tasks,
+                        pipeline::PendingRetryFileEvidence {
+                            version_size: target.version_size,
+                            filename: &evidence.filename,
+                            checksum: &evidence.checksum,
+                            local_path: evidence.local_path_evidence_under(&pass_config.directory),
+                            size: evidence.size_bytes,
+                        },
+                    )
+                    .await
+                    {
+                        pipeline::PendingRetryAdoption::Adopted => {
+                            self.pending_targets.remove(&target);
+                            self.db
+                                .clear_asset_verification(
+                                    &target.library,
+                                    &target.asset_id,
+                                    target.version_size.as_str(),
+                                )
+                                .await?;
+                        }
+                        pipeline::PendingRetryAdoption::StateWriteFailed => {
+                            state_write_failed_targets.insert(target);
+                        }
+                        pipeline::PendingRetryAdoption::NotFound => {}
                     }
-                    pipeline::PendingRetryAdoption::StateWriteFailed => {
-                        state_write_failed_targets.insert(target);
-                    }
-                    pipeline::PendingRetryAdoption::NotFound => {}
                 }
             }
             if let Some(reason) = plan.filter_reason {
@@ -309,76 +308,145 @@ impl PendingRetryPlanning<'_> {
                         .cloned(),
                 );
             }
-            let mut retry_tasks = Vec::with_capacity(plan.tasks.len());
-            for mut task in plan.tasks.into_iter().filter(|task| {
-                !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
-            }) {
-                let target = PendingRetryTarget::from_task(&task);
-                if self
-                    .task_planner
-                    .existing_path_match(&task.download_path)
-                    .await
-                    == planner::ExistingPathMatch::NonRegular
-                {
-                    retry_tasks.push(task);
+            let derived_paths = filter::derive_expected_paths_with_proven_primary_path(
+                asset,
+                pass_config.as_ref(),
+                proven_primary_path.as_deref(),
+            );
+            let mut retry_tasks = Vec::new();
+            for task_template in plan.tasks {
+                let Some(derived) = derived_paths
+                    .iter()
+                    .find(|derived| derived.version_size == task_template.version_size)
+                else {
+                    continue;
+                };
+                let matching_targets: Vec<PendingRetryTarget> = self
+                    .pending_targets
+                    .iter()
+                    .filter(|target| {
+                        target.asset_id.as_ref() == state_id
+                            && target.version_size == task_template.version_size
+                    })
+                    .cloned()
+                    .collect();
+                for target in matching_targets {
+                    if state_write_failed_targets.contains(&target) {
+                        continue;
+                    }
+                    let evidence = self.pending_evidence.get(&target);
+                    let repairs_recorded_path = pass_config.repair_truncated
+                        && evidence.is_some_and(|evidence| {
+                            evidence.last_error.as_deref()
+                                == Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+                        });
+                    if let Some(local_path) = target.local_path.as_deref()
+                        && !repairs_recorded_path
+                        && !pipeline::stored_path_matches_current_collision_family(
+                            asset.state_id(),
+                            derived,
+                            pass_config,
+                            proven_primary_path.as_deref(),
+                            local_path,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                    let mut task = task_template.clone();
+                    if self
+                        .task_planner
+                        .existing_path_match(&task.download_path)
+                        .await
+                        == planner::ExistingPathMatch::NonRegular
+                    {
+                        task.download_path = target
+                            .local_path
+                            .clone()
+                            .unwrap_or_else(|| task.download_path.clone());
+                        retry_tasks.push((target, task));
+                        continue;
+                    }
+                    if let Some(evidence) = evidence
+                        && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
+                    {
+                        if evidence.matches_provider_version(&task)
+                            && let Some(fingerprint) = evidence
+                                .truncated_repair_fingerprint(pass_config.repair_truncated)
+                                .await?
+                        {
+                            if !self
+                                .task_planner
+                                .claim_recorded_repair_path(
+                                    local_path,
+                                    &task.download_path,
+                                    task.size,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    asset_id = %task.asset_id,
+                                    version_size = %task.version_size.as_str(),
+                                    path = %local_path.display(),
+                                    "Could not reserve the recorded truncated path; retaining pending work"
+                                );
+                                continue;
+                            }
+                            task.download_path = local_path.to_path_buf();
+                            task.publication =
+                                file::FinalPublication::ReplaceTruncated(fingerprint);
+                        } else {
+                            let Some(retry_path) = self
+                                .task_planner
+                                .resolve_recorded_retry_path(
+                                    local_path,
+                                    &task.download_path,
+                                    task.size,
+                                    &task.asset_id,
+                                )
+                                .await
+                            else {
+                                tracing::warn!(
+                                    asset_id = %task.asset_id,
+                                    version_size = %task.version_size.as_str(),
+                                    path = %local_path.display(),
+                                    "Could not choose a safe sibling for the recorded retry path; retaining pending work"
+                                );
+                                continue;
+                            };
+                            task.download_path = retry_path;
+                        }
+                    }
+                    retry_tasks.push((target, task));
+                }
+            }
+            let mut queued_targets = Vec::new();
+            let first_new_task = self.tasks.len();
+            for (target, task) in retry_tasks {
+                if !self.pending_targets.contains(&target) {
                     continue;
                 }
-                if let Some(evidence) = self.pending_evidence.get(&target)
-                    && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
-                {
-                    if evidence.matches_provider_version(&task)
-                        && let Some(fingerprint) = evidence
-                            .truncated_repair_fingerprint(pass_config.repair_truncated)
-                            .await?
+                if self.persist_state {
+                    planner::upsert_seen_for_task(self.db, pass_config, asset, &task).await?;
+                    if target.local_path.as_deref() != Some(task.download_path.as_path())
+                        && let Some(old_path) = target.local_path.as_deref()
                     {
-                        if !self
-                            .task_planner
-                            .claim_recorded_repair_path(local_path, &task.download_path, task.size)
-                            .await
-                        {
-                            tracing::warn!(
-                                asset_id = %task.asset_id,
-                                version_size = %task.version_size.as_str(),
-                                path = %local_path.display(),
-                                "Could not reserve the recorded truncated path; retaining pending work"
-                            );
-                            continue;
-                        }
-                        task.download_path = local_path.to_path_buf();
-                        task.publication = file::FinalPublication::ReplaceTruncated(fingerprint);
-                    } else {
-                        let Some(retry_path) = self
-                            .task_planner
-                            .resolve_recorded_retry_path(
-                                local_path,
-                                &task.download_path,
-                                task.size,
-                                &task.asset_id,
+                        self.db
+                            .mark_replica_historical(
+                                &target.library,
+                                &target.asset_id,
+                                target.version_size.as_str(),
+                                old_path,
                             )
-                            .await
-                        else {
-                            tracing::warn!(
-                                asset_id = %task.asset_id,
-                                version_size = %task.version_size.as_str(),
-                                path = %local_path.display(),
-                                "Could not choose a safe sibling for the recorded retry path; retaining pending work"
-                            );
-                            continue;
-                        };
-                        task.download_path = retry_path;
+                            .await?;
                     }
                 }
-                retry_tasks.push(task);
+                self.pending_targets.remove(&target);
+                queued_targets.push(target);
+                self.tasks.push(task);
             }
-            let queued_targets: Vec<PendingRetryTarget> = retry_tasks
-                .iter()
-                .map(PendingRetryTarget::from_task)
-                .filter(|target| self.pending_targets.contains(target))
-                .collect();
-            let first_new_task = self.tasks.len();
-            take_matching_pending_retry_tasks(retry_tasks, self.pending_targets, self.tasks);
             for target in queued_targets {
-                if !self.pending_targets.contains(&target) {
+                if self.persist_state && !self.pending_targets.contains(&target) {
                     self.db
                         .clear_asset_verification(
                             &target.library,
@@ -410,15 +478,28 @@ impl PendingRetryPlanning<'_> {
             .cloned()
             .collect();
         for target in deferred_targets {
-            let transitioned = self
-                .db
-                .mark_policy_excluded(
-                    &target.library,
-                    &target.asset_id,
-                    target.version_size.as_str(),
-                )
-                .await?;
-            if transitioned {
+            let transitioned = if self.persist_state {
+                if let Some(local_path) = target.local_path.as_deref() {
+                    self.db
+                        .mark_replica_historical(
+                            &target.library,
+                            &target.asset_id,
+                            target.version_size.as_str(),
+                            local_path,
+                        )
+                        .await?;
+                }
+                self.db
+                    .mark_policy_excluded(
+                        &target.library,
+                        &target.asset_id,
+                        target.version_size.as_str(),
+                    )
+                    .await?
+            } else {
+                true
+            };
+            if transitioned || target.local_path.is_some() {
                 self.pending_targets.remove(&target);
             }
             tracing::info!(
@@ -431,6 +512,9 @@ impl PendingRetryPlanning<'_> {
             );
         }
         for target in state_write_failed_targets {
+            if !self.persist_state {
+                continue;
+            }
             if !self.pending_targets.contains(&target) {
                 continue;
             }
@@ -445,6 +529,9 @@ impl PendingRetryPlanning<'_> {
                 .await?;
         }
         for target in malformed_targets {
+            if !self.persist_state {
+                continue;
+            }
             if !self.pending_targets.contains(&target) {
                 continue;
             }
@@ -659,45 +746,124 @@ async fn revalidate_policy_excluded_assets(
     Ok(())
 }
 
+async fn load_retry_asset_records(
+    db: &dyn DownloadStore,
+) -> Result<FxHashMap<(String, String, VersionSizeKey), crate::state::AssetRecord>> {
+    const PAGE_SIZE: u32 = 1_000;
+    let mut records = FxHashMap::default();
+    for section in 0..3 {
+        let mut offset = 0_u64;
+        loop {
+            let page = match section {
+                0 => db.get_pending_page(offset, PAGE_SIZE).await?,
+                1 => db.get_failed_page(offset, PAGE_SIZE).await?,
+                _ => db.get_downloaded_page(offset, PAGE_SIZE).await?,
+            };
+            let page_len = page.len();
+            for record in page {
+                if record.metadata.is_deleted {
+                    continue;
+                }
+                records.insert(
+                    (
+                        record.library.to_string(),
+                        record.id.to_string(),
+                        record.version_size,
+                    ),
+                    record,
+                );
+            }
+            if page_len < PAGE_SIZE as usize {
+                break;
+            }
+            offset = offset.saturating_add(u64::from(PAGE_SIZE));
+        }
+    }
+    Ok(records)
+}
+
+#[cfg(test)]
 pub(super) async fn build_pending_retry_download_tasks(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     shutdown_token: CancellationToken,
 ) -> Result<PendingRetryPlan> {
+    build_pending_retry_download_tasks_with_state(passes, config, shutdown_token, true).await
+}
+
+pub(super) async fn build_pending_retry_download_tasks_with_state(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    shutdown_token: CancellationToken,
+    persist_state: bool,
+) -> Result<PendingRetryPlan> {
     let Some(db) = &config.state_db else {
         return Ok(PendingRetryPlan::default());
     };
 
-    revalidate_policy_excluded_assets(passes, config, &shutdown_token).await?;
+    if persist_state {
+        revalidate_policy_excluded_assets(passes, config, &shutdown_token).await?;
+    }
 
     let pending = db.get_pending().await?;
-    let mut pending_targets: FxHashSet<PendingRetryTarget> = pending
+    let asset_records = load_retry_asset_records(db.as_ref()).await?;
+    let replicas = db.list_replicas().await?;
+    let mut pending_targets = FxHashSet::default();
+    let mut pending_evidence = FxHashMap::default();
+    let mut replica_identities = FxHashSet::default();
+    for replica in replicas.iter().filter(|replica| {
+        replica.library == config.library.as_ref()
+            && matches!(
+                replica.status,
+                crate::state::ReplicaStatus::Pending | crate::state::ReplicaStatus::Failed
+            )
+    }) {
+        let key = (
+            replica.library.clone(),
+            replica.asset_id.clone(),
+            replica.version_size,
+        );
+        let Some(record) = asset_records.get(&key) else {
+            continue;
+        };
+        let target = PendingRetryTarget::from_replica(replica);
+        replica_identities.insert(key);
+        pending_evidence.insert(
+            target.clone(),
+            PendingRetryEvidence::from_replica(record, replica),
+        );
+        pending_targets.insert(target);
+    }
+    for record in pending
         .iter()
         .filter(|record| record.library.as_ref() == config.library.as_ref())
-        .map(PendingRetryTarget::from_record)
-        .collect();
+    {
+        let key = (
+            record.library.to_string(),
+            record.id.to_string(),
+            record.version_size,
+        );
+        if replica_identities.contains(&key) {
+            continue;
+        }
+        let target = PendingRetryTarget::from_record(record);
+        pending_evidence.insert(target.clone(), PendingRetryEvidence::from_record(record));
+        pending_targets.insert(target);
+    }
     if pending_targets.is_empty() {
         return Ok(PendingRetryPlan::default());
     }
-    let pending_evidence: FxHashMap<PendingRetryTarget, PendingRetryEvidence> = pending
-        .iter()
-        .filter(|record| record.library.as_ref() == config.library.as_ref())
-        .map(|record| {
-            (
-                PendingRetryTarget::from_record(record),
-                PendingRetryEvidence::from_record(record),
-            )
-        })
-        .collect();
-    let backfilled = db
-        .backfill_asset_master_mappings_from_album_memberships()
-        .await?;
-    if backfilled > 0 {
-        tracing::info!(
-            inserted = backfilled,
-            library = %config.library,
-            "Backfilled asset/master mappings before pending retry"
-        );
+    if persist_state {
+        let backfilled = db
+            .backfill_asset_master_mappings_from_album_memberships()
+            .await?;
+        if backfilled > 0 {
+            tracing::info!(
+                inserted = backfilled,
+                library = %config.library,
+                "Backfilled asset/master mappings before pending retry"
+            );
+        }
     }
 
     let requested = pending_targets.len();
@@ -706,11 +872,11 @@ pub(super) async fn build_pending_retry_download_tasks(
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
     let mut task_planner = planner::TaskPlanner::new();
-    let pending_state_ids: Vec<&str> = pending
+    let pending_state_ids: FxHashSet<&str> = pending_targets
         .iter()
-        .filter(|record| record.library.as_ref() == config.library.as_ref())
-        .map(|record| record.id.as_ref())
+        .map(|target| target.asset_id.as_ref())
         .collect();
+    let pending_state_ids: Vec<&str> = pending_state_ids.into_iter().collect();
     let ProviderLookupPlan {
         requests: lookup_requests,
         master_by_state_id,
@@ -722,7 +888,7 @@ pub(super) async fn build_pending_retry_download_tasks(
         .map(|request| request.state_id.as_str())
         .collect();
     for target in &pending_targets {
-        if !requested_state_ids.contains(target.asset_id.as_ref()) {
+        if persist_state && !requested_state_ids.contains(target.asset_id.as_ref()) {
             db.set_asset_verification(
                 &target.library,
                 &target.asset_id,
@@ -763,6 +929,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                     task_planner: &mut task_planner,
                     tasks: &mut tasks,
                     retry_sources: &mut retry_sources,
+                    persist_state,
                 }
                 .plan_resolved_asset(&asset, state_id.as_str())
                 .await?;
@@ -775,14 +942,16 @@ pub(super) async fn build_pending_retry_download_tasks(
                 {
                     legacy_present_state_ids.insert(state_id.to_string());
                 } else {
-                    set_verification_for_state_id(
-                        db.as_ref(),
-                        &pending_targets,
-                        state_id,
-                        AssetVerificationState::Unknown,
-                        "provider returned the master but omitted the mapped asset record",
-                    )
-                    .await?;
+                    if persist_state {
+                        set_verification_for_state_id(
+                            db.as_ref(),
+                            &pending_targets,
+                            state_id,
+                            AssetVerificationState::Unknown,
+                            "provider returned the master but omitted the mapped asset record",
+                        )
+                        .await?;
+                    }
                 }
             }
             RecordResolution::Deleted {
@@ -790,21 +959,26 @@ pub(super) async fn build_pending_retry_download_tasks(
                 master_family,
             } => {
                 let state_id = state_id.as_str();
-                let resolved = if master_family {
-                    let master = master_by_state_id
-                        .get(state_id)
-                        .map(String::as_str)
-                        .unwrap_or(state_id);
-                    db.resolve_master_family_source_deleted_affected(
-                        &config.library,
-                        master,
-                        deleted_at,
-                    )
-                    .await?
-                } else {
-                    db.resolve_source_deleted_affected(&config.library, state_id, deleted_at)
+                let resolved = if persist_state {
+                    if master_family {
+                        let master = master_by_state_id
+                            .get(state_id)
+                            .map(String::as_str)
+                            .unwrap_or(state_id);
+                        db.resolve_master_family_source_deleted_affected(
+                            &config.library,
+                            master,
+                            deleted_at,
+                        )
                         .await?
+                    } else {
+                        db.resolve_source_deleted_affected(&config.library, state_id, deleted_at)
+                            .await?
+                    }
+                } else {
+                    0
                 };
+                pending_targets.retain(|target| target.asset_id.as_ref() != state_id);
                 tracing::info!(
                     library = %config.library,
                     state_id,
@@ -815,14 +989,16 @@ pub(super) async fn build_pending_retry_download_tasks(
             }
             RecordResolution::AssetPresent { .. } | RecordResolution::Unknown => {
                 // CONTRACT: UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING
-                set_verification_for_state_id(
-                    db.as_ref(),
-                    &pending_targets,
-                    state_id.as_str(),
-                    AssetVerificationState::Unknown,
-                    "provider lookup omitted or could not parse the requested record",
-                )
-                .await?;
+                if persist_state {
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        state_id.as_str(),
+                        AssetVerificationState::Unknown,
+                        "provider lookup omitted or could not parse the requested record",
+                    )
+                    .await?;
+                }
                 tracing::warn!(
                     library = %config.library,
                     state_id = state_id.as_str(),
@@ -830,14 +1006,16 @@ pub(super) async fn build_pending_retry_download_tasks(
                 );
             }
             RecordResolution::TransientFailure(error) => {
-                set_verification_for_state_id(
-                    db.as_ref(),
-                    &pending_targets,
-                    state_id.as_str(),
-                    AssetVerificationState::TransientFailure,
-                    &error.to_string(),
-                )
-                .await?;
+                if persist_state {
+                    set_verification_for_state_id(
+                        db.as_ref(),
+                        &pending_targets,
+                        state_id.as_str(),
+                        AssetVerificationState::TransientFailure,
+                        &error.to_string(),
+                    )
+                    .await?;
+                }
                 tracing::warn!(
                     library = %config.library,
                     state_id = state_id.as_str(),
@@ -866,15 +1044,17 @@ pub(super) async fn build_pending_retry_download_tasks(
                 Ok(assets) => (assets, false),
                 Err(error) => {
                     let reason = error.to_string();
-                    for state_id in &legacy_present_state_ids {
-                        set_verification_for_state_id(
-                            db.as_ref(),
-                            &pending_targets,
-                            state_id,
-                            AssetVerificationState::TransientFailure,
-                            &reason,
-                        )
-                        .await?;
+                    if persist_state {
+                        for state_id in &legacy_present_state_ids {
+                            set_verification_for_state_id(
+                                db.as_ref(),
+                                &pending_targets,
+                                state_id,
+                                AssetVerificationState::TransientFailure,
+                                &reason,
+                            )
+                            .await?;
+                        }
                     }
                     tracing::warn!(
                         library = %config.library,
@@ -916,7 +1096,8 @@ pub(super) async fn build_pending_retry_download_tasks(
                 persisted_owner,
             ) {
                 LegacyCandidateSelection::Selected(asset) => {
-                    if persisted_owner.is_none()
+                    if persist_state
+                        && persisted_owner.is_none()
                         && !db
                             .claim_legacy_master_state_owner(
                                 &config.library,
@@ -941,12 +1122,14 @@ pub(super) async fn build_pending_retry_download_tasks(
                         );
                         continue;
                     }
-                    db.upsert_asset_master_mapping(
-                        &config.library,
-                        asset.asset_record_name(),
-                        asset.id(),
-                    )
-                    .await?;
+                    if persist_state {
+                        db.upsert_asset_master_mapping(
+                            &config.library,
+                            asset.asset_record_name(),
+                            asset.id(),
+                        )
+                        .await?;
+                    }
                     tracing::info!(
                         library = %config.library,
                         state_id,
@@ -963,19 +1146,22 @@ pub(super) async fn build_pending_retry_download_tasks(
                         task_planner: &mut task_planner,
                         tasks: &mut tasks,
                         retry_sources: &mut retry_sources,
+                        persist_state,
                     }
                     .plan_resolved_asset(&asset, &state_id)
                     .await?;
                 }
                 LegacyCandidateSelection::Missing => {
-                    set_verification_for_state_id(
-                        db.as_ref(),
-                        &pending_targets,
-                        &state_id,
-                        AssetVerificationState::Unknown,
-                        "provider confirmed the master exists but no current CPLAsset pair was found",
-                    )
-                    .await?;
+                    if persist_state {
+                        set_verification_for_state_id(
+                            db.as_ref(),
+                            &pending_targets,
+                            &state_id,
+                            AssetVerificationState::Unknown,
+                            "provider confirmed the master exists but no current CPLAsset pair was found",
+                        )
+                        .await?;
+                    }
                     tracing::warn!(
                         library = %config.library,
                         state_id,
@@ -983,14 +1169,16 @@ pub(super) async fn build_pending_retry_download_tasks(
                     );
                 }
                 LegacyCandidateSelection::EvidenceMismatch { candidates } => {
-                    set_verification_for_state_id(
-                        db.as_ref(),
-                        &pending_targets,
-                        &state_id,
-                        AssetVerificationState::Unknown,
-                        "no current provider asset matched the pending version, size, and checksum",
-                    )
-                    .await?;
+                    if persist_state {
+                        set_verification_for_state_id(
+                            db.as_ref(),
+                            &pending_targets,
+                            &state_id,
+                            AssetVerificationState::Unknown,
+                            "no current provider asset matched the pending version, size, and checksum",
+                        )
+                        .await?;
+                    }
                     tracing::warn!(
                         library = %config.library,
                         state_id,
@@ -999,14 +1187,16 @@ pub(super) async fn build_pending_retry_download_tasks(
                     );
                 }
                 LegacyCandidateSelection::Ambiguous { matches } => {
-                    set_verification_for_state_id(
-                        db.as_ref(),
-                        &pending_targets,
-                        &state_id,
-                        AssetVerificationState::Unknown,
-                        "multiple provider asset records matched the legacy master",
-                    )
-                    .await?;
+                    if persist_state {
+                        set_verification_for_state_id(
+                            db.as_ref(),
+                            &pending_targets,
+                            &state_id,
+                            AssetVerificationState::Unknown,
+                            "multiple provider asset records matched the legacy master",
+                        )
+                        .await?;
+                    }
                     tracing::warn!(
                         library = %config.library,
                         state_id,
@@ -1018,17 +1208,48 @@ pub(super) async fn build_pending_retry_download_tasks(
         }
     }
 
-    // Explicit deletion tombstones leave catalog history in place but remove
-    // those rows from the actionable pending reader. Present rows remain
-    // actionable until their retry succeeds.
-    let still_pending: FxHashSet<PendingRetryTarget> = db
-        .get_pending()
-        .await?
-        .iter()
-        .filter(|record| record.library.as_ref() == config.library.as_ref())
-        .map(PendingRetryTarget::from_record)
-        .collect();
-    pending_targets.retain(|target| still_pending.contains(target));
+    if persist_state {
+        let current_records = load_retry_asset_records(db.as_ref()).await?;
+        let current_replicas = db.list_replicas().await?;
+        let mut still_pending = FxHashSet::default();
+        let mut replica_identities = FxHashSet::default();
+        for replica in current_replicas.iter().filter(|replica| {
+            replica.library == config.library.as_ref()
+                && current_records.contains_key(&(
+                    replica.library.clone(),
+                    replica.asset_id.clone(),
+                    replica.version_size,
+                ))
+        }) {
+            replica_identities.insert((
+                replica.library.clone(),
+                replica.asset_id.clone(),
+                replica.version_size,
+            ));
+            if matches!(
+                replica.status,
+                crate::state::ReplicaStatus::Pending | crate::state::ReplicaStatus::Failed
+            ) {
+                still_pending.insert(PendingRetryTarget::from_replica(replica));
+            }
+        }
+        for record in db
+            .get_pending()
+            .await?
+            .iter()
+            .filter(|record| record.library.as_ref() == config.library.as_ref())
+        {
+            let identity = (
+                record.library.to_string(),
+                record.id.to_string(),
+                record.version_size,
+            );
+            if !replica_identities.contains(&identity) {
+                still_pending.insert(PendingRetryTarget::from_record(record));
+            }
+        }
+        pending_targets.retain(|target| still_pending.contains(target));
+    }
 
     if !pending_targets.is_empty() {
         tracing::warn!(
@@ -1170,6 +1391,7 @@ mod tests {
             task_planner: &mut task_planner,
             tasks: &mut tasks,
             retry_sources: &mut retry_sources,
+            persist_state: true,
         }
         .plan_resolved_asset(&asset, asset.state_id())
         .await
@@ -1205,25 +1427,32 @@ mod tests {
             )
             .await
             .unwrap();
-            db.mark_failed(
+            db.finalize_failed_replica(
                 "PrimarySync",
                 asset.state_id(),
                 VersionSizeKey::LiveOriginal.as_str(),
+                &motion_path,
                 "nonregular expected target",
             )
             .await
             .unwrap();
-            let failed_record = db
-                .get_failed()
+            let failed_replica = db
+                .list_replicas_for_asset_version(
+                    "PrimarySync",
+                    asset.state_id(),
+                    VersionSizeKey::LiveOriginal.as_str(),
+                )
                 .await
                 .unwrap()
                 .into_iter()
-                .find(|record| record.version_size == VersionSizeKey::LiveOriginal)
+                .find(|replica| replica.local_path == motion_path)
                 .unwrap();
-            let target = PendingRetryTarget::from_record(&failed_record);
+            let target = PendingRetryTarget::from_replica(&failed_replica);
             let mut pending_targets = FxHashSet::from_iter([target.clone()]);
-            let pending_evidence =
-                FxHashMap::from_iter([(target, PendingRetryEvidence::from_record(&failed_record))]);
+            let pending_evidence = FxHashMap::from_iter([(
+                target,
+                PendingRetryEvidence::from_replica(&motion_record, &failed_replica),
+            )]);
             let download_ctx = super::super::preload_download_context(&pass_configs[0]).await;
             let mut task_planner = planner::TaskPlanner::new();
             let mut tasks = Vec::new();
@@ -1238,6 +1467,7 @@ mod tests {
                 task_planner: &mut task_planner,
                 tasks: &mut tasks,
                 retry_sources: &mut retry_sources,
+                persist_state: true,
             }
             .plan_resolved_asset(&asset, asset.state_id())
             .await
@@ -1312,6 +1542,45 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.policy_excluded, 4);
         assert_eq!(summary.source_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn nonactionable_asset_state_ignores_exact_retry_replicas() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        for (id, deleted) in [("EXCLUDED", false), ("DELETED", true)] {
+            let record = TestAssetRecord::new(id).build();
+            db.upsert_seen(&record).await.unwrap();
+            let path = tempfile::tempdir()
+                .unwrap()
+                .path()
+                .join(format!("{id}.jpg"));
+            assert!(
+                db.claim_pending_replica("PrimarySync", id, "original", &path)
+                    .await
+                    .unwrap()
+            );
+            if deleted {
+                db.mark_soft_deleted("PrimarySync", id, None).await.unwrap();
+            } else {
+                db.mark_replica_historical("PrimarySync", id, "original", &path)
+                    .await
+                    .unwrap();
+                assert!(
+                    db.mark_policy_excluded("PrimarySync", id, "original")
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+        let mut config = DownloadConfig::test_default();
+        config.state_db = Some(db);
+
+        let plan = build_pending_retry_download_tasks(&[], &config, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(plan.requested, 0);
+        assert!(plan.tasks.is_empty());
+        assert!(plan.unmatched_targets.is_empty());
     }
 
     #[test]

@@ -4,16 +4,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::state::{DownloadStateStore, MetadataRewriteStore, VersionSizeKey};
+use crate::state::{
+    DownloadStateStore, ReplicaDownloadEvidence, ReplicaStateStore, VersionSizeKey,
+};
 
 use super::filter::DownloadTask;
 
-pub(super) trait DownloadFinalizationStore:
-    DownloadStateStore + MetadataRewriteStore
-{
-}
+pub(super) trait DownloadFinalizationStore: DownloadStateStore + ReplicaStateStore {}
 
-impl<T> DownloadFinalizationStore for T where T: DownloadStateStore + MetadataRewriteStore + ?Sized {}
+impl<T> DownloadFinalizationStore for T where T: DownloadStateStore + ReplicaStateStore + ?Sized {}
 
 /// A successful download whose state write to SQLite failed on first attempt.
 /// Accumulated during download loops and retried in a final flush.
@@ -25,6 +24,7 @@ pub(super) struct PendingStateWrite {
     pub(super) download_path: PathBuf,
     pub(super) local_checksum: String,
     pub(super) download_checksum: Option<String>,
+    pub(super) metadata_write_succeeded: bool,
     pub(super) mark_capture_repair: bool,
 }
 
@@ -68,28 +68,21 @@ where
     D: DownloadFinalizationStore + ?Sized,
 {
     match db
-        .mark_downloaded_with_capture_repair(
+        .finalize_downloaded_replica(
             library,
             &task.asset_id,
             task.version_size.as_str(),
             &task.download_path,
-            &local_checksum,
-            download_checksum.as_deref(),
+            &ReplicaDownloadEvidence {
+                local_checksum: local_checksum.clone(),
+                download_checksum: download_checksum.clone(),
+            },
+            exif_ok,
             mark_capture_repair,
         )
         .await
     {
-        Ok(()) => {
-            update_metadata_marker(
-                db,
-                library,
-                &task.asset_id,
-                task.version_size.as_str(),
-                exif_ok,
-            )
-            .await;
-            DownloadedFinalization::Persisted
-        }
+        Ok(()) => DownloadedFinalization::Persisted,
         Err(error) => DownloadedFinalization::Deferred {
             write: PendingStateWrite {
                 library: Arc::clone(library),
@@ -98,6 +91,7 @@ where
                 download_path: task.download_path.clone(),
                 local_checksum,
                 download_checksum,
+                metadata_write_succeeded: exif_ok,
                 mark_capture_repair,
             },
             error,
@@ -113,7 +107,7 @@ pub(super) async fn finalize_failed<D>(
     error: &str,
 ) -> Result<(), crate::state::error::StateError>
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadStateStore + ReplicaStateStore + ?Sized,
 {
     let durable_error = match task.publication {
         super::file::FinalPublication::NoReplace => error,
@@ -121,45 +115,14 @@ where
             crate::commands::reconcile::FILE_TRUNCATED_REASON
         }
     };
-    db.mark_failed(
+    db.finalize_failed_replica(
         library,
         &task.asset_id,
         task.version_size.as_str(),
+        &task.download_path,
         durable_error,
     )
     .await
-}
-
-/// Record a metadata-rewrite marker when the EXIF/XMP writer failed.
-///
-/// A successful write does not retire an existing marker. This writes the file
-/// from the snapshot the task was planned with, while the marker describes the
-/// row, and a concurrent pass may have moved the row on since. Retiring it here
-/// would leave the row and the file on different snapshots with nothing left to
-/// repair them. The rewrite drain owns that decision, because it writes the
-/// file from the same row it then clears.
-async fn update_metadata_marker<D>(
-    db: &D,
-    library: &str,
-    asset_id: &str,
-    version_size: &str,
-    exif_ok: bool,
-) where
-    D: MetadataRewriteStore + ?Sized,
-{
-    if exif_ok {
-        return;
-    }
-    if let Err(e) = db
-        .record_metadata_write_failure(library, asset_id, version_size)
-        .await
-    {
-        tracing::warn!(
-            asset_id,
-            error = %e,
-            "Could not set metadata-write-failed marker"
-        );
-    }
 }
 
 async fn retry_pending_state_write<D>(
@@ -168,19 +131,22 @@ async fn retry_pending_state_write<D>(
     pending_count: usize,
 ) -> bool
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadStateStore + ReplicaStateStore + ?Sized,
 {
     use rand::RngExt;
 
     for attempt in 1..=STATE_WRITE_MAX_RETRIES {
         match db
-            .mark_downloaded_with_capture_repair(
+            .finalize_downloaded_replica(
                 &write.library,
                 &write.asset_id,
                 write.version_size.as_str(),
                 &write.download_path,
-                &write.local_checksum,
-                write.download_checksum.as_deref(),
+                &ReplicaDownloadEvidence {
+                    local_checksum: write.local_checksum.clone(),
+                    download_checksum: write.download_checksum.clone(),
+                },
+                write.metadata_write_succeeded,
                 write.mark_capture_repair,
             )
             .await
@@ -229,7 +195,7 @@ pub(super) async fn flush_pending_state_writes_retaining_failures<D>(
     pending: &mut Vec<PendingStateWrite>,
 ) -> StateWriteFlush
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadStateStore + ReplicaStateStore + ?Sized,
 {
     if pending.is_empty() {
         return StateWriteFlush::default();
@@ -270,7 +236,7 @@ where
 /// Returns the number of writes that still failed after all retries.
 pub(super) async fn flush_pending_state_writes<D>(db: &D, pending: &[PendingStateWrite]) -> usize
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadStateStore + ReplicaStateStore + ?Sized,
 {
     if pending.is_empty() {
         return 0;
@@ -312,7 +278,7 @@ pub(super) async fn check_state_write_circuit_breaker<D>(
     pending: &mut Vec<PendingStateWrite>,
 ) -> Option<anyhow::Error>
 where
-    D: DownloadStateStore + ?Sized,
+    D: DownloadStateStore + ReplicaStateStore + ?Sized,
 {
     if pending.len() < STATE_DB_UNWRITABLE_THRESHOLD {
         return None;
@@ -358,12 +324,17 @@ mod tests {
         }
     }
 
-    async fn seed_pending(db: &SqliteStateDb, asset_id: &str, filename: &str) {
+    async fn seed_pending(db: &SqliteStateDb, asset_id: &str, path: &Path) {
         let record = TestAssetRecord::new(asset_id)
             .library(LIBRARY)
-            .filename(filename)
+            .filename(path.file_name().and_then(|name| name.to_str()).unwrap())
             .build();
         db.upsert_seen(&record).await.unwrap();
+        assert!(
+            db.claim_pending_replica(LIBRARY, asset_id, "original", path)
+                .await
+                .unwrap()
+        );
     }
 
     async fn write_file(path: &Path) {
@@ -376,7 +347,7 @@ mod tests {
         let path = tmp.path().join("persisted.jpg");
         write_file(&path).await;
         let db = SqliteStateDb::open_in_memory().unwrap();
-        seed_pending(&db, "FINAL_OK", "persisted.jpg").await;
+        seed_pending(&db, "FINAL_OK", &path).await;
         db.record_metadata_write_failure(LIBRARY, "FINAL_OK", "original")
             .await
             .unwrap();
@@ -412,7 +383,7 @@ mod tests {
         let path = tmp.path().join("capture-replacement.jpg");
         write_file(&path).await;
         let db = SqliteStateDb::open_in_memory().unwrap();
-        seed_pending(&db, "FINAL_CAPTURE", "capture-replacement.jpg").await;
+        seed_pending(&db, "FINAL_CAPTURE", &path).await;
 
         let result = finalize_downloaded(
             &db,
@@ -477,7 +448,7 @@ mod tests {
         let path = tmp.path().join("rewrite-needed.jpg");
         write_file(&path).await;
         let db = SqliteStateDb::open_in_memory().unwrap();
-        seed_pending(&db, "FINAL_REWRITE", "rewrite-needed.jpg").await;
+        seed_pending(&db, "FINAL_REWRITE", &path).await;
 
         let result = finalize_downloaded(
             &db,
@@ -499,8 +470,8 @@ mod tests {
     #[tokio::test]
     async fn finalize_failed_records_failure_status() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        seed_pending(&db, "FINAL_FAILED", "failed.jpg").await;
         let task = task("FINAL_FAILED", PathBuf::from("failed.jpg"));
+        seed_pending(&db, "FINAL_FAILED", &task.download_path).await;
 
         finalize_failed(&db, &Arc::from(LIBRARY), &task, "cdn expired")
             .await
@@ -515,8 +486,8 @@ mod tests {
     #[tokio::test]
     async fn failed_truncated_repair_preserves_durable_authorization() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        seed_pending(&db, "FINAL_REPAIR", "repair.jpg").await;
         let mut task = task("FINAL_REPAIR", PathBuf::from("repair.jpg"));
+        seed_pending(&db, "FINAL_REPAIR", &task.download_path).await;
         task.publication = crate::download::file::FinalPublication::ReplaceTruncated(
             crate::download::file::ExistingFileFingerprint {
                 size: 3,
