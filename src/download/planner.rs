@@ -12,7 +12,7 @@ use crate::icloud::photos::PhotoAsset;
 use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 
 use super::DownloadConfig;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use super::filter::derive_expected_paths;
 use super::filter::{
     DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath,

@@ -955,6 +955,7 @@ impl FileLocation {
         }
     }
 
+    #[cfg(any(feature = "xmp", unix))]
     pub(super) fn try_clone(&self) -> anyhow::Result<Self> {
         Ok(match self {
             Self::Path(path) => Self::Path(path.clone()),
@@ -1092,27 +1093,36 @@ impl FileLocation {
 pub(super) struct LocationCleanupGuard {
     location: Box<FileLocation>,
     pub(super) identity: FileIdentity,
+    _identity_anchor: std::fs::File,
     armed: bool,
 }
 
 impl LocationCleanupGuard {
-    pub(super) fn new(location: FileLocation, identity: FileIdentity) -> Self {
+    pub(super) fn new(
+        location: FileLocation,
+        identity: FileIdentity,
+        identity_anchor: std::fs::File,
+    ) -> Self {
         Self {
             location: Box::new(location),
             identity,
+            _identity_anchor: identity_anchor,
             armed: true,
         }
     }
 
     pub(super) fn for_path(path: &Path) -> anyhow::Result<Self> {
         let location = FileLocation::Path(path.to_path_buf());
-        let identity = file_identity(&location.open_regular()?)?;
-        Ok(Self::new(location, identity))
+        let identity_anchor = location.open_regular()?;
+        let identity = file_identity(&identity_anchor)?;
+        Ok(Self::new(location, identity, identity_anchor))
     }
 
     #[cfg(feature = "xmp")]
     pub(super) fn refresh_identity(&mut self) -> anyhow::Result<()> {
-        self.identity = file_identity(&self.location.open_regular()?)?;
+        let identity_anchor = self.location.open_regular()?;
+        self.identity = file_identity(&identity_anchor)?;
+        self._identity_anchor = identity_anchor;
         Ok(())
     }
 
@@ -1709,6 +1719,7 @@ fn location_destination_exists_or(
     }
 }
 
+#[cfg(unix)]
 fn mixed_location_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,

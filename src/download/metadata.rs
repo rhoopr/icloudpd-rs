@@ -1656,7 +1656,11 @@ fn write_sidecar_locations_with(
         match temp.create_new_regular() {
             Ok(mut file) => {
                 let identity = crate::fs_util::file_identity(&file)?;
-                let guard = super::file::LocationCleanupGuard::new(temp.try_clone()?, identity);
+                let guard = super::file::LocationCleanupGuard::new(
+                    temp.try_clone()?,
+                    identity,
+                    file.try_clone()?,
+                );
                 std::io::Write::write_all(&mut file, &bytes).with_context(|| {
                     format!(
                         "Could not write temporary XMP sidecar {}",

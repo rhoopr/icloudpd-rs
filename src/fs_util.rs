@@ -83,7 +83,17 @@ pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentit
 
 pub(crate) enum IdentityCleanup {
     Removed,
-    Retained { path: PathBuf, verified: bool },
+    #[cfg_attr(
+        windows,
+        expect(
+            dead_code,
+            reason = "Windows deletes through a verified open handle and never retains the entry"
+        )
+    )]
+    Retained {
+        path: PathBuf,
+        verified: bool,
+    },
 }
 
 #[cfg(unix)]
@@ -97,7 +107,7 @@ fn openat_owned(
 
     // SAFETY: the directory descriptor and name remain live for the call. A
     // successful descriptor is newly owned.
-    let raw = unsafe { libc::openat(directory, name.as_ptr(), flags, mode) };
+    let raw = unsafe { libc::openat(directory, name.as_ptr(), flags, libc::c_uint::from(mode)) };
     if raw < 0 {
         Err(std::io::Error::last_os_error())
     } else {
