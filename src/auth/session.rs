@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -66,6 +67,195 @@ pub fn sanitize_username(username: &str) -> String {
             .last()
             .map_or(prefix_len, |(i, c)| i + c.len_utf8());
         format!("{}_{:016x}", &sanitized[..prefix_end], hash)
+    }
+}
+
+pub(crate) fn persisted_auth_files(cookie_dir: &Path, username: &str) -> [PathBuf; 3] {
+    let sanitized = sanitize_username(username);
+    [
+        cookie_dir.join(&sanitized),
+        cookie_dir.join(format!("{sanitized}.session")),
+        cookie_dir.join(format!("{sanitized}.cache")),
+    ]
+}
+
+/// Per-account lock plus a generation that invalidates sessions released for watch sleep.
+#[derive(Debug)]
+pub(crate) struct SessionStateGuard {
+    cookie_dir: PathBuf,
+    sanitized_username: String,
+    lock_file: std::fs::File,
+    generation: AtomicU64,
+    locked: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionGeneration(u64);
+
+fn read_lock_generation(file: &std::fs::File) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut value = String::new();
+    file.read_to_string(&mut value)?;
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(0)
+    } else {
+        value
+            .parse()
+            .context("Session lock file contains an invalid generation")
+    }
+}
+
+fn write_lock_generation(file: &std::fs::File, generation: u64) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = file.try_clone()?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{generation}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+impl SessionStateGuard {
+    pub(crate) async fn acquire(cookie_dir: &Path, username: &str) -> Result<Self> {
+        Self::acquire_with_generation(cookie_dir, username, None).await
+    }
+
+    async fn acquire_with_generation(
+        cookie_dir: &Path,
+        username: &str,
+        expected_generation: Option<SessionGeneration>,
+    ) -> Result<Self> {
+        let cookie_dir = cookie_dir.to_path_buf();
+        fs::create_dir_all(&cookie_dir).await.with_context(|| {
+            format!("Could not create cookie directory {}", cookie_dir.display())
+        })?;
+        let sanitized_username = sanitize_username(username);
+        let lock_path = cookie_dir.join(format!("{sanitized_username}.lock"));
+        let (lock_file, generation) = tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| {
+                    format!("Could not create session lock file {}", lock_path.display())
+                })?;
+            let acquired = file.try_lock_exclusive().with_context(|| {
+                format!("Could not acquire session lock {}", lock_path.display())
+            })?;
+            if !acquired {
+                return Err(crate::auth::error::AuthError::LockContention(format!(
+                    "Another kei instance is running for this account (lock: {}). If running in Docker, check for orphaned containers with `docker ps` and stop them with `docker stop <name>`.",
+                    lock_path.display()
+                ))
+                .into());
+            }
+            let generation = read_lock_generation(&file)?;
+            Ok::<_, anyhow::Error>((file, generation))
+        })
+        .await??;
+        if expected_generation.is_some_and(|expected| expected.0 != generation) {
+            return Err(crate::auth::error::AuthError::SessionReset.into());
+        }
+        Ok(Self {
+            cookie_dir,
+            sanitized_username,
+            lock_file,
+            generation: AtomicU64::new(generation),
+            locked: AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn files(&self) -> [PathBuf; 3] {
+        persisted_auth_files(&self.cookie_dir, &self.sanitized_username)
+    }
+
+    fn has_replayable_auth(&self) -> bool {
+        self.files()[..2].iter().any(|path| path.exists())
+    }
+
+    fn generation(&self) -> SessionGeneration {
+        SessionGeneration(self.generation.load(Ordering::Acquire))
+    }
+
+    pub(crate) async fn discard(&self) -> Result<Vec<PathBuf>> {
+        anyhow::ensure!(
+            self.locked.load(Ordering::Acquire),
+            "Cannot discard iCloud authentication state without the account lock"
+        );
+        let generation = self
+            .generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .context("Session lock generation overflow")?;
+        let lock_file = self.lock_file.try_clone()?;
+        tokio::task::spawn_blocking(move || write_lock_generation(&lock_file, generation))
+            .await??;
+        self.generation.store(generation, Ordering::Release);
+
+        let mut removed = Vec::new();
+        let mut first_error = None;
+        for path in self.files() {
+            match fs::remove_file(&path).await {
+                Ok(()) => removed.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if first_error.is_none() => {
+                    first_error = Some(
+                        anyhow::Error::new(e)
+                            .context(format!("Could not remove {}", path.display())),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(removed),
+        }
+    }
+
+    fn release(&self) -> Result<()> {
+        if !self.locked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        FileExt::unlock(&self.lock_file).context("Could not release the session lock file")?;
+        self.locked.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn reacquire(&self) -> Result<()> {
+        if self.locked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let acquired = self
+            .lock_file
+            .try_lock_exclusive()
+            .context("Could not reacquire the session lock")?;
+        if !acquired {
+            return Err(crate::auth::error::AuthError::LockContention(
+                "Another kei instance acquired the session lock while it was released.".into(),
+            )
+            .into());
+        }
+        let generation = match read_lock_generation(&self.lock_file) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = FileExt::unlock(&self.lock_file);
+                return Err(error);
+            }
+        };
+        if generation != self.generation.load(Ordering::Acquire) {
+            FileExt::unlock(&self.lock_file)?;
+            return Err(crate::auth::error::AuthError::SessionReset.into());
+        }
+        self.locked.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -161,7 +351,7 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 ///
 /// Deletes the file if it is corrupt or unreadable (falling back to the old
 /// delete-everything behaviour).
-pub(crate) async fn strip_session_routing_state(session_file: &Path) {
+async fn strip_session_routing_state_file(session_file: &Path) {
     let contents = match fs::read_to_string(session_file).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -210,6 +400,19 @@ pub(crate) async fn strip_session_routing_state(session_file: &Path) {
     // Invalidate validation cache since session is being reset
     let cache_file = session_file.with_extension("cache");
     crate::fs_util::log_remove_async(&cache_file).await;
+}
+
+pub(crate) async fn strip_session_routing_state(
+    cookie_dir: &Path,
+    username: &str,
+    expected_generation: Option<SessionGeneration>,
+) -> Result<()> {
+    let guard =
+        SessionStateGuard::acquire_with_generation(cookie_dir, username, expected_generation)
+            .await?;
+    let session_file = guard.files()[1].clone();
+    strip_session_routing_state_file(&session_file).await;
+    Ok(())
 }
 
 /// Build the API and download HTTP clients for a session.
@@ -263,10 +466,8 @@ pub struct Session {
     home_endpoint: String,
     /// API client timeout (preserved for `reset_http_clients`).
     api_timeout: Duration,
-    /// Exclusive file lock preventing concurrent instances for the same account.
-    /// The advisory lock is held for the lifetime of the Session via the open
-    /// file descriptor; released automatically when the File is dropped.
-    lock_file: std::fs::File,
+    state_guard: SessionStateGuard,
+    loaded_persisted_auth: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -288,43 +489,48 @@ impl Session {
         home_endpoint: &str,
         timeout_secs: Option<u64>,
     ) -> Result<Self> {
+        Self::new_with_generation(cookie_dir, username, home_endpoint, timeout_secs, None).await
+    }
+
+    pub(crate) async fn new_after_release(
+        cookie_dir: &Path,
+        username: &str,
+        home_endpoint: &str,
+        timeout_secs: Option<u64>,
+        generation: SessionGeneration,
+    ) -> Result<Self> {
+        Self::new_with_generation(
+            cookie_dir,
+            username,
+            home_endpoint,
+            timeout_secs,
+            Some(generation),
+        )
+        .await
+    }
+
+    async fn new_with_generation(
+        cookie_dir: &Path,
+        username: &str,
+        home_endpoint: &str,
+        timeout_secs: Option<u64>,
+        expected_generation: Option<SessionGeneration>,
+    ) -> Result<Self> {
         let sanitized = sanitize_username(username);
         let cookie_dir = cookie_dir.to_path_buf();
 
-        fs::create_dir_all(&cookie_dir).await.with_context(|| {
-            format!("Could not create cookie directory {}", cookie_dir.display())
-        })?;
-
-        // Acquire an exclusive file lock to prevent concurrent instances for
-        // the same account from corrupting session/cookie state.
-        let lock_path = cookie_dir.join(format!("{sanitized}.lock"));
-        let lock_file = tokio::task::spawn_blocking({
-            let lock_path = lock_path.clone();
-            move || {
-                let file = std::fs::File::create(&lock_path).with_context(|| {
-                    format!("Could not create session lock file {}", lock_path.display())
-                })?;
-                let acquired = file
-                    .try_lock_exclusive()
-                    .with_context(|| format!("Could not acquire session lock {}", lock_path.display()))?;
-                if !acquired {
-                    return Err(crate::auth::error::AuthError::LockContention(format!(
-                        "Another kei instance is running for this account (lock: {}). If running in Docker, check for orphaned containers with `docker ps` and stop them with `docker stop <name>`.",
-                        lock_path.display()
-                    ))
-                    .into());
-                }
-                Ok::<std::fs::File, anyhow::Error>(file)
-            }
-        })
-        .await??;
+        let state_guard =
+            SessionStateGuard::acquire_with_generation(&cookie_dir, username, expected_generation)
+                .await?;
+        let loaded_persisted_auth = state_guard.has_replayable_auth();
 
         Self::build(
             cookie_dir,
             &sanitized,
             home_endpoint,
             timeout_secs,
-            lock_file,
+            state_guard,
+            loaded_persisted_auth,
         )
         .await
     }
@@ -336,7 +542,8 @@ impl Session {
         sanitized: &str,
         home_endpoint: &str,
         timeout_secs: Option<u64>,
-        lock_file: std::fs::File,
+        state_guard: SessionStateGuard,
+        loaded_persisted_auth: bool,
     ) -> Result<Self> {
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
@@ -449,7 +656,8 @@ impl Session {
             sanitized_username: sanitized.to_owned(),
             home_endpoint: home_endpoint.to_string(),
             api_timeout: timeout,
-            lock_file,
+            state_guard,
+            loaded_persisted_auth,
         })
     }
 
@@ -524,7 +732,7 @@ impl Session {
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub(crate) fn release_lock(&self) -> Result<()> {
-        FileExt::unlock(&self.lock_file).context("Could not release the session lock file")
+        self.state_guard.release()
     }
 
     /// Re-acquire the exclusive file lock after a prior `release_lock()`.
@@ -532,17 +740,19 @@ impl Session {
     /// Returns `Err(AuthError::LockContention)` if another process acquired
     /// the lock in the interim (e.g. a concurrent `get-code` or `submit-code`).
     pub(crate) fn reacquire_lock(&self) -> Result<()> {
-        let acquired = self
-            .lock_file
-            .try_lock_exclusive()
-            .context("Could not reacquire the session lock")?;
-        if !acquired {
-            return Err(crate::auth::error::AuthError::LockContention(
-                "Another kei instance acquired the session lock while it was released.".into(),
-            )
-            .into());
-        }
-        Ok(())
+        self.state_guard.reacquire()
+    }
+
+    pub(crate) fn loaded_persisted_auth(&self) -> bool {
+        self.loaded_persisted_auth
+    }
+
+    pub(crate) fn generation(&self) -> SessionGeneration {
+        self.state_guard.generation()
+    }
+
+    pub(crate) async fn discard_persisted_auth(&self) -> Result<Vec<PathBuf>> {
+        self.state_guard.discard().await
     }
 
     pub fn client_id(&self) -> Option<&str> {
@@ -837,6 +1047,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_reset_invalidates_a_released_session() {
+        let (_td, dir) = test_dir("reset_while_released");
+        let username = "user@test.com";
+        let files = persisted_auth_files(&dir, username);
+        for path in &files {
+            std::fs::write(path, b"stale").unwrap();
+        }
+        let session = Session::new(&dir, username, "https://example.com", None)
+            .await
+            .unwrap();
+        session.release_lock().unwrap();
+
+        let reset = SessionStateGuard::acquire(&dir, username).await.unwrap();
+        reset.discard().await.unwrap();
+        drop(reset);
+
+        let err = session
+            .reacquire_lock()
+            .expect_err("released session must observe the reset");
+        assert!(matches!(
+            err.downcast_ref::<crate::auth::error::AuthError>(),
+            Some(crate::auth::error::AuthError::SessionReset)
+        ));
+        let _replacement = Session::new(&dir, username, "https://example.com", None)
+            .await
+            .expect("reset generation should allow a fresh session");
+    }
+
+    #[tokio::test]
+    async fn session_reset_invalidates_a_replacement_session() {
+        let (_td, dir) = test_dir("reset_during_replacement");
+        let username = "user@test.com";
+        let session = Session::new(&dir, username, "https://example.com", None)
+            .await
+            .unwrap();
+        let generation = session.generation();
+        session.release_lock().unwrap();
+        drop(session);
+
+        let reset = SessionStateGuard::acquire(&dir, username).await.unwrap();
+        reset.discard().await.unwrap();
+        drop(reset);
+
+        let err =
+            Session::new_after_release(&dir, username, "https://example.com", None, generation)
+                .await
+                .expect_err("replacement must not adopt a reset generation");
+        assert!(matches!(
+            err.downcast_ref::<crate::auth::error::AuthError>(),
+            Some(crate::auth::error::AuthError::SessionReset)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_reset_still_invalidates_a_released_session() {
+        let (_td, dir) = test_dir("failed_reset_while_released");
+        let username = "user@test.com";
+        let files = persisted_auth_files(&dir, username);
+        std::fs::create_dir(&files[0]).unwrap();
+        std::fs::write(&files[1], b"stale").unwrap();
+        let session = Session::new(&dir, username, "https://example.com", None)
+            .await
+            .unwrap();
+        session.release_lock().unwrap();
+
+        let reset = SessionStateGuard::acquire(&dir, username).await.unwrap();
+        reset
+            .discard()
+            .await
+            .expect_err("directory cannot be removed as an auth file");
+        assert!(
+            !files[1].exists(),
+            "later auth files must still be removed after an earlier failure"
+        );
+        drop(reset);
+
+        let err = session
+            .reacquire_lock()
+            .expect_err("failed reset must still invalidate released sessions");
+        assert!(matches!(
+            err.downcast_ref::<crate::auth::error::AuthError>(),
+            Some(crate::auth::error::AuthError::SessionReset)
+        ));
+    }
+
+    #[tokio::test]
+    async fn generation_overflow_preserves_auth_files() {
+        let (_td, dir) = test_dir("generation_overflow");
+        let username = "user@test.com";
+        let files = persisted_auth_files(&dir, username);
+        std::fs::write(&files[0], b"cookie").unwrap();
+        let lock_path = dir.join(format!("{}.lock", sanitize_username(username)));
+        std::fs::write(&lock_path, u64::MAX.to_string()).unwrap();
+        let guard = SessionStateGuard::acquire(&dir, username).await.unwrap();
+
+        guard.discard().await.expect_err("generation must not wrap");
+
+        assert!(files[0].exists());
+    }
+
+    #[tokio::test]
     async fn session_reacquire_lock_contention_error_is_actionable() {
         let (_td, dir) = test_dir("lock_reacquire_contention");
         let s1 = Session::new(&dir, "user@test.com", "https://example.com", None)
@@ -1039,6 +1350,87 @@ mod tests {
         assert_eq!(sanitize_username("@.+-!"), "");
     }
 
+    #[test]
+    fn persisted_auth_files_cover_only_session_artifacts() {
+        let dir = Path::new("/data");
+        let files = persisted_auth_files(dir, "user@test.com");
+        let names: Vec<String> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let sanitized = sanitize_username("user@test.com");
+        assert_eq!(
+            names,
+            vec![
+                sanitized.clone(),
+                format!("{sanitized}.session"),
+                format!("{sanitized}.cache"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_cache_alone_is_not_replayable_auth_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = persisted_auth_files(dir.path(), "user@test.com");
+        std::fs::write(&files[2], b"cache").unwrap();
+
+        let guard = SessionStateGuard::acquire(dir.path(), "user@test.com")
+            .await
+            .unwrap();
+        assert!(!guard.has_replayable_auth());
+    }
+
+    #[tokio::test]
+    async fn discard_persisted_auth_removes_only_session_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let username = "user@test.com";
+        let files = persisted_auth_files(dir.path(), username);
+        for path in &files {
+            std::fs::write(path, b"auth").unwrap();
+        }
+        let credential = dir
+            .path()
+            .join(format!("{}.credential", sanitize_username(username)));
+        let db = dir
+            .path()
+            .join(format!("{}.db", sanitize_username(username)));
+        std::fs::write(&credential, b"credential").unwrap();
+        std::fs::write(&db, b"database").unwrap();
+
+        let guard = SessionStateGuard::acquire(dir.path(), username)
+            .await
+            .unwrap();
+        let removed = guard.discard().await.unwrap();
+
+        assert_eq!(removed, files);
+        assert!(files.iter().all(|path| !path.exists()));
+        assert!(credential.exists());
+        assert!(db.exists());
+    }
+
+    #[tokio::test]
+    async fn discard_persisted_auth_refuses_lock_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let username = "user@test.com";
+        let session = Session::new(dir.path(), username, "https://example.com", None)
+            .await
+            .unwrap();
+        let files = persisted_auth_files(dir.path(), username);
+        std::fs::write(&files[0], b"cookie").unwrap();
+
+        let err = SessionStateGuard::acquire(dir.path(), username)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<crate::auth::error::AuthError>()
+                .is_some_and(crate::auth::error::AuthError::is_lock_contention)
+        );
+        assert!(files[0].exists());
+        drop(session);
+    }
+
     #[tokio::test]
     async fn test_persist_jar_cookies_saves_and_reloads() {
         let (_td, dir) = test_dir("persist_jar");
@@ -1236,7 +1628,7 @@ mod tests {
         });
         std::fs::write(&path, data.to_string()).unwrap();
 
-        strip_session_routing_state(&path).await;
+        strip_session_routing_state_file(&path).await;
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let map: HashMap<String, String> = serde_json::from_str(&contents).unwrap();
@@ -1254,7 +1646,7 @@ mod tests {
         let path = dir.path().join("corrupt.session");
         std::fs::write(&path, "not valid json {{{").unwrap();
 
-        strip_session_routing_state(&path).await;
+        strip_session_routing_state_file(&path).await;
 
         assert!(!path.exists());
     }
@@ -1264,7 +1656,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.session");
 
-        strip_session_routing_state(&path).await;
+        strip_session_routing_state_file(&path).await;
 
         assert!(!path.exists());
     }
@@ -1280,7 +1672,7 @@ mod tests {
         std::fs::write(&path, data.to_string()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        strip_session_routing_state(&path).await;
+        strip_session_routing_state_file(&path).await;
 
         // restore so tempdir cleanup doesn't fail
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1300,7 +1692,7 @@ mod tests {
         });
         std::fs::write(&path, data.to_string()).unwrap();
 
-        strip_session_routing_state(&path).await;
+        strip_session_routing_state_file(&path).await;
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let map: HashMap<String, String> = serde_json::from_str(&contents).unwrap();
@@ -1459,7 +1851,7 @@ mod tests {
         std::fs::write(&cache_path, r#"{"validated_at":1,"account_data":{}}"#).unwrap();
         assert!(cache_path.exists());
 
-        strip_session_routing_state(&session_path).await;
+        strip_session_routing_state_file(&session_path).await;
 
         assert!(
             !cache_path.exists(),

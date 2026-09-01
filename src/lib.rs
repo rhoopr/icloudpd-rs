@@ -540,7 +540,8 @@ fn make_provider_from_auth(
 
 use commands::{
     run_config_show, run_doctor, run_import_existing, run_list, run_login, run_manifest,
-    run_password, run_reconcile, run_reset_state, run_reset_sync_token, run_status, run_verify,
+    run_password, run_reconcile, run_reset_session, run_reset_state, run_reset_sync_token,
+    run_status, run_verify,
 };
 
 /// Get the database path for a given auth config, merging with TOML defaults.
@@ -874,6 +875,9 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
             }
             cli::ResetCommand::SyncToken { yes } => {
                 return run_reset_sync_token(yes, &globals, toml_config.as_ref(), input_mode).await;
+            }
+            cli::ResetCommand::Session { yes } => {
+                return run_reset_session(yes, &globals, toml_config.as_ref()).await;
             }
         },
         Command::Verify(args) => {

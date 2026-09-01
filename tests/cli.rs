@@ -524,6 +524,34 @@ fn reset_sync_token_short_y_flag_parses() {
         .success();
 }
 
+#[test]
+fn reset_session_help_advertises_yes_flag() {
+    // `kei reset session` ships with `--yes` to skip the confirmation
+    // prompt, matching the other reset subcommands. Help text must surface
+    // it so users discover the safe non-interactive form.
+    common::cmd()
+        .args(["reset", "session", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--yes"));
+}
+
+#[test]
+fn reset_session_yes_flag_parses() {
+    common::cmd()
+        .args(["reset", "session", "--yes", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn reset_session_short_y_flag_parses() {
+    common::cmd()
+        .args(["reset", "session", "-y", "--help"])
+        .assert()
+        .success();
+}
+
 // ── Enum validation (rejection only — acceptance covered by unit tests) ─
 
 #[test]
@@ -1276,7 +1304,8 @@ fn reset_help_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("state"))
-        .stdout(predicate::str::contains("sync-token"));
+        .stdout(predicate::str::contains("sync-token"))
+        .stdout(predicate::str::contains("session"));
 }
 
 #[test]
@@ -1292,6 +1321,14 @@ fn reset_state_new_help_succeeds() {
 fn reset_sync_token_help_succeeds() {
     common::cmd()
         .args(["reset", "sync-token", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn reset_session_help_succeeds() {
+    common::cmd()
+        .args(["reset", "session", "--help"])
         .assert()
         .success();
 }

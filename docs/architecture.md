@@ -68,6 +68,19 @@ classifier, which reports auth exit code 3 and the `login get-code` and
 into a durable wait, and only when the resolved configuration is in watch or
 service mode.
 
+Interactive login and `login get-code` may retry once from clean local auth
+state when Apple rejects verification-code delivery with HTTP 403 and the
+attempt loaded a persisted cookie jar or session. The failed session removes
+only its cookie jar, session, and validation cache while it still holds the
+per-account lock, then the shared auth owner creates one clean replacement
+session. Password material and SQLite state remain unchanged. `reset session`
+exposes the same locked cleanup explicitly. Cleanup advances a generation in
+the existing lock file. A watch process that released its lock for idle sleep
+detects a changed generation when it wakes and stops before its old in-memory
+session can recreate reset credentials. Reauthentication handoffs carry their
+pre-release generation into replacement-session creation, so a reset in that
+gap also wins.
+
 ### Sync and provider checkpoints
 
 ```text
