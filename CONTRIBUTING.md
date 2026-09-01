@@ -122,6 +122,26 @@ All changes go through pull requests. Do not commit directly to `main`.
   and documentation surfaces where applicable.
 - Do not dismiss a failing test as unrelated without investigating it.
 
+Changes to durable configuration, filesystem paths, media publication,
+metadata, SQLite state, retry work, or provider checkpoints require a
+state-transition proof through the production call graph. Prove these stages:
+
+1. **Initial durable state:** Seed or create the real SQLite and filesystem
+   state that exists before the change.
+2. **Controlled mutation:** Change one config value, provider fact, local
+   entry, or failure condition.
+3. **Production cycle:** Run the normal owner path instead of reconstructing
+   its decisions in the test.
+4. **Durable outcome:** Assert the file set and bytes, SQLite paths and status,
+   metadata, retry evidence, and checkpoint facts that apply.
+5. **Steady-state cycle:** Run an unchanged follow-up cycle and assert that it
+   does not repeat completed work or create new files or state transitions.
+
+List the applicable pass kinds, media families, destination entry types,
+metadata modes, interruption points, and state-write failures. A passing gate,
+coverage report, fuzz run, or fresh-workspace live test does not replace this
+transition proof. See [the test guide](tests/README.md#state-transition-proof).
+
 Some tests (`tests/sync.rs`, `tests/state_auth.rs`, and
 `tests/import_existing_live.rs`) contact the live iCloud API and need real
 credentials. They are `#[ignore]` by default. See
