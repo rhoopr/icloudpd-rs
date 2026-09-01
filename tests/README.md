@@ -67,9 +67,10 @@ full set with `just test scenarios`.
 
 ## State-transition proof
 
-Use a state-transition test when behavior crosses durable configuration,
-filesystem paths, media publication, metadata, SQLite state, retry work, or
-provider checkpoints. The test must cover these stages:
+Changes to durable configuration, filesystem paths, media publication,
+metadata, SQLite state, retry work, or provider checkpoints require a
+state-transition proof through the production call graph. The test must cover
+these stages:
 
 1. **Initial durable state:** Use real SQLite and a `TempDir` where practical.
    Create the exact state and files that exist before the transition.

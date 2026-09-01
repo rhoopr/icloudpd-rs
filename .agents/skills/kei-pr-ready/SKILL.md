@@ -58,11 +58,13 @@ review covered only one lens, such as scale.
 1. Run the smallest matching focused test or `just test scenario NAME`.
 2. For behavior changes, prefer at least one test through the production call
    graph and cover the relevant failure, retry, interruption, or boundary case.
-   Stateful config, path, publication, metadata, checkpoint, and SQLite changes
-   require a five-stage proof: Initial durable state, Controlled mutation,
-   Production cycle, Durable outcome, and Steady-state cycle. State whether the
-   destination was empty, durable state was pre-seeded, what changed, and what
-   the unchanged follow-up cycle did.
+   Changes to durable configuration, filesystem paths, media publication,
+   metadata, SQLite state, retry work, or provider checkpoints require a
+   state-transition proof through the production call graph. Cover these five
+   stages: Initial durable state, Controlled mutation, Production cycle,
+   Durable outcome, and Steady-state cycle. State whether the destination was
+   empty, durable state was pre-seeded, what changed, and what the unchanged
+   follow-up cycle did.
 3. For CLI or user-flow changes, run the changed command and inspect help,
    Docker, service, Homebrew, and documentation consumers where applicable.
 4. For schema, primary-key, sentinel, durable-key, or serialization changes,

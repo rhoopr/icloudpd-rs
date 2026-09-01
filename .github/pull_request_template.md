@@ -16,7 +16,7 @@
 
 ## State transition proof
 
-<!-- Required for config, path, publication, metadata, retry, checkpoint, or SQLite behavior. Fill in each item, or write "Not applicable" with a concrete reason. -->
+<!-- Changes to durable configuration, filesystem paths, media publication, metadata, SQLite state, retry work, or provider checkpoints require a state-transition proof through the production call graph. Fill in each item, or write "Not applicable" with a concrete reason. -->
 
 - Initial durable state:
 - Controlled mutation:

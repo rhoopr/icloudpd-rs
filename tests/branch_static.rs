@@ -37,6 +37,10 @@ fn missing_required_fragments(contents: &str, required: &[&str]) -> Vec<String> 
         .collect()
 }
 
+fn normalize_whitespace(contents: &str) -> String {
+    contents.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(target_os = "linux")]
 fn write_executable(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
@@ -531,6 +535,7 @@ fn config_reconciliation_scenario_pins_transition_seed_tests() {
 
 #[test]
 fn state_transition_proof_is_pinned_across_process_surfaces() {
+    let applicability = "Changes to durable configuration, filesystem paths, media publication, metadata, SQLite state, retry work, or provider checkpoints require a state-transition proof through the production call graph.";
     let stages = [
         "Initial durable state",
         "Controlled mutation",
@@ -545,12 +550,23 @@ fn state_transition_proof_is_pinned_across_process_surfaces() {
         ".agents/skills/kei-pr-ready/SKILL.md",
     ] {
         let contents = repo_file(path);
+        let normalized = normalize_whitespace(&contents);
+        assert!(
+            normalized.contains(applicability),
+            "{path} state-transition applicability categories drifted"
+        );
         let missing = missing_required_fragments(&contents, &stages);
         assert!(
             missing.is_empty(),
             "{path} missing state-transition proof stages: {missing:?}"
         );
     }
+
+    let deliberately_drifted = repo_file("CONTRIBUTING.md").replacen("retry work, ", "", 1);
+    assert!(
+        !normalize_whitespace(&deliberately_drifted).contains(applicability),
+        "the process contract check must detect a deliberately removed applicability category"
+    );
 
     let readiness = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
     let readiness_requirements = [

@@ -122,8 +122,9 @@ All changes go through pull requests. Do not commit directly to `main`.
   and documentation surfaces where applicable.
 - Do not dismiss a failing test as unrelated without investigating it.
 
-Stateful config, path, publication, metadata, and SQLite changes need a
-state-transition test through the production call graph. Prove these stages:
+Changes to durable configuration, filesystem paths, media publication,
+metadata, SQLite state, retry work, or provider checkpoints require a
+state-transition proof through the production call graph. Prove these stages:
 
 1. **Initial durable state:** Seed or create the real SQLite and filesystem
    state that exists before the change.
