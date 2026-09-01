@@ -1093,6 +1093,7 @@ impl FileLocation {
 pub(super) struct LocationCleanupGuard {
     location: Box<FileLocation>,
     pub(super) identity: FileIdentity,
+    #[cfg(unix)]
     _identity_anchor: std::fs::File,
     armed: bool,
 }
@@ -1103,9 +1104,12 @@ impl LocationCleanupGuard {
         identity: FileIdentity,
         identity_anchor: std::fs::File,
     ) -> Self {
+        #[cfg(not(unix))]
+        drop(identity_anchor);
         Self {
             location: Box::new(location),
             identity,
+            #[cfg(unix)]
             _identity_anchor: identity_anchor,
             armed: true,
         }
@@ -1122,7 +1126,10 @@ impl LocationCleanupGuard {
     pub(super) fn refresh_identity(&mut self) -> anyhow::Result<()> {
         let identity_anchor = self.location.open_regular()?;
         self.identity = file_identity(&identity_anchor)?;
-        self._identity_anchor = identity_anchor;
+        #[cfg(unix)]
+        {
+            self._identity_anchor = identity_anchor;
+        }
         Ok(())
     }
 
@@ -1670,7 +1677,7 @@ fn rename_confined_macos(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn hard_link_locations(
     part_path: &FileLocation,
     final_path: &FileLocation,
@@ -3008,7 +3015,7 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), b"catalog bytes");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn confined_hard_link_cleanup_retains_replaced_source_leaf() {
         let root = tempfile::tempdir().unwrap();
