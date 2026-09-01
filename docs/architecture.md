@@ -176,12 +176,11 @@ Photo mode, live only in the enumeration hash. Changing the selected scope
 stages reconciliation for that scope, so a later selection cannot inherit a
 hash promoted by unrelated libraries or passes. A matching legacy mixed v2
 hash is promoted to the current path-only shape without reconciliation only
-when no downloaded Live Photo video rows exist. A v2 catalogue with downloaded
-Live Photo videos, an older path-only hash, a changed scope, or a genuine path
-change stages reconciliation without discarding provider cursors. If a path
-change is partially applied and configuration returns to the active hash, the
-pending marker is restaged to the active value and reconciliation moves the
-partial rows back before clearing it.
+when no downloaded rows exist. A v2 catalogue with downloaded rows, an older
+path-only hash, a changed scope, or a genuine path change stages reconciliation
+without discarding provider cursors. If a path change is partially applied and
+configuration returns to the active hash, the pending marker is restaged to the
+active value and reconciliation moves the partial rows back before clearing it.
 Path-hash staging, reconciliation, and promotion run only in download mode.
 Print-only and dry-run planning use catalogue and filesystem evidence without
 mutating path-hash metadata, catalogue rows, or local files.
@@ -215,16 +214,17 @@ alternate to an existing nonregular expected leaf, so every run mode reports
 or fails the exact blocked target instead of creating another collision
 ordinal.
 Selected smart folders are never resolved from historical membership rows.
-They require an explicit successful fresh-query marker from the normal sync
-flow before the pending path hash can be promoted. Interruption, refresh
-failure, or a stale pass plan retains the pending hash for the next cycle.
+Path reconciliation streams each selected smart-folder query directly, reuses
+the returned provider assets, and reconciles every matching downloaded version
+to every selected pass path independently of current eligibility. Count drift,
+provider errors, interruption, or a stale pass plan retains the pending hash
+for the next cycle.
 While a path hash is pending, the cycle reconciles every active library plan
 before any library starts inventory, retry, bridge, metadata capture, provider
 metadata refresh, or rewrite-drain work. It unions exact `(library, asset)`
 blocks across those reconciliations and passes the complete set to every
-library, including cross-zone album producers. Smart-folder refresh
-requirements remain library-scoped and promotion waits for every required
-fresh-query result.
+library, including cross-zone album producers. Promotion waits for every selected smart-folder membership query and matching
+selected-pass path reconciliation to complete.
 
 For a genuine path change, reconciliation copies verified bytes and source
 permissions through no-overwrite publication only when the copied bytes match

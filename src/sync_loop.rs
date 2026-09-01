@@ -4047,6 +4047,56 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct SmartFolderReconciliationSession {
+        records: Arc<Vec<serde_json::Value>>,
+        sync_token: Arc<str>,
+        serve_records: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for SmartFolderReconciliationSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/internal/records/query/batch") {
+                self.serve_records
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let count = self
+                    .records
+                    .iter()
+                    .filter(|record| record["recordType"] == "CPLAsset")
+                    .count() as u64;
+                return Ok(album_count_response(count));
+            }
+            if url.contains("/records/lookup?") {
+                return Ok(serde_json::json!({"records": self.records.as_ref()}));
+            }
+            if url.contains("/records/query?") {
+                let records = if self
+                    .serve_records
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.records.as_ref().clone()
+                } else {
+                    Vec::new()
+                };
+                return Ok(serde_json::json!({
+                    "records": records,
+                    "syncToken": self.sync_token.as_ref()
+                }));
+            }
+            Ok(serde_json::json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     fn make_one_photo_incremental_album_for_zone(
         zone: &str,
         zone_sync_token: &str,
@@ -4382,6 +4432,7 @@ mod tests {
             config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
             if options.per_pass_paths {
                 config.folder_structure_albums = Arc::from("{album}");
+                config.folder_structure_smart_folders = Arc::from("{smart-folder}/%Y/%m/%d");
             }
             if let Some(file_match_policy) = options.file_match_policy {
                 config.file_match_policy = file_match_policy;
@@ -9065,14 +9116,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
+    async fn run_cycle_reconciles_excluded_smart_folder_member_and_reaches_steady_state() {
         let config = make_run_cycle_config();
         let db = make_state_db();
         let old_download_dir = tempfile::tempdir().expect("old download tempdir");
         let new_download_dir = tempfile::tempdir().expect("new download tempdir");
+        let media = vec![7u8; 1024];
+        let old_path = old_download_dir
+            .path()
+            .join(run_cycle_expected_date_dir())
+            .join("photo.jpg");
+        tokio::fs::create_dir_all(old_path.parent().expect("old path parent"))
+            .await
+            .expect("create old path parent");
+        tokio::fs::write(&old_path, &media)
+            .await
+            .expect("seed old media");
+        let old_thumb_path = old_download_dir.path().join("old-thumb.jpg");
+        tokio::fs::write(&old_thumb_path, &media)
+            .await
+            .expect("seed old thumbnail");
+        let local_checksum = download::file::compute_sha256(&old_path)
+            .await
+            .expect("checksum old media");
+        let record = crate::test_helpers::TestAssetRecord::new("master-PrimarySync")
+            .filename("photo.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(media.len() as u64)
+            .build();
+        db.upsert_seen(&record)
+            .await
+            .expect("seed downloaded asset");
+        db.mark_downloaded(
+            "PrimarySync",
+            "master-PrimarySync",
+            state::VersionSizeKey::Original.as_str(),
+            &old_path,
+            &local_checksum,
+            None,
+        )
+        .await
+        .expect("mark downloaded asset");
+        let thumb_record = crate::test_helpers::TestAssetRecord::new("master-PrimarySync")
+            .version_size(state::VersionSizeKey::Thumb)
+            .filename("photo.jpg")
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(media.len() as u64)
+            .build();
+        db.upsert_seen(&thumb_record)
+            .await
+            .expect("seed downloaded thumbnail");
+        db.mark_downloaded(
+            "PrimarySync",
+            "master-PrimarySync",
+            state::VersionSizeKey::Thumb.as_str(),
+            &old_thumb_path,
+            &local_checksum,
+            None,
+        )
+        .await
+        .expect("mark downloaded thumbnail");
+        db.claim_legacy_master_state_owner(
+            "PrimarySync",
+            "master-PrimarySync",
+            "asset-master-PrimarySync",
+        )
+        .await
+        .expect("claim durable sibling owner");
 
-        let old_build_download_config =
-            make_run_cycle_download_config_builder(old_download_dir.path(), Arc::clone(&db));
+        let options = RunCycleDownloadConfigOptions {
+            media: media_without_photo_downloads(),
+            per_pass_paths: true,
+            ..RunCycleDownloadConfigOptions::default()
+        };
+        let old_build_download_config = make_run_cycle_download_config_builder_with_options(
+            old_download_dir.path(),
+            Arc::clone(&db),
+            options,
+        );
         let old_download_config = old_build_download_config(
             download::SyncMode::Full,
             Arc::new(rustc_hash::FxHashSet::default()),
@@ -9083,36 +9204,57 @@ mod tests {
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, &old_hash)
             .await
             .expect("seed old download hash");
-        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "zone-tok-prev")
-            .await
-            .expect("seed zone token");
 
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-        let mut lib_state = make_run_cycle_library_state_with_passes(
-            "PrimarySync",
-            &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
-            vec![
-                crate::commands::AlbumPass {
-                    kind: crate::commands::PassKind::Unfiled,
-                    album: make_incremental_album("zone-tok-new"),
-                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-                },
-                crate::commands::AlbumPass {
-                    kind: crate::commands::PassKind::SmartFolder,
-                    album: make_named_empty_full_album(
-                        "PrimarySync",
-                        "Favorites",
-                        "smart-query-token",
-                    ),
-                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-                },
-            ],
-        );
-        let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
-        let build_download_config = make_recording_run_cycle_download_config_builder(
+        let make_smart_folder_state = |sync_token: &str| {
+            let mut page = full_album_page("PrimarySync", "master-PrimarySync", sync_token);
+            page["records"][0]["fields"]["resJPEGThumbRes"] = serde_json::json!({
+                "value": {
+                    "downloadURL": "https://p01.icloud-content.com/photo-thumb.jpg",
+                    "size": media.len() as u64,
+                    "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                }
+            });
+            page["records"][0]["fields"]["resJPEGThumbFileType"] =
+                serde_json::json!({"value": "public.jpeg"});
+            let mut sibling = page["records"][1].clone();
+            sibling["recordName"] = serde_json::json!("asset-sibling-PrimarySync");
+            sibling["fields"]["assetDate"]["value"] =
+                serde_json::json!(RUN_CYCLE_ASSET_DATE_MS - 86_400_000);
+            page["records"]
+                .as_array_mut()
+                .expect("smart-folder records")
+                .insert(1, sibling);
+            let records = page["records"]
+                .as_array()
+                .expect("smart-folder records")
+                .clone();
+            make_run_cycle_library_state_with_passes(
+                "PrimarySync",
+                &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
+                ["Favorites", "Screenshots"]
+                    .into_iter()
+                    .map(|name| crate::commands::AlbumPass {
+                        kind: crate::commands::PassKind::SmartFolder,
+                        album: make_named_full_album_with_boxed_session(
+                            "PrimarySync",
+                            name,
+                            Box::new(SmartFolderReconciliationSession {
+                                records: Arc::new(records.clone()),
+                                sync_token: Arc::from(sync_token),
+                                serve_records: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                            }),
+                        ),
+                        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                    })
+                    .collect(),
+            )
+        };
+        let first_state = make_smart_folder_state("smart-query-token-1");
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
             new_download_dir.path(),
             Arc::clone(&db),
-            Arc::clone(&observed_modes),
+            options,
         );
         let new_hash = download::hash_scoped_download_config(
             &build_download_config(
@@ -9124,9 +9266,8 @@ mod tests {
             &config,
         );
 
-        lib_state.plan_is_stale = true;
-        let stale_result = run_cycle(
-            &[&lib_state],
+        let result = run_cycle(
+            &[&first_state],
             &config,
             Some(db.as_ref()),
             false,
@@ -9137,70 +9278,76 @@ mod tests {
         )
         .await
         .expect("run cycle");
-        assert!(!stale_result.db_sync_token_advance_safe);
+
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(tokio::fs::read(&old_path).await.unwrap(), media);
+        assert_eq!(tokio::fs::read(&old_thumb_path).await.unwrap(), media);
+        assert_eq!(downloaded.len(), 2);
+        for record in &downloaded {
+            assert!(
+                record
+                    .local_path
+                    .as_deref()
+                    .is_some_and(|path| path.starts_with(new_download_dir.path()))
+            );
+        }
+        for folder in ["Favorites", "Screenshots"] {
+            let paths: Vec<_> = std::fs::read_dir(
+                new_download_dir
+                    .path()
+                    .join(folder)
+                    .join(run_cycle_expected_date_dir()),
+            )
+            .expect("read reconciled smart-folder directory")
+            .map(|entry| entry.expect("read reconciled path").path())
+            .collect();
+            assert_eq!(
+                paths.len(),
+                2,
+                "every downloaded version must reach every selected smart-folder path"
+            );
+            for path in paths {
+                assert_eq!(
+                    tokio::fs::read(path).await.unwrap(),
+                    media,
+                    "path drift must reconcile excluded smart-folder media from the durable sibling owner"
+                );
+            }
+        }
         assert_eq!(
             db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
                 .await
                 .expect("read active download hash")
-                .as_deref(),
-            Some(old_hash.as_str()),
-            "a stale plan must not promote the pending path hash"
-        );
-        assert_eq!(
-            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
-                .await
-                .expect("read pending download hash")
                 .as_deref(),
             Some(new_hash.as_str())
-        );
-
-        lib_state.plan_is_stale = false;
-        let result = run_cycle(
-            &[&lib_state],
-            &config,
-            Some(db.as_ref()),
-            false,
-            &build_download_config,
-            download::DownloadControls::download_hidden(),
-            &shared_session,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("run cycle");
-
-        assert_eq!(result.failed_count, 0);
-        assert!(result.stats.smart_folder_refresh_complete);
-        assert_eq!(result.stats.full_enumeration_reason, None);
-        let observed_modes = observed_modes.lock().expect("recorded modes lock").clone();
-        assert!(
-            matches!(
-                observed_modes.last(),
-                Some(download::SyncMode::Incremental { zone_sync_token })
-                    if zone_sync_token == "zone-tok-prev"
-            ),
-            "path-only drift must preserve incremental source tracking: {observed_modes:?}"
-        );
-        assert_eq!(
-            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
-                .await
-                .expect("read zone token")
-                .as_deref(),
-            Some("zone-tok-new"),
-            "the incremental source pass should refresh the selected zone token after success"
-        );
-        assert_eq!(
-            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
-                .await
-                .expect("read active download hash")
-                .as_deref(),
-            Some(new_hash.as_str()),
-            "an empty catalog completes local path reconciliation immediately"
         );
         assert_eq!(
             db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
                 .await
                 .expect("read pending download hash"),
             None
+        );
+
+        let second_state = make_smart_folder_state("smart-query-token-2");
+        let second_result = run_cycle(
+            &[&second_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("repeat cycle");
+
+        assert_eq!(second_result.failed_count, 0);
+        assert_ne!(
+            second_result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::DownloadConfigHashDrift),
+            "the promoted path hash must make the unchanged second cycle steady"
         );
     }
 
@@ -10496,7 +10643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_config_v2_hash_without_live_photo_video_migrates_directly() {
+    async fn download_config_v2_hash_without_downloaded_rows_migrates_directly() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-current-hash")
             .await
@@ -10533,7 +10680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_config_v2_hash_with_live_photo_video_stages_reconciliation() {
+    async fn download_config_v2_hash_with_downloaded_row_stages_reconciliation() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-current-hash")
             .await
@@ -10541,17 +10688,15 @@ mod tests {
         db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")
             .await
             .unwrap();
-        let record = crate::test_helpers::TestAssetRecord::new("LIVE_HASH_MIGRATION")
-            .version_size(state::VersionSizeKey::LiveOriginal)
-            .media_type(state::MediaType::LivePhotoVideo)
-            .filename("IMG_0001_HEVC.MOV")
+        let record = crate::test_helpers::TestAssetRecord::new("HASH_MIGRATION")
+            .filename("IMG_0001.JPG")
             .build();
         db.upsert_seen(&record).await.unwrap();
         db.mark_downloaded(
             "PrimarySync",
-            "LIVE_HASH_MIGRATION",
-            state::VersionSizeKey::LiveOriginal.as_str(),
-            std::path::Path::new("IMG_0001_HEVC.MOV"),
+            "HASH_MIGRATION",
+            state::VersionSizeKey::Original.as_str(),
+            std::path::Path::new("IMG_0001.JPG"),
             "local-checksum",
             None,
         )

@@ -317,9 +317,6 @@ pub struct SyncStats {
     /// True when this cycle durably reduced metadata-capture work.
     #[serde(skip)]
     pub(crate) metadata_capture_progressed: bool,
-    /// True when every selected smart-folder pass completed a fresh query.
-    #[serde(skip)]
-    pub(crate) smart_folder_refresh_complete: bool,
     pub state_write_failures: usize,
     pub enumeration_errors: usize,
     /// Best-effort count-probe failures observed before full enumeration.
@@ -495,7 +492,6 @@ impl SyncStats {
         self.metadata_capture_failures += other.metadata_capture_failures;
         self.metadata_capture_remaining += other.metadata_capture_remaining;
         self.metadata_capture_progressed |= other.metadata_capture_progressed;
-        self.smart_folder_refresh_complete |= other.smart_folder_refresh_complete;
         self.state_write_failures += other.state_write_failures;
         self.enumeration_errors += other.enumeration_errors;
         self.count_probe_failures += other.count_probe_failures;
@@ -3472,7 +3468,6 @@ fn take_matching_retry_tasks<I>(
 #[derive(Debug, Default)]
 pub(crate) struct PathReconciliationResult {
     pub(crate) complete: bool,
-    pub(crate) smart_folder_refresh_required: bool,
     pub(crate) blocked_asset_ids: FxHashSet<ReconciliationBlock>,
     pub(crate) stats: SyncStats,
 }
@@ -3520,6 +3515,116 @@ async fn requeue_catalog_file(
         stats.state_write_failures += 1;
         tracing::warn!(asset_id = %task.asset_id, %error, "Path reconciliation could not requeue a missing catalog file");
     }
+}
+
+async fn current_smart_folder_memberships(
+    passes: &[crate::commands::AlbumPass],
+    shutdown_token: &CancellationToken,
+) -> (Vec<FxHashMap<String, Vec<PhotoAsset>>>, bool) {
+    let mut memberships: Vec<FxHashMap<String, Vec<PhotoAsset>>> =
+        vec![FxHashMap::default(); passes.len()];
+    let mut complete = true;
+
+    for (pass, members) in passes.iter().zip(&mut memberships) {
+        if pass.kind != crate::commands::PassKind::SmartFolder {
+            continue;
+        }
+        let total_count = match pass.album.len().await {
+            Ok(total_count) => total_count,
+            Err(error) => {
+                complete = false;
+                tracing::warn!(
+                    pass = %pass.album.name,
+                    library = pass.album.zone_name(),
+                    %error,
+                    "Smart-folder count failed during path reconciliation"
+                );
+                continue;
+            }
+        };
+        let (mut stream, producer_panicked) = pass.album.photo_stream(None, Some(total_count), 1);
+        let mut pass_complete = true;
+        let mut observed = 0u64;
+        while let Some(item) = stream.next().await {
+            if shutdown_token.is_cancelled() {
+                pass_complete = false;
+                break;
+            }
+            match item {
+                Ok(asset) => {
+                    members
+                        .entry(asset.id().to_string())
+                        .or_default()
+                        .push(asset.clone());
+                    members
+                        .entry(asset.asset_record_name().to_string())
+                        .or_default()
+                        .push(asset);
+                    observed = observed.saturating_add(1);
+                }
+                Err(error) => {
+                    pass_complete = false;
+                    tracing::warn!(
+                        pass = %pass.album.name,
+                        library = pass.album.zone_name(),
+                        %error,
+                        "Smart-folder membership query failed during path reconciliation"
+                    );
+                }
+            }
+        }
+        drop(stream);
+        pass_complete &= producer_panicked.await == Ok(false) && observed == total_count;
+        if observed != total_count {
+            tracing::warn!(
+                pass = %pass.album.name,
+                library = pass.album.zone_name(),
+                expected = total_count,
+                observed,
+                "Smart-folder membership query was incomplete during path reconciliation"
+            );
+        }
+        complete &= pass_complete;
+    }
+
+    (memberships, complete && !shutdown_token.is_cancelled())
+}
+
+fn current_smart_folder_asset(
+    memberships: &[FxHashMap<String, Vec<PhotoAsset>>],
+    state_id: &str,
+    persisted_owner: Option<&str>,
+    records: &[crate::state::AssetRecord],
+) -> Option<PhotoAsset> {
+    let mut candidates = FxHashMap::default();
+    for asset in memberships
+        .iter()
+        .filter_map(|members| members.get(state_id))
+        .flatten()
+    {
+        if persisted_owner.is_some_and(|owner| asset.asset_record_name() != owner) {
+            continue;
+        }
+        if persisted_owner.is_none()
+            && !asset.versions().iter().any(|(_, version)| {
+                records
+                    .iter()
+                    .filter(|record| record.id.as_ref() == state_id)
+                    .any(|record| {
+                        record.checksum.as_ref() == version.checksum.as_ref()
+                            && record.size_bytes == version.size
+                    })
+            })
+        {
+            continue;
+        }
+        candidates
+            .entry(asset.asset_record_name().to_string())
+            .or_insert_with(|| asset.clone());
+    }
+    (candidates.len() == 1)
+        .then(|| candidates.into_values().next())
+        .flatten()
 }
 
 pub(crate) async fn reconcile_catalog_paths(
@@ -3622,9 +3727,6 @@ async fn reconcile_catalog_paths_inner(
     let Some(provider_pass) = passes.first() else {
         return Ok(PathReconciliationResult::default());
     };
-    let smart_folder_refresh_required = passes
-        .iter()
-        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
 
     let mut records = Vec::new();
     let mut offset = 0u64;
@@ -3640,6 +3742,16 @@ async fn reconcile_catalog_paths_inner(
         }
         offset = offset.saturating_add(u64::from(PAGE_SIZE));
     }
+    if records.is_empty() {
+        return Ok(PathReconciliationResult {
+            complete: true,
+            blocked_asset_ids: FxHashSet::default(),
+            stats: SyncStats::default(),
+        });
+    }
+
+    let (smart_folder_memberships, smart_folder_membership_complete) =
+        current_smart_folder_memberships(passes, &shutdown_token).await;
     let mut albums_by_asset: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
     for (asset_id, album_name) in db.get_all_asset_albums(&config.library).await? {
         albums_by_asset
@@ -3649,18 +3761,22 @@ async fn reconcile_catalog_paths_inner(
     }
     records.retain(|record| {
         let known_albums = albums_by_asset.get(record.id.as_ref());
-        passes.iter().any(|pass| match pass.kind {
-            crate::commands::PassKind::Album => {
-                known_albums.is_some_and(|albums| albums.contains(pass.album.name.as_ref()))
-            }
-            crate::commands::PassKind::Unfiled => known_albums.is_none_or(FxHashSet::is_empty),
-            crate::commands::PassKind::SmartFolder => false,
-        })
+        passes
+            .iter()
+            .zip(&smart_folder_memberships)
+            .any(|(pass, smart_folder_members)| match pass.kind {
+                crate::commands::PassKind::Album => {
+                    known_albums.is_some_and(|albums| albums.contains(pass.album.name.as_ref()))
+                }
+                crate::commands::PassKind::Unfiled => known_albums.is_none_or(FxHashSet::is_empty),
+                crate::commands::PassKind::SmartFolder => {
+                    smart_folder_members.contains_key(record.id.as_ref())
+                }
+            })
     });
     if records.is_empty() {
         return Ok(PathReconciliationResult {
-            complete: true,
-            smart_folder_refresh_required,
+            complete: smart_folder_membership_complete,
             blocked_asset_ids: FxHashSet::default(),
             stats: SyncStats::default(),
         });
@@ -3699,13 +3815,18 @@ async fn reconcile_catalog_paths_inner(
                     &album_container_refs,
                 )
                 .await?);
-    let selection_complete = album_membership_complete;
+    let selection_complete = album_membership_complete && smart_folder_membership_complete;
     let batch = provider_pass.album.resolve_records(&requests).await;
     let download_ctx = preload_download_context(&config).await;
     let mut reconciliation_reservations = planner::TaskPlanner::new();
     let mut stats = SyncStats::default();
     let mut tasks = Vec::new();
     let mut task_keys = FxHashSet::default();
+    let mut remaining_task_keys: FxHashMap<PendingRetryTarget, FxHashSet<RetryTaskKey>> =
+        FxHashMap::default();
+    let mut unresolved_targets = FxHashSet::default();
+    let mut reserved_target_paths: FxHashMap<(PendingRetryTarget, PathBuf), PathBuf> =
+        FxHashMap::default();
     let mut invalid_owned_targets = FxHashSet::default();
     let mut blocked_owned_targets = FxHashSet::default();
     let mut cycle_blocked_asset_ids = FxHashSet::default();
@@ -3714,6 +3835,21 @@ async fn reconcile_catalog_paths_inner(
         .map(|record| (PendingRetryTarget::from_record(record), record))
         .collect();
     let mut resolutions = batch.results;
+    for (state_id, resolution) in &mut resolutions {
+        if matches!(resolution, RecordResolution::Present(_)) {
+            continue;
+        }
+        if let Some(asset) = current_smart_folder_asset(
+            &smart_folder_memberships,
+            state_id.as_str(),
+            legacy_master_state_owners
+                .get(state_id.as_str())
+                .map(String::as_str),
+            &records,
+        ) {
+            *resolution = RecordResolution::Present(asset);
+        }
+    }
     let legacy_present_state_ids: FxHashSet<String> = resolutions
         .iter()
         .filter(|(_, resolution)| matches!(resolution, RecordResolution::MasterPresent))
@@ -3785,25 +3921,32 @@ async fn reconcile_catalog_paths_inner(
             RecordResolution::Present(asset) => {
                 let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
                 let known_albums = albums_by_asset.get(state_id.as_str());
-                for (pass, pass_config) in passes.iter().zip(&pass_configs) {
+                let state_targets: Vec<PendingRetryTarget> = targets
+                    .iter()
+                    .filter(|target| target.asset_id.as_ref() == state_id.as_str())
+                    .cloned()
+                    .collect();
+                for ((pass, pass_config), smart_folder_members) in passes
+                    .iter()
+                    .zip(&pass_configs)
+                    .zip(&smart_folder_memberships)
+                {
                     let selected = match pass.kind {
                         crate::commands::PassKind::Album => known_albums
                             .is_some_and(|albums| albums.contains(pass.album.name.as_ref())),
                         crate::commands::PassKind::Unfiled => {
                             known_albums.is_none_or(FxHashSet::is_empty)
                         }
-                        crate::commands::PassKind::SmartFolder => false,
+                        crate::commands::PassKind::SmartFolder => {
+                            smart_folder_members.contains_key(asset.asset_record_name())
+                        }
                     };
                     if !selected {
                         continue;
                     }
-                    let state_targets: Vec<PendingRetryTarget> = targets
-                        .iter()
-                        .filter(|target| target.asset_id.as_ref() == state_id.as_str())
-                        .cloned()
-                        .collect();
-                    for target in state_targets {
-                        let Some(record) = records_by_target.get(&target).copied() else {
+                    for target in &state_targets {
+                        let Some(record) = records_by_target.get(target).copied() else {
+                            unresolved_targets.insert(target.clone());
                             continue;
                         };
                         let target_config =
@@ -3823,6 +3966,7 @@ async fn reconcile_catalog_paths_inner(
                         )
                         .into_iter()
                         .find(|derived| derived.version_size == target.version_size) else {
+                            unresolved_targets.insert(target.clone());
                             continue;
                         };
                         let plan = target_planner
@@ -3852,14 +3996,28 @@ async fn reconcile_catalog_paths_inner(
                                 path,
                             )
                         };
-                        task.download_path = reconciliation_reservations
-                            .reserve_reconciliation_path(
-                                &task.download_path,
-                                task.size,
-                                asset.state_id(),
-                            )
-                            .await
-                            .unwrap_or(task.download_path);
+                        let desired_path = task.download_path.clone();
+                        let reservation_key = (target.clone(), desired_path.clone());
+                        task.download_path =
+                            if let Some(path) = reserved_target_paths.get(&reservation_key) {
+                                path.clone()
+                            } else {
+                                let path = reconciliation_reservations
+                                    .reserve_reconciliation_path(
+                                        &desired_path,
+                                        task.size,
+                                        asset.state_id(),
+                                    )
+                                    .await
+                                    .unwrap_or(desired_path);
+                                reserved_target_paths.insert(reservation_key, path.clone());
+                                path
+                            };
+                        let key = RetryTaskKey::from(&task);
+                        remaining_task_keys
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(key.clone());
                         let provider_version_is_current = record.checksum.as_ref()
                             == task.checksum.as_ref()
                             && record.size_bytes == task.size;
@@ -3922,10 +4080,12 @@ async fn reconcile_catalog_paths_inner(
                             false
                         };
                         if recorded_path_is_current {
-                            targets.remove(&target);
+                            remaining_task_keys
+                                .entry(target.clone())
+                                .or_default()
+                                .remove(&key);
                             continue;
                         }
-                        let key = RetryTaskKey::from(&task);
                         if task_keys.insert(key) {
                             tasks.push(task);
                         }
@@ -3960,6 +4120,7 @@ async fn reconcile_catalog_paths_inner(
 
     let mut deferred_to_pending_retry = false;
     for task in tasks {
+        let task_key = RetryTaskKey::from(&task);
         let target = PendingRetryTarget::from_task(&task);
         let Some(record) = records_by_target.get(&target) else {
             stats.failed += 1;
@@ -4022,7 +4183,10 @@ async fn reconcile_catalog_paths_inner(
             .await
             {
                 Ok(file::ConfinedLocalFileState::Matches) => {
-                    targets.remove(&target);
+                    remaining_task_keys
+                        .entry(target)
+                        .or_default()
+                        .remove(&task_key);
                 }
                 Ok(file::ConfinedLocalFileState::Mismatch) => {
                     deferred_to_pending_retry = true;
@@ -4206,7 +4370,10 @@ async fn reconcile_catalog_paths_inner(
                     stats.state_write_failures += 1;
                     tracing::warn!(asset_id = %task.asset_id, %error, "Failed to persist reconciled local path");
                 } else {
-                    targets.remove(&target);
+                    remaining_task_keys
+                        .entry(target)
+                        .or_default()
+                        .remove(&task_key);
                     stats.downloaded += 1;
                     if matches!(
                         task.media_type,
@@ -4260,6 +4427,12 @@ async fn reconcile_catalog_paths_inner(
             }
         }
     }
+    targets.retain(|target| {
+        unresolved_targets.contains(target)
+            || remaining_task_keys
+                .get(target)
+                .is_none_or(|keys| !keys.is_empty())
+    });
     stats.interrupted = shutdown_token.is_cancelled();
     let complete = provider_lookup_complete
         && selection_complete
@@ -4271,7 +4444,6 @@ async fn reconcile_catalog_paths_inner(
         && !stats.interrupted;
     Ok(PathReconciliationResult {
         complete,
-        smart_folder_refresh_required,
         blocked_asset_ids: cycle_blocked_asset_ids,
         stats,
     })
@@ -6382,20 +6554,6 @@ pub async fn download_photos_with_sync(
     if metadata_capture_repair.stats.sync_token_blocked {
         result.sync_token = None;
     }
-    if passes
-        .iter()
-        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder)
-        && result.full_enumeration_ran
-        && matches!(result.outcome, DownloadOutcome::Success)
-        && !result.stats.interrupted
-        && result.stats.failed == 0
-        && result.stats.exif_failures == 0
-        && result.stats.state_write_failures == 0
-        && result.stats.enumeration_errors == 0
-    {
-        result.stats.smart_folder_refresh_complete = true;
-    }
-
     // Pending is transient — anything still pending after a complete sync either
     // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
     if let Some(db) = &config.state_db
@@ -13968,7 +14126,6 @@ mod tests {
             !result.stats.sync_token_blocked,
             "successful smart-folder refresh should not block an otherwise safe incremental cycle"
         );
-        assert!(result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -14014,7 +14171,6 @@ mod tests {
             !result.stats.sync_token_blocked,
             "blank smart-folder query token is telemetry for the refresh, not a reason to block the incremental zone token"
         );
-        assert!(result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -14043,7 +14199,6 @@ mod tests {
             1 + crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize,
             "smart-folder refresh must enumerate only the selected smart-folder stream"
         );
-        assert!(result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -14079,7 +14234,6 @@ mod tests {
             Some(SMART_FOLDER_REFRESH_FAILED_REASON)
         );
         assert_eq!(result.sync_token, None);
-        assert!(!result.stats.smart_folder_refresh_complete);
     }
 
     #[tokio::test]
@@ -21556,7 +21710,6 @@ mod tests {
             metadata_capture_failures: 1,
             metadata_capture_remaining: 5,
             metadata_capture_progressed: false,
-            smart_folder_refresh_complete: false,
             state_write_failures: 2,
             enumeration_errors: 3,
             count_probe_failures: 4,
@@ -21629,7 +21782,6 @@ mod tests {
             metadata_capture_failures: 2,
             metadata_capture_remaining: 7,
             metadata_capture_progressed: true,
-            smart_folder_refresh_complete: true,
             state_write_failures: 5,
             enumeration_errors: 6,
             count_probe_failures: 7,
@@ -21697,7 +21849,6 @@ mod tests {
         assert_eq!(acc.metadata_capture_failures, 3);
         assert_eq!(acc.metadata_capture_remaining, 12);
         assert!(acc.metadata_capture_progressed);
-        assert!(acc.smart_folder_refresh_complete);
         assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
         assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");
         assert_eq!(

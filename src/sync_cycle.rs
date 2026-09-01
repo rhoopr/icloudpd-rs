@@ -431,7 +431,6 @@ struct PreparedLibraryCycle<'a> {
     state: &'a LibraryState,
     sync_mode_decision: SyncModeDecision,
     download_config: Arc<download::DownloadConfig>,
-    smart_folder_refresh_required: bool,
 }
 
 /// Outcome of [`check_and_persist_enum_config_hash`].
@@ -576,7 +575,7 @@ pub(crate) async fn check_download_config_hash_for_cycle<D>(
     legacy_hash: &str,
 ) -> DownloadConfigHashOutcome
 where
-    D: state::SyncTokenStore + ?Sized,
+    D: state::ReportStateStore + state::SyncTokenStore + ?Sized,
 {
     match db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY).await {
         Ok(Some(stored)) if stored == current_hash => {
@@ -608,18 +607,18 @@ where
                     return DownloadConfigHashOutcome::ReadFailed;
                 }
             }
-            match db.has_downloaded_live_photo_videos().await {
-                Ok(false) => {}
-                Ok(true) => {
+            match db.get_downloaded_page(0, 1).await {
+                Ok(records) if records.is_empty() => {}
+                Ok(_) => {
                     tracing::info!(
-                        "Legacy download path hash includes Live Photo videos; staging local reconciliation"
+                        "Legacy download path hash has downloaded rows with unverified selection scope; staging local reconciliation"
                     );
                     return stage_download_config_hash_reconciliation(db, current_hash).await;
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "Failed to inspect downloaded Live Photo videos for path hash migration"
+                        "Failed to inspect downloaded rows for path hash migration"
                     );
                     return DownloadConfigHashOutcome::ReadFailed;
                 }
@@ -913,7 +912,6 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
-        let mut smart_folder_refresh_required = false;
         if pending_download_config_hash.is_some() {
             let reconciliation = download::reconcile_catalog_paths(
                 &lib_state.plan.passes,
@@ -922,7 +920,6 @@ pub(crate) async fn run_cycle(
             )
             .await?;
             path_reconciliation_complete = path_reconciliation_complete && reconciliation.complete;
-            smart_folder_refresh_required = reconciliation.smart_folder_refresh_required;
             cycle_reconciliation_blocked_asset_ids
                 .extend(reconciliation.blocked_asset_ids.iter().cloned());
             cycle_failed_count = cycle_failed_count
@@ -935,7 +932,6 @@ pub(crate) async fn run_cycle(
             state: lib_state,
             sync_mode_decision,
             download_config,
-            smart_folder_refresh_required,
         });
     }
 
@@ -961,10 +957,6 @@ pub(crate) async fn run_cycle(
             shutdown_token.clone(),
         )
         .await?;
-        if prepared.smart_folder_refresh_required {
-            path_reconciliation_complete =
-                path_reconciliation_complete && sync_result.stats.smart_folder_refresh_complete;
-        }
 
         let mut checkpoint_basis = if sync_result.full_enumeration_ran {
             CheckpointBasis::CompleteInventory
@@ -1325,6 +1317,10 @@ pub(crate) async fn run_cycle(
         && !cycle_has_stale_plan
         && !cycle_session_expired
         && !shutdown_token.is_cancelled()
+        && cycle_failed_count == 0
+        && cycle_stats.enumeration_errors == 0
+        && cycle_stats.state_write_failures == 0
+        && !cycle_stats.interrupted
         && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
         && let Err(e) = db
             .commit_checkpoint_transition(state::CheckpointTransition {
