@@ -21,7 +21,6 @@ use little_exif::filetype::FileExtension;
 #[cfg(not(feature = "xmp"))]
 use little_exif::ifd::ExifTagGroup;
 use little_exif::metadata::Metadata;
-#[cfg(any(not(feature = "xmp"), test))]
 use little_exif::rational::uR64;
 #[cfg(feature = "xmp")]
 use xmp_toolkit::{
@@ -2372,10 +2371,11 @@ fn encode_gps(decimal: f64, pos: char, neg: char) -> String {
     format!("{deg_u32},{min:.4}{hemisphere}")
 }
 
-/// Preserve the provider's altitude precision using Rust's shortest round-trip decimal.
+/// Preserve provider altitude precision in the rational form required by EXIF reconciliation.
 #[cfg(feature = "xmp")]
 fn encode_altitude(meters: f64) -> String {
-    meters.abs().to_string()
+    let rational = uR64::from(meters.abs());
+    format!("{}/{}", rational.nominator, rational.denominator)
 }
 
 #[cfg(all(test, feature = "xmp"))]
@@ -3144,6 +3144,9 @@ mod tests {
 
     #[test]
     fn apply_metadata_gps_roundtrips() {
+        const ALTITUDE: f64 = 9.250_123_456_789;
+        const ALTITUDE_RATIONAL: &str = "2032686204/219746927";
+
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "gps.jpg");
         apply_metadata_with_default_suffix(
@@ -3152,7 +3155,7 @@ mod tests {
                 gps: Some(GpsCoords {
                     latitude: 37.7749,
                     longitude: -122.4194,
-                    altitude: Some(17.0),
+                    altitude: Some(ALTITUDE),
                 }),
                 ..MetadataWrite::default()
             },
@@ -3165,6 +3168,20 @@ mod tests {
         assert!(lat.contains('N'), "lat should end with N: {lat}");
         let lng = meta.property(xmp_ns::EXIF, "GPSLongitude").unwrap().value;
         assert!(lng.contains('W'), "lng should end with W: {lng}");
+        assert_eq!(
+            meta.property(xmp_ns::EXIF, "GPSAltitude").unwrap().value,
+            ALTITUDE_RATIONAL
+        );
+
+        let native = Metadata::new_from_path(&path).unwrap();
+        let native_altitude = native
+            .get_tag(&ExifTag::GPSAltitude(Vec::new()))
+            .next()
+            .and_then(|tag| match tag {
+                ExifTag::GPSAltitude(values) => values.first(),
+                _ => None,
+            });
+        assert_eq!(native_altitude, Some(&ur64(2_032_686_204, 219_746_927)));
         fs::remove_file(&path).ok();
     }
 
