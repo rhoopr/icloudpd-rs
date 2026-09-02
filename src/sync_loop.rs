@@ -7973,6 +7973,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_album_membership_failure_preserves_and_replays_checkpoint() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        Mock::given(method("GET"))
+            .and(path("/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = make_run_cycle_config();
+        let inner = Arc::new(state::SqliteStateDb::open_in_memory().expect("state db"));
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let media_path = download_dir.path().join("TestAlbum/cGhvdG8uanBn.JPG");
+        let page = full_album_page_with_download(
+            "PrimarySync",
+            "master-PrimarySync",
+            "zone-tok-new",
+            &format!("{}/photo.jpg", server.uri()),
+            body.len() as u64,
+            &checksum,
+        );
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(page.clone())
+                .ok(album_count_response(1))
+                .ok(page.clone())
+                .ok(album_count_response(1))
+                .ok(page),
+        );
+        let lib_state = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            vec![crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Album,
+                album,
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            }],
+        );
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                per_pass_paths: true,
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        inner.fail_asset_album_writes_for_test();
+        let failed = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run failed grouping cycle");
+
+        assert_eq!(failed.failed_count, 1, "cycle stats: {:?}", failed.stats);
+        assert_eq!(
+            failed.stats.state_write_failures, 1,
+            "cycle stats: {:?}",
+            failed.stats
+        );
+        assert_eq!(failed.stats.downloaded, 1);
+        assert_eq!(
+            std::fs::read(&media_path).expect("read landed media"),
+            body,
+            "the media must land even though grouping state is not durable"
+        );
+        assert!(!failed.db_sync_token_advance_safe);
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read preserved zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "a missing grouping relationship must preserve the replay checkpoint"
+        );
+        assert!(
+            inner
+                .get_all_asset_albums("PrimarySync")
+                .await
+                .expect("read missing grouping relationship")
+                .is_empty()
+        );
+
+        inner.allow_asset_album_writes_for_test();
+        for cycle in 2..=3 {
+            let recovered = run_cycle(
+                &states,
+                &config,
+                Some(db.as_ref()),
+                false,
+                &build_download_config,
+                download::DownloadControls::download_hidden(),
+                &shared_session,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("grouping replay cycle {cycle} failed: {error}"));
+
+            assert_eq!(recovered.failed_count, 0);
+            assert_eq!(recovered.stats.state_write_failures, 0);
+            assert_eq!(
+                recovered.stats.downloaded, 0,
+                "cycle {cycle} must not redownload landed media"
+            );
+            assert_eq!(
+                inner
+                    .get_all_asset_albums("PrimarySync")
+                    .await
+                    .expect("read recovered grouping relationship"),
+                vec![(
+                    "asset-master-PrimarySync".to_string(),
+                    "TestAlbum".to_string()
+                )],
+                "cycle {cycle} must leave one idempotent relationship"
+            );
+        }
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read recovered zone token")
+                .as_deref(),
+            Some("zone-tok-new"),
+            "the checkpoint may advance after the grouping relationship is durable"
+        );
+        assert_eq!(
+            std::fs::read(&media_path).expect("read stable media"),
+            body,
+            "grouping replay must not change landed media"
+        );
+    }
+
+    #[tokio::test]
     async fn run_cycle_durable_expired_url_failure_advances_zone_checkpoint() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};

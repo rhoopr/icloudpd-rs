@@ -98,6 +98,9 @@ different gates:
 
 - A zone checkpoint may advance after a transfer failure when the exact retry
   work is durable and enumeration/token proof is complete.
+- An exhausted album grouping write preserves the zone checkpoint. Replay
+  retries the relationship before it skips media that is already downloaded,
+  and the relationship insert is idempotent.
 - The broader database pre-check token advances only after a clean aggregate
   cycle for the exact account, selection, filter, config, and selected-zone
   scope.

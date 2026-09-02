@@ -8380,6 +8380,7 @@ async fn download_photos_incremental_collecting_inner(
                     .await
                 && let Some(album_name) = effective_config.album_name.as_deref()
             {
+                planning_state_write_failures = planning_state_write_failures.saturating_add(1);
                 tracing::warn!(
                     asset_id = %asset.id(),
                     album = %album_name,
@@ -15981,6 +15982,102 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "changes/zone is zone-scoped; querying once per pass repeats the same delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn collecting_album_membership_failure_replays_without_redownloading() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let records = incremental_photo_records("COLLECTED_GROUPING");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        seed_complete_album_snapshot(
+            db.as_ref(),
+            "container-vacation",
+            "Vacation",
+            &[("asset-COLLECTED_GROUPING", "COLLECTED_GROUPING")],
+        )
+        .await;
+        let change_calls = Arc::new(AtomicUsize::new(0));
+        let pass = AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container(
+                "Vacation",
+                Some("container-vacation"),
+                changes_zone_session(Arc::clone(&change_calls), records),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.recent = Some(10);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        let media_path = seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &asset).await;
+        let config = Arc::new(config);
+        let media_before = tokio::fs::read(&media_path)
+            .await
+            .expect("read seeded media");
+
+        db.fail_asset_album_writes_for_test();
+        let failed = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &config,
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("membership failure should return a partial result");
+
+        assert!(matches!(
+            failed.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(failed.stats.state_write_failures, 1);
+        assert_eq!(failed.stats.downloaded, 0);
+        assert!(
+            db.get_all_asset_albums("PrimarySync")
+                .await
+                .expect("read missing album membership")
+                .is_empty(),
+            "the injected failure must leave the compatibility relationship absent"
+        );
+
+        db.allow_asset_album_writes_for_test();
+        for cycle in 2..=3 {
+            let recovered = download_photos_incremental(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                &config,
+                "zone-token-prev",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("grouping replay cycle {cycle} failed: {error}"));
+
+            assert!(matches!(recovered.outcome, DownloadOutcome::Success));
+            assert_eq!(recovered.stats.state_write_failures, 0);
+            assert_eq!(
+                recovered.stats.downloaded, 0,
+                "cycle {cycle} must not redownload landed media"
+            );
+            assert_eq!(
+                db.get_all_asset_albums("PrimarySync")
+                    .await
+                    .expect("read recovered album membership"),
+                vec![("COLLECTED_GROUPING".to_string(), "Vacation".to_string())],
+                "cycle {cycle} must leave one idempotent relationship"
+            );
+        }
+        assert_eq!(change_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            tokio::fs::read(&media_path)
+                .await
+                .expect("read stable media"),
+            media_before,
+            "grouping replay must not change landed media"
         );
     }
 
