@@ -1256,6 +1256,11 @@ mod tests {
     }
 
     #[cfg(feature = "xmp")]
+    const CLOUDKIT_ALTITUDE: f64 = 9.250_123_456_789;
+    #[cfg(feature = "xmp")]
+    const CLOUDKIT_ALTITUDE_XMP: &str = "2032686204/219746927";
+
+    #[cfg(feature = "xmp")]
     fn assert_cloudkit_authority_with_source_gps(meta: &XmpMeta) {
         const CAPTURE: &str = "2019-03-04T05:06:07+11:00";
         for (namespace, property) in [
@@ -1272,7 +1277,7 @@ mod tests {
         let coordinate = |name: &str| meta.property(xmp_ns::EXIF, name).expect(name).value;
         assert_eq!(coordinate("GPSLatitude"), "12,20.7360N");
         assert_eq!(coordinate("GPSLongitude"), "78,54.0720W");
-        assert_eq!(coordinate("GPSAltitude"), "9250/1000");
+        assert_eq!(coordinate("GPSAltitude"), CLOUDKIT_ALTITUDE_XMP);
         crate::test_helpers::assert_source_gps_in_xmp(meta);
         assert_ne!(
             meta.property(xmp_ns::EXIF, "GPSTimeStamp")
@@ -2825,7 +2830,7 @@ mod tests {
             timezone_offset: Some(39_600),
             latitude: Some(12.3456),
             longitude: Some(-78.9012),
-            altitude: Some(9.25),
+            altitude: Some(CLOUDKIT_ALTITUDE),
             ..MetadataPayload::default()
         };
         let cloudkit_created = authority_cloudkit_time();
@@ -2878,7 +2883,7 @@ mod tests {
                 timezone_offset: Some(39_600),
                 latitude: Some(12.3456),
                 longitude: Some(-78.9012),
-                altitude: Some(9.25),
+                altitude: Some(CLOUDKIT_ALTITUDE),
                 metadata_hash: Some("gps-retry-hash".into()),
                 ..AssetMetadata::default()
             },
@@ -2945,7 +2950,7 @@ mod tests {
         assert_eq!(value(xmp_ns::XMP, "Rating"), "4");
         assert_eq!(value(xmp_ns::EXIF, "GPSLatitude"), "12,20.7360N");
         assert_eq!(value(xmp_ns::EXIF, "GPSLongitude"), "78,54.0720W");
-        assert_eq!(value(xmp_ns::EXIF, "GPSAltitude"), "9250/1000");
+        assert_eq!(value(xmp_ns::EXIF, "GPSAltitude"), "37/4");
         assert_eq!(
             std::fs::read(&media_path).expect("read source DNG after sidecar"),
             source_bytes,
