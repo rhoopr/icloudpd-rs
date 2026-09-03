@@ -1869,6 +1869,8 @@ where
                                 .await
                                     && let Some(album) = config.album_name.as_deref()
                                 {
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(
                                         asset_id = %asset.id(),
                                         album = %album,

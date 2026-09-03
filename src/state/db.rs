@@ -5931,6 +5931,22 @@ impl MetadataRewriteStore for SqliteStateDb {
 
 #[cfg(test)]
 impl SqliteStateDb {
+    pub(crate) fn fail_asset_album_writes_for_test(&self) {
+        let conn = self.acquire_lock("test_fail_asset_album_writes").unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_asset_album_writes \
+             BEFORE INSERT ON asset_albums \
+             BEGIN SELECT RAISE(FAIL, 'simulated asset album write failure'); END;",
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn allow_asset_album_writes_for_test(&self) {
+        let conn = self.acquire_lock("test_allow_asset_album_writes").unwrap();
+        conn.execute_batch("DROP TRIGGER fail_asset_album_writes")
+            .unwrap();
+    }
+
     pub(crate) fn fail_provider_metadata_refresh_for_test(&self) {
         let conn = self
             .acquire_lock("test_fail_provider_metadata_refresh")
