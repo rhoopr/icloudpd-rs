@@ -175,8 +175,9 @@ but not the path hash, so expanding a date window runs the required inventory
 without treating existing media as path drift. Matching legacy hashes that
 mixed date eligibility into path state migrate without reconciliation. When a
 legacy hash is ambiguous, reconciliation uses the same durable path-family and
-file-integrity proof as normal sync before collision naming, so an asset cannot
-collide with its own recorded file.
+file-integrity proof as normal sync to discard the planned collision task
+before copying or changing state, so an asset cannot collide with its own
+recorded file.
 
 For an asset carrying a usable offset, a path derived under host-local
 rendering is not a current derived path, so a full sweep forwards that asset

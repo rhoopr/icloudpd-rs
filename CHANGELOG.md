@@ -31,9 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Changing only `skip_created_before` or `skip_created_after` no longer copies
   every existing selected file to an ID-suffixed path. Date bounds now change
   inventory eligibility without inventing local path drift, and upgraded
-  workspaces recognise the recorded file before collision naming when an old
-  hash is ambiguous. Existing duplicate files are left untouched. (fixes
-  [#769])
+  workspaces discard a planned collision path when it belongs to the recorded
+  file. Existing duplicate files are left untouched. (fixes [#769])
 - Authentication now retries verification-code delivery once from clean local state when Apple rejects a persisted cookie or session with HTTP 403. The retry
   removes only the affected account's cookie jar, session, and validation cache while holding the account lock; password material and the state database remain
   unchanged. `kei reset session` provides the same cleanup explicitly. ([#716])
