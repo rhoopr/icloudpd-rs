@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Path reconciliation no longer reports newly selected adjusted renditions as failed moves before the download pass creates them. Expanding media or rendition
+  settings now exits successfully when the new files download and state writes complete. ([#795])
 - Changing only `skip_created_before` or `skip_created_after` no longer copies
   every existing selected file to an ID-suffixed path. Date bounds now change
   inventory eligibility without inventing local path drift, and upgraded
@@ -50,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#716]: https://github.com/rhoopr/kei/issues/716
 [#717]: https://github.com/rhoopr/kei/pull/717
 [#726]: https://github.com/rhoopr/kei/issues/726
+[#795]: https://github.com/rhoopr/kei/issues/795
 
 ## [0.23.1] - 2026-08-16
 

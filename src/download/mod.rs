@@ -3612,8 +3612,10 @@ pub(crate) async fn reconcile_catalog_paths(
     for task in tasks {
         let target = PendingRetryTarget::from_task(&task);
         let Some(record) = records_by_target.get(&target) else {
-            stats.failed += 1;
-            tracing::warn!(asset_id = %task.asset_id, "Path reconciliation task had no catalog row");
+            tracing::debug!(
+                version_size = task.version_size.as_str(),
+                "Path reconciliation left newly selected version to normal download"
+            );
             continue;
         };
         let Some(source_path) = record.local_path.as_deref() else {
@@ -14149,8 +14151,14 @@ mod tests {
             .await
             .unwrap();
 
-        let records =
+        let mut records =
             mock_photo_records_for_zone_with_filename("RECONCILE", "PrimarySync", "reconcile.jpg");
+        records[1]["fields"]["resJPEGFullRes"] = json!({"value": {
+            "downloadURL": "https://p01.icloud-content.com/reconcile-adjusted.jpg",
+            "size": 512,
+            "fileChecksum": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        }});
+        records[1]["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
         let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
@@ -14166,9 +14174,16 @@ mod tests {
         let mut config = test_config();
         config.directory = Arc::from(new_dir.path());
         config.state_db = Some(db.clone());
-        let expected_path = filter::expected_paths_for(&asset, &config)
+        config.edited = true;
+        let expected_paths = filter::expected_paths_for(&asset, &config);
+        let expected_path = expected_paths
             .into_iter()
-            .next()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap()
+            .path;
+        let adjusted_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .find(|path| path.version_size == VersionSizeKey::Adjusted)
             .unwrap()
             .path;
 
@@ -14178,12 +14193,15 @@ mod tests {
 
         assert!(result.complete);
         assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(result.stats.failed, 0);
         assert_eq!(tokio::fs::read(&old_path).await.unwrap(), b"catalog bytes");
         assert_eq!(
             tokio::fs::read(&expected_path).await.unwrap(),
             b"catalog bytes"
         );
+        assert!(!adjusted_path.exists());
         let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(downloaded.len(), 1);
         assert_eq!(
             downloaded[0].local_path.as_deref(),
             Some(expected_path.as_path())
@@ -14196,6 +14214,7 @@ mod tests {
                 let mut config = test_config();
                 config.directory = Arc::from(new_dir.path());
                 config.state_db = Some(db.clone());
+                config.edited = true;
                 config
             }),
             CancellationToken::new(),
