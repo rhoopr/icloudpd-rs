@@ -8912,6 +8912,434 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_steady_state() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        #[derive(Clone, Debug)]
+        struct DateBoundSession {
+            records: Arc<Vec<serde_json::Value>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::icloud::photos::PhotosSession for DateBoundSession {
+            async fn post(
+                &self,
+                url: &str,
+                body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                if url.contains("/internal/records/query/batch") {
+                    return Ok(album_count_response((self.records.len() / 2) as u64));
+                }
+                if url.contains("/records/lookup?") {
+                    return Ok(serde_json::json!({"records": self.records.as_ref()}));
+                }
+                if url.contains("/records/query?") {
+                    let request: serde_json::Value = serde_json::from_str(&body)?;
+                    let offset = request["query"]["filterBy"]
+                        .as_array()
+                        .and_then(|filters| {
+                            filters.iter().find_map(|filter| {
+                                (filter["fieldName"] == "startRank")
+                                    .then(|| filter["fieldValue"]["value"].as_u64())
+                                    .flatten()
+                            })
+                        })
+                        .unwrap_or(0);
+                    let limit = request["resultsLimit"].as_u64().unwrap_or(0) / 2;
+                    let records: Vec<_> = self
+                        .records
+                        .chunks_exact(2)
+                        .skip(offset as usize)
+                        .take(limit as usize)
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    return Ok(serde_json::json!({
+                        "records": records,
+                        "syncToken": "zone-token-inventory"
+                    }));
+                }
+                if url.contains("/changes/zone?") {
+                    return Ok(serde_json::json!({
+                        "zones": [{
+                            "zoneID": {
+                                "zoneName": "PrimarySync",
+                                "ownerRecordName": "_defaultOwner"
+                            },
+                            "syncToken": "zone-token-incremental",
+                            "moreComing": false,
+                            "records": []
+                        }]
+                    }));
+                }
+                Ok(serde_json::json!({"records": []}))
+            }
+
+            fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+                Box::new(self.clone())
+            }
+        }
+
+        fn asset_records(
+            record_name: &str,
+            filename: &str,
+            created: chrono::DateTime<chrono::Utc>,
+            download_url: &str,
+            body: &[u8],
+        ) -> Vec<serde_json::Value> {
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+            let mut page = full_album_page_with_download(
+                "PrimarySync",
+                record_name,
+                "unused",
+                download_url,
+                body.len() as u64,
+                &checksum,
+            );
+            page["records"][0]["fields"]["filenameEnc"]["value"] =
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(filename));
+            page["records"][1]["fields"]["assetDate"]["value"] =
+                serde_json::json!(created.timestamp_millis());
+            page["records"][1]["fields"]["addedDate"]["value"] =
+                serde_json::json!(created.timestamp_millis());
+            page["records"].as_array().expect("asset records").clone()
+        }
+
+        fn snapshot_files(
+            root: &std::path::Path,
+        ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn visit(
+                root: &std::path::Path,
+                dir: &std::path::Path,
+                files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+            ) {
+                for entry in std::fs::read_dir(dir).expect("read media directory") {
+                    let entry = entry.expect("read media entry");
+                    let path = entry.path();
+                    if path.is_dir() {
+                        visit(root, &path, files);
+                    } else {
+                        files.insert(
+                            path.strip_prefix(root)
+                                .expect("relative media path")
+                                .to_path_buf(),
+                            std::fs::read(path).expect("read media file"),
+                        );
+                    }
+                }
+            }
+
+            let mut files = std::collections::BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+
+        let server = crate::start_wiremock_or_skip!();
+        let january_body = &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        let april_body = &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        Mock::given(method("GET"))
+            .and(path("/january.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(january_body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/april.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(april_body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let january_created = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc();
+        let april_created = chrono::NaiveDate::from_ymd_opt(2026, 4, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc();
+        let mut records = asset_records(
+            "APRIL",
+            "april.jpg",
+            april_created,
+            &format!("{}/april.jpg", server.uri()),
+            april_body,
+        );
+        records.extend(asset_records(
+            "JANUARY",
+            "january.jpg",
+            january_created,
+            &format!("{}/january.jpg", server.uri()),
+            january_body,
+        ));
+        let album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(DateBoundSession {
+                records: Arc::new(records),
+            }),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let old_lower_bound = config::CreatedDateFilter::CaptureDate(
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+        );
+        let new_lower_bound = config::CreatedDateFilter::CaptureDate(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        );
+        let upper_bound = config::CreatedDateFilter::CaptureDate(
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let mut config = make_run_cycle_config();
+        config.filters.skip_created_before = Some(old_lower_bound);
+        config.filters.skip_created_after = Some(upper_bound);
+        let old_enum_hash = download::compute_config_hash(&config);
+        let old_builder = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                skip_created_before: Some(old_lower_bound),
+                skip_created_after: Some(upper_bound),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let first_result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &old_builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run initial date-bound cycle");
+        assert_eq!(
+            first_result.stats.downloaded, 1,
+            "{:#?}",
+            first_result.stats
+        );
+
+        let first_snapshot = snapshot_files(download_dir.path());
+        assert_eq!(first_snapshot.len(), 1);
+        let april_record = db
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("read initial downloaded rows")
+            .into_iter()
+            .find(|record| record.id.as_ref() == "asset-APRIL")
+            .expect("April downloaded row");
+        let april_path = april_record.local_path.expect("April local path");
+        assert_eq!(tokio::fs::read(&april_path).await.unwrap(), april_body);
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .expect("read initial enumeration hash")
+                .as_deref(),
+            Some(old_enum_hash.as_str())
+        );
+        db.set_metadata(
+            &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
+            "zone-token-old-bound",
+        )
+        .await
+        .expect("seed prior provider checkpoint");
+        let checkpoint_before_expansion = db
+            .get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+            .await
+            .expect("read initial provider checkpoint");
+        assert_eq!(
+            checkpoint_before_expansion.as_deref(),
+            Some("zone-token-old-bound")
+        );
+
+        let old_download_config = old_builder(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        );
+        db.set_metadata(
+            download::DOWNLOAD_CONFIG_HASH_KEY,
+            &download::hash_legacy_download_config(&old_download_config),
+        )
+        .await
+        .expect("seed pre-fix path hash");
+        drop(old_builder);
+
+        config.filters.skip_created_before = Some(new_lower_bound);
+        let current_enum_hash = download::compute_config_hash(&config);
+        let current_builder = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                skip_created_before: Some(new_lower_bound),
+                skip_created_after: Some(upper_bound),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let current_download_config = current_builder(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        );
+        let current_download_hash = download::hash_download_config(&current_download_config);
+        assert_ne!(
+            download::hash_legacy_download_config(&old_download_config),
+            download::hash_legacy_download_config(&current_download_config)
+        );
+
+        let second_result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &current_builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run expanded date-bound cycle");
+        assert_eq!(second_result.stats.downloaded, 1);
+        assert_ne!(
+            second_result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::DownloadConfigHashDrift)
+        );
+
+        let second_snapshot = snapshot_files(download_dir.path());
+        assert_eq!(second_snapshot.len(), 2);
+        assert!(
+            first_snapshot
+                .iter()
+                .all(|entry| second_snapshot.get(entry.0) == Some(entry.1))
+        );
+        assert_eq!(tokio::fs::read(&april_path).await.unwrap(), april_body);
+        let downloaded = db
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("read expanded downloaded rows");
+        assert_eq!(downloaded.len(), 2);
+        assert_eq!(
+            downloaded
+                .iter()
+                .find(|record| record.id.as_ref() == "asset-APRIL")
+                .and_then(|record| record.local_path.as_deref()),
+            Some(april_path.as_path())
+        );
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read current path hash")
+                .as_deref(),
+            Some(current_download_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read pending path hash"),
+            None
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .expect("read provider checkpoint")
+                .as_deref(),
+            Some("zone-token-incremental")
+        );
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .expect("read enumeration hash")
+                .as_deref(),
+            Some(current_enum_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+                .expect("read pending enumeration hash"),
+            None
+        );
+
+        let third_result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &current_builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run steady-state date-bound cycle");
+        assert_eq!(third_result.stats.downloaded, 0);
+        assert_eq!(snapshot_files(download_dir.path()), second_snapshot);
+        assert_ne!(
+            third_result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::DownloadConfigHashDrift)
+        );
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read steady path hash")
+                .as_deref(),
+            Some(current_download_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .expect("read steady pending path hash"),
+            None
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .expect("read steady provider checkpoint")
+                .as_deref(),
+            Some("zone-token-incremental")
+        );
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .expect("read steady enumeration hash")
+                .as_deref(),
+            Some(current_enum_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+                .await
+                .expect("read steady pending enumeration hash"),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn run_cycle_multi_pass_persists_base_download_config_hash() {
         let config = make_run_cycle_config();
         let db = make_state_db();
@@ -9961,7 +10389,12 @@ mod tests {
             .await
             .expect("seed token");
 
-        let outcome = check_download_config_hash_for_cycle(&db, "current-download-hash").await;
+        let outcome = check_download_config_hash_for_cycle(
+            &db,
+            "current-download-hash",
+            "legacy-current-download-hash",
+        )
+        .await;
 
         assert_eq!(outcome, DownloadConfigHashOutcome::Changed);
         assert_eq!(
@@ -9994,7 +10427,12 @@ mod tests {
             .await
             .expect("seed token");
 
-        let outcome = check_download_config_hash_for_cycle(&db, "current-download-hash").await;
+        let outcome = check_download_config_hash_for_cycle(
+            &db,
+            "current-download-hash",
+            "legacy-current-download-hash",
+        )
+        .await;
 
         assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
         assert_eq!(
@@ -10025,7 +10463,8 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = check_download_config_hash_for_cycle(&db, "active-hash").await;
+        let outcome =
+            check_download_config_hash_for_cycle(&db, "active-hash", "legacy-active-hash").await;
 
         assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
         assert_eq!(
@@ -10033,6 +10472,46 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_legacy_hash_migrates_without_reconciliation() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "legacy-current-hash")
+            .await
+            .unwrap();
+        db.set_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY, "abandoned-hash")
+            .await
+            .unwrap();
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")
+            .await
+            .unwrap();
+
+        let outcome =
+            check_download_config_hash_for_cycle(&db, "current-path-hash", "legacy-current-hash")
+                .await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current-path-hash")
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-keep")
         );
     }
 

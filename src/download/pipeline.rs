@@ -923,19 +923,18 @@ fn filenames_match_ampm_equivalent(a: &str, b: &str) -> bool {
     a == b || super::paths::normalize_ampm(a) == super::paths::normalize_ampm(b)
 }
 
-pub(super) async fn state_confirmed_current_path_exists(
-    ctx: &DownloadContext,
+pub(super) async fn recorded_current_path_exists(
     config: &DownloadConfig,
     asset: &PhotoAsset,
-    task: &DownloadTask,
+    version_size: VersionSizeKey,
     task_planner: &mut TaskPlanner,
+    recorded_file: &RecordedLocalFile,
 ) -> Option<PathBuf> {
-    let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
     let stored_path = &recorded_file.path;
     let derived_paths = derive_expected_paths(asset, config);
 
     for derived in &derived_paths {
-        if derived.version_size != task.version_size {
+        if derived.version_size != version_size {
             continue;
         }
         let Some((existing_path, existing_size)) =
@@ -961,7 +960,7 @@ pub(super) async fn state_confirmed_current_path_exists(
     }
 
     for derived in &derived_paths {
-        if derived.version_size != task.version_size {
+        if derived.version_size != version_size {
             continue;
         }
         if !stored_path_matches_current_collision_family(
@@ -976,7 +975,7 @@ pub(super) async fn state_confirmed_current_path_exists(
         let (existing_path, existing_size) = task_planner.existing_path_with_size(stored_path)?;
         if state_path_size_allows_skip(
             asset,
-            task.version_size,
+            version_size,
             &existing_path,
             existing_size,
             derived.size,
@@ -990,6 +989,24 @@ pub(super) async fn state_confirmed_current_path_exists(
     }
 
     None
+}
+
+pub(super) async fn state_confirmed_current_path_exists(
+    ctx: &DownloadContext,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task: &DownloadTask,
+    task_planner: &mut TaskPlanner,
+) -> Option<PathBuf> {
+    let recorded_file = ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)?;
+    recorded_current_path_exists(
+        config,
+        asset,
+        task.version_size,
+        task_planner,
+        recorded_file,
+    )
+    .await
 }
 
 async fn record_seen_for_forwarded_task(
