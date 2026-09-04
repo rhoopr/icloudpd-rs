@@ -170,16 +170,22 @@ timezone.
 
 Capture-local path rendering does not change the download config hash, so a
 sync that sees no other drift stays incremental and never re-enumerates an
-already-downloaded asset. A date-only created bound is hashed under its own
-tag in both the download config hash and the eligibility-config hash, so it
-drifts like any other eligibility field. For an asset carrying a usable
-offset, a path derived under host-local rendering is not a current derived
-path, so a full sweep forwards that asset and downloads it into its
-capture-local folder. The earlier copy stays where it is: kei never deletes
-local media, and no command removes a file that no longer matches a derived
-path. `import-existing` adopts through the same derivation. Assets without a
-usable offset retain host-local paths and remain compatible with icloudpd's
-date-folder layout.
+already-downloaded asset. Date-only created bounds change the eligibility hash
+but not the path hash, so expanding a date window runs the required inventory
+without treating existing media as path drift. Matching legacy hashes that
+mixed date eligibility into path state migrate without reconciliation. When a
+legacy hash is ambiguous, reconciliation uses the same durable path-family and
+file-integrity proof as normal sync to discard the planned collision task
+before copying or changing state, so an asset cannot collide with its own
+recorded file.
+
+For an asset carrying a usable offset, a path derived under host-local
+rendering is not a current derived path, so a full sweep forwards that asset
+and downloads it into its capture-local folder. The earlier copy stays where
+it is: kei never deletes local media, and no command removes a file that no
+longer matches a derived path. `import-existing` adopts through the same
+derivation. Assets without a usable offset retain host-local paths and remain
+compatible with icloudpd's date-folder layout.
 
 Existing embedded and sidecar timestamps are repaired only through the
 explicit `sync --refresh-metadata` flow, which is bounded by the same

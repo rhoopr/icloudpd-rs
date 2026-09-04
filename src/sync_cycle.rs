@@ -564,6 +564,7 @@ where
 pub(crate) async fn check_download_config_hash_for_cycle<D>(
     db: &D,
     current_hash: &str,
+    legacy_hash: &str,
 ) -> DownloadConfigHashOutcome
 where
     D: state::SyncTokenStore + ?Sized,
@@ -576,6 +577,23 @@ where
             {
                 tracing::debug!(error = %e, "Failed to clear reverted pending download config hash");
             }
+            DownloadConfigHashOutcome::Unchanged
+        }
+        Ok(Some(stored)) if stored == legacy_hash => {
+            if let Err(e) = db
+                .commit_checkpoint_transition(state::CheckpointTransition {
+                    metadata_updates: vec![(
+                        download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                        current_hash.to_owned(),
+                    )],
+                    metadata_deletes: vec![PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned()],
+                })
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to migrate legacy download config_hash");
+                return DownloadConfigHashOutcome::ReadFailed;
+            }
+            tracing::info!("Migrated legacy download path config hash");
             DownloadConfigHashOutcome::Unchanged
         }
         Ok(None) => {
@@ -701,7 +719,13 @@ pub(crate) async fn run_cycle(
             Arc::from(first_library.zone_name.as_str()),
         );
         let download_config_hash = download::hash_download_config(&probe_config);
-        let outcome = check_download_config_hash_for_cycle(db, &download_config_hash).await;
+        let legacy_download_config_hash = download::hash_legacy_download_config(&probe_config);
+        let outcome = check_download_config_hash_for_cycle(
+            db,
+            &download_config_hash,
+            &legacy_download_config_hash,
+        )
+        .await;
         force_full_for_download_config_hash = outcome.must_force_full_sync();
         if matches!(outcome, DownloadConfigHashOutcome::Changed) {
             pending_download_config_hash = Some(download_config_hash);

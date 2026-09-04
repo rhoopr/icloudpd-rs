@@ -800,7 +800,8 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 /// Bump this when path derivation changes without a corresponding config
 /// field changing. That forces existing state to revalidate on disk instead
 /// of trusting paths derived under older code.
-const PATH_DERIVATION_HASH_VERSION: u8 = 2;
+const LEGACY_PATH_DERIVATION_HASH_VERSION: u8 = 2;
+const PATH_DERIVATION_HASH_VERSION: u8 = 3;
 const ENUMERATION_SAFETY_HASH_VERSION: u8 = 2;
 pub(crate) const DOWNLOAD_CONFIG_HASH_KEY: &str = "config_hash";
 
@@ -831,10 +832,10 @@ struct SharedHashFields<'a> {
 /// Hash the shared config fields into the hasher. All enum values use
 /// `repr(u8)` byte representations and dates use "YYYY-MM-DD" Display
 /// format for stability across compiler/library upgrades.
-fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
+fn hash_shared_fields(hasher: &mut sha2::Sha256, version: u8, f: &SharedHashFields<'_>) {
     use sha2::Digest;
 
-    hasher.update([PATH_DERIVATION_HASH_VERSION]);
+    hasher.update([version]);
     hash_bytes(hasher, f.directory.as_os_str().as_encoded_bytes());
     hash_bytes(hasher, f.folder_structure.as_bytes());
     hash_bytes(hasher, f.folder_structure_albums.as_bytes());
@@ -847,9 +848,10 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     hasher.update([u8::from(f.alternative)]);
     hasher.update([f.raw_policy as u8]);
     hasher.update([u8::from(f.keep_unicode_in_filenames)]);
-    // Filter fields: changing these affects which assets are eligible, so we
-    // must invalidate the trust-state cache (and stored sync tokens) to avoid
-    // skipping newly-eligible assets on incremental syncs.
+    // Eligibility fields stay in the local trust hash where changing them can
+    // alter the selected versions. Current path hashing passes no date bounds
+    // because the enumeration hash already owns date eligibility; the legacy
+    // caller supplies them only to reproduce the v2 shape.
     //
     // Dates are truncated to day precision before hashing so that relative
     // intervals like "20d" (resolved to now-minus-20-days at parse time)
@@ -1035,11 +1037,30 @@ pub(crate) fn sync_coverage_fingerprint_json(
 /// Separate from [`compute_config_hash`]: path-only changes revalidate local
 /// download state without clearing CloudKit zone tokens.
 pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
+    hash_download_config_with_date_bounds(config, PATH_DERIVATION_HASH_VERSION, false)
+}
+
+/// Reproduce the v2 mixed path-and-date hash for in-place migration.
+pub(crate) fn hash_legacy_download_config(config: &DownloadConfig) -> String {
+    hash_download_config_with_date_bounds(config, LEGACY_PATH_DERIVATION_HASH_VERSION, true)
+}
+
+fn hash_download_config_with_date_bounds(
+    config: &DownloadConfig,
+    version: u8,
+    include_date_bounds: bool,
+) -> String {
     use sha2::{Digest, Sha256};
 
+    let (skip_created_before, skip_created_after) = if include_date_bounds {
+        (config.skip_created_before, config.skip_created_after)
+    } else {
+        (None, None)
+    };
     let mut hasher = Sha256::new();
     hash_shared_fields(
         &mut hasher,
+        version,
         &SharedHashFields {
             directory: &config.directory,
             folder_structure: &config.folder_structure,
@@ -1053,8 +1074,8 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
             alternative: config.alternative,
             raw_policy: config.raw_policy,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
-            skip_created_before: config.skip_created_before,
-            skip_created_after: config.skip_created_after,
+            skip_created_before,
+            skip_created_after,
             force_resolution: config.force_resolution,
             media: config.media,
             live_photo_mode: config.live_photo_mode,
@@ -3461,6 +3482,10 @@ pub(crate) async fn reconcile_catalog_paths(
         .iter()
         .map(|pass| Arc::new(config.with_pass(pass)))
         .collect();
+    let records_by_target: FxHashMap<PendingRetryTarget, &crate::state::AssetRecord> = records
+        .iter()
+        .map(|record| (PendingRetryTarget::from_record(record), record))
+        .collect();
     let mut albums_by_asset: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
     for (asset_id, album_name) in db.get_all_asset_albums(&config.library).await? {
         albums_by_asset
@@ -3519,6 +3544,36 @@ pub(crate) async fn reconcile_catalog_paths(
                         continue;
                     }
                     for task in plan.tasks {
+                        let target = PendingRetryTarget::from_task(&task);
+                        if let Some(record) = records_by_target.get(&target)
+                            && record.checksum.as_ref() == task.checksum.as_ref()
+                            && record.size_bytes == task.size
+                            && let Some(path) = record.local_path.clone()
+                        {
+                            let recorded_file = RecordedLocalFile {
+                                path,
+                                local_checksum: record
+                                    .local_checksum
+                                    .clone()
+                                    .map(String::into_boxed_str),
+                                download_checksum: record
+                                    .download_checksum
+                                    .clone()
+                                    .map(String::into_boxed_str),
+                            };
+                            if pipeline::recorded_current_path_exists(
+                                pass_config,
+                                &asset,
+                                task.version_size,
+                                &mut task_planner,
+                                &recorded_file,
+                            )
+                            .await
+                            .is_some()
+                            {
+                                continue;
+                            }
+                        }
                         let key = RetryTaskKey::from(&task);
                         if task_keys.insert(key) {
                             tasks.push(task);
@@ -3552,10 +3607,6 @@ pub(crate) async fn reconcile_catalog_paths(
         }
     }
 
-    let records_by_target: FxHashMap<PendingRetryTarget, &crate::state::AssetRecord> = records
-        .iter()
-        .map(|record| (PendingRetryTarget::from_record(record), record))
-        .collect();
     let mut stats = SyncStats::default();
     let mut deferred_to_pending_retry = false;
     for task in tasks {
@@ -12701,7 +12752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_skip_created_before() {
+    fn test_hash_download_config_ignores_skip_created_before() {
         let mut config1 = test_config();
         config1.skip_created_before = None;
         let mut config2 = test_config();
@@ -12710,14 +12761,14 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         ));
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_skip_created_after() {
+    fn test_hash_download_config_ignores_skip_created_after() {
         let mut config1 = test_config();
         config1.skip_created_after = None;
         let mut config2 = test_config();
@@ -12726,14 +12777,14 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         ));
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&config1),
             hash_download_config(&config2)
         );
     }
 
     #[test]
-    fn test_hash_download_config_distinguishes_capture_date_from_instant() {
+    fn test_hash_download_config_ignores_created_date_semantics() {
         let date = chrono::NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
         let mut instant = test_config();
         instant.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
@@ -12743,9 +12794,25 @@ mod tests {
         capture_date.skip_created_before =
             Some(crate::config::CreatedDateFilter::CaptureDate(date));
 
-        assert_ne!(
+        assert_eq!(
             hash_download_config(&instant),
             hash_download_config(&capture_date)
+        );
+    }
+
+    #[test]
+    fn test_legacy_download_config_hash_changes_on_skip_created_before() {
+        let mut config1 = test_config();
+        config1.skip_created_before = None;
+        let mut config2 = test_config();
+        config2.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+            DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        assert_ne!(
+            hash_legacy_download_config(&config1),
+            hash_legacy_download_config(&config2)
         );
     }
 
@@ -18923,8 +18990,13 @@ mod tests {
         let config = test_config();
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "c3f2be1a9e394951",
+            hash, "20baba076dd97143",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
+        );
+        assert_eq!(
+            hash_legacy_download_config(&config),
+            "c3f2be1a9e394951",
+            "legacy hash changed -- matching stored hashes would no longer migrate safely"
         );
     }
 
@@ -18959,8 +19031,13 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "d327fda31e8bec04",
+            hash, "4d5a9f1a5a0bf903",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
+        );
+        assert_eq!(
+            hash_legacy_download_config(&config),
+            "d327fda31e8bec04",
+            "legacy hash changed -- matching stored hashes would no longer migrate safely"
         );
     }
 
