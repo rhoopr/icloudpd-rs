@@ -415,16 +415,11 @@ pub(crate) async fn strip_session_routing_state(
     Ok(())
 }
 
-/// Build the API and download HTTP clients for a session.
-///
-/// Both share the same cookie jar. The API client uses a total-request timeout;
-/// the download client uses connect + read timeouts without a total cap so
-/// large file transfers aren't killed mid-stream.
-fn build_clients(
+/// Common cookie jar and browser headers for all session clients.
+fn client_builder(
     cookie_jar: &Arc<reqwest::cookie::Jar>,
     home_endpoint: &str,
-    api_timeout: Duration,
-) -> Result<(Client, Client)> {
+) -> Result<reqwest::ClientBuilder> {
     let mut default_headers = HeaderMap::new();
     default_headers.insert(ORIGIN, HeaderValue::from_str(home_endpoint)?);
     default_headers.insert(
@@ -433,15 +428,23 @@ fn build_clients(
     );
     default_headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
 
-    let client = Client::builder()
+    Ok(Client::builder()
         .cookie_provider(cookie_jar.clone())
-        .default_headers(default_headers.clone())
+        .default_headers(default_headers))
+}
+
+/// The API client has a total timeout; downloads use connect + read timeouts
+/// without a total cap so large transfers aren't killed mid-stream.
+fn build_clients(
+    cookie_jar: &Arc<reqwest::cookie::Jar>,
+    home_endpoint: &str,
+    api_timeout: Duration,
+) -> Result<(Client, Client)> {
+    let client = client_builder(cookie_jar, home_endpoint)?
         .timeout(api_timeout)
         .build()?;
 
-    let download_client = Client::builder()
-        .cookie_provider(cookie_jar.clone())
-        .default_headers(default_headers)
+    let download_client = client_builder(cookie_jar, home_endpoint)?
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(120))
         .pool_max_idle_per_host(20)
@@ -456,6 +459,7 @@ fn build_clients(
 pub struct Session {
     client: Client,
     download_client: Client,
+    photos_capture_client: Option<Client>,
     /// Cookie jar shared with `reqwest::Client`. Queried by
     /// `persist_jar_cookies` to save session cookies to disk, and kept alive
     /// so the client's internal weak reference remains valid.
@@ -650,6 +654,7 @@ impl Session {
         Ok(Self {
             client,
             download_client,
+            photos_capture_client: None,
             cookie_jar,
             session_data,
             cookie_dir,
@@ -717,7 +722,7 @@ impl Session {
         }
     }
 
-    /// Replace both HTTP clients with fresh ones, dropping the old connection
+    /// Replace HTTP clients with fresh ones, dropping the old connection
     /// pools. The existing cookie jar and session data are preserved so no
     /// re-authentication is needed. Used for 421 recovery where the issue is
     /// stale HTTP/2 connection routing, not invalid auth state.
@@ -726,7 +731,21 @@ impl Session {
             build_clients(&self.cookie_jar, &self.home_endpoint, self.api_timeout)?;
         self.client = client;
         self.download_client = download_client;
+        self.photos_capture_client = None;
         Ok(())
+    }
+
+    /// Reuse the API settings and live cookie jar, but expose each redirect body.
+    pub(crate) fn photos_capture_client(&mut self) -> Result<Client> {
+        if let Some(client) = &self.photos_capture_client {
+            return Ok(client.clone());
+        }
+        let client = client_builder(&self.cookie_jar, &self.home_endpoint)?
+            .timeout(self.api_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        self.photos_capture_client = Some(client.clone());
+        Ok(client)
     }
 
     /// Release the exclusive file lock without dropping the Session.
@@ -1611,6 +1630,108 @@ mod tests {
             session.api_timeout,
             Duration::from_secs(45),
             "reset_http_clients must preserve the configured timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn photos_capture_client_shares_settings_cookies_and_resets_lazily() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let (_td, dir) = test_dir("capture_client");
+        let mut session = Session::new(&dir, "user@test.com", &server.uri(), Some(1))
+            .await
+            .unwrap();
+        let url = server.uri().parse().unwrap();
+        session
+            .cookie_jar
+            .add_cookie_str("auth=shared; Path=/", &url);
+        Mock::given(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/final")
+                    .insert_header("Set-Cookie", "capture=shared; Path=/"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/final"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        assert!(session.photos_capture_client.is_none());
+        let capture = session.photos_capture_client().unwrap();
+        let jar_refs = Arc::strong_count(&session.cookie_jar);
+        let _clone = session.photos_capture_client().unwrap();
+        assert_eq!(Arc::strong_count(&session.cookie_jar), jar_refs);
+        assert_eq!(
+            capture
+                .get(format!("{}/redirect", server.uri()))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            302
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            session
+                .http_client()
+                .get(format!("{}/redirect", server.uri()))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let requests = server.received_requests().await.unwrap();
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(request.headers[ORIGIN], server.uri());
+            let referer = if index == 2 { "/redirect" } else { "/" };
+            assert_eq!(
+                request.headers[REFERER],
+                format!("{}{referer}", server.uri())
+            );
+            assert_eq!(request.headers[USER_AGENT], DEFAULT_USER_AGENT);
+            assert!(
+                request.headers["cookie"]
+                    .to_str()
+                    .unwrap()
+                    .contains("auth=shared")
+            );
+        }
+        assert!(
+            requests.last().unwrap().headers["cookie"]
+                .to_str()
+                .unwrap()
+                .contains("capture=shared")
+        );
+        session.reset_http_clients().unwrap();
+        assert!(session.photos_capture_client.is_none());
+        let rebuilt = session.photos_capture_client().unwrap();
+        rebuilt
+            .get(format!("{}/final", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.last().unwrap().headers["cookie"]
+                .to_str()
+                .unwrap()
+                .contains("capture=shared")
+        );
+        Mock::given(path("/slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        assert!(
+            rebuilt
+                .get(format!("{}/slow", server.uri()))
+                .send()
+                .await
+                .unwrap_err()
+                .is_timeout()
         );
     }
 

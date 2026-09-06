@@ -252,8 +252,16 @@ happens:
 
 ## What lives where
 
-- **`cli.rs`** - pure clap parsing. No network, no binary invocation;
-  just `Cli::try_parse_from(...)`.
+- **`cli.rs`** - executable argument-validation and help checks without network
+  access. Includes `--capture-icloud-responses` help coverage for sync and the
+  inherited service flag, including the explicit read-only diagnostic-write
+  exception. Parser unit tests live in `src/cli.rs`.
+- **`src/icloud/photos/capture.rs`, `src/icloud/photos/session.rs`** - Unix-only
+  offline capture tests cover exact raw bytes, HTTP errors and invalid-JSON
+  retries, private permissions, no-overwrite publication, sticky failures,
+  cancellation/partial files, and no extra requests. The capture test in
+  `src/commands/service.rs` covers initialization, 421 recovery, and provider
+  operations through the production Photos session.
 - **`behavioral.rs`** - `assert_cmd`-driven end-to-end against the real
   binary with a pre-seeded state DB. Covers everything that doesn't need
   the network (status flags, reconcile routing, config resolution).
