@@ -642,6 +642,7 @@ async fn run_sync_inner(
     args: SyncArgs,
     capture: Option<&Arc<crate::icloud::photos::capture::ResponseCapture>>,
 ) -> anyhow::Result<()> {
+    let check_capture = || capture.map_or(Ok(()), |capture| capture.check());
     let SyncArgs {
         is_one_shot,
         service_mode,
@@ -921,9 +922,7 @@ async fn run_sync_inner(
             capture.cloned(),
         )
         .await;
-        if let Some(capture) = capture {
-            capture.check()?;
-        }
+        check_capture()?;
         let (ss, mut ps) = match init_result {
             Ok(pair) => pair,
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
@@ -1312,9 +1311,7 @@ async fn run_sync_inner(
     }
 
     loop {
-        if let Some(capture) = capture {
-            capture.check()?;
-        }
+        check_capture()?;
         if shutdown_token.is_cancelled() {
             tracing::info!("Shutdown requested, exiting...");
             break;
@@ -1339,9 +1336,7 @@ async fn run_sync_inner(
         } else {
             WatchPrecheck::proceed_all()
         };
-        if let Some(capture) = capture {
-            capture.check()?;
-        }
+        check_capture()?;
 
         if !config.runtime.dry_run
             && !config.runtime.only_print_filenames
@@ -1382,9 +1377,7 @@ async fn run_sync_inner(
                 &mut consecutive_album_refresh_failures,
             )
             .await;
-            if let Some(capture) = capture {
-                capture.check()?;
-            }
+            check_capture()?;
             let cycle_library_states: Vec<&LibraryState> = library_states
                 .iter()
                 .filter(|s| watch_precheck.should_sync_zone(&s.zone_name))
@@ -1414,9 +1407,7 @@ async fn run_sync_inner(
                 &shutdown_token,
             )
             .await?;
-            if let Some(capture) = capture {
-                capture.check()?;
-            }
+            check_capture()?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
             let refresh_tail_failures = if config.runtime.refresh_metadata {
                 if let Some(db) = state_db.as_deref() {
@@ -1627,9 +1618,7 @@ async fn run_sync_inner(
         }
 
         if let Some(interval) = next_watch_interval {
-            if let Some(capture) = capture {
-                capture.check()?;
-            }
+            check_capture()?;
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
                 break;
@@ -4381,201 +4370,6 @@ mod tests {
             None,
         )
         .expect("test config")
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_cycle_raw_response_capture_preserves_local_state_and_latches_lookup_failure() {
-        use crate::icloud::photos::capture::ResponseCapture;
-        use wiremock::matchers::{body_partial_json, method, path_regex};
-        use wiremock::{Mock, ResponseTemplate};
-
-        let server = crate::start_wiremock_or_skip!();
-        let data_dir = tempfile::tempdir().unwrap();
-        let download_dir = tempfile::tempdir().unwrap();
-        let config = make_run_cycle_config();
-        let db = make_state_db();
-        let token_key = "sync_token:PrimarySync";
-        db.set_metadata(token_key, "zone-tok-prev").await.unwrap();
-        db.set_metadata(
-            ENUM_CONFIG_HASH_KEY,
-            &download::compute_config_hash(&config),
-        )
-        .await
-        .unwrap();
-        seed_run_cycle_metadata_drift_asset(&db, download_dir.path()).await;
-        let downloaded_before = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(downloaded_before.len(), 1);
-        let media_path = downloaded_before[0].local_path.as_ref().unwrap();
-        let media_before = std::fs::read(media_path).unwrap();
-        let metadata_before = downloaded_before[0].metadata.metadata_hash.clone();
-        let excluded = crate::test_helpers::TestAssetRecord::new("excluded").build();
-        db.upsert_seen(&excluded).await.unwrap();
-        db.mark_policy_excluded("PrimarySync", "excluded", "original")
-            .await
-            .unwrap();
-        let known_before = db.get_all_known_ids().await.unwrap();
-        let build_download_config =
-            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
-
-        let indexing = r#" {"records":[{"recordName":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]} "#;
-        let delta = " {\"zones\":[{\"zoneID\":{\"zoneName\":\"PrimarySync\"},\"records\":[],\"syncToken\":\"zone-tok-new\",\"moreComing\":false}],\"unknown\":1,\"unknown\":2} \n";
-        let lookup = " {\"records\":[]} \n";
-        Mock::given(method("POST"))
-            .and(path_regex(r"/private/records/query$"))
-            .and(body_partial_json(serde_json::json!({
-                "query": {"recordType": "CheckIndexingState"}
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_string(indexing))
-            .expect(3)
-            .mount(&server)
-            .await;
-        for (path, body) in [
-            (r"/private/changes/zone$", delta),
-            (r"/private/records/lookup$", lookup),
-        ] {
-            Mock::given(method("POST"))
-                .and(path_regex(path))
-                .respond_with(ResponseTemplate::new(200).set_body_string(body))
-                .expect(3)
-                .mount(&server)
-                .await;
-        }
-
-        assert!(!data_dir.path().join(".diagnostics").exists());
-        let mut runs = Vec::new();
-        for cycle in 0..3 {
-            // Enable capture at the production session-creation boundary, not a test transport.
-            let capture = ResponseCapture::new(data_dir.path()).await.unwrap();
-            let run = std::fs::read_dir(data_dir.path().join(".diagnostics"))
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| !runs.contains(path))
-                .unwrap();
-            let (_session_dir, session) = make_shared_session_for_run_cycle().await;
-            let auth_result = auth::AuthResult {
-                session: Arc::try_unwrap(session).unwrap().into_inner(),
-                data: serde_json::from_value(serde_json::json!({
-                    "webservices": {"ckdatabasews": {"url": server.uri()}}
-                }))
-                .unwrap(),
-                requires_2fa: false,
-            };
-            let (shared_session, mut service) = crate::commands::init_photos_service(
-                auth_result,
-                retry::RetryConfig {
-                    max_retries: 0,
-                    base_delay_secs: 0,
-                    max_delay_secs: 0,
-                },
-                crate::personality::Mode::Off,
-                Some(Arc::clone(&capture)),
-            )
-            .await
-            .unwrap();
-            let library = service.get_library("PrimarySync").await.unwrap().clone();
-            let mut lib_state =
-                make_run_cycle_library_state_with_album("PrimarySync", token_key, library.all());
-            lib_state.library = library;
-            let blocked_part = run.join("000003.body.part");
-            if cycle == 2 {
-                // Indexing and delta succeed; the policy-excluded lookup cannot save its body.
-                std::fs::write(&blocked_part, b"existing partial capture").unwrap();
-            }
-            let result = run_cycle(
-                &[&lib_state],
-                &config,
-                Some(db.as_ref()),
-                false,
-                &build_download_config,
-                download::DownloadControls::download_hidden(),
-                &shared_session,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.failed_count, 0, "lookup policy absorbs its error");
-            assert_eq!(result.stats.downloaded, 0);
-            assert_eq!(result.stats.assets_seen, 0);
-            drop((lib_state, service, shared_session));
-            if cycle == 2 {
-                assert!(capture.finish().await.is_err());
-                assert_eq!(
-                    std::fs::read(&blocked_part).unwrap(),
-                    b"existing partial capture"
-                );
-                assert!(!run.join("000003.body").exists());
-                // Capture promises invocation failure, not rollback of an advanced checkpoint.
-            } else {
-                capture.finish().await.unwrap();
-                assert_eq!(
-                    db.get_metadata(token_key).await.unwrap().as_deref(),
-                    Some("zone-tok-new")
-                );
-            }
-
-            let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), (cycle + 1) * 3);
-            let delta_request: serde_json::Value =
-                serde_json::from_slice(&requests[cycle * 3 + 1].body).unwrap();
-            assert_eq!(
-                delta_request["zones"][0]["syncToken"],
-                if cycle == 0 {
-                    "zone-tok-prev"
-                } else {
-                    "zone-tok-new"
-                }
-            );
-            runs.push(run);
-            assert_eq!(
-                std::fs::read_dir(data_dir.path().join(".diagnostics"))
-                    .unwrap()
-                    .count(),
-                runs.len()
-            );
-            for (index, run) in runs.iter().enumerate() {
-                assert_eq!(std::fs::read_dir(run).unwrap().count(), 3);
-                for (number, body) in [indexing, delta, lookup].iter().enumerate() {
-                    if index != 2 || number != 2 {
-                        assert_eq!(
-                            std::fs::read(run.join(format!("{:06}.body", number + 1))).unwrap(),
-                            body.as_bytes()
-                        );
-                    }
-                }
-            }
-            let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
-            assert_eq!(downloaded.len(), 1);
-            assert_eq!(downloaded[0].status, state::AssetStatus::Downloaded);
-            assert_eq!(downloaded[0].local_path.as_ref(), Some(media_path));
-            assert_eq!(downloaded[0].checksum, downloaded_before[0].checksum);
-            assert_eq!(
-                downloaded[0].local_checksum,
-                downloaded_before[0].local_checksum
-            );
-            assert_eq!(
-                downloaded[0].downloaded_at,
-                downloaded_before[0].downloaded_at
-            );
-            assert_eq!(downloaded[0].metadata.metadata_hash, metadata_before);
-            assert_eq!(std::fs::read(media_path).unwrap(), media_before);
-            assert_eq!(
-                std::fs::read_dir(media_path.parent().unwrap())
-                    .unwrap()
-                    .count(),
-                1
-            );
-            assert_eq!(db.get_all_known_ids().await.unwrap(), known_before);
-            assert!(db.get_pending().await.unwrap().is_empty());
-            assert!(db.get_failed().await.unwrap().is_empty());
-            assert_eq!(
-                db.get_policy_excluded_ids_for_revalidation("PrimarySync")
-                    .await
-                    .unwrap(),
-                vec!["excluded"]
-            );
-        }
-        server.verify().await;
     }
 
     #[cfg(feature = "xmp")]

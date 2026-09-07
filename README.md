@@ -221,47 +221,6 @@ run under `kei service run`.
 
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
-## Private response capture
-
-For local iCloud Photos debugging, opt in for one invocation:
-
-```sh
-kei sync --capture-icloud-responses
-```
-
-Raw application response body bytes from all CloudKit paths used by that run
-are saved before JSON parsing, including HTTP errors, retries, redirect bodies,
-and invalid JSON. Capture follows same-origin redirects only; it saves but
-rejects redirects to other origins. Capture adds no diagnostic queries and leaves `desiredKeys` unchanged: it does not
-fetch every field Apple may hold. It excludes authentication traffic, cookies,
-request headers, and downloaded media bodies. There is no index, metadata
-wrapper, or request context.
-
-Files go under the resolved data directory as
-`.diagnostics/<timestamp>-<uuid>/000001.body`, with numbered bodies thereafter.
-Incomplete captures may leave `.body.part` files. `filenameEnc` may be base64;
-search locally by record ID rather than assuming plaintext filenames:
-
-```sh
-rg -l -F -- 'RECORD_ID' /path/to/data/.diagnostics
-```
-
-These files are sensitive and unredacted: bodies may contain personal metadata,
-provider identifiers, and credential-bearing URLs. Do not share them unredacted.
-Capture is currently Unix-only; other platforms fail closed without creating
-capture files. Unix capture directories are private (`0700`) and files are
-owner-only (`0600`).
-
-Capture is off by default. The explicit flag also works with `--dry-run` and
-`--only-print-filenames`; diagnostic writes are the intentional exception to
-their read-only behavior, not permission to modify media or sync state.
-Watch mode and `kei service run --capture-icloud-responses` are supported, using
-one capture folder for the invocation's lifetime. There is no automatic retention
-limit or cleanup. Storage failures stop further provider requests. Interrupted
-response bodies remain partial and normal network retries continue, but the
-invocation still exits with an incomplete-capture error. This does not promise
-rollback of already-advanced checkpoints.
-
 ## Docs
 
 - [Install](https://github.com/rhoopr/kei/wiki/Install)

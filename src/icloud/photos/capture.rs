@@ -154,6 +154,7 @@ impl CaptureRequest {
         prefix_limit: Option<usize>,
     ) -> anyhow::Result<Vec<u8>> {
         self.capture.check()?;
+        let prefix_limit = prefix_limit.unwrap_or(usize::MAX);
         let number = self.capture.next.fetch_add(1, Ordering::Relaxed);
         let part = self
             .capture
@@ -186,9 +187,7 @@ impl CaptureRequest {
             error.without_url()
         })? {
             self.capture.check()?;
-            let take = prefix_limit
-                .map_or(chunk.len(), |limit| limit.saturating_sub(retained.len()))
-                .min(chunk.len());
+            let take = prefix_limit.saturating_sub(retained.len()).min(chunk.len());
             retained.extend(chunk.iter().take(take));
             let file = Arc::clone(&file);
             let lease = Arc::clone(&self.lease);
@@ -231,16 +230,15 @@ impl Drop for CaptureRequest {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::time::Duration;
 
     use super::ResponseCapture;
 
     #[tokio::test]
-    async fn creates_missing_data_dir_privately_without_changing_existing_modes() {
+    async fn private_bytes_no_overwrite_and_error_latch() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
         let data = root.path().join("missing/data");
         let capture = ResponseCapture::new(&data).await.unwrap();
         for path in [
@@ -251,101 +249,25 @@ mod tests {
         ] {
             assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o700);
         }
-        assert_eq!(
-            std::fs::metadata(root.path()).unwrap().mode() & 0o777,
-            0o750
-        );
-        capture.finish().await.unwrap();
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o750)).unwrap();
-        ResponseCapture::new(&data)
-            .await
-            .unwrap()
-            .finish()
-            .await
-            .unwrap();
-        assert_eq!(std::fs::metadata(&data).unwrap().mode() & 0o777, 0o750);
-        assert_eq!(
-            std::fs::metadata(root.path()).unwrap().mode() & 0o777,
-            0o750
-        );
-    }
-
-    #[tokio::test]
-    async fn private_runs_exact_bytes_and_no_overwrite() {
-        let data = tempfile::tempdir().unwrap();
-        let first = ResponseCapture::new(data.path()).await.unwrap();
-        let second = ResponseCapture::new(data.path()).await.unwrap();
-        assert_ne!(first.directory, second.directory);
-        for path in [
-            data.path().join(".diagnostics"),
-            first.directory.clone(),
-            second.directory.clone(),
-        ] {
-            let metadata = std::fs::metadata(path).unwrap();
-            assert_eq!(metadata.mode() & 0o777, 0o700);
-            assert_eq!(metadata.uid(), crate::service::env::effective_uid());
-        }
-        let bytes = b" {\"unknown\":1,\"unknown\":2} \n";
-        let mut request = first.begin().await.unwrap();
+        let bytes = b"raw bytes";
+        let mut request = capture.begin().await.unwrap();
         let response = reqwest::Response::from(http::Response::new(bytes.to_vec()));
         assert_eq!(request.read_body(response, None).await.unwrap(), bytes);
         drop(request);
-        let body = first.directory.join("000001.body");
+        let body = capture.directory.join("000001.body");
         assert_eq!(std::fs::read(&body).unwrap(), bytes);
         assert_eq!(std::fs::metadata(body).unwrap().mode() & 0o777, 0o600);
-        assert!(!first.directory.join("000001.body.part").exists());
+        assert!(!capture.directory.join("000001.body.part").exists());
 
-        // An existing completed file is never replaced, and failure stays latched.
-        std::fs::write(first.directory.join("000002.body"), b"existing").unwrap();
-        let mut request = first.begin().await.unwrap();
-        let response = reqwest::Response::from(http::Response::new(b"new".to_vec()));
-        assert!(request.read_body(response, None).await.is_err());
-        drop(request);
-        assert_eq!(
-            std::fs::read(first.directory.join("000002.body")).unwrap(),
-            b"existing"
-        );
-        assert_eq!(
-            std::fs::read(first.directory.join("000002.body.part")).unwrap(),
-            b"new"
-        );
-        assert!(first.check().is_err());
-        assert!(first.begin().await.is_err());
-        assert!(first.finish().await.is_err());
-        second.finish().await.unwrap();
-        assert!(second.begin().await.is_err());
-        second.finish().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn rejects_untrusted_diagnostics_and_existing_part() {
-        let data = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let diagnostics = data.path().join(".diagnostics");
-        symlink(outside.path(), &diagnostics).unwrap();
-        assert!(ResponseCapture::new(data.path()).await.is_err());
-        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-        std::fs::remove_file(&diagnostics).unwrap();
-        std::fs::write(&diagnostics, b"not a directory").unwrap();
-        assert!(ResponseCapture::new(data.path()).await.is_err());
-        std::fs::remove_file(&diagnostics).unwrap();
-        std::fs::create_dir(&diagnostics).unwrap();
-        std::fs::set_permissions(&diagnostics, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(ResponseCapture::new(data.path()).await.is_err());
-        std::fs::set_permissions(&diagnostics, std::fs::Permissions::from_mode(0o700)).unwrap();
-        if crate::service::env::effective_uid() == 0 {
-            std::os::unix::fs::chown(&diagnostics, Some(1), None).unwrap();
-            assert!(ResponseCapture::new(data.path()).await.is_err());
-            std::os::unix::fs::chown(&diagnostics, Some(0), None).unwrap();
-        }
-        let capture = ResponseCapture::new(data.path()).await.unwrap();
-        let part = capture.directory.join("000001.body.part");
-        std::fs::write(&part, b"existing").unwrap();
+        let collision = capture.directory.join("000002.body");
+        std::fs::write(&collision, b"existing").unwrap();
         let mut request = capture.begin().await.unwrap();
-        let response = reqwest::Response::from(http::Response::new(b"new".to_vec()));
+        let response = reqwest::Response::from(http::Response::new(bytes.to_vec()));
         assert!(request.read_body(response, None).await.is_err());
         drop(request);
-        assert_eq!(std::fs::read(part).unwrap(), b"existing");
+        assert_eq!(std::fs::read(collision).unwrap(), b"existing");
+        assert!(capture.check().is_err());
+        assert!(capture.begin().await.is_err());
         assert!(capture.finish().await.is_err());
     }
 

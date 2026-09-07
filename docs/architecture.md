@@ -30,7 +30,7 @@ changing behavior.
 | One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, and advances or preserves provider checkpoints. |
 | Library and pass planning | `src/commands/service.rs` | Resolves libraries, collection scope, album plans, smart folders, unfiled passes, and cross-zone hydration. |
 | iCloud Photos adapter | `src/icloud/photos/` | Owns CloudKit records, queries, change streams, provider identity, albums, smart folders, and metadata decoding. |
-| Private CloudKit response capture | `src/icloud/photos/capture.rs`, `src/icloud/photos/session.rs` | Owns opt-in raw body storage before parsing; `src/sync_loop.rs` owns invocation lifetime and failure propagation. |
+| Response capture | `src/icloud/photos/capture.rs`, `src/icloud/photos/session.rs` | Raw body storage; `src/sync_loop.rs` owns lifetime and failure propagation. |
 | Download orchestration | `src/download/mod.rs` | Routes full, incremental, targeted-backfill, and durable-retry work and produces checkpoint evidence. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
 | Streaming workers | `src/download/pipeline.rs` | Runs bounded producers and consumers, coordinates file transfer, metadata writes, adoption, and outcome aggregation. |
@@ -147,35 +147,12 @@ bound did not truncate the stream.
 
 ### Private CloudKit response capture
 
-`sync --capture-icloud-responses` is off by default. `sync_loop::run_sync`
-creates one `ResponseCapture` under the resolved data directory and passes it
-through `commands::service::init_photos_service` to `CapturingPhotosSession`.
-Session clones, authentication recovery, and watch/service cycles share that
-capture for the invocation's lifetime. `service run` inherits the flag; normal
-deployment defaults do not enable it.
-
-All CloudKit paths used by the invocation pass through the Photos session:
-indexing, zone discovery, album and count queries, full enumeration, database
-and zone changes, and targeted record lookup/hydration. The session stores raw
-application body bytes before JSON parsing or HTTP-error handling, including
-every retry response and invalid JSON. A cookie-sharing capture client disables
-automatic redirects so the Photos session can save intermediate bodies before
-following same-origin redirects. Other origins are rejected after capture.
-Capture adds no diagnostic queries and does
-not expand `desiredKeys`, so it is not a complete export of Apple's fields.
-Authentication traffic and media transfers use separate paths and are excluded.
-
-`capture.rs` writes `.diagnostics/<timestamp>-<uuid>/000001.body.part`, then
-syncs and publishes the numbered `.body` without overwriting and syncs its
-parent. There is no index, metadata wrapper, request context, or retention
-policy. Explicit capture permits these diagnostic writes even with `--dry-run`
-or `--only-print-filenames`, without authorizing media or sync-state mutation.
-Storage failures and cancellation stay latched; partial transport bodies retain
-their partial file and allow normal network retries, but fail the final capture
-result. The sync owner checks capture errors even when provider
-policy catches an operation's error, and drains in-flight capture work before
-returning failure. Interrupted or failed captures may retain partial files.
-Failure does not imply rollback of checkpoints already advanced by sync.
+`--capture-icloud-responses` opts sync/service into invocation-scoped raw CloudKit bodies before parsing.
+No auth traffic, headers, media, extra queries, or expanded fields; redirects stay same-origin.
+Under the resolved data directory, `.diagnostics/<timestamp>-<uuid>/NNNNNN.body.part` is fsynced,
+published as `.body` without overwrite, then parent-fsynced. Read-only modes permit only these extra writes.
+Storage failures stop requests; partial transport bodies allow retries but fail capture. The sync owner
+drains in-flight work and propagates failures; partial files may remain, and advanced checkpoints are not rolled back.
 
 ### Download and publication
 
@@ -483,17 +460,10 @@ passwords, session cookies, bearer tokens, or unredacted provider identifiers
 to logs or machine output. Preserve process hardening that limits credential
 exposure through core dumps.
 
-Explicit `--capture-icloud-responses` is a narrow exception for private raw
-CloudKit body files, not logs or machine output. Bodies are unredacted and may
-contain personal metadata, provider identifiers, and credential-bearing URLs;
-never share them unredacted. Capture does not store authentication exchanges,
-cookies, request headers, or downloaded media bodies. Filenames contain only
-generated timestamps, UUIDs, and sequence numbers, not provider identifiers.
-The resolved data directory is the trusted filesystem boundary. On Unix,
-capture directories use `0700` and body files use `0600`; an existing
-`.diagnostics` must be a non-symlink directory owned by the current user with
-no group/other permissions. Non-Unix platforms currently fail closed rather
-than create capture files without an at-creation privacy guarantee.
+Opt-in raw capture is private, not log output: bodies may contain personal metadata,
+identifiers, and credential-bearing URLs. Never share unredacted. Filenames use only generated values.
+The resolved data directory is trusted; `.diagnostics` must be current-user-owned, private, and not a symlink.
+Capture is Unix-only with `0700` directories and `0600` files; other platforms fail closed.
 
 `password set` prompts only in interactive input mode. Headless callers must
 use a password file or password command. The command resolves the secret and
