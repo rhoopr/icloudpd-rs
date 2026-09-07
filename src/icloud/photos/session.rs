@@ -107,56 +107,11 @@ impl PhotosSession for CapturingPhotosSession {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
-        self.capture.check()?;
-        let client = self.session.write().await.photos_capture_client()?;
-        captured_post(&client, url, body, headers, &self.capture).await
-    }
-
-    fn clone_box(&self) -> Box<dyn PhotosSession> {
-        Box::new(self.clone())
-    }
-}
-
-// A captured JSON decode failure must retry just like reqwest::Response::json,
-// without putting provider-controlled bytes from serde's error into logs.
-#[derive(Debug, thiserror::Error)]
-#[error("Could not decode the captured iCloud Photos JSON response")]
-struct CapturedJsonError;
-
-async fn captured_post(
-    client: &reqwest::Client,
-    url: &str,
-    body: String,
-    headers: &[(&str, &str)],
-    capture: &Arc<ResponseCapture>,
-) -> anyhow::Result<Value> {
-    use anyhow::Context;
-    use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
-
-    let mut url = reqwest::Url::parse(url).context("Invalid iCloud Photos request URL")?;
-    let origin = url.origin();
-    let mut method = reqwest::Method::POST;
-    let mut redirects = 0;
-    loop {
-        // A fresh lease per hop keeps cancellation and finish admission correct.
-        let mut request = capture.begin().await?;
-        let mut builder = client.request(method.clone(), url.clone());
-        if method == reqwest::Method::POST {
-            builder = builder.body(body.clone());
-        }
+        let mut request = self.capture.begin().await?;
+        let client = self.session.read().await.http_client().clone();
+        // ponytail: reqwest follows redirects; capture intermediate bodies only if needed later.
+        let mut builder = client.post(url).body(body);
         for &(key, value) in headers {
-            if method == reqwest::Method::GET
-                && [
-                    CONTENT_ENCODING,
-                    CONTENT_LENGTH,
-                    CONTENT_TYPE,
-                    TRANSFER_ENCODING,
-                ]
-                .iter()
-                .any(|header| header.as_str().eq_ignore_ascii_case(key))
-            {
-                continue;
-            }
             builder = builder.header(key, value);
         }
         let resp = match builder.send().await {
@@ -167,34 +122,6 @@ async fn captured_post(
             }
         };
         let status = resp.status();
-        if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
-            && let Some(location) = resp.headers().get(reqwest::header::LOCATION).cloned()
-        {
-            // Save even rejected redirects, without retaining their bodies in memory.
-            request.read_body(resp, Some(0)).await?;
-            anyhow::ensure!(
-                redirects < 10,
-                "iCloud Photos capture redirect limit exceeded"
-            );
-            let next = location
-                .to_str()
-                .ok()
-                .and_then(|location| url.join(location).ok())
-                .context("Invalid iCloud Photos capture redirect location")?;
-            anyhow::ensure!(
-                next.origin() == origin
-                    && next.host_str().is_some()
-                    && next.username().is_empty()
-                    && next.password().is_none(),
-                "Refusing iCloud Photos capture redirect outside the original origin or with credentials"
-            );
-            if matches!(status.as_u16(), 301..=303) {
-                method = reqwest::Method::GET;
-            }
-            url = next;
-            redirects += 1;
-            continue;
-        }
         let is_error = status.is_client_error() || status.is_server_error();
         let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
         let bytes = request
@@ -210,9 +137,19 @@ async fn captured_post(
             }
             .into());
         }
-        return serde_json::from_slice(&bytes).map_err(|_decode_error| CapturedJsonError.into());
+        serde_json::from_slice(&bytes).map_err(|_decode_error| CapturedJsonError.into())
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
     }
 }
+
+// A captured JSON decode failure must retry just like reqwest::Response::json,
+// without putting provider-controlled bytes from serde's error into logs.
+#[derive(Debug, thiserror::Error)]
+#[error("Could not decode the captured iCloud Photos JSON response")]
+struct CapturedJsonError;
 
 // SharedSession delegates to the inner Session's http_client(). The read lock
 // is held only long enough to clone the Arc-backed Client, then released before

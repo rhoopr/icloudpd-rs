@@ -148,7 +148,7 @@ bound did not truncate the stream.
 ### Private CloudKit response capture
 
 `--capture-icloud-responses` opts sync/service into invocation-scoped raw CloudKit bodies before parsing.
-No auth traffic, headers, media, extra queries, or expanded fields; redirects stay same-origin.
+No auth traffic, headers, media, extra queries, or expanded fields; intermediate redirects are not captured.
 Under the resolved data directory, `.diagnostics/<timestamp>-<uuid>/NNNNNN.body.part` is fsynced,
 published as `.body` without overwrite, then parent-fsynced. Read-only modes permit only these extra writes.
 Storage failures stop requests; partial transport bodies allow retries but fail capture. The sync owner
