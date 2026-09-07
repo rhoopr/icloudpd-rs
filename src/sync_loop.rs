@@ -618,6 +618,16 @@ pub(crate) struct SyncArgs {
 /// Run the sync command: authenticate, enumerate photos, download, and
 /// optionally loop in watch mode.
 pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> anyhow::Result<()> {
+    let capture = if args.sync.capture_icloud_responses {
+        let data_dir = config::resolve_data_dir(
+            globals.data_dir.as_deref(),
+            args.toml_config.as_ref(),
+            &args.config_path,
+        );
+        Some(crate::icloud::photos::capture::ResponseCapture::new(&data_dir).await?)
+    } else {
+        None
+    };
     let SyncArgs {
         is_one_shot,
         service_mode,
@@ -890,8 +900,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let (shared_session, mut photos_service, libraries) = loop {
         let this_auth = take_pending_auth(&mut pending_auth)?;
         let released_generation = this_auth.session.generation();
-        let init_result =
-            init_photos_service(this_auth, api_retry_config, config.ui.personality_mode).await;
+        let init_result = init_photos_service(
+            this_auth,
+            api_retry_config,
+            config.ui.personality_mode,
+            capture.clone(),
+        )
+        .await;
         let (ss, mut ps) = match init_result {
             Ok(pair) => pair,
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
@@ -8952,7 +8967,9 @@ mod tests {
                     let limit = request["resultsLimit"].as_u64().unwrap_or(0) / 2;
                     let records: Vec<_> = self
                         .records
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .skip(offset as usize)
                         .take(limit as usize)
                         .flatten()

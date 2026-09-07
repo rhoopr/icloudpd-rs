@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 
+use super::capture::ResponseCapture;
 use crate::retry::{self, RetryAction, RetryConfig, parse_retry_after_header};
 
 /// Upper bound on any `Retry-After` hint from CloudKit, chosen so a
@@ -90,6 +92,60 @@ impl PhotosSession for reqwest::Client {
         Box::new(self.clone())
     }
 }
+
+#[derive(Clone)]
+pub(crate) struct CapturingPhotosSession {
+    pub(crate) session: crate::auth::SharedSession,
+    pub(crate) capture: Arc<ResponseCapture>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for CapturingPhotosSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let client = self.session.read().await.http_client().clone();
+        // ponytail: reqwest follows redirects; capture intermediate bodies only if needed later.
+        let mut builder = client.post(url).body(body);
+        for &(key, value) in headers {
+            builder = builder.header(key, value);
+        }
+        let resp = builder.send().await.map_err(reqwest::Error::without_url)?;
+        let status = resp.status();
+        let is_error = status.is_client_error() || status.is_server_error();
+        let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
+        // ponytail: buffer one response; stream to disk if diagnostic bodies become too large.
+        let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
+        if let Err(error) = self.capture.write(bytes.clone()).await {
+            tracing::error!("Could not save iCloud Photos response");
+            return Err(error.context("Could not save iCloud Photos response"));
+        }
+        if is_error {
+            let body = String::from_utf8_lossy(&bytes);
+            return Err(HttpStatusError {
+                status: status.as_u16(),
+                url: "[captured iCloud Photos endpoint]".to_string(),
+                retry_after,
+                body: (!body.is_empty()).then(|| truncate_body(&body)),
+            }
+            .into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_decode_error| CapturedJsonError.into())
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+// A captured JSON decode failure must retry just like reqwest::Response::json,
+// without putting provider-controlled bytes from serde's error into logs.
+#[derive(Debug, thiserror::Error)]
+#[error("Could not decode the captured iCloud Photos JSON response")]
+struct CapturedJsonError;
 
 // SharedSession delegates to the inner Session's http_client(). The read lock
 // is held only long enough to clone the Arc-backed Client, then released before
@@ -326,6 +382,9 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
 /// (5xx, 429), and retryable `CloudKit` server errors are transient;
 /// client errors (4xx) and non-retryable server errors are permanent.
 fn classify_api_error(e: &anyhow::Error) -> RetryAction {
+    if e.is::<CapturedJsonError>() {
+        return RetryAction::Retry;
+    }
     if let Some(ck_err) = e.downcast_ref::<CloudKitServerError>() {
         return if ck_err.retryable {
             RetryAction::Retry
@@ -469,6 +528,53 @@ pub fn check_changes_zone_error(
             error_code: code.into(),
         }),
         None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod wiremock_tests {
+    use std::sync::Arc;
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, ResponseTemplate};
+
+    use super::{CapturingPhotosSession, PhotosSession};
+    use crate::icloud::photos::capture::ResponseCapture;
+
+    #[tokio::test]
+    async fn capture_http_response_body() {
+        let server = crate::start_wiremock_or_skip!();
+        let raw = b"{}";
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(raw.to_vec()))
+            .mount(&server)
+            .await;
+        let data = tempfile::tempdir().unwrap();
+        let auth = crate::auth::session::Session::new(
+            data.path(),
+            "capture@example.test",
+            "https://example.test",
+            None,
+        )
+        .await
+        .unwrap();
+        let session = CapturingPhotosSession {
+            session: Arc::new(tokio::sync::RwLock::new(auth)),
+            capture: ResponseCapture::new(data.path()).await.unwrap(),
+        };
+        session.post(&server.uri(), "{}".into(), &[]).await.unwrap();
+        let run = std::fs::read_dir(data.path().join(".diagnostics"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut files = std::fs::read_dir(run).unwrap();
+        let body = files.next().unwrap().unwrap().path();
+        assert_eq!(body.extension().unwrap(), "body");
+        assert_eq!(std::fs::read(body).unwrap(), raw);
+        assert!(files.next().is_none());
     }
 }
 

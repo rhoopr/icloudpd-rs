@@ -450,6 +450,9 @@ passwords, session cookies, bearer tokens, or unredacted provider identifiers
 to logs or machine output. Preserve process hardening that limits credential
 exposure through core dumps.
 
+`--capture-icloud-responses` saves unredacted Photos response bodies in private
+`<data-dir>/.diagnostics/<run-id>/` files on Unix. Auth, media, and intermediate redirects are excluded.
+
 `password set` prompts only in interactive input mode. Headless callers must
 use a password file or password command. The command resolves the secret and
 passes it directly to the credential store without printing it.

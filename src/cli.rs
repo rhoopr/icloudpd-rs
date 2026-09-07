@@ -241,6 +241,12 @@ pub struct SyncArgs {
     #[arg(long)]
     pub no_progress_bar: bool,
 
+    /// Save sensitive, unredacted iCloud Photos response bodies under the data directory's
+    /// .diagnostics folder (Unix only). Includes errors and retries, not authentication or media bodies.
+    /// Explicitly writes diagnostics even with --dry-run or --only-print-filenames.
+    #[arg(long)]
+    pub capture_icloud_responses: bool,
+
     /// Skip assets before this cutoff. Date-only values compare the capture-local calendar date;
     /// explicit datetimes and relative intervals compare the instant (e.g., 2025-01-02 or 20d).
     #[arg(long)]
