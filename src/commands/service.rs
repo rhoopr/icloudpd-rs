@@ -73,20 +73,18 @@ pub(crate) async fn init_photos_service(
 
     let shared_session: auth::SharedSession =
         std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
-    let make_session = || -> Box<dyn icloud::photos::PhotosSession> {
-        match &capture {
-            Some(capture) => Box::new(icloud::photos::session::CapturingPhotosSession {
-                session: Arc::clone(&shared_session),
-                capture: Arc::clone(capture),
-            }),
-            None => Box::new(Arc::clone(&shared_session)),
-        }
+    let session_box: Box<dyn icloud::photos::PhotosSession> = match capture {
+        Some(capture) => Box::new(icloud::photos::session::CapturingPhotosSession {
+            session: Arc::clone(&shared_session),
+            capture,
+        }),
+        None => Box::new(shared_session.clone()),
     };
 
     tracing::debug!("Initializing photos service...");
     match icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
-        make_session(),
+        session_box.clone_box(),
         params.clone(),
         api_retry_config,
     )
@@ -114,7 +112,7 @@ pub(crate) async fn init_photos_service(
 
     let service = match icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
-        make_session(),
+        session_box,
         params,
         api_retry_config,
     )

@@ -1567,21 +1567,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_response_capture_is_explicit_and_allows_preview() {
-        assert!(!SyncArgs::default().capture_icloud_responses);
-        for preview in ["--dry-run", "--only-print-filenames"] {
-            let Command::Sync { sync, .. } =
-                Cli::try_parse_from(["kei", "sync", "--capture-icloud-responses", preview])
-                    .unwrap()
-                    .command
-            else {
-                panic!("expected Sync command");
-            };
-            assert!(sync.capture_icloud_responses);
-        }
-    }
-
-    #[test]
     fn sync_refresh_metadata_parses_to_struct_field() {
         let Command::Sync { sync, .. } = Cli::try_parse_from(["kei", "sync", "--refresh-metadata"])
             .unwrap()

@@ -107,26 +107,22 @@ impl PhotosSession for CapturingPhotosSession {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
-        let mut request = self.capture.begin().await?;
         let client = self.session.read().await.http_client().clone();
         // ponytail: reqwest follows redirects; capture intermediate bodies only if needed later.
         let mut builder = client.post(url).body(body);
         for &(key, value) in headers {
             builder = builder.header(key, value);
         }
-        let resp = match builder.send().await {
-            Ok(resp) => resp,
-            Err(error) => {
-                request.complete();
-                return Err(error.without_url().into());
-            }
-        };
+        let resp = builder.send().await.map_err(reqwest::Error::without_url)?;
         let status = resp.status();
         let is_error = status.is_client_error() || status.is_server_error();
         let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
-        let bytes = request
-            .read_body(resp, is_error.then_some(MAX_PRESERVED_BODY + 16))
-            .await?;
+        // ponytail: buffer one response; stream to disk if diagnostic bodies become too large.
+        let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
+        if let Err(error) = self.capture.write(bytes.clone()).await {
+            tracing::error!("Could not save iCloud Photos response");
+            return Err(error.context("Could not save iCloud Photos response"));
+        }
         if is_error {
             let body = String::from_utf8_lossy(&bytes);
             return Err(HttpStatusError {
@@ -568,7 +564,6 @@ mod wiremock_tests {
             capture: ResponseCapture::new(data.path()).await.unwrap(),
         };
         session.post(&server.uri(), "{}".into(), &[]).await.unwrap();
-        session.capture.finish().await.unwrap();
         let run = std::fs::read_dir(data.path().join(".diagnostics"))
             .unwrap()
             .next()

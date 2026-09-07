@@ -30,7 +30,6 @@ changing behavior.
 | One sync cycle | `src/sync_cycle.rs` | Chooses source enumeration, reconciles config drift, dispatches each library, and advances or preserves provider checkpoints. |
 | Library and pass planning | `src/commands/service.rs` | Resolves libraries, collection scope, album plans, smart folders, unfiled passes, and cross-zone hydration. |
 | iCloud Photos adapter | `src/icloud/photos/` | Owns CloudKit records, queries, change streams, provider identity, albums, smart folders, and metadata decoding. |
-| Response capture | `src/icloud/photos/capture.rs`, `src/icloud/photos/session.rs` | Raw body storage; `src/sync_loop.rs` owns lifetime and failure propagation. |
 | Download orchestration | `src/download/mod.rs` | Routes full, incremental, targeted-backfill, and durable-retry work and produces checkpoint evidence. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
 | Streaming workers | `src/download/pipeline.rs` | Runs bounded producers and consumers, coordinates file transfer, metadata writes, adoption, and outcome aggregation. |
@@ -144,15 +143,6 @@ record as a policy, filename, or date skip.
 
 Recent and date-bounded runs may advance only when the producer proves the
 bound did not truncate the stream.
-
-### Private CloudKit response capture
-
-`--capture-icloud-responses` opts sync/service into invocation-scoped raw CloudKit bodies before parsing.
-No auth traffic, headers, media, extra queries, or expanded fields; intermediate redirects are not captured.
-Under the resolved data directory, `.diagnostics/<timestamp>-<uuid>/NNNNNN.body.part` is fsynced,
-published as `.body` without overwrite, then parent-fsynced. Read-only modes permit only these extra writes.
-Storage failures stop requests; partial transport bodies allow retries but fail capture. The sync owner
-drains in-flight work and propagates failures; partial files may remain, and advanced checkpoints are not rolled back.
 
 ### Download and publication
 
@@ -460,10 +450,8 @@ passwords, session cookies, bearer tokens, or unredacted provider identifiers
 to logs or machine output. Preserve process hardening that limits credential
 exposure through core dumps.
 
-Opt-in raw capture is private, not log output: bodies may contain personal metadata,
-identifiers, and credential-bearing URLs. Never share unredacted. Filenames use only generated values.
-The resolved data directory is trusted; `.diagnostics` must be current-user-owned, private, and not a symlink.
-Capture is Unix-only with `0700` directories and `0600` files; other platforms fail closed.
+`--capture-icloud-responses` saves unredacted Photos response bodies in private
+`<data-dir>/.diagnostics/<run-id>/` files on Unix. Auth, media, and intermediate redirects are excluded.
 
 `password set` prompts only in interactive input mode. Headless callers must
 use a password file or password command. The command resolves the secret and

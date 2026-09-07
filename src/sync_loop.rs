@@ -628,21 +628,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     } else {
         None
     };
-    let result = Box::pin(run_sync_inner(globals, args, capture.as_ref())).await;
-    if let Some(capture) = capture {
-        // Some bounded producers outlive their consumer. Drain their in-flight
-        // responses, and surface capture failures even when lookup policy caught them.
-        capture.finish().await?;
-    }
-    result
-}
-
-async fn run_sync_inner(
-    globals: &config::GlobalArgs,
-    args: SyncArgs,
-    capture: Option<&Arc<crate::icloud::photos::capture::ResponseCapture>>,
-) -> anyhow::Result<()> {
-    let check_capture = || capture.map_or(Ok(()), |capture| capture.check());
     let SyncArgs {
         is_one_shot,
         service_mode,
@@ -919,10 +904,9 @@ async fn run_sync_inner(
             this_auth,
             api_retry_config,
             config.ui.personality_mode,
-            capture.cloned(),
+            capture.clone(),
         )
         .await;
-        check_capture()?;
         let (ss, mut ps) = match init_result {
             Ok(pair) => pair,
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
@@ -1311,7 +1295,6 @@ async fn run_sync_inner(
     }
 
     loop {
-        check_capture()?;
         if shutdown_token.is_cancelled() {
             tracing::info!("Shutdown requested, exiting...");
             break;
@@ -1336,7 +1319,6 @@ async fn run_sync_inner(
         } else {
             WatchPrecheck::proceed_all()
         };
-        check_capture()?;
 
         if !config.runtime.dry_run
             && !config.runtime.only_print_filenames
@@ -1377,7 +1359,6 @@ async fn run_sync_inner(
                 &mut consecutive_album_refresh_failures,
             )
             .await;
-            check_capture()?;
             let cycle_library_states: Vec<&LibraryState> = library_states
                 .iter()
                 .filter(|s| watch_precheck.should_sync_zone(&s.zone_name))
@@ -1407,7 +1388,6 @@ async fn run_sync_inner(
                 &shutdown_token,
             )
             .await?;
-            check_capture()?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
             let refresh_tail_failures = if config.runtime.refresh_metadata {
                 if let Some(db) = state_db.as_deref() {
@@ -1618,7 +1598,6 @@ async fn run_sync_inner(
         }
 
         if let Some(interval) = next_watch_interval {
-            check_capture()?;
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
                 break;
